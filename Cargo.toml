@@ -22,14 +22,14 @@ repository = "https://github.com/openbasil/basil"
 homepage = "https://github.com/openbasil/basil"
 
 [workspace.dependencies]
-basil = { path = "crates/basil-client", package = "basil-client" }
-basil-cose = { path = "crates/basil-cose" }
-basil-proto = { path = "crates/basil-proto" }
-basil-nats = { path = "crates/basil-nats" }
-basil-nats-bridge = { path = "crates/basil-nats-bridge" }
-basil-keystore-backend = { path = "crates/basil-keystore-backend" }
-basil-core = { path = "crates/basil-core", default-features = false }
-basil-bin = { path = "crates/basil-bin" }
+basil = { version = "0.5.4", path = "crates/basil-client", package = "basil-client" }
+basil-cose = { version = "0.5.4", path = "crates/basil-cose" }
+basil-proto = { version = "0.5.4", path = "crates/basil-proto" }
+basil-nats = { version = "0.5.4", path = "crates/basil-nats" }
+basil-nats-bridge = { version = "0.5.4", path = "crates/basil-nats-bridge" }
+basil-keystore-backend = { version = "0.5.4", path = "crates/basil-keystore-backend" }
+basil-core = { version = "0.5.4", path = "crates/basil-core", default-features = false }
+basil-bin = { version = "0.5.4", path = "crates/basil-bin" }
 
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 aes-kw = "0.3"
@@ -129,7 +129,7 @@ uuid = { version = "1", features = ["v4"] }
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
 x509-parser = "0.18"
 zero-secrets = "0.2.0"
-zeroize = { version = "1", default-features = false, features = ["derive"] }
+zeroize = { version = "1", default-features = false, features = ["derive", "alloc"] }
 
 # TPM sealed-bundle unlock slot (basil-lpj, feature `unlock-tpm`). Pure-Rust, no
 # C build dependency: `tpm2-protocol` is a no_std, alloc-free, zero-dependency
