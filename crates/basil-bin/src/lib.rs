@@ -50,8 +50,6 @@ pub enum Command {
 pub enum ConfigCommand {
     /// Scaffold a first-run starter set.
     Init(init::InitArgs),
-    /// Lint the catalog against its backends.
-    Check(agent_cli::CheckArgs),
     /// Evaluate a proposed policy decision offline.
     Explain(agent_cli::ExplainArgs),
 }

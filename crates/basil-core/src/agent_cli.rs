@@ -31,7 +31,7 @@ use crate::service::broker::{BrokerIdentityRuntimeConfig, InvocationRuntimeConfi
 use crate::{
     AuditLog, Backend, BackendKind, BackendManager, BrokerLimits, BrokerState, CapabilityPolicy,
     DEFAULT_MAX_ENCRYPT_SIZE, DEFAULT_MAX_PAYLOAD_SIZE, DEFAULT_ROTATION_GRACE_VERSIONS,
-    DEFAULT_SOCKET_MODE, DEFAULT_SVID_TTL_SECS, JwtRevocationStore, MissingPolicy, ReloadActor,
+    DEFAULT_SOCKET_MODE, DEFAULT_SVID_TTL_SECS, JwtRevocationStore, ReloadActor,
     ReloadInputs, ServerConfig, SpiffeConfig, SpiffeVaultBackend, VaultBackend,
     enforce_capabilities, load, reload_generation, run_grpc,
 };
@@ -64,25 +64,6 @@ const BROKER_REQUEST_ENCRYPTION_USE: &str = "request-encryption";
 /// Arguments for the daemon (`run`) path.
 #[derive(Debug, clap::Args)]
 pub struct RunArgs {
-    #[command(flatten)]
-    overrides: ConfigOverrides,
-}
-
-/// Arguments for the read-only catalog **`check`** (lint) path (`vault-roe`).
-///
-/// Loads the catalog/policy + unlocks the bundle (the same setup `run` uses),
-/// then probes each catalog key and reports present/missing per key with its
-/// `missing` policy. With `--require`, exits non-zero iff a required
-/// (`missing=error`) key is absent. It NEVER generates or mutates anything, and
-/// never binds a socket: a CI / pre-deploy gate.
-#[derive(Debug, clap::Args)]
-pub struct CheckArgs {
-    /// Exit non-zero if any `missing=error` (required) key is absent from its
-    /// backend. Without this flag the check is report-only and always exits 0.
-    /// `warn`/`generate`-policy absent keys never fail the gate.
-    #[arg(long)]
-    require: bool,
-
     #[command(flatten)]
     overrides: ConfigOverrides,
 }
@@ -133,19 +114,32 @@ fn parse_op(s: &str) -> Result<crate::catalog::Op, String> {
 /// Arguments for the preflight **`doctor`** path (`basil-f0j`).
 ///
 /// Resolves the same catalog/policy/bundle/socket config `run` uses, then runs a
-/// set of independent read-only diagnostics. By default it NEVER unlocks the
-/// bundle, binds the socket, or mutates anything. `--check-keys` explicitly adds
-/// an authenticated read-only key-material probe that unlocks the bundle but
-/// still never reconciles/generates/mutates. Exits non-zero iff any check FAILs.
+/// set of independent read-only diagnostics: catalog/policy load, backend
+/// capability enforcement, invocation broker-identity/key bindings, feature
+/// compatibility, backend binary on PATH, socket, bundle perms/freshness, and
+/// backend reachability. By default it NEVER unlocks the bundle, binds the socket,
+/// or mutates anything. `--keys` explicitly adds an authenticated read-only
+/// per-key existence probe that unlocks the bundle but still never
+/// reconciles/generates/mutates.
+///
+/// Exit model: non-zero only for FATAL conditions (those that would stop the
+/// broker from starting). Warnings are report-only and exit 0, unless `--strict`
+/// is given, which makes warnings exit non-zero too.
 #[derive(Debug, clap::Args)]
 pub struct DoctorArgs {
     /// Emit a stable machine-readable JSON document instead of human-readable text.
     #[arg(long)]
     json: bool,
 
-    /// Unlock the sealed bundle and run the authenticated read-only key-material probe.
+    /// Unlock the sealed bundle and run the authenticated read-only per-key
+    /// existence probe (an authenticated tier on top of the offline checks).
     #[arg(long)]
-    check_keys: bool,
+    keys: bool,
+
+    /// Treat warnings as failures: exit non-zero if any check is a warning, not
+    /// just on a fatal condition.
+    #[arg(long)]
+    strict: bool,
 
     #[command(flatten)]
     overrides: ConfigOverrides,
@@ -792,12 +786,6 @@ struct RunConfig {
     setup: SetupArgs,
 }
 
-#[derive(Debug, Clone)]
-struct CheckConfig {
-    invocation: InvocationRuntimeConfig,
-    setup: SetupArgs,
-}
-
 /// clap value parser for [`CapabilityPolicy`] (`strict` | `degraded` | `off`).
 fn parse_capability_policy(s: &str) -> Result<CapabilityPolicy, String> {
     s.parse()
@@ -949,7 +937,7 @@ fn validate_basil_identity_uri(field: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_invocation_catalog_bindings(
+pub(crate) fn validate_invocation_catalog_bindings(
     invocation: &InvocationRuntimeConfig,
     catalog: &crate::Catalog,
 ) -> Result<()> {
@@ -1150,14 +1138,14 @@ fn is_metadata_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
-fn load_check_config(overrides: &ConfigOverrides) -> Result<CheckConfig> {
+/// Resolve the setup `doctor --keys` unlocks with. The authenticated key probe is
+/// a preflight read; it must not consume a passphrase file that the subsequent
+/// agent start needs, so it sets `passphrase_no_wipe`.
+fn load_key_probe_config(overrides: &ConfigOverrides) -> Result<SetupArgs> {
     let file = load_config_file(overrides)?;
-    let invocation = resolve_invocation_config(&file.broker_identity, &file.invocation)?;
     let mut setup = build_setup(&file, overrides)?;
-    // `config check --require` and doctor key probing are preflight reads. They
-    // must not consume a passphrase file that the subsequent agent start needs.
     setup.unlock.passphrase_no_wipe = true;
-    Ok(CheckConfig { invocation, setup })
+    Ok(setup)
 }
 
 pub(crate) fn load_config_file(overrides: &ConfigOverrides) -> Result<AgentConfigFile> {
@@ -1721,81 +1709,13 @@ fn spawn_retention_sweep(state: Arc<BrokerState>, interval_secs: u64) {
     std::mem::drop(handle);
 }
 
-/// Run the read-only catalog **check** (`vault-roe`): load catalog/policy, unlock
-/// the bundle, build the manager, then probe each key and report present/missing
-/// (with its `missing` policy). NEVER generates/mutates; never binds a socket.
-///
-/// With `--require`, returns an error (non-zero exit) iff a required
-/// (`missing=error`) key is absent. Without it, the function reports and returns
-/// `Ok` regardless of what is missing. A backend unreachable during the probe is
-/// a fatal error either way (fail closed).
-async fn run_check(args: CheckArgs) -> Result<()> {
-    let check_config = load_check_config(&args.overrides)?;
-    let Prepared {
-        manager, catalog, ..
-    } = prepare_manager(&check_config.setup).await?;
-
-    validate_invocation_catalog_bindings(&check_config.invocation, &catalog)
-        .context("validating invocation broker identity and keys")?;
-
-    // Offline capability check (no backend I/O): does each backend provide what
-    // the catalog requires? Honors `capability-policy`; under `strict` a gap
-    // fails the lint (the offline CI gate), independent of --require.
-    match enforce_capabilities(&catalog, check_config.setup.capability_policy) {
-        Ok(s) => println!(
-            "capability check: {} backend(s) enforced, {} undeclared (skipped), {} warning(s)",
-            s.enforced, s.skipped_undeclared, s.warnings
-        ),
-        Err(e) => bail!("{e}"),
-    }
-
-    // Read-only probe of every catalog key. An unreachable backend is a fatal
-    // error here (never reported as a clean "missing").
-    let report = manager
-        .check()
-        .await
-        .context("probing catalog keys against their backends")?;
-
-    let present = report.present_count();
-    let total = report.keys.len();
-    println!("catalog check: {present}/{total} key(s) present");
-
-    // Emit each missing key with the policy reconcile would apply to it, grouped
-    // so the error-class (required) keys are unmistakable.
-    let mut required_absent = 0usize;
-    for (name, policy) in report.missing() {
-        let label = match policy {
-            MissingPolicy::Error => {
-                required_absent += 1;
-                "required (missing=error)"
-            }
-            MissingPolicy::Warn => "warn (missing=warn)",
-            MissingPolicy::Generate => "would-generate (missing=generate)",
-        };
-        println!("  MISSING {name}  [{label}]");
-    }
-
-    if report.missing().count() == 0 {
-        println!("all catalog keys present");
-    }
-
-    // --require gates ONLY on error-class absent keys; warn/generate-absent never
-    // fail the check. Without --require the check is report-only (always Ok).
-    if args.require && report.should_fail_required() {
-        bail!(
-            "{required_absent} required key(s) absent (missing=error); failing check (--require)"
-        );
-    }
-    Ok(())
-}
-
 /// Build the resolved [`doctor::DoctorInputs`] from the config file + overrides,
 /// using the same path/socket resolution `run` uses. A missing required path
-/// (catalog/policy/bundle) is a clean config error (non-zero exit), exactly as in
-/// `check`: that is a usage error, distinct from a diagnostic failure.
+/// (catalog/policy/bundle) is a clean config error (non-zero exit): that is a
+/// usage error, distinct from a diagnostic failure.
 fn load_doctor_inputs(overrides: &ConfigOverrides) -> Result<doctor::DoctorInputs> {
     let file = load_config_file(overrides)?;
-    let _invocation = resolve_invocation_config(&file.broker_identity, &file.invocation)?;
+    let invocation = resolve_invocation_config(&file.broker_identity, &file.invocation)?;
     let setup = build_setup(&file, overrides)?;
     let socket = overrides
         .socket
@@ -1803,6 +1723,10 @@ fn load_doctor_inputs(overrides: &ConfigOverrides) -> Result<doctor::DoctorInput
         .or(file.socket)
         .unwrap_or_else(|| crate::DEFAULT_SOCKET_PATH.to_string());
     let socket_mode = file.socket_mode.map_or(DEFAULT_SOCKET_MODE, |mode| mode.0);
+    let capability_policy = setup.capability_policy;
+    let unlock_passphrase_selected = setup.unlock.passphrase_file.is_some();
+    let unlock_bip39_selected = setup.unlock.bip39_phrase_file.is_some();
+    let unlock_age_yubikey_selected = setup.unlock.age_yubikey;
 
     Ok(doctor::DoctorInputs {
         catalog: setup.catalog,
@@ -1811,23 +1735,25 @@ fn load_doctor_inputs(overrides: &ConfigOverrides) -> Result<doctor::DoctorInput
         socket,
         socket_mode,
         socket_group: file.socket_group,
-        unlock_passphrase_selected: setup.unlock.passphrase_file.is_some(),
-        unlock_bip39_selected: setup.unlock.bip39_phrase_file.is_some(),
-        unlock_age_yubikey_selected: setup.unlock.age_yubikey,
+        capability_policy,
+        invocation,
+        unlock_passphrase_selected,
+        unlock_bip39_selected,
+        unlock_age_yubikey_selected,
     })
 }
 
 /// Run the preflight **doctor** (`basil-f0j`): resolve config, run every
 /// independent read-only check, print the report (human or `--json`), and exit
-/// non-zero iff any check failed. The default path never unlocks the bundle,
-/// binds the socket, or mutates anything; `--check-keys` explicitly unlocks only
-/// to run the same read-only existence probe as `config check --require`.
+/// per the fatal-vs-warning model. The default path never unlocks the bundle,
+/// binds the socket, or mutates anything; `--keys` explicitly unlocks only to run
+/// the authenticated read-only per-key existence probe.
 async fn run_doctor(args: DoctorArgs) -> Result<()> {
     let inputs = load_doctor_inputs(&args.overrides)?;
     let mut report = doctor::run_doctor(&inputs, doctor::EnabledFeatures::current()).await;
-    if args.check_keys {
-        let key_row = doctor_key_material_check(&args.overrides).await;
-        report.checks.push(key_row);
+    if args.keys {
+        let mut key_rows = doctor_key_material_rows(&args.overrides).await;
+        report.checks.append(&mut key_rows);
         report = doctor::DoctorReport::from_checks(report.checks);
     }
 
@@ -1837,7 +1763,7 @@ async fn run_doctor(args: DoctorArgs) -> Result<()> {
         print!("{}", doctor::render_human(&report));
     }
 
-    if report.has_blocking_failure() {
+    if report.should_exit_nonzero(args.strict) {
         // A blocking misconfiguration exits non-zero, but cleanly: the report has
         // already been printed, so suppress the redundant anyhow error chain.
         std::process::exit(1);
@@ -1845,26 +1771,30 @@ async fn run_doctor(args: DoctorArgs) -> Result<()> {
     Ok(())
 }
 
-async fn doctor_key_material_check(overrides: &ConfigOverrides) -> doctor::CheckResult {
-    let check_config = match load_check_config(overrides) {
-        Ok(config) => config,
+/// Unlock the sealed bundle and run the authenticated read-only per-key existence
+/// probe for `doctor --keys`, mapping the [`crate::CheckReport`] into per-key
+/// [`doctor::CheckResult`] rows. Every failure path is folded into a secret-free
+/// key-material row so one bad probe never aborts the rest of the report.
+async fn doctor_key_material_rows(overrides: &ConfigOverrides) -> Vec<doctor::CheckResult> {
+    let setup = match load_key_probe_config(overrides) {
+        Ok(setup) => setup,
         Err(err) => {
-            return doctor::key_material_check(Err(format!(
-                "could not resolve check configuration: {err:#}"
+            return doctor::key_material_rows(Err(format!(
+                "could not resolve key-probe configuration: {err:#}"
             )));
         }
     };
-    let Prepared { manager, .. } = match prepare_manager(&check_config.setup).await {
+    let Prepared { manager, .. } = match prepare_manager(&setup).await {
         Ok(prepared) => prepared,
         Err(err) => {
-            return doctor::key_material_check(Err(format!(
+            return doctor::key_material_rows(Err(format!(
                 "could not build authenticated backend manager: {err:#}"
             )));
         }
     };
     match manager.check().await {
-        Ok(report) => doctor::key_material_check(Ok(&report)),
-        Err(err) => doctor::key_material_check(Err(err.to_string())),
+        Ok(report) => doctor::key_material_rows(Ok(&report)),
+        Err(err) => doctor::key_material_rows(Err(err.to_string())),
     }
 }
 
@@ -2105,12 +2035,6 @@ pub async fn run_agent(args: RunArgs) -> Result<()> {
     Box::pin(run_with_config_logging(&overrides, run_daemon(args))).await
 }
 
-/// Run the offline catalog/backend check behind `basil config check`.
-pub async fn run_config_check(args: CheckArgs) -> Result<()> {
-    let overrides = args.overrides.clone();
-    Box::pin(run_with_config_logging(&overrides, run_check(args))).await
-}
-
 /// Run the offline policy explainer behind `basil config explain`.
 pub fn run_config_explain(args: &ExplainArgs) -> Result<()> {
     let logging = logging_config_for_overrides(&args.overrides)?;
@@ -2171,6 +2095,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::catalog::MissingPolicy;
     use clap::Parser as _;
 
     fn temp_config(contents: &str) -> PathBuf {

@@ -27,6 +27,8 @@ SPDX-License-Identifier: Apache-2.0
 - 2026-07-05
   - basil-nats is now `no_std` + `alloc` compatible: the crate source is `#![no_std]` (`extern crate alloc`) and gains `std` (default) / `alloc` cargo features; build the minimal target with `cargo build -p basil-nats --no-default-features --features alloc`
   - breaking (pre-announcement): `basil_nats::seal_nats_curve` now takes an explicit `rng: &mut impl RngCore` parameter instead of calling `rand::thread_rng()` internally; pass `rand::thread_rng()` under `std`
+  - breaking (pre-announcement): CLI: `basil config check` is removed, folded into `basil doctor`. Its offline capability enforcement and invocation broker-identity/key binding validation are now offline `doctor` checks; its per-key present/missing detail moves under `basil doctor --keys` (per-key `key_material:<key>` rows). The `doctor --check-keys` flag is renamed `--keys`. The old `--require` gate is replaced by `--strict`
+  - breaking (pre-announcement): `basil doctor` adopts a fatal-vs-warning exit model: non-zero exit only for FATAL conditions (those that would stop the broker from starting — catalog won't load, backend unreachable, bundle won't unlock/is stale, a `missing=error` key reconcile cannot satisfy); everything else (a `missing=generate` key, an optional key absent, `bao` not on PATH, loose bundle perms) is a report-only WARNING. `--strict` also fails on warnings. `DOCTOR_SCHEMA_VERSION` bumps to 2 (`status` token `fail` → `fatal`; summary gains a `fatal` count)
 
 - 2026-07-04
   - renamed basil to basil-client to avoid crates.io name collision

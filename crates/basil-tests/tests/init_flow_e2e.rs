@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Cross-engine LIVE e2e for the full first-run onboarding flow (basil-mil0.7):
-//! `basil config init` → `bundle create` → `check` → `run` → sign with the
-//! scaffolded example key, against a live dev `bao` AND a live dev `vault`.
+//! `basil config init` → `bundle create` → `doctor --keys` → `run` → sign with
+//! the scaffolded example key, against a live dev `bao` AND a live dev `vault`.
 //!
 //! `basil config init` (src/init.rs) scaffolds a "valid by construction" starter
 //! deployment into a target dir: a `catalog.json` with ONE example key (a transit
@@ -21,9 +21,10 @@
 //!      agent .toml (asserted on disk);
 //!   2. `bundle create` (the passphrase-slot + `--backend id=primary,…,token-file=`
 //!      form init prints) seals the bundle file `0600` (asserted);
-//!   3. `check --require -c <toml>` loads + validates the scaffold and probes the
-//!      example key against the live backend (exits 0; the key is `missing=generate`
-//!      so `check` never fails on its absence; `run`'s reconcile creates it next);
+//!   3. `doctor --keys -c <toml>` loads + validates the scaffold, runs the offline
+//!      preflight checks, and unlocks the bundle to probe the example key against
+//!      the live backend (exits 0; the key is `missing=generate` so its absence is
+//!      a WARNING, not fatal; `run`'s reconcile creates it next);
 //!   4. `run -c <toml>` boots: startup reconcile CREATES the `missing=generate`
 //!      example key in the live transit mount, then binds the socket;
 //!   5. over that socket, `basil::Client` SIGNS a message with the example key,
@@ -186,23 +187,21 @@ fn scaffold_and_seal(engine: Engine, backend: &DevBackend, tag: &str) -> PathBuf
         bundle.display()
     );
 
-    // --- step 3: `check --require` loads + validates the scaffold and probes the
-    //     example key against the live backend. The key is missing=generate, so
-    //     --require does NOT fail on its absence (only missing=error keys do); the
-    //     check exiting 0 proves the whole scaffold (catalog/policy/bundle/unlock)
-    //     loads + unlocks + reaches the live backend.
+    // --- step 3: `doctor --keys` loads + validates the scaffold, runs the offline
+    //     preflight checks, and unlocks the bundle to probe the example key against
+    //     the live backend. The key is missing=generate, so its absence is a
+    //     WARNING (not fatal); doctor exiting 0 proves the whole scaffold
+    //     (catalog/policy/bundle/unlock/socket) loads + unlocks + reaches the live
+    //     backend with no fatal condition.
     let config_str = config.to_str().expect("config path is UTF-8");
-    let (ok, out) = run_agent(
-        &["config", "check", "--require", "-c", config_str],
-        backend.addr(),
-    );
+    let (ok, out) = run_agent(&["doctor", "--keys", "-c", config_str], backend.addr());
     assert!(
         ok,
-        "[{}] check --require failed:\n{out}",
+        "[{}] doctor --keys failed:\n{out}",
         engine.prefill_name()
     );
     eprintln!(
-        "INIT-FLOW[{}]: check --require passed against the live backend",
+        "INIT-FLOW[{}]: doctor --keys passed against the live backend",
         engine.prefill_name()
     );
 

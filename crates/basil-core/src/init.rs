@@ -355,7 +355,7 @@ fn build_config_toml(args: &InitArgs, layout: &Layout) -> String {
     out.push_str("# basil-agent config scaffolded by `basil config init`.\n");
     out.push_str("# Edit the placeholders, create the sealed bundle (see the printed\n");
     out.push_str(
-        "# next-steps), then `basil config check -c this-file` and `run -c this-file`.\n\n",
+        "# next-steps), then `basil doctor --keys -c this-file` and `run -c this-file`.\n\n",
     );
     let _ = writeln!(out, "catalog = {}", toml_str(&layout.catalog));
     let _ = writeln!(out, "policy = {}", toml_str(&layout.policy));
@@ -471,8 +471,8 @@ fn print_next_steps(args: &InitArgs, layout: &Layout, uid: u32) {
     }
     println!();
 
-    println!("2. Validate the config (offline + backend probe):");
-    println!("       basil config check -c {cfg}");
+    println!("2. Validate the config (offline + authenticated key probe):");
+    println!("       basil doctor --keys -c {cfg}");
     println!();
     println!("3. Run the broker:");
     println!("       basil agent -c {cfg}");

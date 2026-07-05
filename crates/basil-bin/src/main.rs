@@ -20,7 +20,6 @@ async fn main() -> Result<()> {
         Command::Bundle(command) => agent_cli::run_bundle(*command),
         Command::Config(command) => match *command {
             ConfigCommand::Init(args) => agent_cli::run_config_init(&args),
-            ConfigCommand::Check(args) => agent_cli::run_config_check(args).await,
             ConfigCommand::Explain(args) => agent_cli::run_config_explain(&args),
         },
         Command::Doctor(args) => agent_cli::run_doctor_command(args).await,

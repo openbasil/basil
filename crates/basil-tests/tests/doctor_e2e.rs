@@ -8,11 +8,11 @@
 //! `basil doctor` (`src/doctor.rs`, basil-f0j) runs a set of independent,
 //! read-only preflight checks against a resolved daemon config and emits a
 //! versioned `--json` document (`schema_version=1`): a per-check list
-//! (`{name, status: ok|warn|fail, detail, remediation}`) plus a `summary`
-//! (`blocking` iff any check FAILs). Its default mode never unlocks the bundle,
+//! (`{name, status: ok|warn|fatal, detail, remediation}`) plus a `summary`
+//! (`blocking` iff any check is FATAL). Its default mode never unlocks the bundle,
 //! binds the socket, or mutates anything (it does NOT write the epoch sidecar).
-//! The explicit `--check-keys` mode unlocks the bundle only to run the same
-//! authenticated, read-only key-material probe as `config check --require`.
+//! The explicit `--keys` mode unlocks the bundle only to run the authenticated,
+//! read-only per-key existence probe.
 //!
 //! Doctor reads config and probes the backend directly; it never talks to a live
 //! broker socket. This test therefore uses `boot_dev_backend` to stand up only a
@@ -69,7 +69,7 @@ use basil_tests::{DevBackend, Engine, alloc_addr, boot_dev_backend, on_path, rep
 /// The schema version doctor's `--json` document pins (`DOCTOR_SCHEMA_VERSION`).
 /// Hardcoded here on purpose: this is the scriptable contract an operator gates
 /// on, so a bump must break this live test, not be silently tracked.
-const EXPECTED_SCHEMA_VERSION: u64 = 1;
+const EXPECTED_SCHEMA_VERSION: u64 = 2;
 
 /// The parsed outcome of shelling the REAL `basil doctor --config <toml>
 /// --json` binary: the process exit code plus the parsed JSON document.
@@ -139,8 +139,8 @@ fn assert_nonblocking(run: &DoctorRun, name: &str, context: &str) {
 fn assert_blocking(run: &DoctorRun, name: &str, failed_arm: &str, context: &str) {
     assert_eq!(
         check_status(&run.report, failed_arm),
-        "fail",
-        "[{name}] {context} fails `{failed_arm}`; full report: {}",
+        "fatal",
+        "[{name}] {context} is fatal on `{failed_arm}`; full report: {}",
         run.report
     );
     assert_eq!(
@@ -235,7 +235,7 @@ fn assert_required_key_missing_probe(
     config: &Path,
     name: &str,
 ) {
-    let key_probe = run_doctor_with_args(config, &["--check-keys"]);
+    let key_probe = run_doctor_with_args(config, &["--keys"]);
     assert_nonblocking(
         &key_probe,
         name,
@@ -249,7 +249,7 @@ fn assert_required_key_missing_probe(
     );
 
     delete_required_transit_key(engine, backend.addr(), "web-tls");
-    let required_missing = run_doctor_with_args(config, &["--check-keys"]);
+    let required_missing = run_doctor_with_args(config, &["--keys"]);
     assert_blocking(
         &required_missing,
         name,
@@ -304,7 +304,7 @@ fn drive_engine(engine: Engine, tag: &str, addr: &str) {
     let healthy = run_doctor(&config);
     assert_healthy_doctor(&healthy, name);
 
-    // --- authenticated negative: doctor --check-keys must catch a real required
+    // --- authenticated negative: doctor --keys must catch a real required
     //     catalog key that is absent from the live backend. This is opt-in because
     //     it crosses the default doctor's secret-free/no-unlock boundary.
     assert_required_key_missing_probe(engine, &backend, &config, name);

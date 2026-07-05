@@ -8,9 +8,16 @@
 //! daemon config and reports each as a structured
 //! [`CheckResult`] with actionable remediation. It is a pre-deploy / first-boot
 //! sanity gate: it answers "will `basil agent` even get off the ground here?"
-//! without binding the socket, unlocking the bundle, or mutating anything.
-//! Operators who explicitly need the authenticated key-material probe can opt in
-//! at the CLI layer; the default doctor run keeps the secret-free boundary.
+//! It has two tiers, split on whether the sealed bundle is unlocked:
+//!
+//! - **`basil doctor`** (OFFLINE, no unlock): catalog/policy load, backend
+//!   capability enforcement, invocation broker-identity/key bindings, feature
+//!   compatibility, backend binary on PATH, socket, bundle perms/freshness, and
+//!   backend health reachability. It never unlocks the bundle, binds the socket,
+//!   or mutates anything.
+//! - **`basil doctor --keys`** (UNLOCK): additionally unlocks the sealed bundle
+//!   and runs an authenticated, read-only per-key existence probe. Still never
+//!   reconciles, generates, writes a sidecar, or binds the socket.
 //!
 //! ## Invariants (load-bearing)
 //!
@@ -21,17 +28,23 @@
 //!   freshness only**, never bundle contents, key material, passphrases, or
 //!   tokens. No secret byte reaches stdout, the JSON, or an error string. The
 //!   bundle is parsed for its public header (epoch) but never unlocked.
-//! - **No mutation.** Default doctor never unlocks; the explicit authenticated
+//! - **No mutation.** Default doctor never unlocks; the explicit `--keys`
 //!   key-material mode unlocks only to read. Neither mode reconciles, generates a
 //!   key, writes a sidecar, or binds the socket. The epoch-sidecar check is
 //!   read-only (unlike [`crate::seal::verify_epoch_sidecar`], which advances the
 //!   sidecar).
 //!
-//! ## Output & exit
+//! ## Severity & exit
 //!
-//! Each check is `ok` / `warn` / `fail`. `fail` is **blocking**; `warn` is
-//! advisory. The overall run is healthy iff no check is `fail`. The caller maps
-//! `any fail → nonzero exit`, `warns-alone → zero`.
+//! Each check is `ok` / `warn` / `fatal`. A **fatal** condition would stop the
+//! broker/service from starting (catalog won't load, backend unreachable, bundle
+//! won't unlock, a `missing=error` key reconcile cannot satisfy). Everything else
+//! (a `missing=generate` key, an optional key absent, `bao` not on PATH, loose
+//! bundle perms) is a **warning**: advisory, report-only.
+//!
+//! The caller maps `any fatal → nonzero exit`. Warnings alone exit `0` unless
+//! `--strict` is passed, which also makes warnings exit nonzero. The return code
+//! is derived from the worst severity among the checks that ran.
 
 use std::path::Path;
 use std::time::Duration;
@@ -42,39 +55,41 @@ use crate::catalog::BackendKind;
 
 /// Stable schema version of the `--json` document. Bump on a breaking shape
 /// change; operators script against this.
-pub const DOCTOR_SCHEMA_VERSION: u32 = 1;
+pub const DOCTOR_SCHEMA_VERSION: u32 = 2;
 
-/// Bounded per-backend reachability timeout. A down backend must FAIL the check,
-/// never hang the whole run.
+/// Bounded per-backend reachability timeout. A down backend must be FATAL for the
+/// check, never hang the whole run.
 const REACHABILITY_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The outcome of a single diagnostic check.
 ///
-/// `Ok` passes; `Warn` is advisory (non-blocking); `Fail` is blocking (the run
-/// exits nonzero). The string tokens (`ok` / `warn` / `fail`) are the stable JSON
+/// `Ok` passes; `Warn` is advisory (exits nonzero only under `--strict`); `Fatal`
+/// is blocking (the run exits nonzero, a condition that would stop the broker from
+/// starting). The string tokens (`ok` / `warn` / `fatal`) are the stable JSON
 /// values that operators match on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CheckStatus {
     /// The check passed.
     Ok,
-    /// Advisory: a non-ideal condition that does not block startup.
+    /// Advisory: a non-ideal condition that does not stop startup.
     Warn,
     /// Blocking: this would prevent (or endanger) a clean `run`.
-    Fail,
+    Fatal,
 }
 
 /// One diagnostic result: a named check, its status, a human-readable detail,
 /// and (for non-ok results) actionable remediation text.
 ///
-/// `name` is a stable machine identifier (`snake_case`, scriptable); `detail`
-/// and `remediation` are operator-facing prose and may change wording freely.
-/// **No field ever carries a secret** (the bundle arm reports perms/freshness
-/// only).
+/// `name` is a stable machine identifier (`snake_case`, scriptable); per-key
+/// probe rows carry a `key_material:<key>` name. `detail` and `remediation` are
+/// operator-facing prose and may change wording freely. **No field ever carries a
+/// secret** (the bundle arm reports perms/freshness only; key rows carry catalog
+/// key *names*, which are public config, never key material).
 #[derive(Debug, Clone, Serialize)]
 pub struct CheckResult {
     /// Stable machine identifier for the check (e.g. `backend_reachability`).
-    pub name: &'static str,
+    pub name: String,
     /// Pass / advisory / blocking.
     pub status: CheckStatus,
     /// Human-readable description of what was found.
@@ -84,9 +99,9 @@ pub struct CheckResult {
 }
 
 impl CheckResult {
-    pub(crate) fn ok(name: &'static str, detail: impl Into<String>) -> Self {
+    pub(crate) fn ok(name: impl Into<String>, detail: impl Into<String>) -> Self {
         Self {
-            name,
+            name: name.into(),
             status: CheckStatus::Ok,
             detail: detail.into(),
             remediation: String::new(),
@@ -94,33 +109,33 @@ impl CheckResult {
     }
 
     pub(crate) fn warn(
-        name: &'static str,
+        name: impl Into<String>,
         detail: impl Into<String>,
         remediation: impl Into<String>,
     ) -> Self {
         Self {
-            name,
+            name: name.into(),
             status: CheckStatus::Warn,
             detail: detail.into(),
             remediation: remediation.into(),
         }
     }
 
-    pub(crate) fn fail(
-        name: &'static str,
+    pub(crate) fn fatal(
+        name: impl Into<String>,
         detail: impl Into<String>,
         remediation: impl Into<String>,
     ) -> Self {
         Self {
-            name,
-            status: CheckStatus::Fail,
+            name: name.into(),
+            status: CheckStatus::Fatal,
             detail: detail.into(),
             remediation: remediation.into(),
         }
     }
 }
 
-/// A non-secret summary of a doctor run: per-status counts and the blocking flag.
+/// A non-secret summary of a doctor run: per-status counts and the fatal flag.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct DoctorSummary {
     /// Total number of checks run.
@@ -129,9 +144,10 @@ pub struct DoctorSummary {
     pub ok: usize,
     /// Count of `warn` (advisory) checks.
     pub warn: usize,
-    /// Count of `fail` (blocking) checks.
-    pub fail: usize,
-    /// True iff at least one check is `fail` (the run should exit nonzero).
+    /// Count of `fatal` (blocking) checks.
+    pub fatal: usize,
+    /// True iff at least one check is `fatal` (the run exits nonzero even without
+    /// `--strict`).
     pub blocking: bool,
 }
 
@@ -142,7 +158,7 @@ pub struct DoctorReport {
     pub schema_version: u32,
     /// Every check result, in a deterministic order.
     pub checks: Vec<CheckResult>,
-    /// Roll-up counts + the blocking flag.
+    /// Roll-up counts + the fatal flag.
     pub summary: DoctorSummary,
 }
 
@@ -152,20 +168,20 @@ impl DoctorReport {
     pub fn from_checks(checks: Vec<CheckResult>) -> Self {
         let mut ok = 0;
         let mut warn = 0;
-        let mut fail = 0;
+        let mut fatal = 0;
         for c in &checks {
             match c.status {
                 CheckStatus::Ok => ok += 1,
                 CheckStatus::Warn => warn += 1,
-                CheckStatus::Fail => fail += 1,
+                CheckStatus::Fatal => fatal += 1,
             }
         }
         let summary = DoctorSummary {
             total: checks.len(),
             ok,
             warn,
-            fail,
-            blocking: fail > 0,
+            fatal,
+            blocking: fatal > 0,
         };
         Self {
             schema_version: DOCTOR_SCHEMA_VERSION,
@@ -174,17 +190,19 @@ impl DoctorReport {
         }
     }
 
-    /// Whether the run had any blocking (`fail`) check: the caller exits nonzero.
+    /// Whether the caller should exit nonzero. A fatal check always trips it; a
+    /// warning trips it only under `strict`. The return code is thus derived from
+    /// the worst severity among the checks that ran.
     #[must_use]
-    pub const fn has_blocking_failure(&self) -> bool {
-        self.summary.blocking
+    pub const fn should_exit_nonzero(&self, strict: bool) -> bool {
+        self.summary.fatal > 0 || (strict && self.summary.warn > 0)
     }
 }
 
 /// The resolved, non-secret inputs a doctor run needs.
 ///
-/// Built by the binary from the same config/override resolution `run`/`check`
-/// use, then handed here so the check logic is free of clap/config-file plumbing.
+/// Built by the binary from the same config/override resolution `run` uses, then
+/// handed here so the check logic is free of clap/config-file plumbing.
 #[derive(Debug, Clone)]
 pub struct DoctorInputs {
     /// Path to the exported catalog JSON.
@@ -199,6 +217,11 @@ pub struct DoctorInputs {
     pub socket_mode: u32,
     /// The configured socket group (numeric gid or name), if any.
     pub socket_group: Option<String>,
+    /// The backend-capability enforcement policy (`strict` / `degraded` / `off`).
+    pub capability_policy: crate::CapabilityPolicy,
+    /// The resolved invocation-service runtime config, for offline broker-identity
+    /// and key-binding validation.
+    pub invocation: crate::service::broker::InvocationRuntimeConfig,
     /// Whether a passphrase unlock file is configured.
     pub unlock_passphrase_selected: bool,
     /// Whether a bip39 break-glass phrase file is configured.
@@ -243,19 +266,31 @@ impl EnabledFeatures {
     }
 }
 
-/// Run every diagnostic and assemble the report. Checks are independent: a check
-/// that errors becomes a `fail`/`warn` row and never aborts the rest.
+/// Run every OFFLINE diagnostic and assemble the report.
+///
+/// Checks are independent: a check that errors becomes a `fatal`/`warn` row and
+/// never aborts the rest. This never unlocks the bundle; the caller appends the
+/// `--keys` per-key probe rows (see [`key_material_rows`]).
 ///
 /// The catalog is loaded once (its own check) and, if it parses, reused to derive
-/// the backend-binary and reachability checks. A catalog that fails to load
-/// yields a `fail` row and the backend checks degrade gracefully (they report
-/// "skipped: catalog did not load").
+/// the capability, invocation-binding, backend-binary and reachability checks. A
+/// catalog that fails to load yields a `fatal` row and the catalog-dependent
+/// checks degrade gracefully (they report "skipped: catalog did not load").
 pub async fn run_doctor(inputs: &DoctorInputs, features: EnabledFeatures) -> DoctorReport {
     let mut checks = Vec::new();
 
     // Load the catalog/policy once; the result drives downstream checks.
     let loaded = load_catalog_policy(&inputs.catalog, &inputs.policy);
     checks.push(catalog_policy_check(&loaded));
+
+    // Offline config lints that need the loaded catalog (no unlock, no backend I/O).
+    if let Ok(catalog) = loaded.as_ref() {
+        checks.push(capability_check(catalog, inputs.capability_policy));
+        checks.push(invocation_bindings_check(&inputs.invocation, catalog));
+    } else {
+        checks.push(catalog_dependent_skip("capability"));
+        checks.push(catalog_dependent_skip("invocation_bindings"));
+    }
 
     let backends = loaded.as_ref().ok().map(|c| c.backends.clone());
 
@@ -276,79 +311,122 @@ pub async fn run_doctor(inputs: &DoctorInputs, features: EnabledFeatures) -> Doc
     DoctorReport::from_checks(checks)
 }
 
-/// Build the optional authenticated key-material row for `doctor --check-keys`.
-///
-/// This row is intentionally not part of the default [`run_doctor`] boundary:
-/// its caller must have explicitly unlocked the sealed bundle and run the
-/// read-only [`crate::BackendManager::check`] probe. The result is still
-/// non-secret: it reports catalog key names and counts, never backend tokens or
-/// key material.
-#[must_use]
-pub fn key_material_check(probe: Result<&crate::CheckReport, String>) -> CheckResult {
-    const NAME: &str = "key_material";
-    probe.map_or_else(
-        |reason| {
-            drop(reason);
-            CheckResult::fail(
-                NAME,
-                "authenticated key-material probe failed",
-                "Confirm the sealed bundle unlock settings and backend credentials, then rerun `basil config check --require` for the detailed probe.",
-            )
-        },
-        |report| {
-            let total = report.keys.len();
-            let present = report.present_count();
-            let required_missing = report.required_missing();
-            if required_missing.is_empty() {
-                let optional_missing = report.missing().count();
-                if optional_missing == 0 {
-                    CheckResult::ok(
-                        NAME,
-                        format!("all {total} catalog key(s) are present in the backend"),
-                    )
-                } else {
-                    CheckResult::warn(
-                        NAME,
-                        format!(
-                            "{present}/{total} catalog key(s) present; {optional_missing} optional key(s) absent"
-                        ),
-                        "Provision optional keys if their operations should be available, or let startup reconcile generate keys declared missing=generate.",
-                    )
-                }
-            } else {
-                CheckResult::fail(
-                    NAME,
-                    format!(
-                        "{present}/{total} catalog key(s) present; required key(s) absent: {}",
-                        required_missing.join(", ")
-                    ),
-                    "Provision the missing required key material, then rerun `basil doctor --check-keys` or `basil config check --require`.",
-                )
-            }
-        },
+/// A stable "skipped: catalog did not load" advisory row for a check that needs
+/// the loaded catalog.
+fn catalog_dependent_skip(name: &'static str) -> CheckResult {
+    CheckResult::warn(
+        name,
+        "skipped: catalog did not load",
+        "Fix the catalog/policy load first (see the catalog_policy check).",
     )
 }
 
-/// The subset of a loaded catalog the downstream checks need (the backend table).
-struct LoadedCatalog {
-    backends: std::collections::BTreeMap<String, crate::catalog::BackendRef>,
+/// Build the authenticated per-key-material rows for `doctor --keys`.
+///
+/// This is intentionally not part of the default [`run_doctor`] boundary: its
+/// caller must have explicitly unlocked the sealed bundle and run the read-only
+/// [`crate::BackendManager::check`] probe. The rows are still non-secret: they
+/// report catalog key *names* and counts, never backend tokens or key material.
+///
+/// Returns an aggregate `key_material` summary row plus one `key_material:<key>`
+/// detail row per ABSENT key, classified by its `missing` policy: a `missing=error`
+/// key reconcile cannot satisfy is **fatal**; a `missing=warn`/`missing=generate`
+/// absence is a **warning**. A probe that could not run at all is a single fatal
+/// `key_material` row (secret-free reason).
+#[must_use]
+pub fn key_material_rows(probe: Result<&crate::CheckReport, String>) -> Vec<CheckResult> {
+    const NAME: &str = "key_material";
+    let report = match probe {
+        Ok(report) => report,
+        Err(reason) => {
+            drop(reason);
+            return vec![CheckResult::fatal(
+                NAME,
+                "authenticated key-material probe failed",
+                "Confirm the sealed bundle unlock settings and backend credentials, then rerun `basil doctor --keys` for the detailed probe.",
+            )];
+        }
+    };
+
+    let total = report.keys.len();
+    let present = report.present_count();
+    let required_missing = report.required_missing();
+
+    // Aggregate summary row (stable `key_material` name for scripting).
+    let summary = if required_missing.is_empty() {
+        let optional_missing = report.missing().count();
+        if optional_missing == 0 {
+            CheckResult::ok(
+                NAME,
+                format!("all {total} catalog key(s) are present in the backend"),
+            )
+        } else {
+            CheckResult::warn(
+                NAME,
+                format!(
+                    "{present}/{total} catalog key(s) present; {optional_missing} optional key(s) absent"
+                ),
+                "Provision optional keys if their operations should be available, or let startup reconcile generate keys declared missing=generate.",
+            )
+        }
+    } else {
+        CheckResult::fatal(
+            NAME,
+            format!(
+                "{present}/{total} catalog key(s) present; required key(s) absent: {}",
+                required_missing.join(", ")
+            ),
+            "Provision the missing required key material, then rerun `basil doctor --keys`.",
+        )
+    };
+
+    let mut rows = vec![summary];
+
+    // Per-key detail rows for every ABSENT key, classified by its missing policy.
+    for (name, policy) in report.missing() {
+        let row_name = format!("key_material:{name}");
+        let row = match policy {
+            crate::catalog::MissingPolicy::Error => CheckResult::fatal(
+                row_name,
+                format!(
+                    "required key `{name}` is absent (missing=error); reconcile cannot satisfy it"
+                ),
+                "Provision this key in its backend before starting the broker.",
+            ),
+            crate::catalog::MissingPolicy::Warn => CheckResult::warn(
+                row_name,
+                format!(
+                    "key `{name}` is absent (missing=warn); operations on it fail until provisioned"
+                ),
+                "Provision the key if its operations should be available.",
+            ),
+            crate::catalog::MissingPolicy::Generate => CheckResult::warn(
+                row_name,
+                format!(
+                    "key `{name}` is absent (missing=generate); startup reconcile will create it"
+                ),
+                "No action required unless you expected the key to already exist.",
+            ),
+        };
+        rows.push(row);
+    }
+
+    rows
 }
 
 /// Load + validate the catalog/policy via the SAME loader `check`/`run` use. A
 /// load/validation error is returned verbatim for the catalog/policy check row.
-fn load_catalog_policy(catalog_path: &Path, policy_path: &Path) -> Result<LoadedCatalog, String> {
+fn load_catalog_policy(catalog_path: &Path, policy_path: &Path) -> Result<crate::Catalog, String> {
     let catalog_json = std::fs::read_to_string(catalog_path)
         .map_err(|e| format!("reading catalog {}: {e}", catalog_path.display()))?;
     let policy_json = std::fs::read_to_string(policy_path)
         .map_err(|e| format!("reading policy {}: {e}", policy_path.display()))?;
     let (catalog, _policy, _config, _warnings) =
         crate::catalog::load(&catalog_json, &policy_json).map_err(|e| e.to_string())?;
-    Ok(LoadedCatalog {
-        backends: catalog.backends,
-    })
+    Ok(catalog)
 }
 
-fn catalog_policy_check(loaded: &Result<LoadedCatalog, String>) -> CheckResult {
+fn catalog_policy_check(loaded: &Result<crate::Catalog, String>) -> CheckResult {
     const NAME: &str = "catalog_policy";
     match loaded {
         Ok(c) => CheckResult::ok(
@@ -358,20 +436,72 @@ fn catalog_policy_check(loaded: &Result<LoadedCatalog, String>) -> CheckResult {
                 c.backends.len()
             ),
         ),
-        Err(reason) => CheckResult::fail(
+        Err(reason) => CheckResult::fatal(
             NAME,
             format!("catalog/policy did not load: {reason}"),
-            "Fix the catalog/policy export so it validates (run `basil config check`); the \
-             loader reason above names the offending field.",
+            "Fix the catalog/policy export so it validates; the loader reason above names the \
+             offending field.",
+        ),
+    }
+}
+
+/// Offline backend-capability enforcement: does each backend PROVIDE what the
+/// catalog's keys (and explicit `requires`) need? Honors `capability-policy`;
+/// under a policy that makes a gap fatal, an unmet requirement would fail broker
+/// startup, so it is FATAL here too. Pure and offline (no backend I/O).
+fn capability_check(catalog: &crate::Catalog, policy: crate::CapabilityPolicy) -> CheckResult {
+    const NAME: &str = "capability";
+    match crate::enforce_capabilities(catalog, policy) {
+        Ok(s) => CheckResult::ok(
+            NAME,
+            format!(
+                "backend capabilities cover the catalog: {} enforced, {} undeclared (skipped), {} warning(s)",
+                s.enforced, s.skipped_undeclared, s.warnings
+            ),
+        ),
+        Err(e) => CheckResult::fatal(
+            NAME,
+            format!("backend capability gap: {e}"),
+            "Grant the backend the missing capabilities, or relax `capability-policy`; under the \
+             configured policy this gap would fail broker startup.",
+        ),
+    }
+}
+
+/// Offline invocation validation: when invocation is enabled, its broker-identity
+/// and request/response key bindings must resolve to catalog keys of the right
+/// class and use. A bad binding would fail broker startup, so it is FATAL. Pure
+/// and offline (no bundle, no backend).
+fn invocation_bindings_check(
+    invocation: &crate::service::broker::InvocationRuntimeConfig,
+    catalog: &crate::Catalog,
+) -> CheckResult {
+    const NAME: &str = "invocation_bindings";
+    if !invocation.enabled {
+        return CheckResult::ok(
+            NAME,
+            "invocation is disabled; no broker-identity/key bindings to validate",
+        );
+    }
+    match crate::agent_cli::validate_invocation_catalog_bindings(invocation, catalog) {
+        Ok(()) => CheckResult::ok(
+            NAME,
+            "invocation broker-identity and request/response key bindings are valid",
+        ),
+        Err(e) => CheckResult::fatal(
+            NAME,
+            format!("invocation binding invalid: {e}"),
+            "Fix the invocation broker-identity/key configuration; invocation is enabled but its \
+             catalog bindings would fail broker startup.",
         ),
     }
 }
 
 /// Does the running binary's feature set support what the config asks for?
 ///
-/// - bip39 phrase configured but `unlock-bip39` absent → FAIL.
-/// - age-yubikey requested but `unlock-age-yubikey` absent → FAIL.
-/// - A `keystore`-kind backend in the catalog but `keystore-backend` absent → FAIL.
+/// - bip39 phrase configured but `unlock-bip39` absent → FATAL.
+/// - age-yubikey requested but `unlock-age-yubikey` absent → FATAL.
+/// - A `keystore`-kind backend in the catalog but `keystore-backend` absent → FATAL.
 fn feature_compatibility_check(
     inputs: &DoctorInputs,
     features: EnabledFeatures,
@@ -421,7 +551,7 @@ fn feature_compatibility_check(
             "the binary's enabled features cover the configured backend + unlock methods",
         )
     } else {
-        CheckResult::fail(
+        CheckResult::fatal(
             NAME,
             format!("feature gap(s): {}", gaps.join("; ")),
             "Rebuild `basil` with the missing cargo feature(s) enabled \
@@ -439,11 +569,7 @@ fn backend_binary_check(
 ) -> CheckResult {
     const NAME: &str = "backend_binary";
     let Some(backends) = backends else {
-        return CheckResult::warn(
-            NAME,
-            "skipped: catalog did not load, cannot determine backend kinds",
-            "Fix the catalog/policy load first (see the catalog_policy check).",
-        );
+        return catalog_dependent_skip(NAME);
     };
 
     let has_vault = backends.values().any(|b| b.kind == BackendKind::Vault);
@@ -477,12 +603,14 @@ fn on_path(bin: &str) -> bool {
 }
 
 /// Socket sanity: the parent dir exists and is writable, the mode is not
-/// world-writable, and a configured group resolves. The socket is NOT bound.
+/// world-writable, and a configured group resolves. The socket is NOT bound. A
+/// parent dir the daemon cannot bind under (missing / unwritable / unresolvable
+/// group) is FATAL; a world-writable mode is an advisory posture warning.
 fn socket_check(socket: &str, mode: u32, group: Option<&str>) -> CheckResult {
     const NAME: &str = "socket";
     let path = Path::new(socket);
     let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
-        return CheckResult::fail(
+        return CheckResult::fatal(
             NAME,
             format!("socket path `{socket}` has no parent directory"),
             "Use an absolute socket path under an existing run dir, e.g. /run/basil/basil.sock.",
@@ -490,7 +618,7 @@ fn socket_check(socket: &str, mode: u32, group: Option<&str>) -> CheckResult {
     };
 
     if !parent.exists() {
-        return CheckResult::fail(
+        return CheckResult::fatal(
             NAME,
             format!("socket parent dir {} does not exist", parent.display()),
             format!(
@@ -500,7 +628,7 @@ fn socket_check(socket: &str, mode: u32, group: Option<&str>) -> CheckResult {
         );
     }
     if !dir_is_writable(parent) {
-        return CheckResult::fail(
+        return CheckResult::fatal(
             NAME,
             format!("socket parent dir {} is not writable", parent.display()),
             "Make the run directory writable by the user that runs basil.",
@@ -520,7 +648,7 @@ fn socket_check(socket: &str, mode: u32, group: Option<&str>) -> CheckResult {
     if let Some(group) = group
         && !group_resolves(group)
     {
-        return CheckResult::fail(
+        return CheckResult::fatal(
             NAME,
             format!("configured socket-group `{group}` does not resolve to a gid"),
             "Create the group, or set `socket-group` to an existing group name or numeric gid.",
@@ -565,9 +693,9 @@ fn group_resolves(group: &str) -> bool {
         .any(|name| name == group)
 }
 
-/// Bundle diagnostics: existence + readability, strict `0600` perms, and epoch
-/// freshness (sidecar present + not behind the bundle). Each is its own row so an
-/// operator sees exactly which property failed. **Never reads/decrypts contents.**
+/// Bundle diagnostics: existence + readability, `0600` perms, and epoch freshness
+/// (sidecar present + not behind the bundle). Each is its own row so an operator
+/// sees exactly which property failed. **Never reads/decrypts contents.**
 fn bundle_checks(bundle: &Path) -> Vec<CheckResult> {
     const READ_NAME: &str = "bundle_readable";
     const PERMS_NAME: &str = "bundle_perms";
@@ -582,7 +710,7 @@ fn bundle_checks(bundle: &Path) -> Vec<CheckResult> {
             // A missing/unreadable bundle blocks the perms + freshness checks too;
             // emit them as skipped so the row set is stable.
             return vec![
-                CheckResult::fail(
+                CheckResult::fatal(
                     READ_NAME,
                     detail,
                     "Place the 0600 sealed bundle at the configured path and ensure the \
@@ -611,7 +739,9 @@ fn bundle_checks(bundle: &Path) -> Vec<CheckResult> {
     vec![read_row, perms_row, fresh_row]
 }
 
-/// Strict `0600` permission check on the bundle file (owner-only).
+/// `0600` permission check on the bundle file (owner-only). Loose perms are an
+/// advisory WARNING: startup only refuses them under `strict-bundle-perms`, so on
+/// their own they do not stop the broker from starting.
 fn bundle_perms_check(name: &'static str, bundle: &Path) -> CheckResult {
     #[cfg(unix)]
     {
@@ -622,17 +752,18 @@ fn bundle_perms_check(name: &'static str, bundle: &Path) -> CheckResult {
                 if mode == 0o600 {
                     CheckResult::ok(name, "sealed bundle is 0600 (owner-only)")
                 } else {
-                    CheckResult::fail(
+                    CheckResult::warn(
                         name,
                         format!("sealed bundle has mode {mode:04o}, expected 0600"),
                         format!(
-                            "Run `chmod 600 {}`; broaden perms leak the sealed creds.",
+                            "Run `chmod 600 {}`; broader perms leak the sealed creds. Startup \
+                             refuses this only under `strict-bundle-perms`, hence advisory.",
                             bundle.display()
                         ),
                     )
                 }
             }
-            Err(e) => CheckResult::fail(
+            Err(e) => CheckResult::fatal(
                 name,
                 format!("cannot stat sealed bundle: {e}"),
                 "Ensure the bundle path is correct and accessible.",
@@ -658,7 +789,7 @@ fn bundle_freshness_check(name: &'static str, bundle: &Path, bytes: &[u8]) -> Ch
     let parsed = match crate::seal::format::decode(bytes) {
         Ok(p) => p,
         Err(e) => {
-            return CheckResult::fail(
+            return CheckResult::fatal(
                 name,
                 format!("sealed bundle does not parse (corrupt/wrong format): {e}"),
                 "Re-export the sealed bundle; the on-disk file is not a valid basil bundle.",
@@ -670,7 +801,7 @@ fn bundle_freshness_check(name: &'static str, bundle: &Path, bytes: &[u8]) -> Ch
 
     match std::fs::read_to_string(&sidecar) {
         Ok(raw) => match raw.trim().parse::<u64>() {
-            Ok(seen) if current < seen => CheckResult::fail(
+            Ok(seen) if current < seen => CheckResult::fatal(
                 name,
                 format!(
                     "STALE bundle: epoch {current} is behind the last-seen sidecar epoch {seen}"
@@ -682,7 +813,7 @@ fn bundle_freshness_check(name: &'static str, bundle: &Path, bytes: &[u8]) -> Ch
                 name,
                 format!("bundle epoch {current} is current (sidecar last-seen {seen})"),
             ),
-            Err(e) => CheckResult::fail(
+            Err(e) => CheckResult::fatal(
                 name,
                 format!(
                     "epoch sidecar {} is not a valid integer: {e}",
@@ -697,7 +828,7 @@ fn bundle_freshness_check(name: &'static str, bundle: &Path, bytes: &[u8]) -> Ch
             "Expected on first boot; the daemon initializes it at startup. After the first \
              successful start it should be present.",
         ),
-        Err(e) => CheckResult::fail(
+        Err(e) => CheckResult::fatal(
             name,
             format!("epoch sidecar {} is not readable: {e}", sidecar.display()),
             "Ensure the daemon user can read the .epoch sidecar next to the bundle.",
@@ -714,18 +845,14 @@ fn epoch_sidecar_path(bundle: &Path) -> std::path::PathBuf {
 
 /// Backend reachability: a bounded, unauthenticated probe of each distinct
 /// vault-kind backend address. Hits the Vault/OpenBao `/v1/sys/health` endpoint,
-/// which needs no token. Unreachable within [`REACHABILITY_TIMEOUT`] → FAIL
+/// which needs no token. Unreachable within [`REACHABILITY_TIMEOUT`] → FATAL
 /// (never a hang). A keystore-only catalog has nothing to probe.
 async fn backend_reachability_check(
     backends: Option<&std::collections::BTreeMap<String, crate::catalog::BackendRef>>,
 ) -> CheckResult {
     const NAME: &str = "backend_reachability";
     let Some(backends) = backends else {
-        return CheckResult::warn(
-            NAME,
-            "skipped: catalog did not load, no backend addresses to probe",
-            "Fix the catalog/policy load first (see the catalog_policy check).",
-        );
+        return catalog_dependent_skip(NAME);
     };
 
     // Distinct vault addresses (a keystore addr is a local path, not probed here).
@@ -751,7 +878,7 @@ async fn backend_reachability_check(
     {
         Ok(c) => c,
         Err(e) => {
-            return CheckResult::fail(
+            return CheckResult::fatal(
                 NAME,
                 format!("could not build HTTP client for the reachability probe: {e}"),
                 "This is unexpected; check the host's TLS/HTTP stack.",
@@ -775,7 +902,7 @@ async fn backend_reachability_check(
             format!("all {reached} vault backend address(es) responded to /v1/sys/health"),
         )
     } else {
-        CheckResult::fail(
+        CheckResult::fatal(
             NAME,
             format!(
                 "{} of {} vault backend address(es) unreachable: {}",
@@ -806,9 +933,9 @@ pub fn render_human(report: &DoctorReport) -> String {
     let _ = writeln!(out, "basil doctor - {} check(s)\n", report.checks.len());
     for c in &report.checks {
         let marker = match c.status {
-            CheckStatus::Ok => "OK  ",
-            CheckStatus::Warn => "WARN",
-            CheckStatus::Fail => "FAIL",
+            CheckStatus::Ok => "OK   ",
+            CheckStatus::Warn => "WARN ",
+            CheckStatus::Fatal => "FATAL",
         };
         let _ = writeln!(out, "[{marker}] {}: {}", c.name, c.detail);
         if c.status != CheckStatus::Ok && !c.remediation.is_empty() {
@@ -818,13 +945,16 @@ pub fn render_human(report: &DoctorReport) -> String {
     let s = &report.summary;
     let _ = writeln!(
         out,
-        "\nsummary: {} ok, {} warn, {} fail ({} total)",
-        s.ok, s.warn, s.fail, s.total
+        "\nsummary: {} ok, {} warn, {} fatal ({} total)",
+        s.ok, s.warn, s.fatal, s.total
     );
     if s.blocking {
-        let _ = writeln!(out, "result: BLOCKING, at least one check failed");
+        let _ = writeln!(out, "result: BLOCKING, at least one check is fatal");
     } else if s.warn > 0 {
-        let _ = writeln!(out, "result: OK with advisories");
+        let _ = writeln!(
+            out,
+            "result: OK with advisories (nonzero exit only under --strict)"
+        );
     } else {
         let _ = writeln!(out, "result: OK");
     }
@@ -846,6 +976,8 @@ mod tests {
     // the no-panic gate targets the runtime path, not assertions.
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
+    use crate::catalog::MissingPolicy;
+    use crate::{CheckReport, KeyCheck, KeyStatus};
     use std::io::Write as _;
 
     fn unique_dir() -> std::path::PathBuf {
@@ -888,16 +1020,25 @@ mod tests {
             socket: dir.join("basil.sock").to_string_lossy().into_owned(),
             socket_mode: 0o600,
             socket_group: None,
+            capability_policy: crate::CapabilityPolicy::Off,
+            invocation: crate::service::broker::InvocationRuntimeConfig::default(),
             unlock_passphrase_selected: false,
             unlock_bip39_selected: false,
             unlock_age_yubikey_selected: false,
         }
     }
 
+    fn key_check(name: &str, status: KeyStatus) -> KeyCheck {
+        KeyCheck {
+            name: name.to_string(),
+            status,
+        }
+    }
+
     // --- feature compatibility ---
 
     #[test]
-    fn feature_keystore_backend_in_catalog_without_feature_fails() {
+    fn feature_keystore_backend_in_catalog_without_feature_is_fatal() {
         let dir = unique_dir();
         let inputs = base_inputs(&dir);
         let mut backends = std::collections::BTreeMap::new();
@@ -910,7 +1051,7 @@ mod tests {
             .unwrap(),
         );
         let res = feature_compatibility_check(&inputs, all_features_off(), Some(&backends));
-        assert_eq!(res.status, CheckStatus::Fail);
+        assert_eq!(res.status, CheckStatus::Fatal);
         assert!(res.detail.contains("keystore-backend"));
     }
 
@@ -932,9 +1073,9 @@ mod tests {
     // --- socket ---
 
     #[test]
-    fn socket_missing_parent_dir_fails() {
+    fn socket_missing_parent_dir_is_fatal() {
         let res = socket_check("/nonexistent-basil-dir-xyz/basil.sock", 0o600, None);
-        assert_eq!(res.status, CheckStatus::Fail);
+        assert_eq!(res.status, CheckStatus::Fatal);
     }
 
     #[test]
@@ -954,7 +1095,7 @@ mod tests {
     }
 
     #[test]
-    fn socket_unresolvable_group_fails() {
+    fn socket_unresolvable_group_is_fatal() {
         let dir = unique_dir();
         let sock = dir.join("basil.sock");
         let res = socket_check(
@@ -962,7 +1103,7 @@ mod tests {
             0o660,
             Some("no-such-group-basil-zzz"),
         );
-        assert_eq!(res.status, CheckStatus::Fail);
+        assert_eq!(res.status, CheckStatus::Fatal);
     }
 
     #[test]
@@ -976,24 +1117,26 @@ mod tests {
     // --- bundle ---
 
     #[test]
-    fn bundle_missing_fails_and_skips_dependents() {
+    fn bundle_missing_is_fatal_and_skips_dependents() {
         let dir = unique_dir();
         let bundle = dir.join("absent.sealed");
         let rows = bundle_checks(&bundle);
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].status, CheckStatus::Fail); // readable
+        assert_eq!(rows[0].status, CheckStatus::Fatal); // readable
         assert_eq!(rows[1].status, CheckStatus::Warn); // perms skipped
         assert_eq!(rows[2].status, CheckStatus::Warn); // freshness skipped
     }
 
     #[test]
-    fn bundle_bad_perms_fails_perms_row() {
+    fn bundle_bad_perms_warns_perms_row() {
         let dir = unique_dir();
         let bundle = dir.join("bundle.sealed");
         write_mode(&bundle, b"not-a-real-bundle", 0o644);
         let row = bundle_perms_check("bundle_perms", &bundle);
+        // Loose perms are advisory: startup refuses them only under
+        // `strict-bundle-perms`, so on their own they do not stop startup.
         #[cfg(unix)]
-        assert_eq!(row.status, CheckStatus::Fail);
+        assert_eq!(row.status, CheckStatus::Warn);
         #[cfg(not(unix))]
         assert_eq!(row.status, CheckStatus::Warn);
     }
@@ -1009,71 +1152,95 @@ mod tests {
     }
 
     #[test]
-    fn bundle_freshness_unparsable_blob_fails() {
+    fn bundle_freshness_unparsable_blob_is_fatal() {
         let dir = unique_dir();
         let bundle = dir.join("bundle.sealed");
         let row = bundle_freshness_check("bundle_freshness", &bundle, b"garbage-not-a-bundle");
-        assert_eq!(row.status, CheckStatus::Fail);
+        assert_eq!(row.status, CheckStatus::Fatal);
         assert!(row.detail.contains("does not parse"));
     }
 
     // --- catalog/policy ---
 
     #[test]
-    fn catalog_unloadable_fails() {
+    fn catalog_unloadable_is_fatal() {
         let dir = unique_dir();
         std::fs::write(dir.join("catalog.json"), "not json").unwrap();
         std::fs::write(dir.join("policy.json"), "not json").unwrap();
         let loaded = load_catalog_policy(&dir.join("catalog.json"), &dir.join("policy.json"));
         let row = catalog_policy_check(&loaded);
-        assert_eq!(row.status, CheckStatus::Fail);
+        assert_eq!(row.status, CheckStatus::Fatal);
     }
 
     // --- summary / exit logic ---
 
     #[test]
-    fn summary_blocking_iff_any_fail() {
+    fn summary_counts_and_blocking_iff_any_fatal() {
         let checks = vec![
             CheckResult::ok("a", "fine"),
             CheckResult::warn("b", "meh", "do x"),
         ];
         let report = DoctorReport::from_checks(checks);
-        assert!(!report.has_blocking_failure());
+        assert!(!report.summary.blocking);
         assert_eq!(report.summary.warn, 1);
 
         let checks = vec![
             CheckResult::ok("a", "fine"),
-            CheckResult::fail("c", "broken", "fix it"),
+            CheckResult::fatal("c", "broken", "fix it"),
         ];
         let report = DoctorReport::from_checks(checks);
-        assert!(report.has_blocking_failure());
-        assert_eq!(report.summary.fail, 1);
+        assert!(report.summary.blocking);
+        assert_eq!(report.summary.fatal, 1);
+    }
+
+    #[test]
+    fn exit_code_model_fatal_vs_warn_vs_strict() {
+        // All-ok: never exits nonzero.
+        let ok = DoctorReport::from_checks(vec![CheckResult::ok("a", "fine")]);
+        assert!(!ok.should_exit_nonzero(false));
+        assert!(!ok.should_exit_nonzero(true));
+
+        // Warn-only: exits nonzero only under --strict.
+        let warn = DoctorReport::from_checks(vec![CheckResult::warn("b", "meh", "do x")]);
+        assert!(!warn.should_exit_nonzero(false));
+        assert!(warn.should_exit_nonzero(true));
+
+        // Any fatal: always exits nonzero, strict or not.
+        let fatal = DoctorReport::from_checks(vec![
+            CheckResult::warn("b", "meh", "do x"),
+            CheckResult::fatal("c", "broken", "fix it"),
+        ]);
+        assert!(fatal.should_exit_nonzero(false));
+        assert!(fatal.should_exit_nonzero(true));
     }
 
     #[test]
     fn json_shape_is_stable() {
-        let report = DoctorReport::from_checks(vec![CheckResult::fail("x", "d", "r")]);
+        let report = DoctorReport::from_checks(vec![CheckResult::fatal("x", "d", "r")]);
         let json = render_json(&report).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["schema_version"], DOCTOR_SCHEMA_VERSION);
         assert_eq!(v["checks"][0]["name"], "x");
-        assert_eq!(v["checks"][0]["status"], "fail");
+        assert_eq!(v["checks"][0]["status"], "fatal");
         assert_eq!(v["checks"][0]["detail"], "d");
         assert_eq!(v["checks"][0]["remediation"], "r");
-        assert_eq!(v["summary"]["fail"], 1);
+        assert_eq!(v["summary"]["fatal"], 1);
         assert_eq!(v["summary"]["blocking"], true);
     }
 
+    // --- key material (--keys) per-key detail ---
+
     #[test]
     fn key_material_probe_failure_omits_secret_bearing_reason() {
-        let row = key_material_check(Err(
+        let rows = key_material_rows(Err(
             "reading passphrase from /run/credentials/basil/passphrase failed; \
              sealed bundle /var/lib/basil/bootstrap.bundle; \
              Authorization: Bearer vault-token-s.123; upstream body has credential"
                 .to_string(),
         ));
-        assert_eq!(row.status, CheckStatus::Fail);
-        let visible = format!("{} {}", row.detail, row.remediation);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, CheckStatus::Fatal);
+        let visible = format!("{} {}", rows[0].detail, rows[0].remediation);
         for canary in [
             "/run/credentials/basil/passphrase",
             "/var/lib/basil/bootstrap.bundle",
@@ -1087,8 +1254,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn key_material_all_present_is_single_ok_row() {
+        let report = CheckReport {
+            keys: vec![
+                key_check("web-tls", KeyStatus::Present),
+                key_check("app-sign", KeyStatus::Present),
+            ],
+        };
+        let rows = key_material_rows(Ok(&report));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "key_material");
+        assert_eq!(rows[0].status, CheckStatus::Ok);
+    }
+
+    #[test]
+    fn key_material_required_missing_is_fatal_with_per_key_detail() {
+        let report = CheckReport {
+            keys: vec![
+                key_check("present-key", KeyStatus::Present),
+                key_check("req-key", KeyStatus::Missing(MissingPolicy::Error)),
+                key_check("gen-key", KeyStatus::Missing(MissingPolicy::Generate)),
+            ],
+        };
+        let rows = key_material_rows(Ok(&report));
+        // aggregate + 2 per-missing-key rows.
+        assert_eq!(rows.len(), 3);
+        // aggregate: required missing → fatal.
+        assert_eq!(rows[0].name, "key_material");
+        assert_eq!(rows[0].status, CheckStatus::Fatal);
+        // per-key rows, one fatal (error), one warn (generate).
+        let req = rows
+            .iter()
+            .find(|r| r.name == "key_material:req-key")
+            .expect("req-key row present");
+        assert_eq!(req.status, CheckStatus::Fatal);
+        let generate_row = rows
+            .iter()
+            .find(|r| r.name == "key_material:gen-key")
+            .expect("gen-key row present");
+        assert_eq!(generate_row.status, CheckStatus::Warn);
+    }
+
+    #[test]
+    fn key_material_only_generate_missing_is_warn_not_fatal() {
+        let report = CheckReport {
+            keys: vec![
+                key_check("present-key", KeyStatus::Present),
+                key_check("gen-key", KeyStatus::Missing(MissingPolicy::Generate)),
+            ],
+        };
+        let rows = key_material_rows(Ok(&report));
+        assert_eq!(rows[0].status, CheckStatus::Warn); // aggregate
+        let report = DoctorReport::from_checks(rows);
+        assert!(!report.summary.blocking);
+        assert!(!report.should_exit_nonzero(false));
+        assert!(report.should_exit_nonzero(true));
+    }
+
     #[tokio::test]
-    async fn unreachable_backend_fails_within_timeout() {
+    async fn unreachable_backend_is_fatal_within_timeout() {
         let mut backends = std::collections::BTreeMap::new();
         // 127.0.0.1:1 is reserved/closed; connect is refused quickly.
         backends.insert(
@@ -1102,7 +1327,7 @@ mod tests {
         let started = std::time::Instant::now();
         let res = backend_reachability_check(Some(&backends)).await;
         assert!(started.elapsed() < REACHABILITY_TIMEOUT * 3);
-        assert_eq!(res.status, CheckStatus::Fail);
+        assert_eq!(res.status, CheckStatus::Fatal);
     }
 
     #[tokio::test]
