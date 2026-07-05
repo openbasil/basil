@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Live JWKS HTTP-surface e2e (basil-uce.3).
 //!
 //! basil-uce.1 unit-tests the JWKS handler by driving `build_jwks`/`assemble_jwks`

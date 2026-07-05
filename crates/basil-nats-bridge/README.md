@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # basil-nats-bridge
 
 `basil-nats-bridge` is a NATS request/reply courier for Basil sealed invocation

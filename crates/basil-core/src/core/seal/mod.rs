@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Sealed-bundle seal / open / slot management (vault-vh1).
 //!
 //! Implements `designs/unlock-and-bundle.html`: a `0600` multi-slot sealed bundle

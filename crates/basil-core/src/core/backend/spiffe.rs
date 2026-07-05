@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Vault-compatible (Vault or `OpenBao`) `transit` backend authenticated with a **self-minted
 //! JWT-SVID** instead of a static token.
 //!

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Sign and verify a release artifact through the Basil broker without the
 //! signing key ever leaving the vault.
 //!

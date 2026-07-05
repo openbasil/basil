@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! JWT-SVID revocation deny-list.
 
 use std::collections::BTreeMap;

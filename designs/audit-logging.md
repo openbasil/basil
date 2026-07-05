@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Audit Logging
 
 Basil audit events are secret-free structured events. They are emitted through

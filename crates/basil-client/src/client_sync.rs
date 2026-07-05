@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Blocking client for the basil agent.
 
 use basil_proto::broker::v1 as pb;

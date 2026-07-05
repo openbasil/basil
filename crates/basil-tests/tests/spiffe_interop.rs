@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! External-consumer interop test (basil-dk5.11).
 //!
 //! Proves the STANDARD Rust SPIFFE client crate (`spiffe`, aka rust-spiffe)

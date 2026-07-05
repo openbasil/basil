@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! LIVE cross-engine e2e for JWT-SVID revocation (basil-4gcn).
 //!
 //! Unit coverage already proves the deny-list store in isolation

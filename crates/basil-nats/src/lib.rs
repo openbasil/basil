@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! `basil-nats`: build NATS JWTs (the `ed25519-nkey` JWS profile) **without
 //! holding the signing key**.
 //!

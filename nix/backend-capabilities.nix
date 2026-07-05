@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Backend capability presets: what a given Vault / OpenBao *release provides*.
 #
 # A preset is the `implementation` of a `service.basil.catalog.backends.<name>`

@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # AWS/GCP KMS transit backends (design + SDK notes)
 
 Status: **Phase 2, not yet implemented.** Phase 1 (1Password → keystore-backend,

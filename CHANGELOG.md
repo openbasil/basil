@@ -1,9 +1,17 @@
+<!--
+SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Changelog
 
 ## Unreleased
 
 ### Added
 
+- 2026-07-05
+  - SPDX headers
 - 2026-07-04
   - added SECURITY.md, CODE_OF_CONDUCT.md
 

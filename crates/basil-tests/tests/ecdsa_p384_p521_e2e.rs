@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Cross-engine LIVE-crypto e2e for ECDSA P-384 (ES384) and P-521 (ES512) over
 //! the broker gRPC, on BOTH a dev `OpenBao` AND a dev `Vault` store (basil-0jkw).
 //!

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Encrypt a large file with `basil::stream`, where **Basil owns every nonce**
 //! and the container format is fixed by the library.
 //!

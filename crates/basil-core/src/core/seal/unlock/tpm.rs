@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! TPM2 sealed-bundle unlock slot (§3.1 / §9).
 //!
 //! Two builds, one fail-closed contract:

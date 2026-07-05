@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Peer attestation for accepted connections.
 //!
 //! Adapted from `brightnexus-platform`'s `attestation.rs` and the `PeerInfo`

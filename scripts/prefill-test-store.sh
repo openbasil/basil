@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # prefill-test-store.sh: pre-fill a Vault-compatible store (OpenBao or HashiCorp
 # Vault) + build a matching sealed bundle for basil broker test scenarios (vault-8d1).
 #

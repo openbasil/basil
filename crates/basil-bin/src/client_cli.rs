@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! `basil`: command-line client for the basil agent.
 
 // Index into fixed `serde_json::Value` shapes in test assertions is fine (the

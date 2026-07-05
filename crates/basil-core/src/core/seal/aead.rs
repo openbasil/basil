@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! AES-256-GCM helpers for the sealed bundle (vault-vh1).
 //!
 //! Both the payload encryption and every slot's KEK-wrap use AES-256-GCM with a

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Cross-language interop CLI for the Basil streaming container format.
 //!
 //! It reads plaintext (or a container) on stdin and writes the result to stdout,

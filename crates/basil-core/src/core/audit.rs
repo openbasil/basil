@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! The JSONL audit sink (`vault-vq5`): persist every authorization decision.
 //!
 //! [`crate::decision::DecisionRecord`] is the single place a gated op's

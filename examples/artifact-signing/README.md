@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # artifact-signing
 
 Sign and verify a release artifact **without the signing key ever leaving the

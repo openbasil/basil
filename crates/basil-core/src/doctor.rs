@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! `basil doctor`: preflight environment & deployment checks (basil-f0j).
 //!
 //! Doctor runs a set of **independent**, read-only diagnostics against a resolved

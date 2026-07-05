@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Policy decision point (`PDP`) for per-request
 //! `AuthenticatedActor` authorization. This is `vault-1l8`.
 //!

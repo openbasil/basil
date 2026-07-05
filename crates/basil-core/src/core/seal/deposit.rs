@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Public-key credential deposit support for sealed bundles.
 //!
 //! Deposits are append-only cleartext metadata records whose credential bytes

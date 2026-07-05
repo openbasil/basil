@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! The per-request authorization decision record (the audit hook point).
 //!
 //! Every **PDP-gated** op produces exactly one [`DecisionRecord`]: the broker

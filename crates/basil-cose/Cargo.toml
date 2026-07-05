@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 [package]
 name = "basil-cose"
 description = "Strict deterministic COSE (RFC 9052/9053) profile for basil sealed invocations: signed, sealed, and seal-only constructions with in-place signer/recipient traits"

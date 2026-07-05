@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Sealed-invocation plaintext body schemas and the basil content-type
 //! registry.
 //!

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! `basil-core` library: broker core, service adapters, and transport wiring.
 //!
 //! - [`core::catalog`] is the key inventory + authorization policy loaded at

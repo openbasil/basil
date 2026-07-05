@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! ML-KEM envelope open/seal core for software-custodied sealing keys.
 //!
 //! Basil stores ML-KEM decapsulation keys as the crate-native 64-byte seed. The

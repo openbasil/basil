@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Startup catalog reconcile: apply each key's `missing` policy (design §3.7).
 //!
 //! After the [`BackendManager`] is built and **before** the broker binds its

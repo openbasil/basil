@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! The basil private label registry and canonical label ordering.
 //!
 //! Labels live in the RFC 9052 private range (below -65536). This module is

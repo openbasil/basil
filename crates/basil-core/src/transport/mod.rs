@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Shared tonic transport helpers for broker services.
 //!
 //! The tonic server stores peer identity in request extensions before service

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Generated Basil gRPC API contracts.
 //!
 //! `broker` is Basil's own broker API. `spiffe` is generated from the vendored

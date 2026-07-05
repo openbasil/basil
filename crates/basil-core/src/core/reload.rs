@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Signal-driven hot reload of the catalog/policy **generation** (`basil-y3e`).
 //!
 //! [`reload_generation`] is the single, fail-closed reload engine shared by the

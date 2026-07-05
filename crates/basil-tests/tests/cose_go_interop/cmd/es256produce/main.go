@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // Command es256produce signs a bare COSE_Sign1 under ES256 with go-cose,
 // using the P-256 key material from the checked-in Basil ES256 fixture, and
 // prints the tagged bytes as hex. Basil's P256Verifier must accept the result,

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Unified `basil` binary: daemon, offline config tools, and socket client.
 //!
 //! The command-line definition lives in the crate library (`basil_bin::cli`) so

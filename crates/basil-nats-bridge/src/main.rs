@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 use anyhow::Context;
 use basil_nats_bridge::{Args, Config, run};
 use clap::Parser;

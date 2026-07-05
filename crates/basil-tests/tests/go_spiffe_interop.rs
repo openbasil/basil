@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! External go-spiffe Workload API probe (basil-mmfy.1).
 //!
 //! Boots a live Basil agent with the shared harness, runs a small Go program

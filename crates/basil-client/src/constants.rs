@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Shared constants for the wire protocol and codec.
 
 /// Default path for the agent's listening Unix domain socket.

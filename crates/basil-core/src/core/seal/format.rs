@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Sealed-bundle on-disk container (§2.2 of `designs/unlock-and-bundle.html`).
 //!
 //! Layout: a fixed ASCII magic + `u16` `format_version` (cleartext framing,

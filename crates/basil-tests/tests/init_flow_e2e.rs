@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Cross-engine LIVE e2e for the full first-run onboarding flow (basil-mil0.7):
 //! `basil config init` → `bundle create` → `check` → `run` → sign with the
 //! scaffolded example key, against a live dev `bao` AND a live dev `vault`.

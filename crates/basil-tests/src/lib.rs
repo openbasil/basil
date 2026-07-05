@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Shared live-harness for the SPIFFE Workload API integration tests.
 //!
 //! Extracted from `spiffe_interop.rs` (basil-dk5.11) so later test files

@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Contributor Covenant Code of Conduct
 
 ## Our Pledge

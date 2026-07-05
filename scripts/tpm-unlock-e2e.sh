@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # tpm-unlock-e2e.sh: TPM unlock-slot e2e (basil-h8qq.1 harness + .2/.3 scenarios).
 #
 # Boots emulated-TPM 2.0 guests under qemu + swtpm and drives the just-built

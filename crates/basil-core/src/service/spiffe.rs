@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! SPIFFE Workload API service shell.
 //!
 //! Each method first enforces SPIFFE's `workload.spiffe.io=true` metadata

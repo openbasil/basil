@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! gRPC broker service adapters.
 //!
 //! This module is intentionally a thin transport adapter over the existing

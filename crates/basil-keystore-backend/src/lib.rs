@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Optional materialize-to-use key-store support for Basil.
 //!
 //! This crate holds the storage adapters and local crypto needed when Basil is

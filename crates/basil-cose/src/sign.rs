@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! The signed construction: a bare `COSE_Sign1` (control RPC / push
 //! surfaces; any sign-only basil surface).
 

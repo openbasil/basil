@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! `basil-agent`: the standalone Basil daemon.
 //!
 //! It loads a **`0600` sealed bundle** of the broker's own bootstrap credentials

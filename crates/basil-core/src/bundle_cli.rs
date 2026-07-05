@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Top-level `basil bundle` sealed-bundle management.
 //!
 //! This is the pre-release replacement for the old `basil config bundle`

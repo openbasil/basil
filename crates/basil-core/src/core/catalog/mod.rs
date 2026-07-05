@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Catalog + policy schema, loader, and resolution (design `catalog-policy-schema.html`).
 //!
 //! The broker loads two **exported JSON** documents at startup:

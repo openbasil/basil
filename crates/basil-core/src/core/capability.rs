@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Backend **capability enforcement**: does each backend *provide* what the
 //! catalog *requires*?
 //!

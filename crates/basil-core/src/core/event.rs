@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Internal broker event source shared by Admin Watch and future SPIFFE streams.
 
 use std::time::SystemTime;

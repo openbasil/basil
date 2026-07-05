@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! External `spiffe-rustls` mTLS consumer interop test (basil-dk5.13).
 //!
 //! Proves the STANDARD SPIFFE-aware rustls integration crate (`spiffe-rustls`,

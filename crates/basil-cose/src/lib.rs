@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! # basil-cose
 //!
 //! A strict, deterministic COSE (RFC 9052/9053) profile for basil's sealed

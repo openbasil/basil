@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! GCP Cloud KMS in-place transit [`Backend`].
 //!
 //! The private key never leaves Cloud KMS: Basil brokers `sign` / `encrypt` /

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Key-store backend adapter.
 //!
 //! This adapter is compiled only behind `keystore-backend`. The storage and

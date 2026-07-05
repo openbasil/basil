@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Boot an OpenBao dev server + a Basil agent (pqc feature), then stream-encrypt a
 # multi-MiB file two ways (AES-256-GCM and broker-custodied ML-KEM-768) and prove
 # a tampered stream fails closed. Exit 0 only when every assertion passes.

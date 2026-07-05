@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! `basil`: client library for the basil agent.
 //!
 //! The public client talks to Basil's broker over gRPC.

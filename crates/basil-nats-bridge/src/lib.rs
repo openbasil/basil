@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! NATS request/reply courier for Basil sealed invocation messages.
 //!
 //! The bridge treats invocation messages as opaque tagged `COSE` bytes. It

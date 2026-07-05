@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Cross-engine LIVE e2e for the value-store Ed25519 materialize-to-sign path
 //! (`engine=kv2`, vault-iiz, basil-cy8) over the broker gRPC, on BOTH a dev
 //! `OpenBao` AND a dev `Vault` store.

@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # test-prefill-e2e.sh: gated acceptance test for the pre-fill procedure (vault-8d1).
 #
 # Runs scripts/prefill-test-store.sh, boots the broker against the pre-filled

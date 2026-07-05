@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! age + age-plugin-yubikey unlock slot (§3.1, feature `unlock-age-yubikey`).
 //!
 //! The master KEK is wrapped *to an age recipient* and recovered by *age

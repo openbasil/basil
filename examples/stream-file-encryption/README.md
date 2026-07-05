@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # stream-file-encryption
 
 Encrypt a large file with `basil::stream`, where **Basil owns every nonce** and

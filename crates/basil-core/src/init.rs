@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! `basil config init`: first-run scaffolding (basil-p50).
 //!
 //! Generates a minimal, valid, **least-privilege** starter set into a target

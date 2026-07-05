@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Shared Vault PKI HTTP operations (`HashiCorp` Vault or `OpenBao`).
 //!
 //! PKI issue endpoints are catalog paths such as `pki/issue/web`. Unlike transit

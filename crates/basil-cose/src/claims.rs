@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Claim structs, message roles, and parameterized claim validation.
 //!
 //! The wire codec for claims (CWT map in header 15 plus the basil private

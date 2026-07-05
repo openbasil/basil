@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! The seal-only construction: a bare `COSE_Encrypt` (ECDH-ES + HKDF-256 to
 //! one X25519 recipient, AEAD content encryption).
 //!

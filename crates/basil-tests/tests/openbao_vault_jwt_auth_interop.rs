@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! OpenBao/Vault JWT auth interop for Basil-published JWT-SVID JWKS.
 //!
 //! This lane configures a live engine's JWT auth method to validate Basil

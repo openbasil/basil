@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! LIVE cross-engine e2e for the BIP39 break-glass unlock slot (basil-bp30).
 //!
 //! The BIP39 slot had only KDF-level unit coverage (`seal/unlock/bip39.rs`:

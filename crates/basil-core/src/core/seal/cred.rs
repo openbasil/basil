@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Per-backend credential payload (§4 of `designs/unlock-and-bundle.html`).
 //!
 //! The decrypted sealed-bundle payload is a [`CredBundle`]: a map of opaque

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Vault-compatible (`HashiCorp` Vault or `OpenBao`) `transit` backend,
 //! authenticated with a **static token** (`X-Vault-Token`).
 //!

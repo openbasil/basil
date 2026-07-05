@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 [alias]
 # cargo-xtask convention: `cargo xtask <args>` runs the workspace automation
 # crate. Today its only job is man-page generation (`cargo xtask -o <dir>`).

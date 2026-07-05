@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! COSE sealed-invocation fixtures (plan §8.3).
 //!
 //! Builds the six invocation message types (request + response for sign,

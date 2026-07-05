@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Bundle seal/open integration tests (vault-vh1 definition-of-done).
 //!
 //! These exercise the full container: AES-256-GCM payload + KEK-wrap, the JSON

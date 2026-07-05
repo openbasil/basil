@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Provider-neutral crypto operation dispatch.
 //!
 //! This layer sits below `service::*` and above concrete backends. It describes

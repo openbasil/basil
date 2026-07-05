@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Credential minters.
 //!
 //! A minter assembles a format-specific credential (here, a NATS user JWT) by

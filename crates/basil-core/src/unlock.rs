@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Startup unlock: build the method registry from flags, check bundle perms,
 //! open the sealed bundle, and exchange `AppRole` creds for a short-lived token.
 //!

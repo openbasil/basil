@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Production passphrase unlock slot.
 //!
 //! The passphrase is read by the caller from a file into a zeroizing buffer,

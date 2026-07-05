@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let protos = [
         "proto/basil/broker/v1/broker.proto",

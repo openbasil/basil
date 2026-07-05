@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Workload API wire-compatibility lock for Rust SPIFFE consumers (basil-dk5.12).
 //!
 //! The interop test (`spiffe_interop.rs`) proves the high-level `spiffe` client

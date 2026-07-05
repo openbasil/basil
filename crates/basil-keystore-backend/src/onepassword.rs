@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! `1Password` materialize-to-use backend for [`SecretStore`](crate::SecretStore).
 //!
 //! Secrets are stored as Secure Note items through the `1Password` CLI (`op`),

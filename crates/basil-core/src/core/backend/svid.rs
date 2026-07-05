@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Self-minted JWT-SVIDs.
 //!
 //! The broker acts as its own SPIFFE issuer: it holds an RSA signing key and

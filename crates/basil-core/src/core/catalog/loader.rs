@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Loader: parse + validate the exported catalog & policy JSON, and build the
 //! ready-for-PDP [`ResolvedPolicy`] index (design §5, §6).
 //!

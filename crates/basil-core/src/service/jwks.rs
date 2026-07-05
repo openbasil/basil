@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! The JWKS + OIDC-discovery HTTP surface (`basil-uce.1`, `basil-uce.2`).
 //!
 //! This is the **first and only** HTTP endpoint in an otherwise

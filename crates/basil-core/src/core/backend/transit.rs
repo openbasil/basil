@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Shared Vault `transit` HTTP operations (`HashiCorp` Vault or `OpenBao`).
 //!
 //! Both the static-token [`super::vault::VaultBackend`] and the

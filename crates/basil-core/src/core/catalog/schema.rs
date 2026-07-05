@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Catalog schema types: the key inventory + backend routing table (design §2).
 //!
 //! These are `serde`-derived and deserialized from the **exported JSON** the

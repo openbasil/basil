@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! On-the-wire container format and AEAD primitives for streaming encryption.
 //!
 //! This module owns the byte layout of the Basil streaming container (magic,

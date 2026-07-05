@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Cross-engine LIVE end-to-end for the post-quantum (PQC) local-software
 //! provider over the broker gRPC, on BOTH a dev `OpenBao` AND a dev `Vault`
 //! store, driven entirely through the published `basil` client.

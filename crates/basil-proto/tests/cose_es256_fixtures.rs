@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! ES256 (`COSE_Sign1`) interop fixture (br basil-c033).
 //!
 //! A bare signed `COSE_Sign1` under ES256 (ECDSA P-256 + SHA-256, COSE alg

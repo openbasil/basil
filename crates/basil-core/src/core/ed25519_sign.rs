@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Ed25519 materialize-to-sign: the value-store signing crypto core.
 //!
 //! The self-contained primitive for the materialize-to-sign arm (vault-iiz,

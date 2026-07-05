@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Live `SpiffeSigner` broker-boot e2e (basil-dk5.4).
 //!
 //! Proves the broker boots on the **`SpiffeVaultBackend`** path: it self-mints a

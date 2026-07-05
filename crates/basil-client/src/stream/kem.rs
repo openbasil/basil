@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! ML-KEM key-establishment for streaming encryption.
 //!
 //! For an ML-KEM stream the 256-bit content-encryption key (CEK) is generated

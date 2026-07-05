@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Structural RFC 8949 §4.2 pre-check: a dependency-free walk over raw CBOR
 //! bytes that rejects indefinite-length items and non-minimal integer
 //! headers before any structure decoding, with precise diagnostics.

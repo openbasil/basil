@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Example suite: three Rust + three Go runnable examples (2026-07)
 
 Design for six new runnable examples, three per language, one per language demonstrating

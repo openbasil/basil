@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! COSE fixture interop and strictness checks for the sealed-invocation profile.
 //!
 //! This suite intentionally triages `cose_minicbor` as a second Rust COSE

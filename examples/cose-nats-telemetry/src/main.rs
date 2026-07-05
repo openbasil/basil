@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Two services exchange COSE-signed telemetry over NATS using nothing but
 //! Basil-minted **leases** and **in-place signatures**. No long-lived secrets
 //! anywhere.

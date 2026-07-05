@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 [package]
 name = "basil-bin"
 description = "Unified Basil operator and client binary."

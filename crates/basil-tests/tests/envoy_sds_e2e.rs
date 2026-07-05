@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Live Envoy SDS validation against Basil's Envoy SDS adapter.
 //!
 //! This test boots the existing live OpenBao-backed Basil harness, hot-reloads

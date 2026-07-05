@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Beads Project Configuration
+# issue_prefix: basil
+# default_priority: 2
+# default_type: task

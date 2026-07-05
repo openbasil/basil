@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Unified key/value secret store for Basil's key-store backend.
 
 #[cfg(feature = "db-keystore")]

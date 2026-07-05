@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! SHA3-256 request-hash helper (claim `-70002`).
 
 use sha3::{Digest, Sha3_256};

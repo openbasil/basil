@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Bundle credential deposit (public-key contribution)
 
 Status: **implemented** (2026-07-03; br `basil-ey2u` / `basil-3p9l`). Extends

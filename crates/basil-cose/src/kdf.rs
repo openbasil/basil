@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! KDF party identities and the ECDH-ES + HKDF-256 content-key derivation.
 //!
 //! The HKDF info is the RFC 9053 §5.2 `COSE_KDF_Context` (serialized by the

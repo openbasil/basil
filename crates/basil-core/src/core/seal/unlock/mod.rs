@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Unlock-method abstraction (§3 of `designs/unlock-and-bundle.html`).
 //!
 //! One [`UnlockMethod`] = the logic behind one slot kind. A method turns its

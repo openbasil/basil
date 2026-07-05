@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Shared sealed-bundle slot KDF/AAD helpers.
 
 use argon2::{Algorithm, Argon2, Params, Version};

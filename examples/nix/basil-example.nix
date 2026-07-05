@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Example Basil catalog, policy, NixOS service configuration, and foreground
 # runner. This file is intentionally self-contained so it can be imported by a
 # NixOS configuration or used directly with `nix run -f ./basil-example.nix run`.

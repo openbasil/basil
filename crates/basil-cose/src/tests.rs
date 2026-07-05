@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Crate-level tests: round trips for all three constructions with both
 //! content algorithms, adversarial tampering, and encoding-strictness
 //! negatives (hand-crafted hostile CBOR).

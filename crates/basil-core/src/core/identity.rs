@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Local hardware-or-software signing identity (kept TPM/HSM scaffolding).
 //!
 //! Adapted from `brightnexus-platform`'s `tpm2.rs` / `factory.rs`. It detects a

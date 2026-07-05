@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # basil-cose: public API and broker COSE-unseal RPC
 
 - Status: proposed (feeds human review `basil-o6mm`; gates milestones C1–C3)

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 [package]
 name = "basil-nats"
 description = "Generic, dependency-light builder for NATS account/user JWTs (ed25519-nkey) where signing is delegated to an external signer (e.g. a key held in a vault/HSM)."

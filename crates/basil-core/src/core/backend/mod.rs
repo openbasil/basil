@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Pluggable signing / key-store backends.
 //!
 //! The agent is a *proxy*: incoming `NEW_KEY` / `SIGN` / `VERIFY` messages are

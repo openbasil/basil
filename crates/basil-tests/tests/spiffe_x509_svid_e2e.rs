@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Cross-engine SPIFFE X509-SVID (URI-SAN) issuance + x509 bundle/CRL e2e
 //! over the live Workload API (basil-dk5.10).
 //!

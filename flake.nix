@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 {
   description = "Basil: Broker for Attestation, Secrets, Identity & Leases";
   inputs = {

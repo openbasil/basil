@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! BIP39 break-glass unlock slot (§3.1, feature `unlock-bip39`).
 //!
 //! `recover_kek`: the operator supplies the 24-word phrase on a controlled input

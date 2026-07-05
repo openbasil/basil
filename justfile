@@ -2,8 +2,8 @@
 _default:
     @just --list
    
-docs:
-    cargo doc -p basil -p basil-nats -p basil-proto --all-features --no-deps
+rust-docs:
+    cargo doc -p basil-client  -p basil-nats -p basil-proto -p basil-cose --all-features --no-deps
     dufs -p 21000 target/doc
 
 # Generate roff man pages for the `basil` and `basil-nats-bridge` binaries into
@@ -86,7 +86,7 @@ cargo-live-e2e:
 test-stream-interop:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo build -p basil --example stream_cli
+    cargo build -p basil-client --example stream_cli
     cli="$PWD/target/debug/examples/stream_cli"
     echo "== go test -tags interop: clients/go/stream (BASIL_STREAM_RUST_CLI=$cli)"
     BASIL_STREAM_RUST_CLI="$cli" go test -C clients/go -tags interop ./stream/...
@@ -148,3 +148,30 @@ ubs:
     ~/.local/bin/ubs-rust.sh -v --ci  --exclude-tests  --exclude=.work \
         --strict-gitignore \
         --emit-findings-json=/tmp/ubs-basil.json  . >/tmp/ubs-basil.out
+
+_spdx PATH="." CHECK="":
+    @addlicense \
+      {{CHECK}} \
+      -y 2026 \
+      -c "OpenBasil Contributors" \
+      -l "apache" \
+      -s \
+      -ignore '**/*.lock' \
+      -ignore '.github/**' \
+      -ignore '.git/**' \
+      -ignore '.beads/**'  \
+      -ignore '.gitmodules'  \
+      -ignore '**/vendor/**' \
+      -ignore '**/*.pem' \
+      -ignore '**/Cargo.lock' \
+      -ignore '**/go.dum' \
+      -ignore '**/*.json' \
+      -ignore 'target/**' \
+      -ignore 'clippy.toml' \
+      {{PATH}}
+    
+check-spdx PATH=".": (_spdx PATH "-check")
+
+# add SPDX copyright and license headers
+add-spdx PATH=".": (_spdx  PATH "")
+

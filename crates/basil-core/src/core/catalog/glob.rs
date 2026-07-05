@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Key-glob parsing and matching (design §3.4).
 //!
 //! A target glob matches a **dotted, lowercase** key segment-by-segment.

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Closed, diagnostic error enums.
 //!
 //! Every enum here is closed (no `Unknown`/catch-all arms for wire values) and

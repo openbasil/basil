@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # cose-nats-telemetry
 
 Two services exchange **COSE-signed telemetry over NATS** using nothing but

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Shared helpers for the cloud KMS transit backends (`aws_kms`, `gcp_kms`):
 //! public-key parsing and caller-`aad` binding. No SDK dependency lives here.
 

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Unit tests for the streaming encryption container. No live broker is needed:
 //! the ML-KEM path is exercised through [`LocalSeedCekRecovery`].
 

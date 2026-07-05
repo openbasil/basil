@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! The sealed construction: a `COSE_Sign1` over an embedded tagged
 //! `COSE_Encrypt` (basil invocation requests/responses, peer messages).
 //!

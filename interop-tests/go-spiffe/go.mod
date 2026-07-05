@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 module github.com/openbasil/basil-interop-go-spiffe
 
 go 1.26.3

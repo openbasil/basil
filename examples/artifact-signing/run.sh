@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Boot an OpenBao dev server + a Basil agent, then sign & verify a release
 # manifest through the broker and prove the deny path. Exit 0 only when every
 # assertion in the example binary passes.

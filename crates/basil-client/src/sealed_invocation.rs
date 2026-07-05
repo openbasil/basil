@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Client-side COSE sealed invocation helpers.
 //!
 //! The broker carrier is raw tagged COSE bytes in

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Validated identifier newtypes and byte-carrying parameter structs.
 //!
 //! Everything a caller passes is a named struct or a closed enum: no bare

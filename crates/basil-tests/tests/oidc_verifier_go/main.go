@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // Command oidcverifier is a tiny, faithful "ordinary OIDC relying party" used as
 // an EXTERNAL verifier in Basil's live e2e (br basil-mil0.2). It proves a Basil
 // JWT-SVID validates off nothing but Basil's PUBLISHED OIDC documents: the

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 [package]
 name = "basil-keystore-backend"
 description = "Optional Basil key-store backends over db-keystore and 1Password."

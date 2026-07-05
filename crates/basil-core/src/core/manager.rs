@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Multi-backend manager + per-key routing (design §2.2, §17.7).
 //!
 //! The [`BackendManager`] is the layer between the gRPC service adapters and the

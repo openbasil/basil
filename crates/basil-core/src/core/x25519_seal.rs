@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! X25519 sealed-box: the self-contained crypto core for enrollment unseal
 //! (basil-t9a, design §17.7: the materialize-to-use local-custody arm).
 //!

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Cross-engine LIVE e2e for the **SIGHUP hot-reload signal path** (`basil-y3e`,
 //! `basil-mil0.4`) over a dev `OpenBao` AND a dev `Vault` store.
 //!

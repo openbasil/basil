@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Boot OpenBao + a Basil agent + an operator-mode nats-server, then have two
 # services exchange COSE-signed telemetry over NATS using Basil-minted user
 # leases and in-place NKey signing. Exit 0 only when every assertion passes.

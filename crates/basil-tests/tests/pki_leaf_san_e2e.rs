@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Cross-engine LIVE e2e for DNS/IP-SAN X.509 TLS leaf issuance from a real
 //! backend PKI engine (basil-0jkw / basil-5qur) over the broker gRPC, on BOTH a
 //! dev `OpenBao` AND a dev `Vault` store.

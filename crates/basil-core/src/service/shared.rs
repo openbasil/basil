@@ -1,5 +1,9 @@
 #![allow(clippy::result_large_err)]
 
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use basil_proto::broker::v1 as pb;

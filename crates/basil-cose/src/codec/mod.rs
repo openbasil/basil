@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! The codec seam: the in-tree deterministic COSE profile encoder/decoder
 //! over `minicbor`. This in-tree encoder is the primary and only path).
 //!

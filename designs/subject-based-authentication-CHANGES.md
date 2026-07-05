@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Subject-Based Authentication API Changes
 
 This is a condensed implementation guide for the latest changes in

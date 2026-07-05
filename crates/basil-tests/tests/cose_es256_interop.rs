@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! ES256 `COSE_Sign1` interop with `veraison/go-cose` (br basil-c033).
 //!
 //! Two directions, both gated on Go being installed:

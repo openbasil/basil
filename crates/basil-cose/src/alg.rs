@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Closed algorithm enums and their COSE codepoints.
 //!
 //! Decode of any codepoint outside these enums is a

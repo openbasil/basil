@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # db-keystore Backend Example
 
 This example runs the unified `basil` binary against the optional `db-keystore`

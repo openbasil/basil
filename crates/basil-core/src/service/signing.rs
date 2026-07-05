@@ -1,5 +1,9 @@
 #![allow(clippy::result_large_err)]
 
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 use basil_proto::broker::v1 as pb;
 use basil_proto::broker::v1::signing_service_server::SigningService;
 use tonic::{Request, Response};

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Library surface for the unified `basil` binary.
 //!
 //! This crate is primarily a binary (`basil`), but it also exposes its

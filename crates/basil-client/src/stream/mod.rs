@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Streaming, chunked authenticated encryption for large payloads and files.
 //!
 //! These APIs encrypt and decrypt a [`tokio::io::AsyncRead`] into a

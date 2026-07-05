@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! ML-DSA (FIPS 204) software signing core for the local-software PQC provider.
 //!
 //! Pure, backend-free ML-DSA: deterministic key generation from a 32-byte seed

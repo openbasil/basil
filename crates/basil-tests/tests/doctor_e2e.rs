@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Cross-engine LIVE e2e for **`basil doctor`** over a dev `OpenBao` AND a dev
 //! `Vault` store.
 //!

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! LIVE e2e round-trips through the `basil-nats-bridge` COSE courier over a
 //! real `nats-server`.
 //!
