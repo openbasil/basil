@@ -35,12 +35,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # rust-toolchain.toml pins channel 1.96.0 with rustfmt + clippy, so the
-      # toolchain action installs exactly what the workspace targets.
+      # Provision the exact toolchain pinned by rust-toolchain.toml (channel +
+      # rustfmt/clippy components + targets). `rustup show` installs the
+      # override-file toolchain if it is missing, so the workflow never hardcodes
+      # a Rust version -- bump rust-toolchain.toml and CI follows.
       - name: Install Rust toolchain (from rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@1.96.0
-        with:
-          components: rustfmt, clippy
+        run: rustup show
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -83,3 +83,41 @@ jobs:
       # SKIPping. Non-zero exit iff any engine's e2e FAILED.
       - name: Cross-engine e2e (OpenBao + Vault)
         run: just test-e2e both
+
+  # Go unit tests plus the Rust<->Go streaming interop suite. Kept separate from
+  # the cargo gates so the Go toolchain and the `clients/go` submodule are only
+  # provisioned here. `test-stream-interop` builds the Rust `stream_cli` example
+  # and drives it from the Go interop tests, so this job needs BOTH toolchains.
+  go-tests:
+    name: go + rust<->go stream interop
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with clients/go submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # `test-stream-interop` compiles a Rust example; use the same
+      # rust-toolchain.toml-pinned toolchain as the gates job.
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Go (from clients/go/go.mod)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: clients/go/go.mod
+
+      - name: Install just
+        uses: extractions/setup-just@v2
+
+      # Every checked-in Go module: clients/go, the OIDC verifier, and go-spiffe.
+      - name: Go unit tests
+        run: just test-go
+
+      # Proves the Go and Rust stream implementations produce byte-identical
+      # containers by driving the built Rust `stream_cli` from the Go interop tests.
+      - name: Rust<->Go stream interop
+        run: just test-stream-interop

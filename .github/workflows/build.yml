@@ -1,0 +1,128 @@
+name: Build
+
+# Reproducible per-architecture builds of the `basil` binaries via the Nix
+# flake (`nix build .#basil-<arch>`). Because the flake's toolchain comes from
+# rust-toolchain.toml (fenix `fromToolchainFile`), no Rust version is pinned in
+# this workflow -- bumping rust-toolchain.toml is the single source of truth.
+#
+# Triggers:
+#   * push of a `basil-v*` tag -> build ALL THREE platforms (release build). A
+#     guard rejects tags whose commit is not on `main`.
+#   * manual `workflow_dispatch` -> build one chosen architecture (or `all`)
+#     from a chosen branch (default `main`).
+# It deliberately does NOT run on branch pushes or pull requests.
+
+on:
+  push:
+    tags:
+      - 'basil-v*'
+  workflow_dispatch:
+    inputs:
+      architecture:
+        description: Architecture to build (dispatch only; tag builds are always all)
+        type: choice
+        default: all
+        options:
+          - all
+          - x86_64-linux
+          - aarch64-linux
+          - aarch64-darwin
+      branch:
+        description: Branch to build from (dispatch only)
+        type: string
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}-${{ github.event.inputs.architecture || 'all' }}
+  cancel-in-progress: true
+
+jobs:
+  # Compute the build matrix. A tag push builds all three platforms; a manual
+  # dispatch builds the single selected architecture, or all three when `all`.
+  # Each architecture builds natively on its matching runner so `nix build`
+  # never cross-compiles.
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.set.outputs.include }}
+    steps:
+      - id: set
+        shell: bash
+        env:
+          # Tag pushes (and any non-dispatch event) build everything.
+          ARCH: ${{ github.event_name == 'workflow_dispatch' && inputs.architecture || 'all' }}
+        run: |
+          all='[
+            {"arch":"x86_64-linux","runner":"ubuntu-latest"},
+            {"arch":"aarch64-linux","runner":"ubuntu-22.04-arm"},
+            {"arch":"aarch64-darwin","runner":"macos-14"}
+          ]'
+          if [ "$ARCH" = "all" ]; then
+            include=$(jq -c . <<<"$all")
+          else
+            include=$(jq -c --arg a "$ARCH" '[ .[] | select(.arch == $a) ]' <<<"$all")
+          fi
+          echo "include=$include" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.matrix.outputs.include) }}
+    name: build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Resolve ref to build
+        id: ref
+        shell: bash
+        run: |
+          # Manual runs build the requested branch; tag pushes build the tag.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "ref=${{ inputs.branch }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=${{ github.ref }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.ref.outputs.ref }}
+          persist-credentials: false
+          # Full history so the "tag is on main" guard can check ancestry.
+          fetch-depth: 0
+
+      - name: Reject release tags not on main
+        if: ${{ github.event_name == 'push' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::tag ${{ github.ref_name }} (${GITHUB_SHA}) is not an ancestor of main; refusing to release-build" >&2
+            exit 1
+          fi
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v14
+
+      - name: Build basil (${{ matrix.arch }})
+        run: nix build -L ".#basil-${{ matrix.arch }}"
+
+      - name: Stage binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          dest="dist/${{ matrix.arch }}"
+          mkdir -p "$dest"
+          # `result` is a symlink into the store; -L dereferences it.
+          cp -L result/bin/* "$dest/"
+          ls -l "$dest"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: basil-${{ matrix.arch }}
+          path: dist/${{ matrix.arch }}
+          if-no-files-found: error

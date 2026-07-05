@@ -28,6 +28,7 @@ path = [
   "CLAUDE.md",
   "packaging/**",
   ".github/workflows/ci.yml",
+  ".github/workflows/build.yml",
   ".github/workflows/partials/**",
   "crates/basil-proto/fixtures/**",
   "examples/db-keystore/*.template.json",

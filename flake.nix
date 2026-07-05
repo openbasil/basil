@@ -177,6 +177,15 @@
             default = basil;
             basil = basil;
             basil-tpm = basilTpm;
+            # Per-architecture release target. `${system}` is already the arch
+            # name CI selects on (`x86_64-linux`, `aarch64-linux`,
+            # `aarch64-darwin`), so this exposes `nix build .#basil-x86_64-linux`
+            # etc. as a single uniform command each build runner invokes on its
+            # matching native `system`. It resolves to the plain `basil` build, so
+            # the Rust toolchain is taken from rust-toolchain.toml (via fenix,
+            # `mkBasil`'s `toolchain`) with no per-arch version drift. On
+            # x86_64-linux the cross `basil-aarch64-linux` below is a distinct key.
+            "basil-${system}" = basil;
           }
           // lib.optionalAttrs (system == "x86_64-linux") {
             basil-aarch64-linux = basilAarch64Linux;

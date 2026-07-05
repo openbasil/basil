@@ -13,6 +13,11 @@ SPDX-License-Identifier: Apache-2.0
 - 2026-07-05
   - SPDX headers
   - cargo aliases: 'cargo install-basil','cargo install-bridge' installs basil binary & basil-nats-bridge
+  - CI: Go unit tests and the Rust<->Go stream interop suite over the clients/go submodule (basil-ubd)
+  - Nix: per-architecture build targets `basil-x86_64-linux`, `basil-aarch64-linux`, `basil-aarch64-darwin`
+  - workflow `build.yml`: reproducible per-arch Nix builds — manual dispatch (choose architecture + branch) and automatic on `basil-v*` tags (all three platforms, tags must be on main)
+  - Arch Linux aarch64 package alongside x86_64 (basil-60f)
+  - `scripts/pin-github-actions.sh` and `just pin-actions`: pin GitHub Actions to commit SHAs, run automatically from `gen-release-workflow` (basil-yko)
 
 - 2026-07-04
   - added SECURITY.md, CODE_OF_CONDUCT.md

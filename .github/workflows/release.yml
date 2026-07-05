@@ -386,8 +386,10 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.96.0
+      # Provision the toolchain pinned by rust-toolchain.toml (no hardcoded Rust
+      # version); `rustup show` installs the override-file channel if missing.
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        run: rustup show
       - name: Build stripped release binaries and man pages
         # No --target: the runner arch matches the package arch, so this is a
         # native build. basil-bin's DEFAULT features (spiffe + db-keystore +
@@ -443,19 +445,31 @@ jobs:
       - name: Attach the .deb to the GitHub Release
         run: gh release upload "${{ needs.plan.outputs.tag }}" "${{ steps.deb.outputs.path }}" --clobber
 
-  # Arch Linux .pkg.tar.zst, built from the PUBLISHED x86_64 release archive
-  # inside an archlinux container (dist has no native Arch support). The PKGBUILD
-  # lives at packaging/arch/PKGBUILD; CI patches pkgver from the tag and runs
-  # `updpkgsums` so the sha256 matches the real release tarball (correct sha256
+  # Arch Linux .pkg.tar.zst for x86_64 and aarch64, each built from the PUBLISHED
+  # release archive of that arch inside an Arch container (dist has no native Arch
+  # support). x86_64 uses the official `archlinux` image; aarch64 builds natively
+  # on an arm64 runner in an Arch Linux ARM image. The PKGBUILD lives at
+  # packaging/arch/PKGBUILD; CI patches pkgver from the tag and runs `updpkgsums`
+  # so the per-arch sha256 matches the real release tarball (correct sha256
   # handling -- no blind 'SKIP'). AUR publication is a separate MANUAL step that
   # needs AUR credentials (see docs/runbooks/release.md).
   arch-package:
-    name: arch-package (x86_64)
+    name: arch-package (${{ matrix.arch }})
     needs:
       - plan
       - host
     if: ${{ needs.plan.outputs.publishing == 'true' }}
-    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+            image: archlinux:base-devel
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+            image: menci/archlinuxarm:latest
+    runs-on: ${{ matrix.runner }}
     permissions:
       "contents": "write"
       "id-token": "write"
@@ -472,20 +486,24 @@ jobs:
         run: |
           tag="${{ needs.plan.outputs.tag }}"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
-      - name: Build .pkg.tar.zst in an archlinux container
+      - name: Build .pkg.tar.zst in an Arch container (${{ matrix.arch }})
         env:
           PKGVER: ${{ steps.ver.outputs.version }}
         # makepkg refuses to run as root, so we create an unprivileged `builder`
         # user. `updpkgsums` downloads the release tarball and rewrites the
         # sha256sums in PKGBUILD before makepkg re-downloads and verifies it.
+        # makepkg picks source_<CARCH> for the container's native arch (x86_64 on
+        # the official image, aarch64 on the Arch Linux ARM image), so no CARCH
+        # override is needed. `sudo` is installed explicitly since the ARM base
+        # image does not ship it.
         run: |
           docker run --rm \
             -e PKGVER \
             -v "$PWD/packaging/arch:/pkg" \
             -w /pkg \
-            archlinux:base-devel \
+            ${{ matrix.image }} \
             bash -euo pipefail -c '
-              pacman -Syu --noconfirm --needed base-devel git pacman-contrib
+              pacman -Syu --noconfirm --needed base-devel git pacman-contrib sudo
               useradd -m builder
               chown -R builder:builder /pkg
               sed -i "s/^pkgver=.*/pkgver=${PKGVER}/" PKGBUILD

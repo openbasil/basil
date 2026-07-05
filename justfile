@@ -49,7 +49,17 @@ gen-release-workflow:
     "${dist_cmd[@]}" generate --mode ci
     # ... then re-append the hand-written jobs, minus the anchor header.
     tail -n +"$((header_lines + 1))" "$fragment" >> "$workflow"
-    echo "regenerated $workflow and re-appended hand-written jobs from $fragment"
+    # dist emits actions pinned to moving tags (`@v4`); dist 0.32 has no config
+    # to SHA-pin them, so re-pin the whole assembled file (dist-emitted jobs plus
+    # the re-appended hand-written ones) to commit SHAs. Needs gh auth / GH_TOKEN.
+    scripts/pin-github-actions.sh "$workflow"
+    echo "regenerated $workflow, re-appended hand-written jobs, and pinned actions to SHAs"
+
+# Pin every third-party GitHub Action referenced in .github/workflows/*.yml to a
+# full commit SHA (the moving tag is kept as a trailing comment). Idempotent.
+# Needs the GitHub CLI authenticated (`gh auth login`) or GH_TOKEN set.
+pin-actions:
+    scripts/pin-github-actions.sh
 
 check:
     cargo build  --workspace --all-features
