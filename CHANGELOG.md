@@ -24,6 +24,10 @@ SPDX-License-Identifier: Apache-2.0
 
 ### Changed
 
+- 2026-07-05
+  - basil-nats is now `no_std` + `alloc` compatible: the crate source is `#![no_std]` (`extern crate alloc`) and gains `std` (default) / `alloc` cargo features; build the minimal target with `cargo build -p basil-nats --no-default-features --features alloc`
+  - breaking (pre-announcement): `basil_nats::seal_nats_curve` now takes an explicit `rng: &mut impl RngCore` parameter instead of calling `rand::thread_rng()` internally; pass `rand::thread_rng()` under `std`
+
 - 2026-07-04
   - renamed basil to basil-client to avoid crates.io name collision
   - fix: add SSL_CERT_FILE in flake.nix, needed by reqwest's rustls-no-provider

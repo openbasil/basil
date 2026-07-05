@@ -1241,8 +1241,13 @@ impl BackendManager {
         let private = self
             .materialize_sealing_private(key_id, "encrypt_nats_curve")
             .await?;
-        basil_nats::seal_nats_curve(&private, recipient_public_xkey, plaintext)
-            .map_err(|e| nats_curve_error(&e))
+        basil_nats::seal_nats_curve(
+            &private,
+            recipient_public_xkey,
+            plaintext,
+            &mut rand::thread_rng(),
+        )
+        .map_err(|e| nats_curve_error(&e))
     }
 
     /// Decrypt a NATS curve xkey authenticated box with a custodied recipient key.

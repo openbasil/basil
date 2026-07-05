@@ -923,6 +923,7 @@ dependencies = [
  "ed25519-dalek",
  "nkeys",
  "rand 0.8.6",
+ "rand_core 0.6.4",
  "salsa20",
  "serde",
  "serde_json",

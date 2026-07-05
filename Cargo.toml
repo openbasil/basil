@@ -98,6 +98,7 @@ pkcs8 = "0.10"
 prost = "0.14.4"
 prost-types = "0.14.4"
 rand = "0.8"
+rand_core = "0.6"
 # reqwest 0.13's `rustls` feature forces the `aws-lc-rs` provider (a C build dep,
 # forbidden here); `rustls-no-provider` pulls rustls with its default `ring`
 # provider and no C toolchain. `default-features = false` drops the native-tls

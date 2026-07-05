@@ -22,23 +22,29 @@
 //! Claim *field order* does not affect validity (servers parse JSON), but the
 //! `jti` hash is order-sensitive, so the hash struct mirrors `nats-io/jwt`.
 
+#![no_std]
 // Index/slice in test code is fine (fixed test vectors); the no-panic
 // `indexing_slicing` gate has no test-allow config option, unlike unwrap/expect.
 #![cfg_attr(test, allow(clippy::indexing_slicing))]
 
+extern crate alloc;
+
+use alloc::collections::BTreeMap;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use crypto_secretbox::aead::{Aead, KeyInit};
 use crypto_secretbox::{Key as SecretboxKey, Nonce as SecretboxNonce, XSalsa20Poly1305};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use rand::RngCore;
+use rand_core::RngCore;
 use salsa20::cipher::consts::{U10, U16};
 use salsa20::hsalsa;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha512_256};
-use std::collections::BTreeMap;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
@@ -138,8 +144,8 @@ impl NkeyType {
     }
 }
 
-impl std::fmt::Display for NkeyType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for NkeyType {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", self.letter())
     }
 }
@@ -179,8 +185,8 @@ pub enum Error {
     XKeyOpenFailed,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::BadPublicKeyLen(n) => write!(f, "expected a 32-byte Ed25519 public key, got {n}"),
             Self::UnsupportedPrefix(c) => write!(f, "unsupported NKey prefix letter: {c}"),
@@ -202,7 +208,7 @@ impl std::fmt::Display for Error {
         }
     }
 }
-impl std::error::Error for Error {}
+impl core::error::Error for Error {}
 impl From<serde_json::Error> for Error {
     fn from(e: serde_json::Error) -> Self {
         Self::Json(e)
@@ -341,7 +347,9 @@ pub fn xkey_public_from_private(private: &Zeroizing<[u8; 32]>) -> [u8; 32] {
 /// The wire format matches `nats-io/nkeys`: `xkv1 || 24-byte nonce ||
 /// XSalsa20-Poly1305 ciphertext`. The sender private is materialized by the
 /// caller and zeroized there; this function keeps ECDH and derived-key
-/// intermediates in zeroizing buffers.
+/// intermediates in zeroizing buffers. The 24-byte nonce is drawn from the
+/// caller-supplied `rng`, so the crate stays `no_std` (no ambient `thread_rng`);
+/// pass `rand::thread_rng()` under `std`.
 ///
 /// # Errors
 ///
@@ -352,10 +360,11 @@ pub fn seal_nats_curve(
     sender_private: &Zeroizing<[u8; 32]>,
     recipient_public_xkey: &str,
     plaintext: &[u8],
+    rng: &mut impl RngCore,
 ) -> Result<Vec<u8>, Error> {
     let recipient_public = decode_xkey_public(recipient_public_xkey)?;
     let mut nonce = [0u8; XKEY_NONCE_LEN];
-    rand::thread_rng().fill_bytes(&mut nonce);
+    rng.fill_bytes(&mut nonce);
     let ciphertext = box_crypt(
         sender_private,
         &recipient_public,
@@ -1620,8 +1629,8 @@ impl RoleKind {
     }
 }
 
-impl std::fmt::Display for RoleKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for RoleKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(self.as_str())
     }
 }
@@ -1707,6 +1716,8 @@ fn single_line_creds_field<'a>(name: &str, value: &'a str) -> Result<&'a str, Er
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::ToString;
+    use alloc::vec;
     use nkeys::{KeyPair, XKey};
     use serde_json::json;
 
@@ -1900,8 +1911,13 @@ mod tests {
         )
         .expect("receiver xkey encodes");
 
-        let boxed =
-            seal_nats_curve(&sender_private, &receiver_public, b"payload").expect("seal succeeds");
+        let boxed = seal_nats_curve(
+            &sender_private,
+            &receiver_public,
+            b"payload",
+            &mut rand::thread_rng(),
+        )
+        .expect("seal succeeds");
         assert!(boxed.starts_with(XKEY_VERSION_V1));
         assert_eq!(
             boxed.len(),
@@ -1929,8 +1945,13 @@ mod tests {
         let sender = XKey::new_from_raw(*sender_private);
         let receiver = XKey::new_from_raw(*receiver_private);
 
-        let basil_box = seal_nats_curve(&sender_private, &receiver.public_key(), b"from basil")
-            .expect("basil seal succeeds");
+        let basil_box = seal_nats_curve(
+            &sender_private,
+            &receiver.public_key(),
+            b"from basil",
+            &mut rand::thread_rng(),
+        )
+        .expect("basil seal succeeds");
         let nkeys_opened = receiver
             .open(&basil_box, &sender)
             .expect("nkeys opens basil box");
