@@ -1,5 +1,5 @@
 [package]
-name = "basil"
+name = "basil-client"
 description = "Client library for the basil agent."
 version.workspace = true
 edition.workspace = true

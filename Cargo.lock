@@ -763,7 +763,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "basil"
+name = "basil-bin"
+version = "0.5.4"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "basil-client",
+ "basil-core",
+ "basil-nats",
+ "clap",
+ "hex",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "basil-client"
 version = "0.5.4"
 dependencies = [
  "aes-gcm",
@@ -790,23 +807,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "basil-bin"
-version = "0.5.4"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "basil",
- "basil-core",
- "basil-nats",
- "clap",
- "hex",
- "serde",
- "serde_json",
- "tokio",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "basil-core"
 version = "0.5.4"
 dependencies = [
@@ -821,7 +821,7 @@ dependencies = [
  "aws-sdk-kms",
  "axum",
  "base64 0.22.1",
- "basil",
+ "basil-client",
  "basil-cose",
  "basil-keystore-backend",
  "basil-nats",
@@ -897,7 +897,7 @@ name = "basil-keystore-backend"
 version = "0.5.4"
 dependencies = [
  "aes-gcm",
- "basil",
+ "basil-client",
  "chacha20poly1305",
  "db-keystore",
  "ed25519-dalek",
@@ -974,7 +974,7 @@ version = "0.5.4"
 dependencies = [
  "async-nats",
  "base64 0.22.1",
- "basil",
+ "basil-client",
  "basil-core",
  "basil-cose",
  "basil-nats-bridge",
