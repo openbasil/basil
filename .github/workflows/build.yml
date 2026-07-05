@@ -87,7 +87,7 @@ jobs:
             echo "ref=${{ github.ref }}" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           ref: ${{ steps.ref.outputs.ref }}
           persist-credentials: false
@@ -106,7 +106,7 @@ jobs:
           fi
 
       - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@v14
+        uses: DeterminateSystems/nix-installer-action@da36cb69b1c3247ad7a1f931ebfd954a1105ef14 # v14
 
       - name: Build basil (${{ matrix.arch }})
         run: nix build -L ".#basil-${{ matrix.arch }}"
@@ -121,7 +121,7 @@ jobs:
           cp -L result/bin/* "$dest/"
           ls -l "$dest"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: basil-${{ matrix.arch }}
           path: dist/${{ matrix.arch }}

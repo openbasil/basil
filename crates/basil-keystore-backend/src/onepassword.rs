@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+// SPDX-FileCopyrightText: 2026 cachix/secretspec
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -10,10 +11,10 @@
 //! of non-UTF-8 bytes fails closed with [`StoreError::NonUtf8Value`]. This is a
 //! limitation of the `1Password` backend, not of `SecretStore` in general.
 //!
-//! Ported from the `secretspec` `onepassword` provider, adapted to Basil's
-//! byte-oriented store interface: values move as bytes (a UTF-8 string round
-//! trip through `op`), never a `SecretString`, and every error is reduced to a
-//! stable, leak-safe summary before it leaves this module.
+//! Ported from `github.com/cachix/secretspec` onepassword v0.12.0 (Apaache-2.0 license)
+//! and adapted to Basil's byte-oriented store interface: values move as bytes
+//! (a UTF-8 string round trip through `op`), never a `SecretString`, and
+//! every error is reduced to a stable, leak-safe summary before it leaves this module.
 
 use std::process::Command;
 
