@@ -1,0 +1,6 @@
+[toolchain]
+# Pin the stable toolchain the workspace targets (edition 2024 + rust-version 1.96).
+channel = "1.96.1"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+profile = "minimal"

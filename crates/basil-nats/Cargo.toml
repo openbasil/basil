@@ -1,0 +1,29 @@
+[package]
+name = "basil-nats"
+description = "Generic, dependency-light builder for NATS account/user JWTs (ed25519-nkey) where signing is delegated to an external signer (e.g. a key held in a vault/HSM)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version = "1.85"
+publish = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+data-encoding = { workspace = true }
+ed25519-dalek = { workspace = true }
+crypto_secretbox = { workspace = true }
+salsa20 = { workspace = true }
+x25519-dalek = { workspace = true }
+rand = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+# Used only by tests to cross-check our wire format against a real NKey impl.
+nkeys = { workspace = true }
+
+[lints]
+workspace = true

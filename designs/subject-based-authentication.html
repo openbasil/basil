@@ -1,0 +1,1606 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Subject-Based Authentication and Signed Requests - Basil</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --font-sans: "Noto Sans", ui-sans-serif, system-ui, -apple-system,
+          BlinkMacSystemFont, "Segoe UI", sans-serif;
+        --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas,
+          "Liberation Mono", monospace;
+        --weight-body: 400;
+        --weight-heading: 600;
+        --weight-strong: 600;
+        --code-font-size: 0.875em;
+        --code-block-font-size: 0.875rem;
+
+        --bg: #f7f8fa;
+        --fg: #1f2933;
+        --muted: #5b6776;
+        --panel: #ffffff;
+        --border: #d8dee7;
+        --accent: #1d6f8f;
+        --accent-soft: #e7f4f8;
+        --warn: #7a4d00;
+        --warn-soft: #fff4d6;
+        --review: #6b21a8;
+        --review-soft: #f5ecfb;
+        --code-bg: #eef2f6;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #11161d;
+          --fg: #e6edf3;
+          --muted: #a8b3c1;
+          --panel: #171e27;
+          --border: #2d3948;
+          --accent: #6cc4e0;
+          --accent-soft: #102832;
+          --warn: #ffd37a;
+          --warn-soft: #302610;
+          --review: #d8b4fe;
+          --review-soft: #2a1f38;
+          --code-bg: #202a36;
+          --weight-body: 300;
+          --weight-heading: 500;
+          --weight-strong: 500;
+        }
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--fg);
+        font-family: var(--font-sans);
+        font-weight: var(--weight-body);
+        line-height: 1.55;
+      }
+
+      header, main, footer { width: min(1180px, 90%); margin: 0 auto; }
+      header { padding: 40px 0 18px; }
+      main { padding-bottom: 48px; }
+
+      h1, h2, h3, h4 {
+        line-height: 1.2;
+        letter-spacing: 0;
+        font-weight: var(--weight-heading);
+      }
+      h1 { margin: 0 0 12px; font-size: clamp(2rem, 4vw, 3.2rem); }
+      h2 {
+        margin: 36px 0 14px;
+        padding-top: 8px;
+        font-size: 1.65rem;
+        border-top: 1px solid var(--border);
+      }
+      h3 { margin: 24px 0 10px; font-size: 1.18rem; }
+      h4 { margin: 18px 0 8px; font-size: 1rem; }
+
+      a { color: var(--accent); }
+      strong { font-weight: var(--weight-strong); }
+      p, ul, ol { margin: 0 0 14px; }
+      li { margin-bottom: 5px; }
+
+      code, pre { font-family: var(--font-mono); }
+      code {
+        padding: 0.08rem 0.24rem;
+        border-radius: 4px;
+        background: var(--code-bg);
+        font-size: var(--code-font-size);
+      }
+      pre code { font-size: inherit; padding: 0; background: none; }
+      pre {
+        overflow-x: auto;
+        padding: 14px 16px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--code-bg);
+        font-size: var(--code-block-font-size);
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 14px 0 22px;
+        background: var(--panel);
+      }
+      th, td {
+        vertical-align: top;
+        padding: 10px 12px;
+        border: 1px solid var(--border);
+        text-align: left;
+      }
+      th { background: var(--accent-soft); font-size: 1.05rem; font-weight: 500; }
+
+      dl {
+        display: grid;
+        grid-template-columns: minmax(170px, 280px) 1fr;
+        gap: 8px 18px;
+        margin: 14px 0 22px;
+      }
+      dt { font-weight: var(--weight-strong); }
+      dd { margin: 0; }
+
+      .lede { max-width: 920px; color: var(--muted); font-size: 1.08rem; }
+
+      .note, .warning {
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 14px 16px;
+        background: var(--panel);
+      }
+      .note { border-left: 4px solid var(--accent); }
+      .warning { border-left: 4px solid var(--warn); background: var(--warn-soft); }
+
+      .doc-status {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+        gap: 10px 18px;
+        align-items: start;
+        margin-top: 18px;
+        padding: 14px 16px;
+        border: 1px solid var(--border);
+        border-left: 4px solid var(--accent);
+        border-radius: 8px;
+        background: var(--panel);
+      }
+      .doc-status-badge {
+        grid-column: 1 / -1;
+        justify-self: start;
+        display: inline-block;
+        font-size: 0.74rem;
+        font-weight: 700;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+        border-radius: 999px;
+        padding: 2px 12px;
+        border: 1px solid currentColor;
+      }
+      .doc-status.is-plan { border-left-color: var(--review); }
+      .doc-status.is-plan .doc-status-badge { color: var(--review); }
+
+      .toc {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        gap: 8px 18px;
+        padding: 16px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--panel);
+      }
+      .toc ol { margin: 0; padding-left: 20px; }
+
+      .decision {
+        padding: 12px 14px;
+        border: 1px solid var(--border);
+        border-left: 4px solid var(--review);
+        border-radius: 8px;
+        background: var(--review-soft);
+      }
+
+      footer {
+        padding: 24px 0 40px;
+        color: var(--muted);
+        border-top: 1px solid var(--border);
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Subject-Based Authentication and Signed Requests</h1>
+      <p class="lede">
+        A design for moving Basil authorization from Unix-only uid/gid principals
+        to named subjects authenticated by typed proofs, while keeping the request
+        authorization path simple, default-deny, auditable, and ready for signed
+        NATS transports, executable identity, cgroups, and X.509 proof-of-possession.
+      </p>
+      <div class="doc-status is-plan" aria-label="Document status">
+        <span class="doc-status-badge">Design</span>
+        <div><strong>Status</strong><br>approved</div>
+        <div><strong>Date</strong><br>2026-06-29</div>
+        <div><strong>Scope</strong><br>policy, authn, gRPC, Nix</div>
+        <div><strong>Compatibility</strong><br>intentional breaking change</div>
+      </div>
+    </header>
+
+    <main>
+      <nav aria-labelledby="toc-heading">
+        <h2 id="toc-heading">Contents</h2>
+        <div class="toc">
+          <ol>
+            <li><a href="#1-summary">Summary</a></li>
+            <li><a href="#2-goals-and-non-goals">Goals and non-goals</a></li>
+            <li><a href="#3-terminology">Terminology</a></li>
+            <li><a href="#4-security-model">Security model</a></li>
+            <li><a href="#5-policy-schema">Policy schema</a></li>
+          </ol>
+          <ol start="6">
+            <li><a href="#6-subject-resolution">Subject resolution</a></li>
+            <li><a href="#7-request-and-response-signing">Request and response protection</a></li>
+            <li><a href="#8-grpc-api">gRPC API</a></li>
+            <li><a href="#9-nix-api">Nix API</a></li>
+            <li><a href="#10-implementation">Implementation</a></li>
+          </ol>
+          <ol start="11">
+            <li><a href="#11-milestones">Milestones</a></li>
+            <li><a href="#12-security-tests">Security tests</a></li>
+            <li><a href="#13-operations">Operations</a></li>
+            <li><a href="#14-decisions-and-deferred-features">Decisions and deferred features</a></li>
+          </ol>
+        </div>
+      </nav>
+
+      <h2 id="1-summary">1. Summary</h2>
+      <p>
+        Today Basil authorizes requests by the Unix uid/gid captured from
+        <code>SO_PEERCRED</code> on the Unix socket. That model is excellent for
+        host-local workloads, but it does not cover messages relayed over NATS,
+        remote gRPC bridges, X.509 proof-of-possession, container identity, or
+        executable identity without making the policy expression language grow a
+        new syntax branch for every authenticator.
+      </p>
+      <p>
+        This design introduces a stable policy concept: <strong>rules grant to named
+        subjects</strong>. A subject is resolved from one or more typed
+        <strong>principals</strong>, where a principal is a configured proof or local
+        identity selector such as a Unix uid/gid, process hash, NATS public
+        NKey, Ed25519 public key, SSH Ed25519 public key, X.509 SAN under a trust
+        bundle, or cgroup fact.
+      </p>
+      <div class="decision">
+        <p>
+          <strong>Core decision:</strong> replace rule-level
+          <code>principal: "user:9001 || group:10"</code> expressions with
+          <code>subjects: ["svc.web", "ops.wheel"]</code>. Rules OR their listed
+          subjects. The old expression parser is no longer needed because
+          <code>allOf</code> and <code>anyOf</code> carry the AND/OR logic in the
+          subject registry, where it is structured, typed, validated by Serde,
+          and extensible without redesigning the rule parser.
+        </p>
+      </div>
+
+      <h2 id="2-goals-and-non-goals">2. Goals and non-goals</h2>
+      <h3>Goals</h3>
+      <ul>
+        <li>Keep Basil default-deny: no request is authorized until a subject is resolved and a policy rule grants the operation.</li>
+        <li>Keep runtime inputs at four files: agent config, catalog, policy, and sealed bundle. Subject definitions live in the policy document.</li>
+        <li>Separate the transport peer from the authorized subject so bridges cannot become confused deputies.</li>
+        <li>Support the immediate NATS use case with signed and encrypted request envelopes and signed and encrypted responses.</li>
+        <li>Leave clean extension points for executable identity, cgroups, Kubernetes pods, and X.509 proof-of-possession.</li>
+        <li>Prefer simple rule APIs over a complex string language. Use structured schemas for typed identity evidence.</li>
+        <li>Make audit logs tell the full story: subject, proof, presenter, transport, policy generation, decision, and target.</li>
+      </ul>
+
+      <h3>Non-goals</h3>
+      <ul>
+        <li>Do not build a general OAuth2 or OpenID Connect authorization server.</li>
+        <li>Do not introduce bearer tokens as a replacement for signed proof-of-possession.</li>
+        <li>Do not require a NATS-specific identity model. NATS is one proof kind, not the policy model.</li>
+        <li>Do not add a fifth runtime configuration file.</li>
+        <li>Do not implement all future authenticators now. The first implementation should cover Unix subjects and sealed request subjects.</li>
+      </ul>
+
+      <h2 id="3-terminology">3. Terminology</h2>
+      <dl>
+        <dt>Subject</dt>
+        <dd>
+          The authenticated actor that Basil authorizes. Policy rules grant to
+          subjects by stable names such as <code>content.publisher</code>,
+          <code>svc.web</code>, or <code>support.admin</code>.
+        </dd>
+        <dt>Principal</dt>
+        <dd>
+          One configured identity selector or proof that can establish a subject:
+          Unix uid/gid, process digest, public signing key, X.509 identity, or
+          cgroup fact.
+        </dd>
+        <dt>Presenter</dt>
+        <dd>
+          The entity that delivered the request to Basil. For a local Unix socket
+          call, this is the process on the other end of the socket. For a NATS
+          bridge, this is the local bridge process, not necessarily the actor whose
+          request it carries.
+        </dd>
+        <dt>Transport peer</dt>
+        <dd>
+          The low-level peer facts captured from transport, such as
+          <code>SO_PEERCRED</code> uid/gid/pid, process path, executable digest,
+          cgroup, or TLS peer certificate. These facts are evidence, not automatic
+          authority.
+        </dd>
+        <dt>Actor</dt>
+        <dd>
+          The subject selected for authorization after evaluating all presented
+          evidence. Most code should use <code>AuthenticatedActor</code> rather than
+          raw uid/gid arguments.
+        </dd>
+      </dl>
+
+      <h2 id="4-security-model">4. Security model</h2>
+      <h3>4.1 Security principles</h3>
+      <ul>
+        <li><strong>Authenticate before authorize.</strong> Policy never evaluates an unauthenticated string supplied by the request.</li>
+        <li><strong>The subject gets the grant.</strong> The presenter is evidence and audit context; it does not inherit the subject's rights.</li>
+        <li><strong>Bridges are couriers.</strong> A NATS or gRPC bridge forwards an envelope; it does not assert identity and does not need the sender's private key.</li>
+        <li><strong>Bind signatures to intent.</strong> Signed proofs cover the message type, target key, ciphertext, sender subject, recipient subject, nonce, and expiry.</li>
+        <li><strong>Encrypt bridged payloads by default.</strong> Request and response bodies are sealed to the recipient. A bridge should not see key material in either direction.</li>
+        <li><strong>Fail closed on missing evidence.</strong> A missing executable hash, unreadable cgroup, expired certificate, unknown signer, or replayed nonce resolves no subject.</li>
+        <li><strong>Prefer proof-of-possession over bearer credentials.</strong> A stolen message body without the signing key must be useless.</li>
+        <li><strong>Keep public trust material out of the sealed bundle.</strong> Subject public keys and trust roots belong in policy; backend bootstrap secrets remain in the bundle.</li>
+        <li><strong>Keep private broker signing material out of policy.</strong> Policy may name the broker identity key, but private material is in the backend or unlocked runtime state.</li>
+      </ul>
+
+      <h3>4.2 Threat model</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Threat</th>
+            <th>Required defense</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Bridge sets <code>subject=content.publisher</code> without a valid sender signature.</td>
+            <td>Subject resolution ignores bridge claims. The named subject resolves only when the sealed invocation carries a valid proof from a configured principal for that subject.</td>
+          </tr>
+          <tr>
+            <td>Attacker replays a sealed request from NATS or a log.</td>
+            <td>Signed envelopes carry recipient subject, message id, issued time, and expiry. Basil stores a bounded replay cache per signer or subject.</td>
+          </tr>
+          <tr>
+            <td>Bridge changes the target key or operation after receiving a signed message.</td>
+            <td>Signature covers canonical message type, ciphertext, and target key fields.</td>
+          </tr>
+          <tr>
+            <td>Transport security is absent or untrusted.</td>
+            <td>Integrity, identity, and payload confidentiality are supplied by the invocation envelope. Operators may still use TLS as defense in depth, but the bridge must not need TLS to avoid seeing secret request or response bodies.</td>
+          </tr>
+          <tr>
+            <td>A request or response carries key material, such as import-key input or get-secret output.</td>
+            <td>The invocation protocol seals every request body to Basil and every response body to the caller's response recipient key id with a unique nonce. There is no per-message opt-in switch to forget.</td>
+          </tr>
+          <tr>
+            <td>Process path is spoofed or replaced.</td>
+            <td>Executable identity uses digest as the primary signal. Path alone is advisory unless paired with digest.</td>
+          </tr>
+          <tr>
+            <td>Cgroup or Kubernetes label is mutable or ambiguous.</td>
+            <td>Selectors prefer stable facts such as namespace, service account, pod UID, container ID, and validated projected token claims. Labels are optional and treated as lower-trust constraints.</td>
+          </tr>
+          <tr>
+            <td>Certificate is valid but used for the wrong request.</td>
+            <td>X.509 support is proof-of-possession: the private key signs the Basil request envelope. Chain validation alone is not enough.</td>
+          </tr>
+          <tr>
+            <td>Response is forged by the bridge.</td>
+            <td>Basil signs response envelopes with a configured broker identity key. Clients verify before trusting results.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>4.3 Rules of thumb</h3>
+      <ul>
+        <li>If the evidence is typed, keep it out of a string parser.</li>
+        <li>If a request is bridged, record the bridge as presenter in audit, but authorize only the subject proved by the envelope.</li>
+        <li>If a proof can cross a network, it needs a recipient subject, message id, timestamp, and expiry.</li>
+        <li>If a proof depends on local machine state, it must define what happens when that state cannot be read. The answer is always deny.</li>
+        <li>If two workloads share a subject, they share policy authority. Subject names should be operationally meaningful and shared only intentionally.</li>
+        <li>If a proof kind is not fully understood by the current Basil build, the loader rejects it rather than preserving it as opaque.</li>
+      </ul>
+
+      <h2 id="5-policy-schema">5. Policy schema</h2>
+      <p>
+        Subject definitions live in <code>policy.json</code>. They are authorization
+        trust material and must reload atomically with rules. The catalog remains
+        the resource inventory. The sealed bundle remains secret bootstrap
+        material. The agent TOML remains process wiring.
+      </p>
+
+      <h3>5.1 Policy document shape</h3>
+      <pre><code>{
+  "schemaVersion": 2,
+  "subjects": {
+    "svc.web": {
+      "allOf": [
+        { "kind": "unix", "uid": 9001 }
+      ]
+    },
+    "ops.wheel": {
+      "allOf": [
+        { "kind": "unix", "gid": 10 }
+      ]
+    },
+    "content.publisher": {
+      "anyOf": [
+        {
+          "kind": "signature-key",
+          "algorithm": "nats-nkey",
+          "public": "U..."
+        },
+        {
+          "kind": "signature-key",
+          "algorithm": "ed25519",
+          "public": "base64url..."
+        }
+      ]
+    }
+  },
+  "roles": {
+    "reader": ["get", "list", "get_public_key"],
+    "signer": ["sign", "verify", "get_public_key"]
+  },
+  "rules": [
+    {
+      "id": "web-reads-web-keys",
+      "subjects": ["svc.web"],
+      "action": ["role:reader"],
+      "target": ["web.**"]
+    },
+    {
+      "id": "publisher-signs-feed",
+      "subjects": ["content.publisher"],
+      "action": ["role:signer"],
+      "target": ["content.feed.signing_key"]
+    }
+  ],
+  "config": {
+    "names": {
+      "users": { "9001": "svc-web" },
+      "groups": { "10": "wheel" }
+    },
+    "memberships": { "9001": [9001] }
+  }
+}</code></pre>
+
+      <h3>5.2 Rule shape</h3>
+      <p>
+        A rule grants to one or more subject names. The list is an OR. There is
+        no inline boolean expression in rules.
+      </p>
+      <pre><code>{
+  "id": "support-admin-can-reload",
+  "subjects": ["support.admin", "breakglass.root"],
+  "action": ["op:reload"],
+  "target": ["broker.reload"]
+}</code></pre>
+      <p>
+        The loader rejects a rule that references an undefined subject. It also
+        rejects empty subject lists. A convenience singular field
+        <code>subject</code> may be accepted by source tooling, but the exported JSON
+        should use <code>subjects</code> for one canonical runtime shape.
+      </p>
+
+      <h3>5.3 Subject expression shape</h3>
+      <p>
+        A subject definition has exactly one top-level composition key:
+        <code>allOf</code> or <code>anyOf</code>. Each list item is a principal
+        spec. There is no extra <code>principal</code> wrapper, and the first
+        implementation should not support nested boolean expressions. More complex
+        OR cases can be expressed by defining multiple subjects and listing them
+        together on a rule. Negation is deliberately omitted for the first version.
+        Most useful policy can be expressed positively, and negation over missing
+        evidence is easy to misunderstand.
+      </p>
+      <pre><code>{
+  "breakGlass": false,
+  "allOf": [
+    { "kind": "unix", "uid": 9001 },
+    {
+      "kind": "process",
+      "exePath": "/nix/store/.../bin/web-api",
+      "sha256": "hex..."
+    }
+  ]
+}</code></pre>
+      <p>
+        <code>breakGlass</code> is optional and defaults to <code>false</code>. It is
+        not a grant. It only marks a subject as eligible to appear in rules whose
+        target is the global wildcard <code>*</code>. The loader rejects
+        <code>target: ["*"]</code> unless every subject named by that rule has
+        <code>breakGlass: true</code>.
+      </p>
+
+      <h3>5.4 Break-glass wildcard target</h3>
+      <p>
+        A global wildcard target is deliberately harder to express than ordinary
+        key globs. The subject must be marked in the subject registry, and the
+        rule must still explicitly grant the desired actions. The marker exists
+        so code can enforce operator intent; comments are not sufficient.
+      </p>
+      <pre><code>{
+  "subjects": {
+    "breakglass.root": {
+      "breakGlass": true,
+      "allOf": [
+        { "kind": "unix", "uid": 0 }
+      ]
+    }
+  },
+  "rules": [
+    {
+      "id": "root-breakglass",
+      "subjects": ["breakglass.root"],
+      "action": ["*"],
+      "target": ["*"],
+      "comment": "Emergency operator path; keep out of normal service policy."
+    }
+  ]
+}</code></pre>
+
+      <h3>5.5 Principal kinds</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Kind</th>
+            <th>Status</th>
+            <th>Purpose</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>unix</code></td>
+            <td>first implementation</td>
+            <td>Matches the <code>SO_PEERCRED</code> uid and/or the export-resolved group set for that uid. A <code>gid</code> match uses the full configured group membership, not only the primary gid.</td>
+          </tr>
+          <tr>
+            <td><code>unauthenticated</code></td>
+            <td>first implementation</td>
+            <td>Matches only when no actor proof is present and policy explicitly configured <code>unauthenticatedSubject</code> to this subject. Recommended subject name: <code>guest</code>.</td>
+          </tr>
+          <tr>
+            <td><code>signature-key</code></td>
+            <td>first implementation</td>
+            <td>Verifies a signed Basil request envelope with a configured public key. Algorithms: <code>ed25519</code>, <code>nats-nkey</code>, and later <code>ssh-ed25519</code>.</td>
+          </tr>
+          <tr>
+            <td><code>process</code></td>
+            <td>roadmap</td>
+            <td>Matches executable digest and optionally path. Digest is primary; path is advisory or an additional constraint.</td>
+          </tr>
+          <tr>
+            <td><code>cgroup</code></td>
+            <td>roadmap</td>
+            <td>Matches cgroup/container facts for Docker or systemd scopes.</td>
+          </tr>
+          <tr>
+            <td><code>kubernetes</code></td>
+            <td>roadmap</td>
+            <td>Matches namespace, service account, pod UID, and projected service-account token claims after issuer/audience validation.</td>
+          </tr>
+          <tr>
+            <td><code>x509-pop</code></td>
+            <td>roadmap</td>
+            <td>Validates certificate chain and SAN constraints, then requires private-key proof over the Basil request envelope.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>5.6 NATS bridge as a courier</h3>
+      <p>
+        The NATS bridge does not assert identity. It forwards an invocation
+        envelope whose encrypted body and sender signature are verified by
+        <code>basil-agent</code>. The bridge can be authenticated as a local Unix
+        process for audit and operational controls, but that presenter identity
+        is not the subject being authorized.
+      </p>
+      <pre><code>{
+  "subjects": {
+    "transport.nats-bridge": {
+      "allOf": [
+        { "kind": "unix", "uid": 9100 }
+      ]
+    },
+    "content.publisher": {
+      "anyOf": [
+        {
+          "kind": "signature-key",
+          "algorithm": "nats-nkey",
+          "public": "U..."
+        }
+      ]
+    }
+  },
+  "rules": [
+    {
+      "id": "nats-bridge-can-submit-invocations",
+      "subjects": ["transport.nats-bridge"],
+      "action": ["op:invoke"],
+      "target": ["broker.invocation"]
+    }
+  ]
+}</code></pre>
+      <p>
+        The first implementation does not have systemd service authentication, so
+        the bridge presenter subject resolves from Unix uid/gid evidence. A
+        dedicated <code>op:invoke</code> grant over <code>broker.invocation</code> lets that
+        presenter submit sealed envelopes without granting data-plane authority.
+        Basil still authorizes the actor proved by the sealed request for the
+        actual operation and target.
+      </p>
+      <pre><code>[nats]
+url = "nats://127.0.0.1:4222"
+creds = "/run/credentials/basil-nats-bridge/nats.creds"
+
+[basil]
+socket = "/run/basil/agent.sock"
+
+[bridge]
+request-subject = "basil.invocation.v1"
+queue-group = "basil-nats-bridge"
+max-message-bytes = 1048576</code></pre>
+      <p>
+        The NATS request payload is protobuf-encoded <code>SecureMessage</code>; the
+        reply payload is protobuf-encoded response <code>SecureMessage</code>. NATS
+        request/reply inboxes provide transport correlation, while the signed
+        response header still binds <code>request_id</code> to the request
+        <code>message_id</code>. If the bridge cannot obtain a sealed Basil response,
+        it replies with an empty payload and NATS headers:
+        <code>Basil-Bridge-Error</code>, <code>Basil-Bridge-Message</code>, and
+        <code>Basil-Bridge-Retryable</code>. Stable error tokens include
+        <code>MALFORMED_REQUEST</code>, <code>MESSAGE_TOO_LARGE</code>,
+        <code>BASIL_UNAVAILABLE</code>, <code>BASIL_REJECTED</code>, <code>TIMEOUT</code>, and
+        <code>INTERNAL</code>. If Basil returns a sealed response, the bridge forwards
+        it unchanged and does not add bridge error headers.
+      </p>
+      <p>
+        A future delegation feature may allow one subject to delegate to another,
+        but that is a separate capability and should not be confused with the
+        NATS bridge path. The bridge path is simpler: no private sender key, no
+        impersonation.
+      </p>
+
+      <h2 id="6-subject-resolution">6. Subject resolution</h2>
+      <p>
+        Authorization should run over an <code>AuthenticatedActor</code>, not a uid.
+        The actor carries the selected subject plus the evidence chain that
+        established it.
+      </p>
+      <pre><code>struct AuthenticatedActor {
+    subject: SubjectName,
+    authenticated_by: Vec&lt;ProofSummary&gt;,
+    presenter: PresenterInfo,
+    transport: TransportInfo,
+}</code></pre>
+
+      <h3>6.1 Resolution order</h3>
+      <ol>
+        <li>Collect transport evidence from request extensions: Unix uid/gid/pid, executable path/digest when configured, cgroup facts when configured, TLS peer certificate when available. The pid is informational and logged when available; it is not used for authentication.</li>
+        <li>Parse request-level authentication evidence: sealed envelope, requested subject, sender signature, certificate proof, nonce, and timestamps.</li>
+        <li>Resolve the presenter subject, if any, from transport evidence.</li>
+        <li>Resolve the actor subject from direct proof in the envelope.</li>
+        <li>Reject ambiguous actor resolution unless the request explicitly names one subject and that subject resolves.</li>
+        <li>Run the PDP on the resolved actor subject.</li>
+      </ol>
+
+      <h3>6.2 Local Unix compatibility</h3>
+      <p>
+        Existing local calls can remain ergonomic. A request with no explicit auth
+        evidence resolves exactly one subject from the presenter's Unix facts. The
+        Nix exporter should generate subjects for configured users and groups.
+      </p>
+      <pre><code>"subjects": {
+  "unix.user.svc-web": {
+    "allOf": [
+      { "kind": "unix", "uid": 9001 }
+    ]
+  },
+  "unix.group.wheel": {
+    "allOf": [
+      { "kind": "unix", "gid": 10 }
+    ]
+  }
+}</code></pre>
+
+      <h3>6.3 Unauthenticated subject</h3>
+      <p>
+        Basil may support a NATS-style unauthenticated subject mapping for public
+        or low-risk operations such as health checks or fetching public identity
+        material. This is disabled by default. When enabled, the operator names
+        the subject; <code>guest</code> is the recommended conventional name, not a
+        hard-coded rule.
+      </p>
+      <pre><code>{
+  "unauthenticatedSubject": "guest",
+  "subjects": {
+    "guest": {
+      "anyOf": [
+        { "kind": "unauthenticated" }
+      ]
+    }
+  },
+  "rules": [
+    {
+      "id": "guest-can-read-public-identities",
+      "subjects": ["guest"],
+      "action": ["op:get_public_key"],
+      "target": ["identity.public.**"]
+    }
+  ]
+}</code></pre>
+      <p>
+        The loader rejects <code>kind: "unauthenticated"</code> unless
+        <code>unauthenticatedSubject</code> names that same subject. This keeps
+        anonymous access explicit and easy to audit.
+      </p>
+
+      <h3>6.4 Authorization API</h3>
+      <p>
+        The PDP should move from <code>decide(uid, op, key)</code> to
+        <code>decide(actor, op, key)</code>. The policy matching step becomes a
+        lookup over subject names rather than a uid/gid predicate expression.
+      </p>
+      <pre><code>impl Pdp {
+    fn decide(&amp;self, actor: &amp;AuthenticatedActor, op: Op, key: &amp;str) -&gt; Decision;
+    fn decide_admin(&amp;self, actor: &amp;AuthenticatedActor, op: Op) -&gt; Decision;
+}</code></pre>
+      <p>
+        Audit records should carry both the actor and the presenter:
+      </p>
+      <pre><code>{
+  "actor_kind": "subject",
+  "actor_id": "content.publisher",
+  "authenticated_by": "signature-key:nats-nkey:sha256:...",
+  "presenter_kind": "unix_peercred",
+  "presenter_id": "svc-nats-bridge(9100)",
+  "outcome": "allow"
+}</code></pre>
+
+      <h2 id="7-request-and-response-signing">7. Request and response protection</h2>
+      <p class="callout">
+        <strong>Superseded by COSE:</strong> the protobuf
+        <code>Header</code>/<code>SecureMessage</code>/<code>MessageType</code>
+        envelope in this section is historical. The implemented sealed
+        invocation path is the COSE design in
+        <a href="basil-cose-api.md"><code>designs/basil-cose-api.md</code></a>
+        and <a href="cose-sealed-invocation.html"><code>designs/cose-sealed-invocation.html</code></a>:
+        callers send raw tagged <code>COSE_Sign1</code> bytes, the broker opens
+        the embedded tagged <code>COSE_Encrypt</code>, and responses bind the
+        complete request COSE bytes with the <code>-70002</code> SHA3-256 claim.
+      </p>
+      <h3>7.1 Sealed invocation envelope</h3>
+      <p>
+        The immediate signed-message use case should use a Basil request envelope,
+        not a NATS-specific authorization grammar. The envelope can be carried over
+        NATS, gRPC, a file queue, or any future transport. For bridged transport,
+        the body is always encrypted to Basil; encryption is not an optional flag.
+      </p>
+      <pre><code>enum MessageType {
+  MESSAGE_TYPE_UNSPECIFIED = 0;
+  MINT_JWT_REQUEST = 1;
+  MINT_NATS_USER_REQUEST = 2;
+  SIGN_REQUEST = 3;
+  SIGN_RESPONSE = 4;
+  MINT_JWT_RESPONSE = 5;
+  MINT_NATS_USER_RESPONSE = 6;
+}
+
+message Header {
+  uint32 version = 1;
+  string message_id = 2;
+  optional string request_id = 3;
+  MessageType message_type = 4;
+  uint32 issued_at_unix = 5;
+  optional uint32 expires_at_unix = 6;
+  string sender_sign_id = 7;
+  optional string sender_subject = 8;
+  string recipient_key_id = 9;
+  optional string recipient_subject = 10;
+  optional string response_encryption_key_id = 11;
+  bytes encapsulated_key = 12;
+  bytes nonce = 13;
+}
+
+message SecureMessage {
+  Header header = 1;
+  bytes body = 2;
+  bytes signature = 3;
+}</code></pre>
+      <p>
+        The runtime wire shape is a protobuf <code>SecureMessage</code>, not JSON.
+        Protobuf <code>bytes</code> fields are length-delimited raw bytes on the gRPC
+        wire; they are only base64-encoded by protobuf JSON mappings or
+        human-readable debug renderings. No base64 conversion is part of the Basil
+        wire protocol.
+      </p>
+      <ul>
+        <li>
+          <strong><code>version</code></strong> is the envelope format version. v1 is
+          the only supported value. Example: <code>1</code>.
+        </li>
+        <li>
+          <strong><code>message_id</code></strong> is a sender-generated message id,
+          unique for that sender within the replay window for every envelope,
+          request or response. A UUIDv7 works, but so does a durable monotonic
+          counter. Request callers generate request message ids; Basil generates
+          response message ids. Example: <code>uuid7-or-persisted-counter</code>.
+        </li>
+        <li>
+          <strong><code>request_id</code></strong> correlates a response to the request
+          it answers. It is absent on first-leg requests and present on responses,
+          where it equals the request envelope's <code>message_id</code>.
+        </li>
+        <li>
+          <strong><code>message_type</code></strong> is the complete payload
+          discriminator. Each request and response body type gets a stable enum
+          value such as <code>MINT_JWT_REQUEST</code>,
+          <code>MINT_NATS_USER_REQUEST</code>, or <code>SIGN_RESPONSE</code>. No
+          separate <code>body_type</code>, method string, or protobuf type URL is
+          carried in v1.
+        </li>
+        <li>
+          <strong><code>issued_at_unix</code></strong> is the signed Unix issue time.
+          Basil checks it against the configured clock-skew allowance. Example:
+          <code>1782740000</code>.
+        </li>
+        <li>
+          <strong><code>expires_at_unix</code></strong> is the optional signed expiry.
+          It may be omitted, in which case its effective value is
+          <code>issued_at_unix + 60</code> seconds. Basil still enforces the configured
+          maximum TTL.
+        </li>
+        <li>
+          <strong><code>sender_sign_id</code></strong> names the configured signing
+          key record that signs the transcript digest. Encryption and signature
+          algorithms are resolved from configured key records, not from
+          caller-supplied algorithm fields. Example:
+          <code>publisher.signing.2026q3</code>.
+        </li>
+        <li>
+          <strong><code>sender_subject</code></strong> is the subject asserted by the
+          signer of this envelope. For requests, it is the authorization principal
+          evaluated by policy; for responses, it is the broker identity subject. It
+          may be omitted when
+          <code>sender_sign_id</code> resolves to exactly one subject in policy; if
+          the signer can prove multiple subjects, the message must name the
+          intended subject and the signature must cover it. Example:
+          <code>content.publisher</code>.
+        </li>
+        <li>
+          <strong><code>recipient_key_id</code></strong> names the configured recipient
+          encryption key the body is sealed to. For requests this is the broker
+          request-encryption key; for responses it is the caller's response
+          encryption key. If using PQC encryption, the message carries
+          per-message KEM encapsulation output, not recipient public keys. Callers
+          resolve this catalog key id to key type and public key bytes before
+          encryption; Section 7.5 describes the existing lookup APIs. Example:
+          <code>broker.invocation_encryption.2026q3</code>.
+        </li>
+        <li>
+          <strong><code>recipient_subject</code></strong> is the intended recipient
+          identity bound into the signature. For requests, it is the broker
+          identity or configured recipient subject. For responses, it is the caller or response
+          recipient identity. It may be omitted when <code>recipient_key_id</code>
+          resolves to exactly one recipient subject; otherwise it is required. If
+          present, Basil verifies it matches the registry. Example:
+          <code>basil://prod/us-east-1/agent-a</code>.
+        </li>
+        <li>
+          <strong><code>response_encryption_key_id</code></strong> is present only on
+          requests. It names the requester-controlled response recipient key Basil
+          must use when encrypting the response. The agent validates that the key
+          exists in the backend, has the expected response-encryption use, and has
+          not been revoked before executing the operation. Responses omit this
+          field; their <code>recipient_key_id</code> is the request's
+          <code>response_encryption_key_id</code>.
+        </li>
+        <li>
+          <strong><code>encapsulated_key</code></strong> is the raw KEM encapsulation
+          output for the per-message body key (if using PQC encryption). On the
+          protobuf wire this is binary bytes, not base64 text.
+        </li>
+        <li>
+          <strong><code>nonce</code></strong> is the raw AEAD nonce for the encrypted
+          body. On the protobuf wire this is binary bytes, not base64 text.
+        </li>
+        <li>
+          <strong><code>body</code></strong> is the encrypted CBOR body bytes. On the
+          protobuf wire this is binary bytes, not base64 text.
+        </li>
+        <li>
+          <strong><code>signature</code></strong> is the raw signature over the
+          BLAKE3 canonical transcript digest. On the protobuf wire this is binary
+          bytes, not base64 text.
+        </li>
+      </ul>
+      <p>
+        The plaintext message body is serialized as CBOR before encryption.
+        <code>MessageType</code> selects the CBOR schema for the body, and every
+        message type must define that schema in one registry. Implementations
+        use the same deterministic CBOR profile for maps, integers, byte strings,
+        text strings, arrays, booleans, and nulls. Unknown fields are rejected in
+        v1 rather than ignored, so client implementations fail closed when their
+        schema registries diverge. M2 defines the CBOR structs in Rust first and
+        adds every request and response body to the <code>MessageType</code> enum as the
+        Rust implementation needs them. M2 and M3 use Rust-generated fixtures to
+        debug the protocol quickly; Go implementation is deferred until after
+        M4's Rust bridge is stable. Interoperability tests cover both the CBOR
+        plaintext bytes and the encrypted <code>SecureMessage.body</code> bytes.
+      </p>
+      <p>
+        Response bodies are operation-specific on the wire but share common
+        declared fields: <code>status</code> and <code>policy_generation</code>. Rust and Go
+        helper APIs may expose this as an ergonomic
+        <code>InvocationResponse&lt;T&gt;</code> wrapper or a common status trait, but the
+        stable CBOR registry still declares each response body explicitly.
+      </p>
+      <pre><code>enum InvocationStatusCode {
+  OK = 1;
+  DENIED = 2;
+  INVALID_REQUEST = 3;
+  INTERNAL_ERROR = 4;
+}
+
+struct InvocationStatus {
+  1: code,
+  2: reason,
+  3: message?,    # sanitized, optional
+  4: retryable
+}
+
+struct SignInvocationResponse {
+  1: status,
+  2: policy_generation,
+  3: signature
+}
+
+struct MintJwtInvocationResponse {
+  1: status,
+  2: policy_generation,
+  3: jwt,
+  4: expires_at_unix?
+}
+
+struct MintNatsUserInvocationResponse {
+  1: status,
+  2: policy_generation,
+  3: jwt,
+  4: expires_at_unix?
+}</code></pre>
+      <p>
+        Request binding is not a separate body field. Implementations compute the
+        binding from the canonical request fields and transcript described at the
+        end of this section.
+      </p>
+      <p>
+        The signature input is the 32-byte unkeyed BLAKE3 digest of a canonical
+        transcript. BLAKE3 uses its normal parameters. The transcript starts with
+        the fixed domain-separation string <code>basil-secure-message-v1</code>, then
+        includes every field in <code>Header</code> in protobuf field-number order, then the
+        encrypted <code>body</code>. This deterministic transcript encoding is separate
+        from the protobuf wire encoding used by gRPC; protobuf still sends enum
+        and integer fields using its normal numeric wire format. For the
+        transcript only, integers and enum values are encoded as <code>u32</code>
+        little-endian. Optional fields are encoded as a single <code>u8</code> presence
+        flag (<code>0</code> or <code>1</code>) followed by the value when present. Strings are
+        encoded as <code>u32</code> little-endian byte length followed by UTF-8 bytes. Byte
+        fields are encoded as <code>u32</code> little-endian length followed by raw bytes.
+        The authenticated encryption associated
+        data is the same canonical header transcript, without <code>body</code>, so a
+        bridge cannot transplant ciphertext into a different message type,
+        sender, recipient, key id, nonce, request id, or expiry.
+      </p>
+
+      <h3>7.2 Payload confidentiality</h3>
+      <p>
+        Every bridged invocation body is sealed, including apparently harmless
+        operations. This avoids requiring every future API author to remember
+        which messages carry secrets. It also protects sensitive metadata that can
+        appear in requests and responses over time.
+      </p>
+      <ul>
+        <li>Requests are encrypted to the broker's configured request-encryption public key.</li>
+        <li>Requests name a <code>response_encryption_key_id</code> in the signed header; responses are encrypted to that validated requester key.</li>
+        <li>Every sealed message, request or response, uses a fresh nonce and, if using PQC encryption, a fresh KEM encapsulation. A response never reuses the request's <code>encapsulated_key</code> (if using PQC encryption) or <code>nonce</code>.</li>
+        <li>The bridge may see envelope routing fields needed to deliver the message, but not serialized broker request or response bodies.</li>
+        <li>Local typed gRPC over Unix sockets may continue to send plaintext protobuf on that local connection; this sealed envelope is the required shape for bridged or remote invocation.</li>
+      </ul>
+
+      <h3>7.3 Replay protection</h3>
+      <ul>
+        <li>Every sealed request must include a <code>message_id</code> that is unique for the sender within the replay window.</li>
+        <li>Every sealed request must include a short expiry. A default maximum of 60 seconds is appropriate for message bridges.</li>
+        <li>Basil keeps a bounded replay cache keyed by signer fingerprint plus <code>message_id</code> until the expiry plus skew allowance.</li>
+        <li>Clock skew should be explicit and small. A default of 30 seconds is enough for same-fleet systems.</li>
+      </ul>
+
+      <h3>7.4 Broker response protection</h3>
+      <p>
+        For async or bridged transports, callers need to know that a response came
+        from Basil and corresponds to the exact request. Basil signs response
+        envelopes with a configured broker identity key and encrypts the response
+        body to the response recipient key id named by
+        <code>response_encryption_key_id</code> on the request.
+        The response header sets <code>request_id</code> to the request envelope's
+        <code>message_id</code>. The encrypted response body schema is selected by
+        <code>MessageType</code>. Request binding is computed from the canonical request
+        fields and transcript rather than carried as a trusted
+        <code>request_hash</code> field.
+      </p>
+      <p>
+        Denials and errors should also be signed. Otherwise a bridge can hide
+        Basil's decision or forge failure modes. Operation status and other
+        trusted response metadata live inside the encrypted response body. The
+        clear gRPC status is transport status only; it says whether a sealed
+        response was returned, not whether the broker operation succeeded.
+      </p>
+      <p>
+        If Basil cannot construct a signed and encrypted response after accepting
+        a request, it fails closed at the transport level with a generic
+        <code>INVOCATION_RESPONSE_PROTECTION_FAILED</code> reason and no operation
+        result details. It must audit the failure with the trusted context
+        available at that point and never fall back to an unsigned or plaintext
+        response.
+      </p>
+
+      <h3>7.5 Broker identity and encryption keys</h3>
+      <p>
+        Broker response-signing and request-encryption keys are configured by
+        catalog key id. Private key material lives in the backend; the catalog
+        holds metadata, key type, and backend location. Policy can trust public
+        material, but it must not contain the broker's private signing material.
+      </p>
+      <pre><code>[broker-identity]
+id = "basil://prod/us-east-1/agent-a"
+response-signing-key-id = "broker.response_signing.2026q3"
+
+[invocation]
+enable = true
+audience = ["basil://prod/us-east-1/agent-a"]
+request-encryption-key-id = "broker.request_encryption.2026q3"
+max-ttl-secs = 60
+clock-skew-secs = 30
+replay-cache-capacity = 4096</code></pre>
+      <p>
+        Response signing is always required whenever invocation is enabled; there
+        is no <code>response-signing = "disabled"</code> mode. Response encryption is
+        also mandatory, but the recipient key is selected per request through
+        <code>response_encryption_key_id</code> because Basil does not know the remote
+        requester set at startup.
+      </p>
+      <p>
+        Header key ids are Basil catalog names, not self-describing algorithm
+        handles. A caller that builds a sealed message must know the recipient
+        catalog key's public bytes and key type before encryption, because the key
+        type selects the public-key encoding and encryption suite. Basil already
+        has forward lookup APIs for callers that are connected over an
+        authenticated local or otherwise trusted channel:
+      </p>
+      <pre><code>service SecretService {
+  rpc ListCatalog(ListCatalogRequest) returns (stream CatalogEntry);
+}
+
+message CatalogEntry {
+  string name = 1;
+  CatalogKind kind = 2;
+  optional KeyType key_type = 3;
+  uint32 latest_version = 4;
+}
+
+service SigningService {
+  rpc GetPublicKey(GetPublicKeyRequest) returns (GetPublicKeyResponse);
+}
+
+message GetPublicKeyRequest {
+  string key_id = 1;
+  optional uint32 version = 2;
+}
+
+message GetPublicKeyResponse {
+  string key_id = 1;
+  KeyType key_type = 2;
+  bytes public_key = 3;
+  uint32 version = 4;
+}</code></pre>
+      <p>
+        <code>ListCatalog</code> lets an authorized local caller discover visible key
+        names, key classes, key types, and latest versions.
+        <code>GetPublicKey</code> returns the public bytes and <code>KeyType</code> for a chosen
+        catalog key. These RPCs are not a trust bootstrap mechanism over an
+        untrusted bridge or network: a man-in-the-middle could substitute its own
+        recipient key unless the response is authenticated by a broker signing key
+        the caller already trusts.
+      </p>
+      <p>
+        For bridged or direct remote invocation, the caller obtains broker public
+        keys out of band. M3 does not add a JWKS, status, or public discovery
+        surface for invocation keys. Clients pin at least the broker id, response
+        signing public key, request-encryption public key, accepted key ids, and
+        key type/version metadata before using a bridge. No reverse
+        <code>describe_key(public_key)</code> API is required for sealed invocation; if a
+        caller only has public bytes, it still needs an authenticated catalog key
+        id to put in <code>recipient_key_id</code>.
+      </p>
+
+      <h2 id="8-grpc-api">8. gRPC API</h2>
+      <p class="callout">
+        <strong>Superseded by COSE:</strong> the implemented
+        <code>InvocationService.Invoke</code> signature is
+        <code>Invoke(SealedRequest) returns (SealedResponse)</code>. The gRPC
+        carrier contains opaque tagged COSE bytes in <code>message</code> plus
+        an optional clear <code>response_subject</code> on responses for courier
+        routing; it no longer accepts or returns protobuf
+        <code>SecureMessage</code> values.
+      </p>
+      <h3>8.1 Recommended shape</h3>
+      <p>
+        Do not add authentication fields to every existing broker request yet.
+        That is noisy and still leaves non-gRPC transports without a native shape.
+        Add one transport-neutral invocation service for sealed bridged calls,
+        while local typed gRPC services continue to use Unix peer credentials.
+        The service is compiled into the agent but disabled by default at
+        runtime.
+      </p>
+      <pre><code>service InvocationService {
+  rpc Invoke(SecureMessage) returns (SecureMessage);
+}</code></pre>
+      <p>
+        Section 7.1 defines <code>Header</code> and <code>SecureMessage</code>. The request
+        argument is a sealed request message. The return value is a sealed response
+        message whose header carries a new sender-unique <code>message_id</code> and a
+        <code>request_id</code> pointing back to the request. The gRPC status is only
+        transport status: disabled service, malformed envelope, oversized payload,
+        or inability to construct a sealed response. Broker operation success,
+        denial, and failure status live inside the encrypted response body.
+      </p>
+      <p>
+        Rust and Go client libraries should hide <code>InvocationService</code> behind
+        the same typed API methods. Direct local clients call typed gRPC services.
+        Remote or NATS clients build sealed invocation envelopes.
+      </p>
+
+      <h3>8.2 Why not metadata-only auth?</h3>
+      <p>
+        gRPC metadata works for direct gRPC, but it is a poor universal envelope
+        for NATS messages and other async transports. A sealed invocation gives
+        one canonical object for queues, bridges, logs, replay protection,
+        response signing, and response encryption. Metadata can still be added
+        later as an optimization for direct remote gRPC if there is a real need.
+        This does not refer to cgroup or Kubernetes evidence; those are principal
+        kinds collected by authenticators. A metadata proof would be a direct
+        gRPC-only signature/certificate proof attached to a normal RPC. That path
+        is deferred.
+      </p>
+
+      <h3>8.3 Breaking admin explain API</h3>
+      <p>
+        <code>ExplainRequest</code> currently evaluates a uid. It should evaluate a
+        subject instead. Offline explain should also accept a subject name and a
+        mock evidence bundle for subject-resolution tests.
+      </p>
+      <pre><code>message ExplainRequest {
+  string subject = 1;
+  string op = 2;
+  string key = 3;
+}
+
+message ExplainResponse {
+  string subject = 1;
+  string op = 2;
+  string key = 3;
+  string decision = 4;
+  MatchedRule matched = 5;
+}</code></pre>
+
+      <h2 id="9-nix-api">9. Nix API</h2>
+      <p>
+        Nix remains the preferred source form. The Nix module should export the
+        subject registry into <code>policy.json</code>; it should not create a new
+        runtime file.
+      </p>
+
+      <h3>9.1 Rule API</h3>
+      <pre><code>services.basil.policy.rules = [
+  {
+    id = "web-reads-web-keys";
+    subjects = [ "svc.web" ];
+    action = [ "role:reader" ];
+    target = [ "web.**" ];
+  }
+  {
+    id = "publisher-signs-feed";
+    subjects = [ "content.publisher" ];
+    action = [ "op:sign" ];
+    target = [ "content.feed.signing_key" ];
+  }
+];</code></pre>
+
+      <h3>9.2 Subject API</h3>
+      <pre><code>services.basil.policy.subjects = {
+  "svc.web" = {
+    allOf = [
+      { unix.uid = 9001; }
+      {
+        process = {
+          exePath = "/nix/store/.../bin/web-api";
+          sha256 = "hex...";
+        };
+      }
+    ];
+  };
+
+  "content.publisher" = {
+    anyOf = [
+      {
+        signature = {
+          algorithm = "nats-nkey";
+          public = "U...";
+        };
+      }
+      {
+        signature = {
+          algorithm = "ed25519";
+          public = "base64url...";
+        };
+      }
+    ];
+  };
+
+  "breakglass.root" = {
+    breakGlass = true;
+    allOf = [
+      { unix.uid = 0; }
+    ];
+  };
+};</code></pre>
+
+      <h3>9.3 Generated Unix subjects</h3>
+      <p>
+        To keep common host-local policy concise, the module may generate Unix
+        subjects from a source-level shortcut:
+      </p>
+      <pre><code>services.basil.policy.unixSubjects = {
+  "svc.web".user = "svc-web";
+  "ops.wheel".group = "wheel";
+};</code></pre>
+      <p>
+        The exporter resolves names to numeric uid/gid, writes those numeric
+        values into <code>policy.json</code>, and preserves the name mapping in
+        <code>config.names</code> for audit readability.
+      </p>
+
+      <h3>9.4 Broker identity API</h3>
+      <pre><code>services.basil.brokerIdentity = {
+  id = "basil://prod/us-east-1/agent-a";
+  responseSigningKeyId = "broker.response_signing.2026q3";
+};</code></pre>
+      <pre><code>services.basil.invocation = {
+  enable = false; # secure default
+  audience = [ "basil://prod/us-east-1/agent-a" ];
+  requestEncryptionKeyId = "broker.request_encryption.2026q3";
+  maxTtlSeconds = 60;
+  clockSkewSeconds = 30;
+  replayCacheCapacity = 4096;
+};</code></pre>
+      <p>
+        <code>responseSigningKeyId</code> names a backend-custodied catalog signing key
+        used by the broker itself for response signatures.
+        <code>requestEncryptionKeyId</code> names the public recipient key clients use to
+        seal bridged invocation bodies to Basil. These are not granted through
+        data-plane policy; they are agent identity and invocation transport
+        settings. The loader must validate that the keys exist and have the
+        required signing or encryption class.
+      </p>
+      <p>
+        The TOML agent config should mirror this split: broker identity keys are
+        configured under broker identity, and the invocation service is enabled
+        with an explicit runtime flag. This should not need a Cargo feature flag;
+        the code-size cost is not expected to justify a separate build.
+      </p>
+      <pre><code>[invocation]
+enable = false</code></pre>
+
+      <h2 id="10-implementation">10. Implementation</h2>
+      <h3>10.1 Rust type sketch</h3>
+      <pre><code>struct Policy {
+    schema_version: u32,
+    subjects: BTreeMap&lt;SubjectName, SubjectDefinition&gt;,
+    roles: BTreeMap&lt;String, Vec&lt;Op&gt;&gt;,
+    rules: Vec&lt;Rule&gt;,
+    config: Config,
+    unauthenticated_subject: Option&lt;SubjectName&gt;,
+}
+
+struct Rule {
+    id: String,
+    subjects: Vec&lt;SubjectName&gt;,
+    action: Vec&lt;ActionTerm&gt;,
+    target: Vec&lt;KeyGlob&gt;,
+    comment: Option&lt;String&gt;,
+}
+
+struct SubjectDefinition {
+    break_glass: bool,
+    match_: SubjectMatch,
+}
+
+enum SubjectMatch {
+    AllOf(Vec&lt;PrincipalSpec&gt;),
+    AnyOf(Vec&lt;PrincipalSpec&gt;),
+}
+
+enum PrincipalSpec {
+    Unix { uid: Option&lt;u32&gt;, gid: Option&lt;u32&gt; },
+    Unauthenticated,
+    SignatureKey { algorithm: SignatureKeyKind, public: PublicKeySpec },
+    Process { exe_path: Option&lt;String&gt;, sha256: String },
+    Cgroup { /* future typed fields */ },
+    Kubernetes { /* future typed fields */ },
+    X509Pop { /* future typed fields */ },
+}</code></pre>
+
+      <h3>10.2 Loader rules</h3>
+      <ul>
+        <li>Reject duplicate subject names after normalization.</li>
+        <li>Reject rules that reference undefined subjects.</li>
+        <li>Reject unsupported principal kinds and unsupported signature algorithms.</li>
+        <li>Reject <code>unix</code> principals that name neither <code>uid</code> nor <code>gid</code>.</li>
+        <li>Reject <code>unauthenticated</code> principals unless <code>unauthenticatedSubject</code> names the containing subject.</li>
+        <li>Reject subject expressions with empty <code>allOf</code> or <code>anyOf</code>.</li>
+        <li>Reject broker identity config that names a missing key or a key with the wrong use.</li>
+        <li>Reject wildcard target <code>*</code> unless every referenced subject has <code>breakGlass: true</code>.</li>
+      </ul>
+
+      <h3>10.3 PDP changes</h3>
+      <p>
+        Resolved policy no longer needs to preserve a parsed
+        <code>PeerPredicate</code> on every rule. It can expand rule subjects into
+        a set or sorted vector of subject names and match directly against the
+        actor subject.
+      </p>
+      <pre><code>struct ResolvedRule {
+    subjects: BTreeSet&lt;SubjectName&gt;,
+    grants: Vec&lt;Grant&gt;,
+}</code></pre>
+      <p>
+        The world-readable public-class rule can remain unchanged, but audit
+        should still require an authenticated actor. If no subject can be
+        resolved, public reads should either be denied or resolved to a dedicated
+        built-in <code>anonymous.local</code> subject. The simpler and safer first
+        version is to deny missing subject.
+      </p>
+
+      <h3>10.4 Audit changes</h3>
+      <p>
+        The audit record should stop hard-coding <code>actor_kind=unix_uid</code>.
+        Recommended fields:
+      </p>
+      <pre><code>{
+  "event_kind": "basil.audit.authz",
+  "event_version": 2,
+  "generation": 42,
+  "op": "sign",
+  "target_kind": "catalog_key",
+  "target_id": "content.feed.signing_key",
+  "actor_kind": "subject",
+  "actor_id": "content.publisher",
+  "authenticated_by": ["signature-key:nats-nkey:sha256:..."],
+  "presenter_kind": "unix_peercred",
+  "presenter_id": "svc-nats-bridge(9100)",
+  "outcome": "allow",
+  "reason": "subject_rule"
+}</code></pre>
+
+      <h2 id="11-milestones">11. Milestones</h2>
+      <h3>M1. Subject schema and Unix parity</h3>
+      <ul>
+        <li>Add subject registry to policy JSON and Nix export.</li>
+        <li>Convert existing user/group rule tests to generated Unix subjects.</li>
+        <li>Replace <code>PeerPredicate</code> in the PDP with subject matching.</li>
+        <li>Update explain, effective permissions, and audit records to subject names.</li>
+      </ul>
+
+      <h3>M2. Sealed invocation envelope</h3>
+      <ul>
+        <li>Add runtime-disabled-by-default <code>InvocationService.Invoke</code> and deterministic envelope bytes.</li>
+        <li>Define the first Rust CBOR body structs and add each request and response body to <code>MessageType</code> as it becomes part of the sealed invocation path.</li>
+        <li>Implement Ed25519 and NATS NKey signature-key principals.</li>
+        <li>Encrypt bridged request bodies to the broker invocation encryption key.</li>
+        <li>Add replay cache, expiry checks, recipient-subject checks, and clock-skew handling.</li>
+        <li>Add Rust client helpers and Rust fixtures for sealed invocations. Go helpers are deferred until after the Rust M3/M4 path has stabilized.</li>
+      </ul>
+
+      <h3>M3. Broker response protection</h3>
+      <ul>
+        <li>Add broker identity config and validation.</li>
+        <li>Sign success, denial, and error response envelopes.</li>
+        <li>Validate the request's <code>response_encryption_key_id</code> and encrypt response bodies to that requester key.</li>
+        <li>Add Rust client decryption, verification helpers, and failure-mode tests, continuing to debug against Rust fixtures.</li>
+      </ul>
+
+      <h3>M4. NATS bridge courier path</h3>
+      <ul>
+        <li>Implement a separate Rust <code>basil-nats-bridge</code> crate/binary that connects to NATS and to Basil over the existing Unix socket.</li>
+        <li>Authorize the bridge presenter with <code>op:invoke</code> over <code>broker.invocation</code>, using Unix uid/gid subject resolution for the first implementation.</li>
+        <li>Forward NATS request payloads containing protobuf <code>SecureMessage</code> bytes to <code>InvocationService.Invoke</code> and return protobuf <code>SecureMessage</code> response bytes.</li>
+        <li>Report bridge-level failures that have no sealed Basil response with NATS headers, not a fabricated invocation response.</li>
+        <li>Audit both actor subject and presenter process for every bridged request.</li>
+        <li>Verify import-key and get-secret examples remain opaque to the bridge in both directions.</li>
+        <li>Update README/CHANGELOG as needed and update basil-doc with bridge config, policy, message contract, failure modes, actor-vs-presenter semantics, and the explicit Go-helper deferral.</li>
+      </ul>
+
+      <h3>M5. Roadmap authenticators</h3>
+      <ul>
+        <li>Add process digest collection and subject principal matching.</li>
+        <li>Add cgroup/container facts.</li>
+        <li>Add Kubernetes projected service-account token validation.</li>
+        <li>Add X.509 proof-of-possession for sealed invocations.</li>
+      </ul>
+
+      <h2 id="12-security-tests">12. Security tests</h2>
+      <h3>12.1 Loader and schema tests</h3>
+      <ul>
+        <li>Undefined subject in a rule is a fatal load error.</li>
+        <li>Unsupported principal kind is a fatal load error.</li>
+        <li>Unsupported signature algorithm is a fatal load error.</li>
+        <li>Empty <code>subjects</code>, <code>allOf</code>, or <code>anyOf</code> is rejected.</li>
+        <li><code>unix</code> principal with neither <code>uid</code> nor <code>gid</code> is rejected.</li>
+        <li><code>unauthenticated</code> principal is rejected unless it is the configured unauthenticated subject.</li>
+        <li>Nix name resolution emits numeric uid/gid principals and preserves audit names.</li>
+      </ul>
+
+      <h3>12.2 PDP parity tests</h3>
+      <ul>
+        <li>A generated Unix subject grants the same operations as the previous <code>user:uid</code> rule.</li>
+        <li>A generated group subject uses the configured full membership set, not only primary gid.</li>
+        <li>A configured unauthenticated subject can reach only rules that explicitly name that subject.</li>
+        <li>Without <code>unauthenticatedSubject</code>, missing actor proof is denied even for public-class reads.</li>
+        <li>A denied subject does not inherit grants from the presenter.</li>
+        <li>Admin operations remain excluded from wildcard data-plane grants.</li>
+        <li>Public-class reads require a resolved subject, or the chosen anonymous behavior is tested explicitly.</li>
+      </ul>
+
+      <h3>12.3 Sealed request tests</h3>
+      <ul>
+        <li><code>InvocationService</code> rejects requests while disabled in TOML config.</li>
+        <li>Valid Ed25519 sealed invocation resolves the configured subject and authorizes normally.</li>
+        <li>Valid NATS NKey sealed invocation resolves the configured subject and authorizes normally.</li>
+        <li>Wrong recipient subject is rejected before policy evaluation.</li>
+        <li>Expired request is rejected before policy evaluation.</li>
+        <li>Replay of the same request <code>message_id</code> is rejected.</li>
+        <li>Changing message type, key id, ciphertext, <code>encapsulated_key</code> (if using PQC encryption), nonce, sender subject, recipient subject, expiry, or request id breaks the signature.</li>
+        <li>Remote clients reject a recipient public-key descriptor unless it is configured out of band or signed by a previously trusted broker identity key.</li>
+        <li>Omitted <code>expires_at_unix</code> uses the signed default of <code>issued_at_unix + 60</code> seconds.</li>
+        <li>Omitted <code>sender_subject</code> and <code>recipient_subject</code> are accepted only when they resolve unambiguously from <code>sender_sign_id</code> and <code>recipient_key_id</code>.</li>
+        <li>Each <code>MessageType</code> added in M2 has a Rust CBOR body struct, a documented body schema, and Rust fixtures that lock the plaintext CBOR bytes before encryption.</li>
+        <li>M2 and M3 Rust test vectors produce stable canonical transcript bytes, BLAKE3 transcript hashes, AAD bytes, and signatures for the same header and body bytes; deferred Go tests must later match those vectors byte-for-byte.</li>
+        <li>Test vectors are checked in as JSON fixtures containing named header fields, message type, structured body value, hex-encoded plaintext CBOR body, hex-encoded encrypted body, hex-encoded canonical transcript, hex-encoded AAD, expected BLAKE3 digest, signer public key, signature, and expected validation result.</li>
+        <li>Unknown signer and bad signature are indistinguishable at the public error level.</li>
+      </ul>
+
+      <h3>12.4 Bridge courier tests</h3>
+      <ul>
+        <li>A bridge cannot make an unsigned envelope resolve to a subject.</li>
+        <li>A bridge cannot change the envelope subject without breaking the sender signature.</li>
+        <li>A bridge cannot change the message type, target key, ciphertext, <code>encapsulated_key</code> (if using PQC encryption), nonce, sender subject, recipient subject, expiry, request id, or recipient key id without breaking the sender signature.</li>
+        <li>The bridge's own data-plane grants are not used for the sender subject.</li>
+        <li>Audit records include sender subject, presenter process, and signature proof.</li>
+      </ul>
+
+      <h3>12.5 Response protection tests</h3>
+      <ul>
+        <li>Client verifies a successful response against the configured broker public key.</li>
+        <li>Client rejects a response signed by an unknown broker key.</li>
+        <li>Client rejects a response with a mismatched request id or failed canonical request binding.</li>
+        <li>Denied responses and internal-error responses are signed.</li>
+        <li>Client ignores gRPC status for broker-operation results and trusts only the decrypted signed response body.</li>
+        <li>Bridge-visible response envelopes do not contain plaintext secret values or imported key material.</li>
+        <li>Client rejects a response encrypted to the wrong recipient key.</li>
+        <li>Policy generation in the response matches the generation that decided the request.</li>
+      </ul>
+
+      <h3>12.6 Future authenticator tests</h3>
+      <ul>
+        <li>Process digest principal fails closed when <code>/proc/pid/exe</code> cannot be read.</li>
+        <li>Process path alone is never accepted for high-trust examples unless explicitly configured.</li>
+        <li>Cgroup parser rejects malformed or ambiguous cgroup evidence.</li>
+        <li>Kubernetes token validation rejects wrong audience, wrong issuer, expired token, and forged signature.</li>
+        <li>X.509 proof-of-possession rejects valid certificates that do not sign the request envelope.</li>
+      </ul>
+
+      <h2 id="13-operations">13. Operations</h2>
+      <h3>13.1 Observability</h3>
+      <ul>
+        <li>Count subject-resolution failures by stable reason: no subject, bad signature, unknown signer, decrypt failed, expired, replay, wrong recipient subject.</li>
+        <li>Count authorizations by actor subject, op, and outcome, with bounded labels.</li>
+        <li>Expose replay-cache size and eviction counters when metrics are enabled.</li>
+        <li>Log the broker identity key id at startup, never private material.</li>
+      </ul>
+
+      <h3>13.2 Operator guidance</h3>
+      <ul>
+        <li>Name subjects after operational roles or workloads, not after key formats.</li>
+        <li>Use direct signed proof when the real actor can sign the request.</li>
+        <li>Treat bridges as couriers. If a future delegation feature is added, model it as explicit delegation, not as bridge identity.</li>
+        <li>Distribute broker response-signing and request-encryption public trust material out of band before remote clients use a bridge.</li>
+        <li>Keep sealed request TTLs short. Long-lived reusable credentials are a different system design.</li>
+        <li>Rotate subject keys by adding a second principal, deploying clients, then removing the old principal.</li>
+      </ul>
+
+      <h3>13.3 Documentation impact</h3>
+      <p>
+        Once implemented, basil-doc pages that describe uid/gid policy will need a
+        coordinated update. Until then, this document is the forward-looking design
+        source and should not be treated as current user documentation.
+      </p>
+
+      <h2 id="14-decisions-and-deferred-features">14. Decisions and deferred features</h2>
+      <h3>Resolved decisions</h3>
+      <ol>
+        <li>
+          Unauthenticated requests are denied by default. Operators may configure
+          <code>unauthenticatedSubject</code>, conventionally <code>guest</code>, and
+          then grant that subject explicitly in policy.
+        </li>
+        <li>
+          <code>InvocationService</code> is compiled in but disabled by default in
+          the TOML config. Enabling it requires explicit configuration. No Cargo
+          feature flag is proposed.
+        </li>
+        <li>
+          Bridged invocation response signing and payload encryption are mandatory
+          whenever <code>InvocationService</code> is enabled.
+        </li>
+        <li>
+          Broker response-signing and request-encryption private keys live in the
+          backend. Agent config names catalog key ids; the catalog carries
+          metadata and backend location. Bridged clients obtain broker public
+          trust material out of band.
+        </li>
+        <li>
+          Response encryption is selected per request with
+          <code>response_encryption_key_id</code>. The response omits that field and
+          sets <code>recipient_key_id</code> to the validated requester key.
+        </li>
+        <li>
+          The first NATS bridge is a separate Rust binary. It is authorized as a
+          Unix uid/gid presenter through <code>op:invoke</code> on
+          <code>broker.invocation</code>; actor authorization still comes only from the
+          sealed envelope proof.
+        </li>
+        <li>
+          Direct remote gRPC should use the sealed invocation service first.
+          Metadata-based proof is not part of the first implementation.
+        </li>
+        <li>
+          The canonical byte format is <code>SecureMessage</code> with a signed
+          <code>Header</code> plus encrypted body. <code>MessageType</code> is the complete body
+          discriminator. The BLAKE3 signature transcript starts with the
+          <code>basil-secure-message-v1</code> domain-separation string, then includes
+          every <code>Header</code> field in protobuf field-number order, then the encrypted
+          body. That deterministic transcript encoding is separate from
+          protobuf's gRPC wire encoding and uses <code>u32</code> little-endian integers,
+          <code>u32</code>-length-prefixed strings and bytes, and <code>u8</code> presence flags for
+          optional fields.
+          <code>MessageType</code> selects a documented CBOR schema for the plaintext
+          message body. M2 and M3 define the schemas as Rust structs first and
+          check in Rust-generated fixtures; Go helpers are deferred to a later
+          issue and must produce identical CBOR bytes for every shared fixture
+          before encryption when implemented.
+          <code>sender_subject</code> and <code>recipient_subject</code> may be derived only when the sender
+          or recipient key id maps unambiguously. Omitted expiry defaults to 60
+          seconds after issue time. Secret-bearing payloads use zeroizing storage
+          and redacted debug output. Rust fixtures carry expected transcript, AAD,
+          digest, and signature bytes for future cross-language implementations.
+        </li>
+      </ol>
+      <h3>Deferred features</h3>
+      <ol>
+        <li><code>ssh-ed25519</code> sealed-request principals are deferred behind raw Ed25519 and NATS NKey.</li>
+        <li>Direct gRPC metadata proofs are deferred. This would mean a gRPC-only signature or certificate proof attached to a normal RPC, not cgroup or Kubernetes evidence.</li>
+        <li>Go sealed-invocation helpers are deferred until after the Rust M3/M4 schemas, fixtures, and NATS bridge are stable.</li>
+      </ol>
+    </main>
+
+    <footer>
+      <p>
+        This is a design proposal for Basil's pre-release API. It intentionally
+        favors a clean breaking change over compatibility shims.
+      </p>
+    </footer>
+  </body>
+</html>

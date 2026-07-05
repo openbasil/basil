@@ -1,0 +1,30 @@
+[package]
+name = "basil-proto"
+description = "Generated gRPC contracts for the Basil broker and SPIFFE Workload API."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version = "1.85"
+publish = true
+
+[dependencies]
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+serde = { workspace = true }
+serde_bytes = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }
+
+[dev-dependencies]
+# Path-only dev-dependency: stripped by `cargo package`, so it does not
+# raise the published dependency floor. The COSE fixtures test round-trips
+# the checked-in vectors through the strict profile.
+basil-cose = { workspace = true, features = ["fixtures"] }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

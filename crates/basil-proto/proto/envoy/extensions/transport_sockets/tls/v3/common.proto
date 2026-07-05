@@ -1,0 +1,5 @@
+syntax = "proto3";
+
+package envoy.extensions.transport_sockets.tls.v3;
+
+message SubjectAltNameMatcher {}

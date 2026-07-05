@@ -1,0 +1,85 @@
+name: CI
+
+# Mandatory cargo gates (build / clippy / test / fmt) plus the cross-engine
+# acceptance suite (`just test-e2e both`) with BOTH OpenBao (`bao`) and
+# HashiCorp Vault (`vault`) on PATH. The e2e runner SKIPs cleanly when an
+# engine binary is absent, so CI installs both to get real coverage and to
+# fail the build on cross-engine regressions or capability/wire drift.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Pin the engine versions installed below. Bump deliberately.
+  OPENBAO_VERSION: "2.5.4"
+  VAULT_VERSION: "1.17.6"
+
+jobs:
+  ci:
+    name: gates + cross-engine e2e
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins channel 1.96.0 with rustfmt + clippy, so the
+      # toolchain action installs exactly what the workspace targets.
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install just
+        uses: extractions/setup-just@v2
+
+      - name: Install OpenBao (bao) onto PATH
+        run: |
+          set -euo pipefail
+          url="https://github.com/openbao/openbao/releases/download/v${OPENBAO_VERSION}/bao_${OPENBAO_VERSION}_linux_amd64.deb"
+          curl -fsSL -o /tmp/bao.deb "$url"
+          sudo dpkg -i /tmp/bao.deb
+          bao version
+
+      - name: Install HashiCorp Vault (vault) onto PATH
+        run: |
+          set -euo pipefail
+          url="https://releases.hashicorp.com/vault/${VAULT_VERSION}/vault_${VAULT_VERSION}_linux_amd64.zip"
+          curl -fsSL -o /tmp/vault.zip "$url"
+          sudo unzip -o /tmp/vault.zip -d /usr/local/bin
+          sudo chmod +x /usr/local/bin/vault
+          vault version
+
+      # ---- Mandatory cargo gates (AGENTS.md) ----
+      - name: Build
+        run: cargo build --workspace --all-features
+
+      - name: Clippy (zero warnings)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      # ---- Cross-engine acceptance suite (OpenBao + Vault) ----
+      # Both engines are on PATH, so this exercises real coverage rather than
+      # SKIPping. Non-zero exit iff any engine's e2e FAILED.
+      - name: Cross-engine e2e (OpenBao + Vault)
+        run: just test-e2e both

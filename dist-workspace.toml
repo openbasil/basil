@@ -1,0 +1,61 @@
+# dist (cargo-dist) release configuration.
+#
+# Pinned to dist 0.32.0 -- the current stable release (2026-05-21).
+# Reference: https://axodotdev.github.io/cargo-dist/book/reference/config.html
+#
+# What dist owns here:
+#   * signed, attested `.tar.xz` archives of the `basil-bin` package for the
+#     three first-class targets below, each containing `basil` and
+#     `basil-nats-bridge`;
+#   * a Homebrew formula (serves macOS arm64 AND Linux) published to the
+#     `openbasil/homebrew-tap` tap;
+#   * GitHub Artifact Attestations (build provenance) for every artifact.
+#
+# What dist does NOT do natively (0.32.0 has no `.deb`/`.rpm`/Arch installer),
+# and is therefore handled by hand-written jobs in .github/workflows/release.yml:
+#   * Debian `.deb` packages (amd64 + arm64) via `dpkg-deb`;
+#   * an Arch `.pkg.tar.zst` built from the release archives via packaging/arch.
+
+[workspace]
+members = ["cargo:."]
+
+[dist]
+# Pin the exact dist version CI installs and runs. Bump deliberately.
+cargo-dist-version = "0.32.0"
+# CI backend + release hosting.
+ci = "github"
+hosting = "github"
+# The dist-able package is `crates/basil-bin`, which ships both the unified
+# `basil` binary and the companion `basil-nats-bridge` courier. The `basil`
+# binary is built with its DEFAULT features (onepassword + unlock-age-yubikey +
+# unlock-bip39); SPIFFE and PQC are always compiled in. Optional HTTP,
+# db-keystore, TPM, AWS KMS, and GCP KMS surfaces are deliberately outside the
+# default release build.
+packages = ["basil-bin"]
+installers = ["homebrew"]
+# First-class release targets.
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "aarch64-apple-darwin",
+]
+# Compressed-tar archive for every (unix-only) target.
+unix-archive = ".tar.xz"
+# Homebrew tap the `publish-homebrew-formula` job pushes to. The tap repo must
+# exist and CI must hold a HOMEBREW_TAP_TOKEN secret (see docs/runbooks/release.md).
+tap = "openbasil/homebrew-tap"
+publish-jobs = ["homebrew"]
+# Name the formula `basil` (not the crate name `basil-bin`) so the install is
+# `brew install openbasil/tap/basil`.
+formula = "basil"
+# Only run `dist plan` on PRs (no artifact uploads).
+pr-run-mode = "plan"
+# Emit GitHub Artifact Attestations (Sigstore build provenance) for all
+# artifacts. Verified with `gh attestation verify` (public repo required).
+github-attestations = true
+# release.yml is deliberately hand-extended beyond what `dist generate` emits
+# (the Debian and Arch-package jobs above). Without this, every dist command
+# fails the CI-freshness check against the generated baseline. Consequence:
+# dist will never auto-update release.yml; after bumping cargo-dist-version,
+# re-run `dist generate` and re-apply the custom jobs (see docs/runbooks/release.md).
+allow-dirty = ["ci"]

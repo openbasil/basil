@@ -1,0 +1,1093 @@
+syntax = "proto3";
+
+// Basil broker API, version 1.
+//
+// The broker brokers cryptographic *operations* (sign, verify, encrypt,
+// decrypt, wrap, mint, issue) over key material that never leaves the vault.
+// Every RPC names a catalog key/secret by its dotted `*_id`; the broker
+// resolves it, checks policy against the caller's attested identity, and
+// performs the operation in place. Public keys, ciphertext, tokens, and
+// certificates come back; private key material does not (the sole exception is
+// `IssueCertificate`, which by design releases a freshly-minted leaf private
+// key to the caller).
+package basil.broker.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/struct.proto";
+
+// Asymmetric key type for key creation, import, signing, and minting.
+enum KeyType {
+  // Unset; rejected by the broker.
+  KEY_TYPE_UNSPECIFIED = 0;
+  // Raw Ed25519 signing key.
+  KEY_TYPE_ED25519 = 1;
+  // Ed25519 wrapped in the NATS `NKey` envelope (needs a `nats_type` label).
+  KEY_TYPE_ED25519_NKEY = 2;
+  // RSA-2048.
+  KEY_TYPE_RSA_2048 = 3;
+  // ECDSA P-256.
+  KEY_TYPE_ECDSA_P256 = 10;
+  // ECDSA P-384.
+  KEY_TYPE_ECDSA_P384 = 11;
+  // ECDSA P-521.
+  KEY_TYPE_ECDSA_P521 = 12;
+  // ML-DSA (FIPS 204) post-quantum signatures, parameter set 44.
+  KEY_TYPE_ML_DSA_44 = 4;
+  // ML-DSA parameter set 65.
+  KEY_TYPE_ML_DSA_65 = 5;
+  // ML-DSA parameter set 87.
+  KEY_TYPE_ML_DSA_87 = 6;
+  // ML-KEM (FIPS 203) post-quantum key encapsulation, parameter set 512.
+  KEY_TYPE_ML_KEM_512 = 7;
+  // ML-KEM parameter set 768.
+  KEY_TYPE_ML_KEM_768 = 8;
+  // ML-KEM parameter set 1024.
+  KEY_TYPE_ML_KEM_1024 = 9;
+  reserved 13 to 31;
+}
+
+// Signature scheme for `Sign`/`Verify`. `UNSPECIFIED` lets the broker pick the
+// scheme implied by the key's catalog type.
+enum SigningAlgorithm {
+  // Unset; the broker derives the scheme from the key type.
+  SIGNING_ALGORITHM_UNSPECIFIED = 0;
+  // Raw Ed25519 (EdDSA over the message).
+  SIGNING_ALGORITHM_ED25519 = 1;
+  // Ed25519 over a NATS `NKey` signing input.
+  SIGNING_ALGORITHM_ED25519_NKEY = 2;
+  // RSASSA-PKCS1-v1_5 over SHA-256.
+  SIGNING_ALGORITHM_RS256 = 3;
+  // ECDSA P-256 over SHA-256.
+  SIGNING_ALGORITHM_ES256 = 7;
+  // ML-DSA parameter set 44.
+  SIGNING_ALGORITHM_ML_DSA_44 = 4;
+  // ML-DSA parameter set 65.
+  SIGNING_ALGORITHM_ML_DSA_65 = 5;
+  // ML-DSA parameter set 87.
+  SIGNING_ALGORITHM_ML_DSA_87 = 6;
+  reserved 8 to 31;
+}
+
+// NATS JWT claim shape for validated arbitrary NATS JWT signing.
+enum NatsJwtType {
+  // No caller assertion; derive the type from `claims.nats.type`.
+  NATS_JWT_TYPE_UNSPECIFIED = 0;
+  // `nats.type=user`.
+  NATS_JWT_TYPE_USER = 1;
+  // `nats.type=account`.
+  NATS_JWT_TYPE_ACCOUNT = 2;
+  // `nats.type=operator`.
+  NATS_JWT_TYPE_OPERATOR = 3;
+  // `nats.type=signer`.
+  NATS_JWT_TYPE_SIGNER = 4;
+  // `nats.type=server`.
+  NATS_JWT_TYPE_SERVER = 5;
+  // `nats.type=curve`.
+  NATS_JWT_TYPE_CURVE = 6;
+  reserved 7 to 31;
+}
+
+// How SignNatsJwt handles a supplied but incorrect NATS `jti`.
+enum NatsJtiMode {
+  // Insert a missing `jti`, but reject a supplied value that does not match the
+  // NATS standard-claim hash.
+  NATS_JTI_MODE_REQUIRE_VALID = 0;
+  // Insert or replace `jti` with the computed NATS standard-claim hash.
+  NATS_JTI_MODE_REWRITE = 1;
+}
+
+// Result of validating a presented NATS JWT.
+enum NatsJwtValidationReason {
+  // Unset; not returned by the broker.
+  NATS_JWT_VALIDATION_REASON_UNSPECIFIED = 0;
+  // Token is valid under the supplied candidate signer set.
+  NATS_JWT_VALIDATION_REASON_VALID = 1;
+  // Compact JWT syntax, header, claims, issuer, or signature encoding is malformed.
+  NATS_JWT_VALIDATION_REASON_MALFORMED = 2;
+  // The signer matched, but the Ed25519 signature is invalid.
+  NATS_JWT_VALIDATION_REASON_BAD_SIGNATURE = 3;
+  // No supplied candidate signer matched the token's embedded `iss`.
+  NATS_JWT_VALIDATION_REASON_UNKNOWN_SIGNER = 4;
+  // The token is expired.
+  NATS_JWT_VALIDATION_REASON_EXPIRED = 5;
+  // The token's `nbf` is in the future.
+  NATS_JWT_VALIDATION_REASON_NOT_YET_VALID = 6;
+  // The token's `nats.type` does not match `expected_type`.
+  NATS_JWT_VALIDATION_REASON_WRONG_TYPE = 7;
+  reserved 8 to 31;
+}
+
+// AEAD suite for `Encrypt`/`Decrypt`. Basil owns the nonce in every case.
+enum AeadAlgorithm {
+  // Unset; the broker rejects it on encrypt and treats it as the default on
+  // decrypt for forward compatibility.
+  AEAD_ALGORITHM_UNSPECIFIED = 0;
+  // ChaCha20-Poly1305 (12-byte nonce, 16-byte tag).
+  AEAD_ALGORITHM_CHACHA20_POLY1305 = 1;
+  // AES-256-GCM (12-byte nonce, 16-byte tag).
+  AEAD_ALGORITHM_AES_256_GCM = 2;
+  reserved 3 to 15;
+}
+
+// Key-encapsulation mechanism for `WrapEnvelope`/`UnwrapEnvelope`.
+enum KemAlgorithm {
+  // Unset; rejected by the broker.
+  KEM_ALGORITHM_UNSPECIFIED = 0;
+  // ML-KEM (FIPS 203) parameter set 512.
+  KEM_ALGORITHM_ML_KEM_512 = 1;
+  // ML-KEM parameter set 768.
+  KEM_ALGORITHM_ML_KEM_768 = 2;
+  // ML-KEM parameter set 1024.
+  KEM_ALGORITHM_ML_KEM_1024 = 3;
+  // X25519 sealed box (ECDH + HKDF-SHA256 + AEAD). The `encapsulated_key` field
+  // of `KemEnvelope` carries the 32-byte ephemeral X25519 public key.
+  KEM_ALGORITHM_X25519 = 4;
+  reserved 5 to 31;
+}
+
+// AEAD that seals the payload under the KEM-derived key in an envelope.
+enum EnvelopeAlgorithm {
+  // Unset; rejected by the broker.
+  ENVELOPE_ALGORITHM_UNSPECIFIED = 0;
+  // AES-256-GCM.
+  ENVELOPE_ALGORITHM_AES_256_GCM = 1;
+  // ChaCha20-Poly1305.
+  ENVELOPE_ALGORITHM_CHACHA20_POLY1305 = 2;
+  reserved 3 to 31;
+}
+
+// The class of a catalog entry, returned by `ListCatalog`.
+enum CatalogKind {
+  // Unset.
+  CATALOG_KIND_UNSPECIFIED = 0;
+  // An asymmetric signing key.
+  CATALOG_KIND_SIGNING = 1;
+  // An opaque secret value.
+  CATALOG_KIND_VALUE = 2;
+  // A symmetric AEAD encryption key.
+  CATALOG_KIND_ENCRYPTION = 3;
+}
+
+// BYOK key material for `Import`/`ImportSet`. Write-only: it is accepted into
+// the vault but never returned by any RPC.
+message KeyMaterial {
+  // The supplied private key material, tagged by encoding.
+  oneof material {
+    // 32-byte raw Ed25519 seed.
+    bytes ed25519_seed = 1;
+    // Generic PKCS#8 DER private key.
+    bytes pkcs8_der = 2;
+  }
+}
+
+// Self-describing AEAD ciphertext from `Encrypt`, consumed by `Decrypt`. The
+// broker owns the nonce, so a caller can neither choose nor misuse it.
+message CiphertextEnvelope {
+  // AEAD suite used.
+  AeadAlgorithm alg = 1;
+  // Key version the ciphertext was produced under.
+  uint32 key_version = 2;
+  // Broker-generated nonce.
+  bytes nonce = 3;
+  // AEAD ciphertext, including the authentication tag.
+  bytes ciphertext = 4;
+}
+
+// A KEM + AEAD envelope from `WrapEnvelope`, consumed by `UnwrapEnvelope`.
+message KemEnvelope {
+  // KEM used to encapsulate the data-encryption key.
+  KemAlgorithm kem_algorithm = 1;
+  // AEAD that sealed the payload under the encapsulated key.
+  EnvelopeAlgorithm envelope_algorithm = 2;
+  // Key version the recipient key was at.
+  uint32 key_version = 3;
+  // KEM ciphertext / ephemeral public key carrying the encapsulated key.
+  bytes encapsulated_key = 4;
+  // AEAD nonce.
+  bytes nonce = 5;
+  // AEAD ciphertext, including the authentication tag.
+  bytes ciphertext = 6;
+}
+
+// One visible catalog entry, streamed by `ListCatalog`.
+message CatalogEntry {
+  // Dotted catalog name.
+  string name = 1;
+  // Entry class (signing key, value, or encryption key).
+  CatalogKind kind = 2;
+  // Key type, present for signing/encryption keys; absent for opaque values.
+  optional KeyType key_type = 3;
+  // Latest version visible to the caller.
+  uint32 latest_version = 4;
+}
+
+// Transport-neutral sealed invocation request. The message is a complete tagged
+// COSE_Sign1 value carrying the Basil invocation request profile.
+message SealedRequest {
+  // Complete tagged COSE_Sign1 bytes, exactly as received.
+  bytes message = 1;
+}
+
+// Transport-neutral sealed invocation response.
+message SealedResponse {
+  // Complete tagged COSE_Sign1 bytes to return to the caller.
+  bytes message = 1;
+  // Optional protocol response subject requested by the sealed request.
+  optional string response_subject = 2;
+}
+
+// Disabled-by-default transport-neutral invocation service. Local clients keep
+// using the typed gRPC services over Unix sockets.
+service InvocationService {
+  // Submit a sealed invocation message.
+  rpc Invoke(SealedRequest) returns (SealedResponse);
+}
+
+// Create, import, and use asymmetric signing keys. Private key material is
+// generated or imported into the vault and never returned.
+service SigningService {
+  // Generate a new key under a catalog name.
+  rpc NewKey(NewKeyRequest) returns (NewKeyResponse);
+  // Import caller-supplied key material under a catalog name.
+  rpc Import(ImportRequest) returns (NewKeyResponse);
+  // Import several keys in one authorized call.
+  rpc ImportSet(ImportSetRequest) returns (ImportSetResponse);
+  // Sign a message with a catalog key (the key signs in place).
+  rpc Sign(SignRequest) returns (SignResponse);
+  // Verify a signature with a catalog key.
+  rpc Verify(VerifyRequest) returns (VerifyResponse);
+  // Fetch a key's public half by catalog name and optional version.
+  rpc GetPublicKey(GetPublicKeyRequest) returns (GetPublicKeyResponse);
+}
+
+// Request to generate a new key.
+message NewKeyRequest {
+  // Catalog name to create the key under.
+  string key_id = 1;
+  // Key type to generate.
+  KeyType key_type = 2;
+}
+
+// Result of creating or importing a single key.
+message NewKeyResponse {
+  // Catalog name the key is stored under.
+  string key_id = 1;
+  // The key's public half (empty for value/symmetric keys).
+  bytes public_key = 2;
+}
+
+// Request to import caller-supplied key material.
+message ImportRequest {
+  // Catalog name to store the key under.
+  string key_id = 1;
+  // The key's type.
+  KeyType key_type = 2;
+  // The private key material to import.
+  KeyMaterial material = 3;
+}
+
+// One key to import as part of an `ImportSet` batch.
+message ImportEntry {
+  // Catalog name to store the key under.
+  string key_id = 1;
+  // The key's type.
+  KeyType key_type = 2;
+  // The private key material to import.
+  KeyMaterial material = 3;
+}
+
+// Import several keys in one call (e.g. an nsc-init bundle: operator + SYS
+// account + SYS user, or account + account-signing-key). Authorization is
+// all-or-nothing (every entry is policy-checked before any import), but the
+// imports themselves are sequential, not transactional.
+message ImportSetRequest {
+  // The keys to import, in order.
+  repeated ImportEntry entries = 1;
+}
+
+// One imported key in an `ImportSet` result.
+message ImportedKey {
+  // Catalog name the key was stored under.
+  string key_id = 1;
+  // The key's public half.
+  bytes public_key = 2;
+}
+
+// Result of an `ImportSet`, one entry per imported key in request order.
+message ImportSetResponse {
+  // The imported keys.
+  repeated ImportedKey keys = 1;
+}
+
+// Request to sign a message.
+message SignRequest {
+  // Catalog name of the signing key.
+  string key_id = 1;
+  // The raw bytes to be signed. This is the message itself, NOT a precomputed
+  // digest: the broker signs the input as-is and does no caller-directed
+  // prehashing. For NATS this can be either a server nonce or the complete
+  // JWT signing input (`base64url(header).base64url(claims)`) for a caller-built
+  // rich claim.
+  bytes message = 2;
+  // Signature scheme; `UNSPECIFIED` lets the broker pick from the key type.
+  SigningAlgorithm algorithm = 3;
+}
+
+// A produced signature.
+message SignResponse {
+  // The raw signature bytes.
+  bytes signature = 1;
+}
+
+// Request to verify a signature.
+message VerifyRequest {
+  // Catalog name of the verifying key.
+  string key_id = 1;
+  // The raw signed message (see `SignRequest.message`).
+  bytes message = 2;
+  // The signature to check.
+  bytes signature = 3;
+  // Signature scheme; `UNSPECIFIED` lets the broker pick from the key type.
+  SigningAlgorithm algorithm = 4;
+}
+
+// The outcome of a verification.
+message VerifyResponse {
+  // Whether the signature is valid for the message and key.
+  bool valid = 1;
+}
+
+// Request for a key's public half.
+message GetPublicKeyRequest {
+  // Catalog name of the key.
+  string key_id = 1;
+  // Specific version to fetch; absent = the latest visible version.
+  optional uint32 version = 2;
+}
+
+// A key's public half and metadata.
+message GetPublicKeyResponse {
+  // Catalog name of the key.
+  string key_id = 1;
+  // The key's type.
+  KeyType key_type = 2;
+  // The public key bytes.
+  bytes public_key = 3;
+  // The version these bytes belong to.
+  uint32 version = 4;
+}
+
+// Authenticated encryption with broker-owned nonces, plus KEM enveloping.
+service AeadService {
+  // Encrypt plaintext; the broker generates the nonce.
+  rpc Encrypt(EncryptRequest) returns (EncryptResponse);
+  // Decrypt a Basil ciphertext envelope.
+  rpc Decrypt(DecryptRequest) returns (DecryptResponse);
+  // Wrap plaintext under a KEM recipient key.
+  rpc WrapEnvelope(WrapEnvelopeRequest) returns (WrapEnvelopeResponse);
+  // Unwrap a KEM envelope.
+  rpc UnwrapEnvelope(UnwrapEnvelopeRequest) returns (UnwrapEnvelopeResponse);
+  // Open a COSE_Encrypt sealed to a backend-custodied X25519 recipient key.
+  rpc UnsealCose(UnsealCoseRequest) returns (UnsealCoseResponse);
+}
+
+// Request to encrypt plaintext.
+message EncryptRequest {
+  // Catalog name of the encryption key.
+  string key_id = 1;
+  // AEAD suite to use.
+  AeadAlgorithm algorithm = 2;
+  // The plaintext to encrypt.
+  bytes plaintext = 3;
+  // Optional additional authenticated data (bound but not encrypted).
+  optional bytes aad = 4;
+  reserved 5;
+}
+
+// The produced ciphertext envelope.
+message EncryptResponse {
+  // Self-describing ciphertext (suite, key version, nonce, ciphertext).
+  CiphertextEnvelope envelope = 1;
+}
+
+// Request to decrypt a ciphertext envelope.
+message DecryptRequest {
+  // Catalog name of the encryption key.
+  string key_id = 1;
+  // The ciphertext envelope to decrypt.
+  CiphertextEnvelope envelope = 2;
+  // Additional authenticated data; must match what `Encrypt` was given.
+  optional bytes aad = 3;
+}
+
+// The recovered plaintext.
+message DecryptResponse {
+  // The decrypted plaintext.
+  bytes plaintext = 1;
+}
+
+// Request to wrap plaintext under a KEM recipient key.
+message WrapEnvelopeRequest {
+  // Catalog name of the recipient KEM key.
+  string key_id = 1;
+  // KEM used to encapsulate the data-encryption key.
+  KemAlgorithm kem_algorithm = 2;
+  // AEAD that seals the payload under the encapsulated key.
+  EnvelopeAlgorithm envelope_algorithm = 3;
+  // The plaintext to wrap.
+  bytes plaintext = 4;
+  // Optional additional authenticated data.
+  optional bytes aad = 5;
+}
+
+// The produced KEM envelope.
+message WrapEnvelopeResponse {
+  // The KEM + AEAD envelope.
+  KemEnvelope envelope = 1;
+}
+
+// Request to unwrap a KEM envelope.
+message UnwrapEnvelopeRequest {
+  // Catalog name of the recipient KEM key.
+  string key_id = 1;
+  // The envelope to unwrap.
+  KemEnvelope envelope = 2;
+  // Additional authenticated data; must match what `WrapEnvelope` was given.
+  optional bytes aad = 3;
+}
+
+// The recovered plaintext.
+message UnwrapEnvelopeResponse {
+  // The unwrapped plaintext.
+  bytes plaintext = 1;
+}
+
+// Request to unseal a strict-profile COSE_Encrypt message.
+message UnsealCoseRequest {
+  // Catalog name of the recipient sealing key.
+  string key_id = 1;
+  // Complete tagged COSE_Encrypt bytes, exactly as received.
+  bytes cose_encrypt = 2;
+  // Encryption-layer external AAD; must match what the sender bound.
+  optional bytes external_aad = 3;
+}
+
+// The recovered COSE plaintext.
+message UnsealCoseResponse {
+  // The unsealed plaintext.
+  bytes plaintext = 1;
+}
+
+// Store, fetch, rotate, and list opaque secrets and catalog entries.
+service SecretService {
+  // Fetch a secret payload by id and optional version.
+  rpc GetSecret(GetSecretRequest) returns (GetSecretResponse);
+  // Store a secret payload, creating a new version.
+  rpc SetSecret(SetSecretRequest) returns (SetSecretResponse);
+  // Rotate a secret to a new version.
+  rpc RotateSecret(RotateSecretRequest) returns (RotateSecretResponse);
+  // Stream the catalog entries visible to the caller.
+  rpc ListCatalog(ListCatalogRequest) returns (stream CatalogEntry);
+}
+
+// Request to fetch a secret.
+message GetSecretRequest {
+  // Catalog name of the secret.
+  string secret_id = 1;
+  // Specific version to fetch; absent = the latest visible version.
+  optional uint32 version = 2;
+}
+
+// A fetched secret.
+message GetSecretResponse {
+  // The raw secret bytes.
+  bytes value = 1;
+  // The version these bytes were read from.
+  uint32 version = 2;
+}
+
+// Request to store a secret.
+message SetSecretRequest {
+  // Catalog name of the secret.
+  string secret_id = 1;
+  // The bytes to store.
+  bytes value = 2;
+}
+
+// The version created by a store.
+message SetSecretResponse {
+  // The newly created version number.
+  uint32 version = 1;
+}
+
+// Request to rotate a secret.
+message RotateSecretRequest {
+  // Catalog name of the secret to rotate.
+  string secret_id = 1;
+}
+
+// The version created by a rotation.
+message RotateSecretResponse {
+  // The newly created version number.
+  uint32 version = 1;
+}
+
+// Request to list catalog entries.
+message ListCatalogRequest {
+  // Optional dotted-name prefix to filter by; absent = all visible entries.
+  optional string prefix = 1;
+}
+
+// Mint short-lived generic JWT credentials and issue X.509 leaves, each signed
+// in place by a catalog key.
+service MintingService {
+  // Mint a generic JWT with caller-supplied claims.
+  rpc MintJwt(MintJwtRequest) returns (CredentialResponse);
+  // Issue a DNS/IP-SAN X.509 leaf certificate from a backend PKI role.
+  rpc IssueCertificate(IssueCertificateRequest) returns (IssueCertificateResponse);
+}
+
+// NATS identity and JWT operations.
+service NatsService {
+  // Mint a NATS user JWT signed by an account key.
+  rpc MintNatsUser(MintNatsUserRequest) returns (CredentialResponse);
+  // Mint a NATS account JWT signed by an operator key (or self-signed).
+  rpc MintNatsAccount(MintNatsAccountRequest) returns (CredentialResponse);
+  // Mint a NATS operator JWT (usually self-signed).
+  rpc MintNatsOperator(MintNatsOperatorRequest) returns (CredentialResponse);
+  // Mint a NATS account/operator signing-key JWT.
+  rpc MintNatsSigner(MintNatsSignerRequest) returns (CredentialResponse);
+  // Mint a NATS server JWT.
+  rpc MintNatsServer(MintNatsServerRequest) returns (CredentialResponse);
+  // Mint a NATS curve (x25519 xkey) JWT.
+  rpc MintNatsCurve(MintNatsCurveRequest) returns (CredentialResponse);
+  // Encrypt a payload with a custodied NATS curve xkey to a peer xkey.
+  rpc EncryptNatsCurve(EncryptNatsCurveRequest) returns (EncryptNatsCurveResponse);
+  // Decrypt a NATS curve xkey box from a peer xkey.
+  rpc DecryptNatsCurve(DecryptNatsCurveRequest) returns (DecryptNatsCurveResponse);
+  // Validate and sign a caller-supplied NATS JWT claim document.
+  rpc SignNatsJwt(SignNatsJwtRequest) returns (CredentialResponse);
+  // Validate a caller-supplied NATS JWT against candidate signers.
+  rpc ValidateNatsJwt(ValidateNatsJwtRequest) returns (ValidateNatsJwtResponse);
+}
+
+// Request to mint a generic JWT.
+message MintJwtRequest {
+  // Catalog name of the signing key.
+  string key_id = 1;
+  // JWT subject (`sub`); required by the generic minter.
+  optional string subject = 2;
+  // Time-to-live; sets `exp` relative to issue time. Absent = non-expiring.
+  google.protobuf.Duration ttl = 3;
+  // Additional, non-reserved claims to embed.
+  google.protobuf.Struct claims = 4;
+}
+
+// Request to mint a NATS user JWT (issued by an account key).
+message MintNatsUserRequest {
+  // Catalog name of the issuing account signing key.
+  string key_id = 1;
+  // Subject user public NKey (`U…`) the credential is for.
+  string subject_user_nkey = 2;
+  // Human-readable user name (the `name` claim).
+  string name = 3;
+  // Time-to-live; absent = non-expiring.
+  google.protobuf.Duration ttl = 4;
+  // Subjects the user may publish to (empty = unrestricted).
+  repeated string pub_allow = 5;
+  // Subjects the user may not publish to.
+  repeated string pub_deny = 6;
+  // Subjects the user may subscribe to (empty = unrestricted).
+  repeated string sub_allow = 7;
+  // Subjects the user may not subscribe to.
+  repeated string sub_deny = 8;
+  // Account identity public NKey (`A…`) that owns the signing key. REQUIRED when
+  // `key_id` is an account *signing* key (not the account identity key): it
+  // populates the `nats.issuer_account` claim so nats-server can bind the minted
+  // user to its account. Omit when `key_id` is the account identity key itself.
+  optional string issuer_account = 9;
+}
+
+// Request to mint a NATS account JWT (issued by an operator key).
+message MintNatsAccountRequest {
+  // Catalog name of the issuing operator signing key.
+  string key_id = 1;
+  // Subject account public NKey (`A…`) the credential is for.
+  string subject_account_nkey = 2;
+  // Human-readable account name.
+  string name = 3;
+  // Time-to-live; absent = non-expiring.
+  google.protobuf.Duration ttl = 4;
+  // Account signing keys (`A…`) authorized to sign on the account's behalf.
+  repeated string signing_keys = 5;
+}
+
+// Request to mint a NATS operator JWT.
+message MintNatsOperatorRequest {
+  // Catalog name of the issuing operator signing key.
+  string key_id = 1;
+  // Subject operator public NKey (`O…`); absent = self-signed (sub == iss).
+  optional string subject_operator_nkey = 2;
+  // Human-readable operator name.
+  string name = 3;
+  // Time-to-live; absent = non-expiring.
+  google.protobuf.Duration ttl = 4;
+  // Operator signing keys (`O…`).
+  repeated string signing_keys = 5;
+  // Account-resolver / account-server URL.
+  optional string account_server_url = 6;
+  // System account public NKey (`A…`).
+  optional string system_account = 7;
+}
+
+// Request to mint a NATS account/operator signing-key JWT.
+message MintNatsSignerRequest {
+  // Catalog name of the issuing account or operator signing key.
+  string key_id = 1;
+  // Subject signing-key public NKey; shares the issuer's role.
+  string subject_nkey = 2;
+  // Human-readable name.
+  string name = 3;
+  // Time-to-live; absent = non-expiring.
+  google.protobuf.Duration ttl = 4;
+}
+
+// Request to mint a NATS server JWT.
+message MintNatsServerRequest {
+  // Catalog name of the issuing signing key.
+  string key_id = 1;
+  // Subject server public NKey (`N…`).
+  string subject_server_nkey = 2;
+  // Human-readable server name.
+  string name = 3;
+  // Time-to-live; absent = non-expiring.
+  google.protobuf.Duration ttl = 4;
+}
+
+// Request to mint a NATS curve (x25519 xkey) JWT.
+message MintNatsCurveRequest {
+  // Catalog name of the issuing signing key.
+  string key_id = 1;
+  // Subject curve public NKey (`X…`).
+  string subject_curve_nkey = 2;
+  // Human-readable name.
+  string name = 3;
+  // Time-to-live; absent = non-expiring.
+  google.protobuf.Duration ttl = 4;
+}
+
+// Request to encrypt with a custodied NATS curve xkey.
+message EncryptNatsCurveRequest {
+  // Catalog name of the sender xkey (`class=sealing`, `keyType=x25519`).
+  string key_id = 1;
+  // Recipient public curve NKey (`X...`).
+  string recipient_public_xkey = 2;
+  // Plaintext to encrypt.
+  bytes plaintext = 3;
+}
+
+// Response from NATS curve encryption.
+message EncryptNatsCurveResponse {
+  // `xkv1 || nonce || XSalsa20-Poly1305 ciphertext`.
+  bytes ciphertext = 1;
+}
+
+// Request to decrypt with a custodied NATS curve xkey.
+message DecryptNatsCurveRequest {
+  // Catalog name of the recipient xkey (`class=sealing`, `keyType=x25519`).
+  string key_id = 1;
+  // Sender public curve NKey (`X...`).
+  string sender_public_xkey = 2;
+  // `xkv1 || nonce || XSalsa20-Poly1305 ciphertext`.
+  bytes ciphertext = 3;
+}
+
+// Response from NATS curve decryption.
+message DecryptNatsCurveResponse {
+  // Recovered plaintext.
+  bytes plaintext = 1;
+}
+
+// Request to validate and sign a rich NATS JWT claim document. The broker
+// derives `iss` from the signing key's public half and catalog `nats_type` label,
+// validates `sub` and `nats.type`, computes NATS `jti`, and signs with the fixed
+// `ed25519-nkey` NATS JWS profile.
+message SignNatsJwtRequest {
+  // Catalog name of the NATS signing key.
+  string key_id = 1;
+  // UTF-8 encoded full NATS JWT claims JSON object. Must contain `sub` and
+  // `nats`; `name` is optional following upstream NATS `omitempty` semantics.
+  bytes claims_json = 2;
+  // Optional assertion against `claims.nats.type`.
+  NatsJwtType expected_type = 3;
+  // Relative lifetime. Mutually exclusive with `expires_at`.
+  google.protobuf.Duration ttl = 4;
+  // Absolute expiry. Mutually exclusive with `ttl`.
+  google.protobuf.Timestamp expires_at = 5;
+  // Issued-at time; absent = broker time unless claims already carries `iat`.
+  google.protobuf.Timestamp issued_at = 6;
+  // Whether to reject or rewrite a mismatched supplied `jti`.
+  NatsJtiMode jti_mode = 7;
+}
+
+// A candidate signer for NATS JWT validation.
+message AllowedNatsSigner {
+  oneof signer {
+    // Catalog key name. The broker resolves its public key and NATS role.
+    string key_id = 1;
+    // Raw public NKey (`A…`, `O…`, `U…`, etc.).
+    string nats_public_key = 2;
+  }
+}
+
+// Request to validate a caller-supplied NATS JWT.
+message ValidateNatsJwtRequest {
+  // Compact NATS JWT.
+  string jwt = 1;
+  // Candidate trust roots. Must be non-empty.
+  repeated AllowedNatsSigner allowed_signers = 2;
+  // Optional expected `nats.type`.
+  NatsJwtType expected_type = 3;
+}
+
+// Response from NATS JWT validation.
+message ValidateNatsJwtResponse {
+  // True only when `reason` is VALID.
+  bool valid = 1;
+  // Machine-readable validation result.
+  NatsJwtValidationReason reason = 2;
+  // Extracted `sub`, when the token was parseable.
+  string subject = 3;
+  // Extracted `iss`, when the token was parseable.
+  string issuer = 4;
+  // Catalog key id that matched, when the matching candidate was a key id.
+  string matched_signer_key_id = 5;
+  // Extracted `nats.type`.
+  NatsJwtType jwt_type = 6;
+  // Extracted `exp`, when present.
+  uint64 expires_at_unix = 7;
+  // Extracted `iat`, when present.
+  uint64 issued_at_unix = 8;
+}
+
+// A minted credential (JWT/NATS token) and its expiry.
+message CredentialResponse {
+  // The compact token.
+  string token = 1;
+  // Absolute expiry; absent when the credential does not expire.
+  optional google.protobuf.Timestamp expires_at = 2;
+}
+
+// Issue a DNS/IP-SAN X.509 leaf (a TLS cert, not a SPIFFE SVID) from a backend
+// PKI role. The issuing CA key never leaves the backend; the leaf private key is
+// returned to the caller because a TLS server needs it to terminate connections.
+message IssueCertificateRequest {
+  // Catalog name of the issuing CA key (a `pki` issue role).
+  string issuer_key_id = 1;
+  // Certificate common name.
+  string common_name = 2;
+  // DNS subject alternative names.
+  repeated string dns_sans = 3;
+  // IP subject alternative names.
+  repeated string ip_sans = 4;
+  // Certificate lifetime.
+  google.protobuf.Duration ttl = 5;
+}
+
+// An issued X.509 leaf, its private key, and its trust chain.
+message IssueCertificateResponse {
+  // DER leaf certificate followed by any issuer certificates.
+  repeated bytes cert_chain_der = 1;
+  // DER PKCS#8 leaf private key (released to the caller).
+  bytes private_key_der = 2;
+  // DER issuing-CA / trust-bundle certificates.
+  repeated bytes ca_chain_der = 3;
+}
+
+// Broker introspection and change notifications.
+service AdminService {
+  // Report backend, version, and protocol.
+  rpc Status(StatusRequest) returns (StatusResponse);
+  // Liveness: is the broker process up and serving the socket? Cheap,
+  // always-answerable, never touches a backend. A successful response means the
+  // daemon is alive; it says nothing about whether it can serve data-plane ops.
+  rpc Health(HealthRequest) returns (HealthResponse);
+  // Readiness: can the broker actually serve? Probes per-backend reachability
+  // and every catalog key's material, and reports whether serving would fail
+  // closed (an unreachable backend, or a `missing=error` key whose material is
+  // absent). The detail is a non-secret SUMMARY (counts + a coarse reason): it
+  // never returns key names, key material, or the catalog inventory.
+  rpc Readiness(ReadinessRequest) returns (ReadinessResponse);
+  // Stream change events (key rotations, bundle changes, revocations).
+  rpc Watch(WatchRequest) returns (stream Event);
+  // Hot-reload the catalog/policy generation FROM DISK (basil-atq). The broker
+  // re-reads the catalog/policy from the same on-disk paths it was started with,
+  // runs the full startup/`check` validation, and, on success, atomically swaps
+  // in a new generation. This RPC is permission-gated by a dedicated `reload`
+  // policy op (NOT implied by any data-plane grant) and peer-cred attested; both
+  // the success (generation change) and a denial are audited.
+  //
+  // TRUST BOUNDARY: the request carries NO catalog/policy bytes: the only input
+  // is `check` (dry-run). Config is taken from disk (Nix/root-owned) only, so the
+  // wire can never inject policy. A `check=true` request validates the candidate
+  // and reports the would-be outcome WITHOUT swapping the serving generation.
+  rpc Reload(ReloadRequest) returns (ReloadResponse);
+  // Explain a policy decision against the currently serving generation. This is
+  // permission-gated by a dedicated `explain` admin op over `broker.explain`
+  // because it exposes policy reachability; no data-plane grant implies it.
+  rpc Explain(ExplainRequest) returns (ExplainResponse);
+  // Persist and publish a JWT-SVID revocation. This is permission-gated by a
+  // dedicated `revoke` admin op over `broker.revoke`; no data-plane grant
+  // implies it. The broker requires a configured `revocation_store=jwt-svid`
+  // backing key so the revocation survives restart.
+  rpc Revoke(RevokeRequest) returns (RevokeResponse);
+}
+
+// Request to hot-reload the catalog/policy generation from disk.
+//
+// Deliberately minimal: it carries NO catalog/policy content. The broker always
+// re-reads config from the configured on-disk paths; the wire cannot supply or
+// override it (a policy-injection trust boundary, enforced by construction:
+// there is simply no field for config here).
+message ReloadRequest {
+  // Dry-run: validate the on-disk candidate (re-read + full validation + the
+  // restart-only routing-shape guard) and report the would-be outcome WITHOUT
+  // swapping the serving generation. `false` performs the real validate-then-swap.
+  bool check = 1;
+}
+
+// Result of an admin `Reload`. On a validation/routing rejection the previous
+// generation keeps serving; the RPC returns `OK` with `applied = false` and a
+// `rejection` describing why. (Permission-denied is a `PERMISSION_DENIED` status,
+// rather than a body, so the caller never reaches a result here.)
+message ReloadResponse {
+  // Whether a swap occurred. `true` only for a successful non-dry-run reload;
+  // `false` for a dry-run (`check`) or any rejection.
+  bool applied = 1;
+  // Whether this was a dry-run (`check = true`): validated, never swapped.
+  bool checked = 2;
+  // The generation that was serving before this call (and still is, on a dry-run
+  // or rejection).
+  uint64 previous_generation = 3;
+  // The generation now serving (a real, applied reload), or the would-be new
+  // generation (a dry-run that validated). Equals `previous_generation` on a
+  // rejection.
+  uint64 new_generation = 4;
+  // Number of catalog keys in the validated candidate generation.
+  uint32 key_count = 5;
+  // Number of resolved policy allow-grants in the validated candidate generation.
+  uint32 grant_count = 6;
+  // Set only when the candidate was rejected (`applied = false` and not a clean
+  // dry-run). Carries a stable non-secret reason token + a human message.
+  ReloadRejection rejection = 7;
+}
+
+// Why a `Reload` candidate was rejected (the previous generation keeps serving).
+message ReloadRejection {
+  // A stable, non-secret reason token (e.g. `validation_failed`,
+  // `routing_shape_changed`, `catalog_read_failed`, `no_reload_inputs`).
+  string reason = 1;
+  // A human-readable, non-secret message describing the rejection.
+  string message = 2;
+}
+
+// Request for a live policy explanation against the broker's serving generation.
+message ExplainRequest {
+  // Subject name whose effective policy should be evaluated.
+  string subject = 1;
+  // Policy operation token (`get`, `sign`, `set`, ...).
+  string op = 2;
+  // Catalog key/target to evaluate.
+  string key = 3;
+}
+
+// Rule provenance for a live explanation allow decision.
+message MatchedRule {
+  // Policy rule id that matched.
+  string rule = 1;
+  // Scope that matched (`subject:<name>`).
+  string via = 2;
+  // Action token that matched.
+  string action = 3;
+  // Target glob that matched.
+  string target = 4;
+  // The matched policy subject.
+  string subject = 5;
+}
+
+// Live policy explanation. Its shape mirrors `basil config explain --json` for
+// the single-tuple path.
+message ExplainResponse {
+  // Subject name evaluated.
+  string subject = 1;
+  // Operation token evaluated.
+  string op = 2;
+  // Catalog key/target evaluated.
+  string key = 3;
+  // `allow` or `deny`.
+  string decision = 4;
+  // Allow scope (`subject:<name>` or `public_class`); empty on deny.
+  string via = 5;
+  // Deny reason token (`unknown_key`, `not_writable`, `not_permitted`); empty on allow.
+  string reason = 6;
+  // Rule provenance for rule-based allows. Absent for denies and public-class allows.
+  MatchedRule matched_rule = 7;
+}
+
+// Request to revoke a JWT-SVID by its tuple.
+message RevokeRequest {
+  // SPIFFE trust domain for the token issuer, without `spiffe://`.
+  string trust_domain = 1;
+  // JWT ID (`jti`) to deny.
+  string jti = 2;
+  // Unix expiry of the credential. Revocation entries auto-expire at this time.
+  uint64 expires_at_unix = 3;
+}
+
+// Result of a live revocation.
+message RevokeResponse {
+  // Trust domain revoked.
+  string trust_domain = 1;
+  // JWT ID revoked.
+  string jti = 2;
+  // Expiry recorded for the deny-list entry.
+  uint64 expires_at_unix = 3;
+  // Whether the revocation was persisted to the configured backing store.
+  bool persisted = 4;
+}
+
+// Request for broker liveness.
+message HealthRequest {}
+
+// Broker liveness. A returned response is itself the liveness signal: the
+// process is up and serving the socket. No backend I/O is performed.
+message HealthResponse {
+  // Always `true` for a response that was produced (the daemon is alive). The
+  // field is explicit so a future degraded-but-alive state has a home.
+  bool alive = 1;
+  // Broker build version string (matches `StatusResponse.version`).
+  string version = 2;
+}
+
+// Request for broker readiness.
+message ReadinessRequest {}
+
+// Why the broker is not ready to serve (coarse, non-secret category). `READY`
+// when serving would not fail closed; otherwise the dominant blocking reason.
+enum ReadinessReason {
+  // Unset.
+  READINESS_REASON_UNSPECIFIED = 0;
+  // The broker can serve: every backend is reachable and no `missing=error`
+  // key's material is absent.
+  READINESS_REASON_READY = 1;
+  // At least one backend was unreachable (or rejecting) while probing.
+  READINESS_REASON_BACKEND_UNREACHABLE = 2;
+  // At least one `missing=error` key's material is absent, so its ops would
+  // fail closed.
+  READINESS_REASON_REQUIRED_KEY_MISSING = 3;
+}
+
+// Broker readiness: a non-secret operational summary. Never carries key names,
+// key material, or the catalog inventory.
+message ReadinessResponse {
+  // Whether the broker can serve: `true` iff serving would NOT fail closed for
+  // any configured key and every backend is reachable.
+  bool ready = 1;
+  // The dominant reason readiness was decided (a coarse category, not a key
+  // name). `READINESS_REASON_READY` when `ready` is `true`.
+  ReadinessReason reason = 2;
+  // The id of the currently serving policy/catalog generation (monotonic,
+  // bumped on each successful hot reload).
+  uint64 generation = 3;
+  // Total number of catalog keys probed.
+  uint32 keys_total = 4;
+  // Keys whose material is present in its backend.
+  uint32 keys_present = 5;
+  // Absent keys whose `missing=error` policy makes their ops fail closed (the
+  // count that, when non-zero, makes the broker not ready).
+  uint32 keys_required_missing = 6;
+  // Absent keys whose `missing` policy is `warn` or `generate` (reported for
+  // visibility; they do not by themselves make the broker not ready).
+  uint32 keys_optional_missing = 7;
+}
+
+// Request for broker status.
+message StatusRequest {}
+
+// Broker identity and protocol info.
+message StatusResponse {
+  // Backend identifier the broker is running against (e.g. `vault`).
+  string backend = 1;
+  // Broker build version string.
+  string version = 2;
+  // Wire protocol version number.
+  uint32 protocol = 3;
+}
+
+// Request to watch for change events, optionally filtered by kind.
+message WatchRequest {
+  // Event kinds to receive; empty = all kinds.
+  repeated EventKind kinds = 1;
+}
+
+// The kind of a change `Event`.
+enum EventKind {
+  // Unset.
+  EVENT_KIND_UNSPECIFIED = 0;
+  // A key was rotated to a new version.
+  EVENT_KIND_KEY_ROTATED = 1;
+  // A trust bundle changed.
+  EVENT_KIND_BUNDLE_CHANGED = 2;
+  // A credential was revoked.
+  EVENT_KIND_REVOKED = 3;
+  reserved 4 to 15;
+}
+
+// A change-notification event streamed by `Watch`.
+message Event {
+  // The event kind.
+  EventKind kind = 1;
+  // When the event occurred.
+  google.protobuf.Timestamp at = 2;
+  // Kind-specific detail.
+  oneof detail {
+    // Set when `kind == KEY_ROTATED`.
+    KeyRotated key_rotated = 3;
+    // Set when `kind == BUNDLE_CHANGED`.
+    BundleChanged bundle_changed = 4;
+    // Set when `kind == REVOKED`.
+    Revoked revoked = 5;
+  }
+}
+
+// Detail for a key-rotation event.
+message KeyRotated {
+  // Catalog name of the rotated key.
+  string key_id = 1;
+  // The version the key rotated to.
+  uint32 new_version = 2;
+}
+
+// Detail for a trust-bundle-change event.
+message BundleChanged {
+  // Trust domain whose bundle changed.
+  string trust_domain = 1;
+}
+
+// Detail for a revocation event.
+message Revoked {
+  // Trust domain the revoked credential belongs to.
+  string trust_domain = 1;
+  // Identifier of the revoked credential (e.g. a JWT `jti`).
+  string id = 2;
+}
+
+// Structured error detail attached to a failed RPC's `google.rpc.Status`,
+// carrying the broker's machine-readable reason and the operation that failed.
+message BrokerErrorInfo {
+  // Machine-readable reason code (e.g. `UNAUTHORIZED`, `INVALID_REQUEST`).
+  string reason = 1;
+  // The broker operation that failed (e.g. `sign`, `mint_nats_user`).
+  string op = 2;
+}

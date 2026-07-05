@@ -1,0 +1,503 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Master-Unlock + Sealed-Bundle Format in Basil</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --font-sans: "Noto Sans", ui-sans-serif, system-ui, -apple-system,
+          BlinkMacSystemFont, "Segoe UI", sans-serif;
+        --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas,
+          "Liberation Mono", monospace;
+        --weight-body: 400;
+        --weight-heading: 600;
+        --weight-strong: 600;
+        --code-font-size: 0.875em;
+        --code-block-font-size: 0.875rem;
+
+        --bg: #f7f8fa;
+        --fg: #1f2933;
+        --muted: #5b6776;
+        --panel: #ffffff;
+        --border: #d8dee7;
+        --accent: #1d6f8f;
+        --accent-soft: #e7f4f8;
+        --warn: #7a4d00;
+        --warn-soft: #fff4d6;
+        --review: #6b21a8;
+        --review-soft: #f5ecfb;
+        --code-bg: #eef2f6;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #11161d;
+          --fg: #e6edf3;
+          --muted: #a8b3c1;
+          --panel: #171e27;
+          --border: #2d3948;
+          --accent: #6cc4e0;
+          --accent-soft: #102832;
+          --warn: #ffd37a;
+          --warn-soft: #302610;
+          --review: #d8b4fe;
+          --review-soft: #2a1f38;
+          --code-bg: #202a36;
+          --weight-body: 300;
+          --weight-heading: 500;
+          --weight-strong: 500;
+        }
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--fg);
+        font-family: var(--font-sans);
+        font-weight: var(--weight-body);
+        line-height: 1.55;
+      }
+
+      header, main, footer { width: min(1180px, 90%); margin: 0 auto; }
+      header { padding: 40px 0 18px; }
+      main { padding-bottom: 48px; }
+
+      h1, h2, h3, h4 { line-height: 1.2; letter-spacing: 0; font-weight: var(--weight-heading); }
+      h1 { margin: 0 0 12px; font-size: clamp(2rem, 4vw, 3.2rem); }
+      h2 { margin: 36px 0 14px; padding-top: 8px; font-size: 1.65rem; border-top: 1px solid var(--border); }
+      h3 { margin: 24px 0 10px; font-size: 1.18rem; }
+      h4 { margin: 18px 0 8px; font-size: 1rem; }
+
+      a { color: var(--accent); }
+      strong { font-weight: var(--weight-strong); }
+      p, ul, ol { margin: 0 0 14px; }
+
+      code, pre { font-family: var(--font-mono); }
+      code { padding: 0.08rem 0.24rem; border-radius: 4px; background: var(--code-bg); font-size: var(--code-font-size); }
+      pre code { font-size: inherit; padding: 0; background: none; }
+      pre {
+        overflow-x: auto; padding: 14px 16px; border: 1px solid var(--border);
+        border-radius: 8px; background: var(--code-bg); font-size: var(--code-block-font-size);
+      }
+
+      table { width: 100%; border-collapse: collapse; margin: 14px 0 22px; background: var(--panel); }
+      th, td { vertical-align: top; padding: 10px 12px; border: 1px solid var(--border); text-align: left; }
+      th { background: var(--accent-soft); font-size: 1.05rem; font-weight: 500; }
+
+      dl { display: grid; grid-template-columns: minmax(160px, 260px) 1fr; gap: 8px 18px; margin: 14px 0 22px; }
+      dt { font-weight: var(--weight-strong); }
+      dd { margin: 0; }
+
+      .lede { max-width: 880px; color: var(--muted); font-size: 1.08rem; }
+
+      .note, .warning { border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; background: var(--panel); }
+      .note { border-left: 4px solid var(--accent); }
+      .warning { border-left: 4px solid var(--warn); background: var(--warn-soft); }
+
+      .doc-status {
+        display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+        gap: 10px 18px; align-items: start; margin-top: 18px; padding: 14px 16px;
+        border: 1px solid var(--border); border-left: 4px solid var(--accent);
+        border-radius: 8px; background: var(--panel);
+      }
+      .doc-status-badge {
+        grid-column: 1 / -1; justify-self: start; display: inline-block;
+        font-size: 0.74rem; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase;
+        border-radius: 999px; padding: 2px 12px; border: 1px solid currentColor;
+      }
+      .doc-status.is-plan { border-left-color: var(--review); }
+      .doc-status.is-plan .doc-status-badge { color: var(--review); }
+
+      .toc { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 8px 18px; padding: 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); }
+      .toc ol { margin: 0; padding-left: 20px; }
+
+      footer { padding: 24px 0 40px; color: var(--muted); border-top: 1px solid var(--border); }
+
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Master-Unlock + Sealed-Bundle Format</h1>
+      <p class="lede">
+        Master unlock and sealed bundle format for Basil's own backend bootstrap
+        credentials, replacing plaintext token loading with a multi-slot encrypted
+        bundle.
+      </p>
+      <div class="doc-status is-plan" aria-label="Document status">
+        <span class="doc-status-badge">Design</span>
+        <div><strong>Status</strong><br>design / ratified</div>
+        <div><strong>Issue</strong><br><code>vault-er3</code> (P1)</div>
+        <div><strong>Implementer contract</strong><br><code>vault-vh1</code></div>
+        <div><strong>Review gate</strong><br><code>vault-68w</code></div>
+      </div>
+    </header>
+
+    <main>
+      <nav aria-labelledby="toc-heading">
+        <h2 id="toc-heading">Contents</h2>
+        <div class="toc">
+          <ol>
+            <li><a href="#0-tl-dr">0. TL;DR</a></li>
+            <li><a href="#1-problem-statement-constraints">1. Problem statement &amp; constraints</a></li>
+            <li><a href="#2-sealed-bundle-on-disk-format">2. Sealed-bundle on-disk format</a></li>
+            <li><a href="#3-unlock-method-abstraction-rust-trait-sketch">3. Unlock-method abstraction (Rust trait sketch)</a></li>
+            <li><a href="#4-per-backend-cred-payload-schema">4. Per-backend cred payload schema</a></li>
+          </ol>
+          <ol start="6">
+            <li><a href="#5-startup-flow">5. Startup flow</a></li>
+            <li><a href="#6-recovery-rotation-flows">6. Recovery &amp; rotation flows</a></li>
+            <li><a href="#7-options-considered-chosen-approach-rationale">7. Options considered, chosen approach, rationale</a></li>
+            <li><a href="#8-decisions">8. Decisions</a></li>
+            <li><a href="#9-out-of-scope-deferred-logged-separately-as-ofis">9. Out-of-scope / deferred (logged separately as OFIs)</a></li>
+          </ol>
+        </div>
+      </nav>
+<div class="note">
+<p>Issue: <strong>vault-er3</strong> (P1; labels design, security). Implementer contract for <strong>vault-vh1</strong> (&quot;unlock methods + bundle seal/open + per-backend cred plumbing&quot;). Review gate: <strong>vault-68w</strong>. Status: design / <strong>ratified</strong> (crypto-primitive choices signed off 2026-06-22; see §8). VCS jj. Tracker br. Spec source: <code>edge/docs/designs/secrets-vault.html</code> §8 (Key Hierarchy), §9 (VaultUnlockPolicy), §13 (Security Properties), §17.2 / §17.7 &quot;Unlock &amp; bootstrap&quot;.</p>
+</div>
+<h2 id="0-tl-dr">0. TL;DR</h2>
+<p>The broker is a Unix-socket signing/secrets proxy in front of a Vault-compatible backend (OpenBao or HashiCorp Vault). To <em>talk to</em> its backends it needs its own <strong>bootstrap credentials</strong> (a Vault token / AppRole secret-id today; a db-keystore DEK or other backend creds later). Today those live in plaintext: a <code>--vault-token</code> flag, <code>$VAULT_TOKEN</code>, or <code>~/.vault-token</code>. That is the gap §17.7 &quot;Unlock &amp; bootstrap&quot; closes.</p>
+<p>This document specifies:</p>
+<ul>
+<li>a <strong>pluggable master unlock</strong> that recovers a <strong>master KEK</strong>, and</li>
+<li>a <strong><code>0600</code> multi-slot sealed bundle</strong> the KEK opens, holding a versioned map of per-backend credentials.</li>
+</ul>
+<p>Each unlock method is an independent <strong>slot</strong> that wraps the same master KEK. Methods: <code>age-yubikey-plugin</code> (operator-presence), <code>bip39</code> (break-glass recovery), <code>passphrase</code> (file-sourced Argon2id passphrase), <code>tpm</code> (later). Adding or removing a method rewraps one slot; it never re-encrypts the payload.</p>
+<p>This is <strong>not</strong> the data plane. Data-plane secrets (signing keys, NATS seeds, opaque values) live in the Vault-compatible backend (transit + KV v2); backend seal/unseal + KV versioning already handle DEK/KEK/rotation for <em>data</em> (§17.1). The sealed bundle is a small local store for the broker&#x27;s <em>own</em> bootstrap creds, nothing else.</p>
+<hr>
+<h2 id="1-problem-statement-constraints">1. Problem statement &amp; constraints</h2>
+<h3 id="1-1-what-the-broker-must-hold-at-rest-and-why">1.1 What the broker must hold at rest, and why</h3>
+<p>The broker authenticates <em>to</em> each backend before it can serve any request. Those backend credentials cannot themselves live in a backend the broker can only reach <em>after</em> it authenticates: a bootstrap chicken-and-egg. They must be present locally at process start. Today (<code>crates/basil-agent/src/main.rs</code>) they are:</p>
+<table>
+<thead><tr><th>Cred</th><th>Source today</th><th>Sensitivity</th></tr></thead>
+<tbody>
+<tr><td>Vault-compatible token (<code>X-Vault-Token</code>)</td><td><code>--vault-token</code> / <code>$VAULT_TOKEN</code> / <code>~/.vault-token</code></td><td>Full transit sign/mint authority for every key the broker fronts.</td></tr>
+<tr><td>AppRole <code>secret_id</code> (planned)</td><td>not yet wired</td><td>Equivalent: exchanged for a token.</td></tr>
+<tr><td>SPIFFE/JWT-SVID signing key (planned, <code>--backend spiffe</code>)</td><td>implicit/self-issued today</td><td>Used to obtain a short-lived bao token via the <code>jwt</code> auth method.</td></tr>
+<tr><td>db-keystore DEK (future value-store backend, §17.7)</td><td>n/a yet</td><td>Decrypts a local encrypted DB; equivalent to all values in it.</td></tr>
+</tbody></table>
+<p>Every one of these is a long-lived, high-value secret. A leaked bao token is <em>the</em> keys to the transit engine. Storing it as a world-or-owner-readable plaintext file or in an environment variable (visible via <code>/proc/&lt;pid&gt;/environ</code>, leaked into core dumps, inherited by children) is the weakness this design removes.</p>
+<p>The sealed bundle is the <strong>single local at-rest home</strong> for all of these. The broker unlocks it once at startup, hands each credential to the backend that needs it, and zeroizes the plaintext.</p>
+<p><strong>This implementation replaces the old plaintext path outright.</strong> vault-vh1 removes the <code>--vault-token</code> / <code>$VAULT_TOKEN</code> / <code>~/.vault-token</code> loading and the implicit SPIFFE-flag handling in <code>crates/basil-agent/src/main.rs</code>. There is <strong>no compatibility fallback</strong> to plaintext bootstrap creds: leaving one in place would be permanent technical debt and would defeat the at-rest protection this design exists to provide. The sealed bundle becomes the only supported source of bootstrap credentials.</p>
+<h3 id="1-2-threat-model">1.2 Threat model</h3>
+<p><strong>In scope.</strong> The bundle file and the sealed-method state sit on the broker host&#x27;s persistent disk. We assume an attacker may obtain:</p>
+<ol>
+<li>The <code>0600</code> bundle file itself (backup theft, disk clone, snapshot, lost laptop).</li>
+<li>Read access to the broker&#x27;s runtime as a non-root, non-broker user.</li>
+</ol>
+<p><strong>What an attacker with the bundle file but no unlock method gets:</strong> nothing usable. The payload is AEAD-encrypted under a key (the master KEK) that exists only after a successful unlock. Each slot wraps that KEK under a method-specific key the attacker does not have:</p>
+<ul>
+<li><code>age-yubikey</code> slot: the master KEK is wrapped to an age recipient whose private half is on a YubiKey (PIV/FIDO2). Without the physical token <em>and</em> its PIN/touch, the slot is opaque. A cloned disk does not clone the token (matches §9 <code>removable-token</code> / <code>operator-presence</code>).</li>
+<li><code>bip39</code> slot: wrapped under a key derived (memory-hard KDF) from a 24-word recovery phrase the attacker does not hold (it is printed and stored offline, never on the host).</li>
+<li><code>tpm</code> slot (later): sealed to the TPM + PCR policy of <em>this</em> host; non-exportable, does not move with a disk image.</li>
+<li><code>passphrase</code> slot: the master KEK is wrapped under an Argon2id key derived from a passphrase read from a <code>0600</code> file or systemd credential file. This is production-supported, but operators must protect the file source; Basil best-effort wipes the file after startup unless <code>unlock-passphrase-no-wipe</code> is configured.</li>
+</ul>
+<p><strong>Explicitly out of scope</strong> (document, do not claim to defend):</p>
+<ul>
+<li>An attacker who is <strong>root on a running, already-unlocked broker</strong> can read the live bao token from the broker&#x27;s memory or impersonate it on the socket. The bundle defends <em>at-rest</em> state, not a compromised live host. (This mirrors §13&#x27;s stance and §17.3&#x27;s &quot;only path to the backend&quot; caveat.)</li>
+<li>A <strong>stolen device with the YubiKey attached / PIN cached</strong> unlocks, documented in §9 <code>removable-token</code> risk. <code>operator-presence</code> (touch-per-boot) and <code>tpm</code> raise this bar.</li>
+<li><strong>Physical full-disk rollback</strong> to an older bundle (anti-rollback for the bundle itself is §6.4, best-effort; it is not a TPM-monotonic guarantee, the same scope caveat as §13.1).</li>
+</ul>
+<h3 id="1-3-constraints">1.3 Constraints</h3>
+<ul>
+<li><strong>Secure by default, least privilege</strong> (§17 guiding principles). Bundle file is <code>mode 0600</code>, owned by the broker user, in the broker&#x27;s private runtime/state dir. No env-var or argv path for the unwrapped creds.</li>
+<li><strong>Provider-neutral / generic.</strong> No edge or &quot;realm&quot; terms. Backend ids are opaque strings.</li>
+<li><strong><code>zeroize</code></strong> the master KEK and every materialized credential as early as possible (§5, §17.7 &quot;Audit &amp; process&quot; already mandates zeroize for materialized key bytes).</li>
+<li><strong>Crypto with no footguns</strong> (§17 principle): broker-owned AEAD nonces, no caller-nonce path, versioned format, deny-by-default builds (<code>unsafe_code</code> forbid, pedantic/nursery deny per <code>.agent-notes</code>).</li>
+<li><strong>No runtime panics: fail closed, never crash.</strong> The broker is an <strong>unrestartable service</strong>: a crash, panic, or aborted process halts the entire signing/secrets plane (there is no supervisor that can safely restart it mid-flight). Therefore the unlock/crypto code (and <strong>all</strong> broker runtime code) must contain <strong>no runtime panics</strong>: no <code>unwrap()</code>, <code>expect()</code>, <code>panic!</code>, <code>unreachable!</code>, <code>todo!</code>, <code>unimplemented!</code>, panicking slice/array indexing, or arithmetic overflow on any runtime path. Every fallible step returns a <code>Result</code> and <strong>fails closed gracefully</strong>: a failed unlock produces a clean non-zero exit, never a panic or abort. The only sanctioned process exit is the SIGINT/SIGQUIT shutdown path. This is enforced repo-wide by clippy restriction lints (<code>unwrap_used</code> / <code>expect_used</code> / <code>panic</code> / <code>unreachable</code> / <code>todo</code> / <code>unimplemented</code> / <code>indexing_slicing</code> set to <code>deny</code>, allowed only in <code>#[cfg(test)]</code> code).</li>
+<li>Must compose with the existing <code>tpm2</code>-style feature gating already in the workspace (<code>crates/basil-agent/Cargo.toml</code>).</li>
+</ul>
+<hr>
+<h2 id="2-sealed-bundle-on-disk-format">2. Sealed-bundle on-disk format</h2>
+<h3 id="2-1-goals-of-the-layout">2.1 Goals of the layout</h3>
+<ul>
+<li><strong>Wrapped-DEK / multi-slot envelope</strong> (§8): one symmetric <strong>master KEK</strong> encrypts the payload; <em>N</em> slots each independently wrap that KEK under a different unlock method. Any one slot recovers the KEK (this is how the bundle supports &quot;two or more recovery methods&quot;; see §16 Hub recovery).</li>
+<li>Adding/removing a method = add/remove a slot, <strong>without</strong> re-encrypting the payload.</li>
+<li>Self-describing &amp; versioned so the opener can refuse formats it does not understand.</li>
+<li>Single file, atomically replaceable (write temp in same dir, <code>fsync</code>, <code>rename</code>).</li>
+</ul>
+<h3 id="2-2-file-container">2.2 File container</h3>
+<p>The bundle is a single file at e.g. <code>${STATE_DIR}/bundle.sealed</code> (<code>0600</code>). Encoding is <strong>JSON</strong>: a fixed ASCII magic + <code>u16</code> version prefix, then a JSON body (header + slot table + sealed payload), so the file is greppable and the version is checkable <em>before</em> any deserialization. Binary fields (nonces, ciphertexts, salts, the <code>bundle_id</code>) are <strong>base64, no padding</strong> (<code>URL_SAFE_NO_PAD</code>, the same alphabet <code>basil-nats</code> uses elsewhere in the tree). JSON uses <code>serde_json</code>, already a workspace dependency: this adds <strong>no new container dependency</strong> (CBOR was dropped for exactly this reason; §7). Conceptually three regions:</p>
+<pre><code>+-----------------------------------------------------------+
+| MAGIC  &quot;BASILBDL\x00&quot;        (9 bytes, fixed)             |  framing prefix (pre-JSON)
+| format_version  u16          (= 1)                       |  (cleartext; version checkable
++-----------------------------------------------------------+   before any JSON parse)
+| JSON BODY:                                                |
+|   &quot;header&quot;: {                                             |  header object: the EXACT on-disk
+|     format_version, suite ids (2.5),                     |  bytes of this object are the AAD
+|     bundle_id (b64-nopad, 16B), created_unix,            |  (read back verbatim; never
+|     epoch (monotonic; anti-rollback)                     |  re-serialized, see below)
+|   },                                                      |
+|   &quot;slots&quot;: [ Slot, ... ]   (slot table, 2.4),           |  one entry per unlock method
+|   &quot;payload&quot;: SealedPayload  (2.3)                        |  the per-backend cred map (§4)
++-----------------------------------------------------------+</code></pre>
+<p>The <strong>header is bound as AAD</strong> over both the payload AEAD and every slot&#x27;s KEK-wrap AEAD, so an attacker cannot downgrade <code>format_version</code>, swap the suite ids, or splice slots/payload from a different <code>bundle_id</code>/<code>epoch</code> without breaking authentication. To avoid any JSON-canonicalization ambiguity, the AAD is the <strong>literal on-disk header bytes</strong>: the opener reads the exact byte span of the <code>header</code> object from the file and feeds those bytes to the AEAD. The header is <strong>never re-serialized for verification</strong>, so whitespace/key-ordering differences cannot affect the tag.</p>
+<h3 id="2-3-sealed-payload">2.3 Sealed payload</h3>
+<pre><code>struct SealedPayload {
+    nonce:      [u8; 12],   // base64-nopad; broker-generated, fresh random per encryption (never caller-supplied)
+    ciphertext: Vec&lt;u8&gt;,    // base64-nopad; AES-256-GCM(key = master_kek, aad = header_bytes) over the JSON cred map (§4)
+    // 16-byte GCM tag is appended to ciphertext by the AEAD
+}</code></pre>
+<ul>
+<li><strong>AEAD: AES-256-GCM.</strong> The master KEK is a 32-byte symmetric key. Each encryption draws a fresh <strong>12-byte (96-bit) nonce from the OS CSPRNG</strong>: the nonce is <strong>broker-owned</strong>; there is no caller-supplied-nonce path. A random 96-bit nonce is safe here because the bundle is re-sealed only rarely (re-seal / rotate / add-slot, never on a hot path), so the birthday-bound risk of nonce collision under one key is negligible at this frequency. This also matches the AES-256-GCM symmetric primitive the wire protocol already uses (<code>.agent-notes</code> wire-v2).</li>
+<li>The payload is encrypted <strong>once</strong> under the master KEK. Slots never touch the payload; they only wrap the KEK. This is the property that makes add/remove-method cheap.</li>
+</ul>
+<h3 id="2-4-slot-table">2.4 Slot table</h3>
+<p>Each slot independently wraps the <strong>same</strong> 32-byte master KEK:</p>
+<pre><code>struct Slot {
+    slot_id:    u32,            // stable id, for add/remove/CLI reference
+    method:     MethodKind,     // tagged enum: AgeYubikey | Bip39 | Passphrase | Tpm  (2.6)
+    label:      String,         // operator-facing, e.g. &quot;primary-yubikey-5C&quot;, &quot;break-glass-2026&quot;
+    created_unix: u64,
+    params:     MethodParams,   // method-specific public material (NOT secret); see below
+    wrap:       KekWrap,        // how the master KEK is wrapped for this method
+}
+
+struct KekWrap {
+    // For methods that yield a 32-byte slot key (bip39, passphrase, tpm):
+    //   AES-256-GCM(key = slot_key, aad = header_bytes || slot_id) over the master KEK.
+    nonce:      [u8; 12],       // base64-nopad; fresh random per wrap from the OS CSPRNG
+    ciphertext: Vec&lt;u8&gt;,        // base64-nopad; wrapped master KEK + 16-byte GCM tag
+}</code></pre>
+<p><code>MethodParams</code> holds only <strong>non-secret</strong> material the method needs to reconstruct its slot key:</p>
+<table>
+<thead><tr><th>Method</th><th><code>params</code> contents</th><th><code>wrap</code> shape</th></tr></thead>
+<tbody>
+<tr><td><code>AgeYubikey</code></td><td>the <strong>age recipient</strong> string (public); optional plugin/identity hint</td><td>The master KEK is encrypted with <strong><code>age</code></strong> to that recipient. <code>wrap.ciphertext</code> is the age stanza/file; no separate <code>slot_key</code>; age does the wrap. <code>nonce</code> unused (age manages its own).</td></tr>
+<tr><td><code>Bip39</code></td><td>KDF salt (16B), Argon2id params (mem = 64 MiB, t = 3, p = 1)</td><td><code>slot_key = Argon2id(mnemonic_entropy, salt, params)</code>; then AES-256-GCM-wrap the master KEK under <code>slot_key</code>.</td></tr>
+<tr><td><code>Passphrase</code></td><td>KDF salt (16B), Argon2id params (mem = 64 MiB, t = 3, p = 1)</td><td><code>slot_key = Argon2id(file_passphrase, salt, params)</code>; then AES-256-GCM-wrap the master KEK under <code>slot_key</code>.</td></tr>
+<tr><td><code>Tpm</code> (later)</td><td>PCR selection, sealed-blob handle/public area</td><td>TPM <code>unseal</code> yields <code>slot_key</code> (or unseals the KEK directly). AES-256-GCM-wrap as above.</td></tr>
+</tbody></table>
+<div class="note">
+<p><strong>Why <code>age</code> for the yubikey slot, not a hand-rolled wrap:</strong> <code>age-plugin-yubikey</code> is the §16 first-class decision (&quot;Support PIV and <code>age-plugin-yubikey</code> first&quot;). Reusing <code>age</code>&#x27;s recipient stanza for the KEK-wrap means the YubiKey slot is exactly an <code>age</code> decryption: well-reviewed, handles PIV/touch/PIN, and is what operators already use. The other methods produce a raw 32-byte <code>slot_key</code> and go through the broker&#x27;s own AES-256-GCM wrap for uniformity.</p>
+</div>
+<h3 id="2-5-suite-ids-versioning">2.5 Suite ids (versioning)</h3>
+<p><code>format_version = 1</code> pins the suite. The header carries small enum ids so a future v2 can change a primitive without ambiguity, and the opener refuses unknown ids:</p>
+<ul>
+<li><code>container = json</code> (ASCII magic + <code>u16</code> version prefix + JSON body; binary fields base64-nopad)</li>
+<li><code>payload_aead = aes-256-gcm</code></li>
+<li><code>kek_wrap_aead = aes-256-gcm</code></li>
+<li><code>recovery_kdf = argon2id</code> (mem = 64 MiB, t = 3, p = 1), used by bip39 / passphrase</li>
+<li><code>age_recipient</code> (yubikey slot)</li>
+</ul>
+<p>No silent algorithm negotiation; one named suite per <code>format_version</code>.</p>
+<h3 id="2-6-method-enum-wire-struct">2.6 Method enum (wire/struct)</h3>
+<pre><code>enum MethodKind { AgeYubikey, Bip39, Passphrase, Tpm }</code></pre>
+<p><code>Passphrase</code> is a production file-sourced Argon2id method. <code>Tpm</code> is a reserved variant that returns <code>NotImplemented</code> until the TPM slot lands (§9 / §16 require fail-closed for <code>tpm-bound</code> before support exists).</p>
+<h3 id="2-7-add-remove-slots">2.7 Add / remove slots</h3>
+<ul>
+<li><strong>Add:</strong> unlock via any existing slot → recover master KEK in memory → build the new slot&#x27;s <code>KekWrap</code> (e.g. <code>age</code>-encrypt KEK to the new YubiKey recipient) → append <code>Slot</code> → atomically rewrite the file. Payload untouched. (<code>epoch</code> unchanged, since content didn&#x27;t change, only access.)</li>
+<li><strong>Remove:</strong> drop the <code>Slot</code> from the table → atomically rewrite. Refuse to remove the <strong>last</strong> slot (would brick the bundle); CLI requires <code>--force-empty</code> only with an explicit out-of-band confirmation. Production policy SHOULD warn when removing the last <em>recovery</em> slot, mirroring §16 (&quot;prompt for two or more recovery methods&quot;).</li>
+</ul>
+<hr>
+<h2 id="3-unlock-method-abstraction-rust-trait-sketch">3. Unlock-method abstraction (Rust trait sketch)</h2>
+<div class="note">
+<p>Sketch only: vault-vh1 owns the implementation in <code>crates/basil-agent</code> (or a new <code>crates/basil-seal</code> crate). Mirrors the existing <code>Backend</code> trait style (<code>crates/basil-agent/src/core/backend/mod.rs</code>): a small object-safe trait, errors as a <code>thiserror</code> enum, async not required (unlock is local and one-shot, but a method may shell out to <code>age</code>/TPM, so keep it sync + blocking, run off the async accept loop at startup). Every method below returns a <code>Result</code> on every fallible step: no <code>unwrap</code>/<code>expect</code>/panicking index anywhere (§1.3).</p>
+</div>
+<pre><code class="language-rust">/// 32-byte symmetric key material that zeroizes on drop.
+/// (Newtype over `zeroize::Zeroizing&lt;[u8; 32]&gt;`.)
+pub struct KeyMaterial(/* zeroizing [u8; 32] */);
+
+#[derive(Debug, thiserror::Error)]
+pub enum UnlockError {
+    #[error(&quot;method unavailable: {0}&quot;)]      Unavailable(String),   // no token plugged, no TPM, ...
+    #[error(&quot;authentication failed&quot;)]         AuthFailed,            // wrong PIN / phrase / disk key
+    #[error(&quot;method not implemented: {0:?}&quot;)] NotImplemented(MethodKind), // tpm (later)
+    #[error(&quot;feature not enabled: {0:?}&quot;)]    FeatureDisabled(MethodKind),// disk in prod build
+    #[error(&quot;crypto: {0}&quot;)]                   Crypto(String),
+    #[error(&quot;io: {0}&quot;)]                       Io(#[from] std::io::Error),
+}
+
+/// One unlock method = the logic behind one slot kind.
+/// Implementations are stateless w.r.t. the master KEK; they only know how to
+/// turn their `params` + an out-of-band secret (token touch / phrase / key file)
+/// into the ability to unwrap *this slot&#x27;s* `KekWrap`.
+pub trait UnlockMethod: Send + Sync {
+    fn kind(&amp;self) -&gt; MethodKind;
+
+    /// Is this method usable *right now* on this host? (token present, TPM node,
+    /// key file readable). Used to order attempts and to report status.
+    fn available(&amp;self) -&gt; bool;
+
+    /// Recover the master KEK from one slot. The method performs whatever
+    /// interaction it needs (age/YubiKey touch, prompt for phrase, TPM unseal)
+    /// and returns the unwrapped master KEK, or an `UnlockError` (never panics).
+    fn recover_kek(
+        &amp;self,
+        slot: &amp;Slot,
+        header_aad: &amp;[u8],
+    ) -&gt; Result&lt;KeyMaterial, UnlockError&gt;;
+
+    /// Build a fresh `KekWrap` for this method over an existing master KEK
+    /// (used by add-slot / re-seal). `params` captures the public material.
+    fn wrap_kek(
+        &amp;self,
+        kek: &amp;KeyMaterial,
+        header_aad: &amp;[u8],
+    ) -&gt; Result&lt;(MethodParams, KekWrap), UnlockError&gt;;
+}</code></pre>
+<h3 id="3-1-how-each-method-recovers-the-kek">3.1 How each method recovers the KEK</h3>
+<ul>
+<li><strong><code>AgeYubikey</code></strong> (<code>unlock-age-yubikey</code>, default-on): <code>recover_kek</code> feeds <code>slot.wrap.ciphertext</code> (the age stanza) to an <code>age</code> decryptor configured with the YubiKey identity (via <code>age-plugin-yubikey</code>); the plugin drives PIN/touch. Output is the master KEK. <code>wrap_kek</code> <code>age</code>-encrypts the KEK to the slot&#x27;s recipient.</li>
+<li><strong><code>Bip39</code></strong> (<code>unlock-bip39</code>, default-on): prompt for the 24-word phrase on a controlled input (tty / systemd <code>AskPassword</code> / agent socket, never argv/env). Validate the BIP39 checksum, derive entropy, <code>Argon2id(entropy, slot.params.salt, mem = 64 MiB, t = 3, p = 1)</code> → <code>slot_key</code>, AES-256-GCM-unwrap the master KEK.</li>
+<li><strong><code>Passphrase</code></strong>: read a passphrase from a <code>0600</code> file or systemd credential file into zeroizing memory, optionally best-effort wipe the file, then <code>Argon2id(passphrase, slot.params.salt, mem = 64 MiB, t = 3, p = 1)</code> → <code>slot_key</code> → AES-256-GCM-unwrap.</li>
+<li><strong><code>Tpm</code></strong> (<code>unlock-tpm</code>, later): <code>tpm available?</code> check reusing the existing <code>identity::tpm_available()</code> probe; <code>TPM2_Unseal</code> under the PCR policy → <code>slot_key</code>/KEK. Until implemented, <code>recover_kek</code>/<code>wrap_kek</code> return <code>NotImplemented</code> (fail-closed, §9).</li>
+</ul>
+<h3 id="3-2-method-registry-policy">3.2 Method registry / policy</h3>
+<p>The broker builds an ordered list of enabled <code>UnlockMethod</code>s from config (which maps onto §9 <code>VaultUnlockPolicy</code>: <code>operator-presence</code> → require an interactive method like <code>age-yubikey</code>/<code>bip39</code>; <code>passphrase</code> → file-sourced passphrase; <code>tpm-bound</code> → <code>tpm</code>). On startup it walks the bundle&#x27;s slot table, and for each slot whose <code>method</code> has an enabled, <code>available()</code> handler, attempts <code>recover_kek</code> until one succeeds. <strong>Default-deny:</strong> if no slot can be opened, the broker fails to start (it has no way to reach its backends) rather than serving an empty/degraded data plane.</p>
+<h3 id="3-3-mapping-to-vaultunlockpolicy-9">3.3 Mapping to <code>VaultUnlockPolicy</code> (§9)</h3>
+<table>
+<thead><tr><th>§9 policy</th><th>enabled method(s)</th><th>notes</th></tr></thead>
+<tbody>
+<tr><td><code>operator-presence</code></td><td><code>AgeYubikey</code> (+ <code>Bip39</code> recovery slot)</td><td>human touch/PIN per boot. Hub default.</td></tr>
+<tr><td><code>removable-token</code></td><td><code>AgeYubikey</code> (touch-optional / PIN-cached)</td><td>unattended while token attached.</td></tr>
+<tr><td><code>tpm-bound</code></td><td><code>Tpm</code> (+ recovery slot)</td><td>later; fail-closed until implemented.</td></tr>
+<tr><td><code>passphrase</code></td><td><code>Passphrase</code></td><td>production file-sourced passphrase; use <code>unlock-passphrase-no-wipe</code> for read-only credential mounts.</td></tr>
+<tr><td><code>disk-key</code> (loose)</td><td><code>Passphrase</code> or <code>Bip39</code>-from-file</td><td>explicit opt-in only; same risk class as §9 <code>disk-key</code>.</td></tr>
+</tbody></table>
+<h3 id="3-4-passphrase-file-source">3.4 Passphrase file source</h3>
+<p><code>Passphrase</code> slots are always available in production builds. The agent reads <code>[unlock].unlock-passphrase-file</code> into zeroizing memory, derives the slot key with the slot-stored Argon2id salt and params, and best-effort wipes the file after a successful read. Set <code>[unlock].unlock-passphrase-no-wipe = true</code> for read-only credential mounts such as systemd credentials. Wipe failures warn but do not block startup after the passphrase has been read.</p>
+<hr>
+<h2 id="4-per-backend-cred-payload-schema">4. Per-backend cred payload schema</h2>
+<p>The decrypted payload (the AEAD plaintext, §2.3) is a JSON map: <strong>backend id → credential</strong>. Backend ids are the same opaque strings the catalog routes keys to (§17.7 &quot;per-key routing&quot;). The broker hands <code>creds[backend_id]</code> to the backend constructor at startup (§5).</p>
+<pre><code class="language-rust">struct CredBundle {
+    schema_version: u16,                       // independent of format_version
+    backends: BTreeMap&lt;String, BackendCred&gt;,   // &quot;vault-transit&quot; -&gt; ...
+}
+
+enum BackendCred {
+    /// Vault-compatible static token (today&#x27;s `--vault-token`). Dev / simple setups.
+    VaultToken { token: Zeroizing&lt;String&gt;, addr: Option&lt;String&gt; },
+
+    /// Vault-compatible AppRole: secret-id (+ role-id) exchanged for a short-lived token at startup.
+    /// Recommended production default (see below).
+    VaultAppRole { role_id: String, secret_id: Zeroizing&lt;String&gt;, addr: Option&lt;String&gt; },
+
+    /// SPIFFE/JWT-SVID signing key for the `--backend spiffe` path: a private key
+    /// the broker uses to self-issue an SVID, exchanged via bao `jwt` auth.
+    SpiffeSigner { key_pem: Zeroizing&lt;String&gt;, spiffe_id: String },
+
+    /// Future value-store backend (db-keystore): the DEK that opens the local DB.
+    DbKeystoreDek { dek: Zeroizing&lt;[u8; 32]&gt; },
+
+    /// Escape hatch for a backend kind not yet modelled: opaque labelled bytes.
+    Opaque { kind: String, secret: Zeroizing&lt;Vec&lt;u8&gt;&gt; },
+}</code></pre>
+<p><strong>Static token vs AppRole: why AppRole is the production default.</strong> A <code>VaultToken</code> is one long-lived bearer secret: the broker sends it on every call, and if it leaks, the holder has the token&#x27;s full authority until it expires or is manually revoked (a large blast radius). <code>VaultAppRole</code> splits the credential into a <strong>non-secret <code>role_id</code></strong> and a <strong>secret <code>secret_id</code></strong>; at startup the broker exchanges the pair with the backend's Vault-compatible AppRole auth method for a <strong>short-lived token</strong> that it then uses for calls. So the secret sitting at rest in the bundle is short-TTL / single-use-capable / independently revocable, which means a leak of the bundle&#x27;s <code>secret_id</code> has a much smaller blast radius than a leaked static token. For that reason <strong>AppRole is the recommended pattern for production hubs</strong>; the static <code>VaultToken</code> is retained for dev and simple/single-operator setups.</p>
+<p>Notes:</p>
+<ul>
+<li>Every secret field is <code>Zeroizing</code> so the <em>whole decrypted payload</em> zeroizes on drop, not just the KEK.</li>
+<li><code>addr</code> is optional per-cred so the bundle can pin which bao a token is for; otherwise the broker&#x27;s <code>--vault-addr</code>/<code>$VAULT_ADDR</code> applies.</li>
+<li>This map is the <strong>only</strong> place these creds live at rest. The CLI to seed it (<code>init</code> / <code>set-cred</code>) is part of vault-vh1; it reads a token/secret-id from a controlled input and writes a new sealed payload.</li>
+</ul>
+<hr>
+<h2 id="5-startup-flow">5. Startup flow</h2>
+<p>This flow <strong>replaces</strong> the old plaintext bootstrap-cred loading in <code>crates/basil-agent/src/main.rs</code> entirely (§1.1): the <code>--vault-token</code> / <code>$VAULT_TOKEN</code> / <code>~/.vault-token</code> and implicit-SPIFFE paths are removed, with no compat fallback. Every step is fallible-by-<code>Result</code> and <strong>fails closed without panicking</strong> (§1.3): any error → clean non-zero exit.</p>
+<pre><code>1. Load bundle file (0600); parse + verify MAGIC, format_version, suite ids.
+   - bad perms (not 0600 / wrong owner) -&gt; warn-or-refuse per policy.
+2. Build enabled UnlockMethod registry from config (§3.2 / §9 policy).
+3. For each slot with an enabled, available() method (ordered):
+     kek = method.recover_kek(slot, header_aad)?   // touch / phrase / unseal
+     on first success -&gt; break
+   No slot opens -&gt; FAIL CLOSED (clean non-zero exit; broker cannot reach backends).
+4. payload = AES-256-GCM_decrypt(kek, header_aad, sealed_payload)
+   -&gt; CredBundle (§4).            // authenticity failure also fails closed (no panic).
+5. ZEROIZE kek immediately (no longer needed after payload decrypt).
+6. For each (backend_id, cred) in CredBundle.backends:
+     construct the Backend (e.g. VaultBackend::new(addr, token, mount),
+     or exchange AppRole role_id+secret_id for a short-lived token first)
+     handing it its cred.  A down/invalid backend fails only that key&#x27;s ops,
+     not the broker (§17.7 routing).
+7. ZEROIZE the CredBundle once every backend holds what it needs
+   (VaultBackend stores its own copy of the token; db-keystore holds the DEK).
+8. Drop bundle plaintext. Proceed to bind the socket / accept loop.</code></pre>
+<ul>
+<li><strong>No panics on any path</strong> (§1.3): bad magic, version mismatch, malformed JSON, base64 decode failure, a wrong-length nonce/key, AEAD tag mismatch, or &quot;no slot opened&quot; all return errors that propagate to a graceful non-zero exit. There is no <code>unwrap</code>/<code>expect</code>/panicking index in this path; the only sanctioned exit besides a fail-closed startup error is the SIGINT/SIGQUIT shutdown.</li>
+<li><strong>Zeroize discipline</strong> (§17.7 &quot;Audit &amp; process&quot; mandates zeroize for materialized key bytes): master KEK zeroized right after step 4; full <code>CredBundle</code> zeroized after step 7; any transient buffers (<code>age</code> output, KDF output) use <code>Zeroizing</code>. The broker keeps only what each backend intrinsically must hold live (e.g. the Vault token inside <code>VaultBackend</code>).</li>
+<li>The bundle is <strong>not</strong> kept open. Re-reads (re-seal, add-slot) re-run unlock. There is no in-memory long-lived KEK after startup.</li>
+<li>Audit (§17.7): emit a JSONL event <code>{op:&quot;unlock&quot;, slot_id, method, outcome}</code>, never the cred bytes.</li>
+</ul>
+<hr>
+<h2 id="6-recovery-rotation-flows">6. Recovery &amp; rotation flows</h2>
+<h3 id="6-1-break-glass-with-bip39-recovery">6.1 Break-glass with <code>bip39</code> (recovery)</h3>
+<p>At <code>init</code>, the broker generates a 24-word BIP39 phrase, derives the recovery <code>slot_key</code> (<code>Argon2id</code>, mem = 64 MiB, t = 3, p = 1), wraps the master KEK into a <code>Bip39</code> slot, and <strong>displays the phrase once</strong> for the operator to print/store offline (§16: &quot;optional printed BIP39 passphrase&quot;). The phrase is never written to the host. If the primary (YubiKey/TPM) method is lost (token destroyed, motherboard replaced), the operator runs <code>unlock --method bip39</code>, types the phrase on a controlled input, and the bundle opens. Recommended posture (§16 &quot;two or more recovery methods&quot;): every production bundle has <strong>≥1 primary + ≥1 break-glass</strong> slot; CLI <code>status</code> warns if only one slot exists.</p>
+<h3 id="6-2-key-rotation-re-seal-rotate-the-master-kek">6.2 Key rotation / re-seal (rotate the master KEK)</h3>
+<p>Rotating the KEK is needed if the KEK is suspected exposed, or as periodic hygiene. Because the payload is encrypted under the KEK, rotating the KEK re-encrypts the payload (small, just the cred map), and <strong>rewraps every slot</strong>. Each new encryption draws a fresh CSPRNG nonce (§2.3); these re-seal events are rare and operator-driven, which is why a random 96-bit nonce is safe:</p>
+<pre><code>re-seal(reason):
+  kek_old   = unlock()                       // via any slot
+  payload   = decrypt(kek_old)               // CredBundle
+  kek_new   = 32 bytes from the OS CSPRNG
+  for slot in slots:
+     (params, wrap) = method(slot).wrap_kek(kek_new, header_aad&#x27;)   // re-touch YubiKey, re-derive bip39, ...
+     slot.params, slot.wrap = params, wrap
+  sealed_payload&#x27; = encrypt(kek_new, header_aad&#x27;, payload)          // AES-256-GCM, fresh 12B nonce
+  epoch += 1                                  // anti-rollback (§6.4)
+  atomically replace file
+  ZEROIZE kek_old, kek_new, payload</code></pre>
+<ul>
+<li>Rewrapping a slot may require the operator to re-present that method (YubiKey touch, re-enter the bip39 phrase to re-derive its key). The CLI walks the operator through each slot.</li>
+<li><strong>Rotating a backend credential</strong> (e.g. a new bao token / <code>secret_id</code> after revocation) is the <em>same</em> re-seal, except the step replaces an entry in the payload map rather than the KEK. <code>set-cred &lt;backend&gt; &lt;...&gt;</code> → decrypt → mutate map → re-encrypt under the <em>same</em> KEK (no slot rewrap needed) → <code>epoch += 1</code>.</li>
+</ul>
+<h3 id="6-3-distinction-from-data-plane-rotation">6.3 Distinction from data-plane rotation</h3>
+<p>This is <strong>bundle/bootstrap</strong> rotation only. Data-plane key rotation (transit key versions, 7-day retention, grace periods; see §17.7 &quot;Key lifecycle&quot;) is the Vault-compatible backend&#x27;s job and is out of scope here. The bundle KEK has no fixed retention; rotate on compromise or policy.</p>
+<h3 id="6-4-anti-rollback-epoch-sidecar-ratified-mvp-decision">6.4 Anti-rollback (epoch sidecar, ratified MVP decision)</h3>
+<p><code>epoch</code> is a monotonic counter in the header, bound as AAD. Bumped on every content change (re-seal, cred rotate, remove-slot). For the <strong>MVP this is implemented as a <code>0600</code> sidecar file</strong> holding the last-seen <code>epoch</code>: the broker persists <code>epoch</code> outside the bundle and refuses a bundle whose <code>epoch</code> is lower: catching a swap-in of an old bundle that still has a revoked token. This is logical anti-rollback only (matches §13.1 scope); it is <strong>not</strong> a defense against a full-disk rollback of host + sidecar together. <strong>TPM NV-counter binding is deferred</strong> as the future hardening (same as §13.1); the sidecar is the accepted MVP mechanism.</p>
+<hr>
+<h2 id="7-options-considered-chosen-approach-rationale">7. Options considered, chosen approach, rationale</h2>
+<table>
+<thead><tr><th>Decision</th><th>Options</th><th>Chosen</th><th>Rationale</th></tr></thead>
+<tbody>
+<tr><td>Where do bootstrap creds live?</td><td>(a) keep plaintext <code>~/.vault-token</code> / env; (b) push into bao itself; (c) local sealed bundle</td><td><strong>(c)</strong></td><td>(a) is the gap we&#x27;re closing; (b) is the bootstrap chicken-and-egg: can&#x27;t reach bao without the cred.</td></tr>
+<tr><td>Envelope shape</td><td>(a) one key per method re-encrypting payload N times; (b) single payload key + N slot-wraps (wrapped-DEK)</td><td><strong>(b)</strong></td><td>§8 key hierarchy; add/remove method = rewrap one slot, payload untouched; supports &quot;≥2 recovery methods&quot; (§16) cheaply.</td></tr>
+<tr><td>Payload + KEK-wrap AEAD</td><td><strong>AES-256-GCM</strong>; ChaCha20-Poly1305; XChaCha20-Poly1305</td><td><strong>AES-256-GCM</strong></td><td>12-byte CSPRNG nonce, fresh per encryption; re-seal is rare so a random 96-bit nonce is collision-safe; matches the wire-v2 symmetric primitive; broker-owned nonce, no caller-nonce path.</td></tr>
+<tr><td>AEAD nonce source</td><td>caller-supplied; <strong>broker-owned random (OS CSPRNG)</strong></td><td><strong>broker-owned CSPRNG</strong></td><td>no caller-nonce footgun; fresh 12-byte nonce per encryption; safe at the bundle&#x27;s rare re-seal frequency.</td></tr>
+<tr><td>YubiKey slot wrap</td><td>hand-rolled ECDH+AEAD to a PIV key; <strong><code>age</code> + <code>age-plugin-yubikey</code></strong></td><td><strong><code>age</code></strong></td><td>§16 first-class method; reuses a reviewed tool that already handles PIV/PIN/touch; operators already use it. <code>age</code> is a confirmed dep.</td></tr>
+<tr><td>Recovery KDF</td><td>scrypt; PBKDF2; <strong>Argon2id (mem = 64 MiB, t = 3, p = 1)</strong></td><td><strong>Argon2id</strong></td><td>memory-hard (§13.2); Argon2id cost is memory + a small time cost + parallelism (not a large iteration count); 64 MiB / t=3 / p=1 is a sound boot-time default for human-phrase keys.</td></tr>
+<tr><td>Recovery phrase encoding</td><td>raw hex; <strong>BIP39 24-word</strong></td><td><strong>BIP39</strong></td><td>§16 (&quot;printed BIP39 passphrase&quot;); checksum catches transcription errors; human-transcribable. <code>bip39</code> is a confirmed dep.</td></tr>
+<tr><td>Container encoding</td><td><strong>JSON (magic + u16 version + JSON body, binary base64-nopad)</strong>; CBOR; protobuf</td><td><strong>JSON</strong></td><td>uses <code>serde_json</code> already in the tree (no new dep, the &quot;reduce dependencies&quot; goal); magic+version greppable/checkable pre-parse; AAD = literal on-disk header bytes sidesteps JSON non-canonicalization. CBOR dropped to avoid a dependency.</td></tr>
+<tr><td><code>disk</code> method</td><td>runtime flag only; <strong>cargo feature + runtime guard</strong></td><td><strong>feature + guard</strong></td><td>mirrors existing <code>tpm2</code> feature; a prod build literally cannot link the disk-unlock path (§13 test-leak risk).</td></tr>
+<tr><td>Bootstrap cred (production)</td><td>static <code>VaultToken</code>; <strong>AppRole (<code>role_id</code> + <code>secret_id</code>)</strong></td><td><strong>AppRole</strong></td><td>secret-at-rest is short-TTL / single-use-capable / independently revocable → smaller blast radius than a long-lived static token (§4). Static token kept for dev/simple setups.</td></tr>
+<tr><td>Anti-rollback</td><td>none; <strong><code>0600</code> epoch sidecar</strong>; TPM NV counter</td><td><strong>epoch sidecar (MVP)</strong></td><td>logical anti-rollback catches old-bundle swap-in; TPM NV-counter binding deferred (§6.4 / §13.1).</td></tr>
+<tr><td>KEK lifetime in memory</td><td>cache for session; <strong>zeroize right after payload decrypt</strong></td><td><strong>zeroize early</strong></td><td>least exposure; re-unlock for re-seal is rare and operator-driven (§17.7 zeroize mandate).</td></tr>
+<tr><td>Panic posture</td><td>best-effort error handling; <strong>no-panic, fail-closed (clippy-enforced)</strong></td><td><strong>no-panic</strong></td><td>broker is unrestartable: a panic halts the whole plane; every path returns a <code>Result</code> and exits cleanly (§1.3).</td></tr>
+</tbody></table>
+<hr>
+<h2 id="8-decisions">8. Decisions</h2>
+<p>The crypto-primitive and dependency choices below were reviewed and <strong>ratified by the operator on 2026-06-22</strong>. They are baked into <code>format_version = 1</code> and override any earlier proposal text in this document.</p>
+<ol>
+<li><strong>Payload + KEK-wrap AEAD = AES-256-GCM.</strong> Each encryption uses a fresh <strong>12-byte (96-bit) nonce from the OS CSPRNG</strong>; the nonce is broker-owned, with no caller-supplied-nonce path. A random 96-bit nonce is safe at the bundle&#x27;s rare re-seal frequency (re-seal / rotate / add-slot only). Master KEK = 32 bytes. (Pins the §2.5 suite ids <code>payload_aead = aes-256-gcm</code>, <code>kek_wrap_aead = aes-256-gcm</code>.)</li>
+</ol>
+<ol>
+<li><strong>Recovery KDF = Argon2id, mem = 64 MiB, t = 3 (time cost), p = 1 (parallelism).</strong> Argon2id cost is memory + a small time cost + parallelism, <em>not</em> a large iteration count. This profile is a sound boot-time default for keys derived from a human recovery phrase or file-sourced passphrase, and is baked into the <code>Bip39</code> / <code>Passphrase</code> slot params for <code>format_version = 1</code>.</li>
+</ol>
+<ol>
+<li><strong>YubiKey slot = <code>age</code> + <code>age-plugin-yubikey</code>.</strong> Confirmed; <code>age</code> is pulled into the broker&#x27;s dependency tree (along with <code>bip39</code> and <code>argon2</code>). Reuses a reviewed tool that already handles PIV/PIN/touch (§2.4, §3.1).</li>
+</ol>
+<ol>
+<li><strong>AppRole is the recommended production default; static token is for dev / simple setups.</strong> A static <code>VaultToken</code> is a single long-lived bearer secret with a large blast radius if leaked; AppRole keeps a non-secret <code>role_id</code> + a secret <code>secret_id</code> and exchanges them at startup for a short-lived token, so the secret-at-rest is short-TTL / single-use-capable / independently revocable. Production hubs use AppRole (§4).</li>
+</ol>
+<ol>
+<li><strong>Anti-rollback = <code>0600</code> <code>epoch</code> sidecar, acceptable for MVP.</strong> TPM NV-counter binding is deferred to a later hardening pass (consistent with §13.1). See §6.4.</li>
+</ol>
+<ol>
+<li><strong>Container = JSON, CBOR dropped.</strong> A fixed ASCII magic + <code>u16</code> version prefix followed by a JSON body (header + slot table + sealed payload); binary fields are <strong>base64 no-pad</strong> (<code>URL_SAFE_NO_PAD</code>, matching <code>basil-nats</code>). The <strong>AAD is the literal on-disk header bytes</strong> (read back as bytes, never re-serialized), which sidesteps JSON non-canonicalization. JSON uses <code>serde_json</code>, already in the tree, so this adds no new dependency: the reason CBOR was dropped (§2.2, §7).</li>
+</ol>
+<hr>
+<h2 id="9-out-of-scope-deferred-logged-separately-as-ofis">9. Out-of-scope / deferred (logged separately as OFIs)</h2>
+<ul>
+<li>TPM slot implementation (<code>unlock-tpm</code>): reserved variant, fail-closed today (§9/§16); reuses <code>identity::tpm_available()</code>.</li>
+<li>TPM NV-counter anti-rollback binding (§6.4): the epoch sidecar is the ratified MVP; the NV-counter is the future hardening.</li>
+<li><code>basil-agent</code> helper for cached unlock sessions (§7 of the spec, &quot;agent-backed unlock sessions&quot;): a related but separate surface; the bundle just needs <em>an</em> unlock at startup.</li>
+<li>Post-quantum wrap of the bundle (harvest-now/decrypt-later); §17.7 &quot;Encryption / later&quot;; the suite-id versioning leaves room (<code>format_version = 2</code>).</li>
+</ul>
+    </main>
+
+    <footer>
+      Basil design document.
+    </footer>
+  </body>
+</html>

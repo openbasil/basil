@@ -1,0 +1,4 @@
+[alias]
+# cargo-xtask convention: `cargo xtask <args>` runs the workspace automation
+# crate. Today its only job is man-page generation (`cargo xtask -o <dir>`).
+xtask = "run --package xtask --"

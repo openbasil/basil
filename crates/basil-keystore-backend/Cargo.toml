@@ -1,0 +1,34 @@
+[package]
+name = "basil-keystore-backend"
+description = "Optional Basil key-store backends over db-keystore and 1Password."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version = "1.85"
+publish = true
+
+[features]
+default = []
+db-keystore = ["dep:db-keystore", "dep:keyring-core"]
+onepassword = ["dep:serde", "dep:serde_json", "dep:url", "dep:percent-encoding"]
+
+[dependencies]
+basil = { workspace = true }
+
+aes-gcm = { workspace = true }
+chacha20poly1305 = { workspace = true }
+db-keystore = { workspace = true, optional = true }
+ed25519-dalek = { workspace = true }
+keyring-core = { workspace = true, optional = true }
+percent-encoding = { workspace = true, optional = true }
+rand = { workspace = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+thiserror = { workspace = true }
+url = { workspace = true, optional = true }
+zero-secrets = { workspace = true }
+zeroize = { workspace = true }
+
+[lints]
+workspace = true

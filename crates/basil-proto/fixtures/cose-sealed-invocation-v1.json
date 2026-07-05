@@ -1,0 +1,370 @@
+{
+  "description": "Complete tagged COSE bytes (COSE_Sign1 over embedded tagged COSE_Encrypt, EdDSA/-8 + ECDH-ES+HKDF-256/-25) for the six basil invocation message types, built with deterministic parts. Test keys only. Consumers must reproduce and verify these byte-for-byte.",
+  "format": "basil-cose-sealed-invocation-fixtures",
+  "keys": {
+    "broker-encryption": {
+      "algorithm": "x25519",
+      "key_id": "broker.invocation-encryption.test",
+      "private_hex": "3333333333333333333333333333333333333333333333333333333333333333",
+      "public_hex": "7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b14"
+    },
+    "broker-signing": {
+      "algorithm": "ed25519",
+      "key_id": "broker.signing.test",
+      "private_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+      "public_hex": "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0"
+    },
+    "client-response-encryption": {
+      "algorithm": "x25519",
+      "key_id": "client.response.test",
+      "private_hex": "4444444444444444444444444444444444444444444444444444444444444444",
+      "public_hex": "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b"
+    },
+    "client-signing": {
+      "algorithm": "ed25519",
+      "key_id": "client.signing.test",
+      "private_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "public_hex": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737"
+    }
+  },
+  "rejects": [
+    {
+      "cose_sign1_hex": "d2845818a201270453636c69656e742e7369676e696e672e74657374a059013cd86084589aa601030284030f3a000111723a0001117303781e6170706c69636174696f6e2f626173696c2e7369676e2d726571756573740fa40373626173696c3a2f2f62726f6b65722e74657374041a6a40517c061a6a4051400750e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e13a0001117253636c69656e742e7369676e696e672e746573743a0001117374636c69656e742e726573706f6e73652e74657374a1054c6767676767676767676767675836a906d642dd74dc4d5b8dcdc6daa3f12c398fab7223ed7fe8f935a6e6f8379c265697965e7bf1dac0ec478c9977e7fc1efe06c9bfb6ab818344a1013818a204582162726f6b65722e696e766f636174696f6e2d656e6372797074696f6e2e7465737420a3010120042158207d904be3bcab1a910c65ac4b0a2cdd16a846ad8a0ac72db31cc3e47671d30e02f65840ac9442f1862076f8c05b167405b4856862da4aa3db9d2d2ca2eadeb936db74d0ae691cf7b065f2472c277f48628b6423f1cea3603a6d1e5c6c017ceda69f1801",
+      "description": "valid seal; claims expired before validation.now_unix",
+      "name": "expired-request",
+      "open_aad_hex": null,
+      "reason": "claims-expired",
+      "recipient": null,
+      "role": "request",
+      "stage": "verify",
+      "verdict": "reject",
+      "verifier": "client-signing"
+    },
+    {
+      "cose_sign1_hex": "d2845818a201270453636c69656e742e7369676e696e672e74657374a0590159d8608458b7a701030285030f3a000111723a000111733a0001117403781e6170706c69636174696f6e2f626173696c2e7369676e2d726571756573740fa40373626173696c3a2f2f62726f6b65722e74657374041a6a42745c061a6a4274200750a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a13a0001117253636c69656e742e7369676e696e672e746573743a0001117374636c69656e742e726573706f6e73652e746573743a00011174727376632d612e7265706c6965732e74657374a1054c61616161616161616161616158360a9a0ff5a89ed06067806492cc999223dc06b1eab6fcfb24200c9e7ca8639a5fbe95429a669687a7489ca3308bb6adffb1287f4548a5818344a1013818a204582162726f6b65722e696e766f636174696f6e2d656e6372797074696f6e2e7465737420a301012004215820ad908a8a708aca07588cda7c4ed3e44d4966a80a9abb2f1e4bbac53c67414e34f65840fcceb7adaa535cc9b2b7bc369d3ddedc3570f9e5e417a455a11b03c0a472871b1c2888e2f6f87993f3a72a4bad881ab28963879ca723b6399c8cb6a27ab77501",
+      "description": "sign-request with the last signature byte flipped",
+      "name": "tampered-signature",
+      "open_aad_hex": null,
+      "reason": "signature-invalid",
+      "recipient": null,
+      "role": "request",
+      "stage": "verify",
+      "verdict": "reject",
+      "verifier": "client-signing"
+    },
+    {
+      "cose_sign1_hex": "d3845818a201270453636c69656e742e7369676e696e672e74657374a0590159d8608458b7a701030285030f3a000111723a000111733a0001117403781e6170706c69636174696f6e2f626173696c2e7369676e2d726571756573740fa40373626173696c3a2f2f62726f6b65722e74657374041a6a42745c061a6a4274200750a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a13a0001117253636c69656e742e7369676e696e672e746573743a0001117374636c69656e742e726573706f6e73652e746573743a00011174727376632d612e7265706c6965732e74657374a1054c61616161616161616161616158360a9a0ff5a89ed06067806492cc999223dc06b1eab6fcfb24200c9e7ca8639a5fbe95429a669687a7489ca3308bb6adffb1287f4548a5818344a1013818a204582162726f6b65722e696e766f636174696f6e2d656e6372797074696f6e2e7465737420a301012004215820ad908a8a708aca07588cda7c4ed3e44d4966a80a9abb2f1e4bbac53c67414e34f65840fcceb7adaa535cc9b2b7bc369d3ddedc3570f9e5e417a455a11b03c0a472871b1c2888e2f6f87993f3a72a4bad881ab28963879ca723b6399c8cb6a27ab77500",
+      "description": "sign-request with outer tag 18 rewritten to tag 19",
+      "name": "wrong-outer-tag",
+      "open_aad_hex": null,
+      "reason": "decode-wrong-tag",
+      "recipient": null,
+      "role": "request",
+      "stage": "verify",
+      "verdict": "reject",
+      "verifier": "client-signing"
+    },
+    {
+      "cose_sign1_hex": "d2845818a201270453636c69656e742e7369676e696e672e74657374a0590159d8608458b7a701030285030f3a000111723a000111733a0001117403781e6170706c69636174696f6e2f626173696c2e7369676e2d726571756573740fa40373626173696c3a2f2f62726f6b65722e74657374041a6a42745c061a6a4274200750a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a13a0001117253636c69656e742e7369676e696e672e746573743a0001117374636c69656e742e726573706f6e73652e746573743a00011174727376632d612e7265706c6965732e74657374a1054c61616161616161616161616158360a9a0ff5a89ed06067806492cc999223dc06b1eab6fcfb24200c9e7ca8639a5fbe95429a669687a7489ca3308bb6adffb1287f4548a5818344a1013818a204582162726f6b65722e696e766f636174696f6e2d656e6372797074696f6e2e7465737420a301012004215820ad908a8a708aca07588cda7c4ed3e44d4966a80a9abb2f1e4bbac53c67414e34f65840fcceb7adaa535cc9b2b7bc369d3ddedc3570f9e5e417a455a11b03c0a472871b1c2888e2f6f87993f3a72a4bad881ab28963879ca723b6399c8cb6a27ab775",
+      "description": "sign-request with the final byte removed",
+      "name": "truncated",
+      "open_aad_hex": null,
+      "reason": "decode-malformed",
+      "recipient": null,
+      "role": "request",
+      "stage": "verify",
+      "verdict": "reject",
+      "verifier": "client-signing"
+    },
+    {
+      "cose_sign1_hex": "d2845818a201270453636c69656e742e7369676e696e672e74657374a0590159d8608458b7a701030285030f3a000111723a000111733a0001117403781e6170706c69636174696f6e2f626173696c2e7369676e2d726571756573740fa40373626173696c3a2f2f62726f6b65722e74657374041a6a42745c061a6a4274200750a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a13a0001117253636c69656e742e7369676e696e672e746573743a0001117374636c69656e742e726573706f6e73652e746573743a00011174727376632d612e7265706c6965732e74657374a1054c61616161616161616161616158360a9a0ff5a89ed06067806492cc999223dc06b1eab6fcfb24200c9e7ca8639a5fbe95429a669687a7489ca3308bb6adffb1287f4548a5818344a1013818a204582162726f6b65722e696e766f636174696f6e2d656e6372797074696f6e2e7465737420a301012004215820ad908a8a708aca07588cda7c4ed3e44d4966a80a9abb2f1e4bbac53c67414e34f65840fcceb7adaa535cc9b2b7bc369d3ddedc3570f9e5e417a455a11b03c0a472871b1c2888e2f6f87993f3a72a4bad881ab28963879ca723b6399c8cb6a27ab77500",
+      "description": "valid sign-request opened with a different encryption external AAD",
+      "name": "aad-mismatch",
+      "open_aad_hex": "6d69736d61746368",
+      "reason": "open-failed",
+      "recipient": "broker-encryption",
+      "role": "request",
+      "stage": "open",
+      "verdict": "reject",
+      "verifier": "client-signing"
+    },
+    {
+      "cose_sign1_hex": "d2845818a201270453636c69656e742e7369676e696e672e74657374a0590159d8608458b7a701030285030f3a000111723a000111733a0001117403781e6170706c69636174696f6e2f626173696c2e7369676e2d726571756573740fa40373626173696c3a2f2f62726f6b65722e74657374041a6a42745c061a6a4274200750a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a13a0001117253636c69656e742e7369676e696e672e746573743a0001117374636c69656e742e726573706f6e73652e746573743a00011174727376632d612e7265706c6965732e74657374a1054c61616161616161616161616158360a9a0ff5a89ed06067806492cc999223dc06b1eab6fcfb24200c9e7ca8639a5fbe95429a669687a7489ca3308bb6adffb1287f4548a5818344a1013818a204582162726f6b65722e696e766f636174696f6e2d656e6372797074696f6e2e7465737420a301012004215820ad908a8a708aca07588cda7c4ed3e44d4966a80a9abb2f1e4bbac53c67414e34f65840fcceb7adaa535cc9b2b7bc369d3ddedc3570f9e5e417a455a11b03c0a472871b1c2888e2f6f87993f3a72a4bad881ab28963879ca723b6399c8cb6a27ab77500",
+      "description": "sign-request validated with the response role shape",
+      "name": "role-mismatch",
+      "open_aad_hex": null,
+      "reason": "claims-role-shape",
+      "recipient": null,
+      "role": "response",
+      "stage": "verify",
+      "verdict": "reject",
+      "verifier": "client-signing"
+    }
+  ],
+  "validation": {
+    "allowed_audiences": [
+      "basil://broker.test"
+    ],
+    "default_ttl_secs": 60,
+    "max_clock_skew_secs": 30,
+    "max_ttl_secs": 300,
+    "now_unix": 1782740010
+  },
+  "vectors": [
+    {
+      "body": {
+        "fields": {
+          "algorithm": 1,
+          "key_id": "app.signing.test",
+          "message_hex": "7061796c6f61642d746f2d7369676e"
+        },
+        "plaintext_cbor_hex": "a301706170702e7369676e696e672e74657374024f7061796c6f61642d746f2d7369676e0301",
+        "schema": "SignInvocationRequest"
+      },
+      "claims": {
+        "audience": "basil://broker.test",
+        "expires_at_unix": 1782740060,
+        "in_reply_to_hex": null,
+        "issued_at_unix": 1782740000,
+        "issuer": null,
+        "message_id_hex": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        "request_hash_sha3_256_hex": null,
+        "response_key_id": "client.response.test",
+        "response_subject": "svc-a.replies.test",
+        "sender_key_id": "client.signing.test"
+      },
+      "content_algorithm": 3,
+      "content_type": "application/basil.sign-request",
+      "cose_sign1_hex": "d2845818a201270453636c69656e742e7369676e696e672e74657374a0590159d8608458b7a701030285030f3a000111723a000111733a0001117403781e6170706c69636174696f6e2f626173696c2e7369676e2d726571756573740fa40373626173696c3a2f2f62726f6b65722e74657374041a6a42745c061a6a4274200750a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a13a0001117253636c69656e742e7369676e696e672e746573743a0001117374636c69656e742e726573706f6e73652e746573743a00011174727376632d612e7265706c6965732e74657374a1054c61616161616161616161616158360a9a0ff5a89ed06067806492cc999223dc06b1eab6fcfb24200c9e7ca8639a5fbe95429a669687a7489ca3308bb6adffb1287f4548a5818344a1013818a204582162726f6b65722e696e766f636174696f6e2d656e6372797074696f6e2e7465737420a301012004215820ad908a8a708aca07588cda7c4ed3e44d4966a80a9abb2f1e4bbac53c67414e34f65840fcceb7adaa535cc9b2b7bc369d3ddedc3570f9e5e417a455a11b03c0a472871b1c2888e2f6f87993f3a72a4bad881ab28963879ca723b6399c8cb6a27ab77500",
+      "kdf": {
+        "party_u_hex": null,
+        "party_v_hex": null
+      },
+      "name": "sign-request",
+      "parts": {
+        "ephemeral_private_hex": "5151515151515151515151515151515151515151515151515151515151515151",
+        "nonce_hex": "616161616161616161616161"
+      },
+      "recipient": "broker-encryption",
+      "role": "request",
+      "signer": "client-signing",
+      "verdict": "accept"
+    },
+    {
+      "body": {
+        "fields": {
+          "policy_generation": 42,
+          "signature_hex": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+          "status": {
+            "code": 1,
+            "message": null,
+            "reason": "OK",
+            "retryable": false
+          }
+        },
+        "plaintext_cbor_hex": "a301a4010102624f4b03f604f402182a035840abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+        "schema": "SignInvocationResponse"
+      },
+      "claims": {
+        "audience": null,
+        "expires_at_unix": 1782740060,
+        "in_reply_to_hex": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        "issued_at_unix": 1782740000,
+        "issuer": null,
+        "message_id_hex": "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+        "request_hash_sha3_256_hex": "78eadf84a5c0ccbf98847d156d9e4c86782e45b3b9f1cec93606a8b2df526ac1",
+        "response_key_id": null,
+        "response_subject": null,
+        "sender_key_id": "broker.signing.test"
+      },
+      "content_algorithm": 3,
+      "content_type": "application/basil.sign-response",
+      "cose_sign1_hex": "d2845818a20127045362726f6b65722e7369676e696e672e74657374a059016fd8608458aea701030285030f3a000111703a000111713a0001117203781f6170706c69636174696f6e2f626173696c2e7369676e2d726573706f6e73650fa3041a6a42745c061a6a4274200750b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b13a0001117050a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a13a00011171582078eadf84a5c0ccbf98847d156d9e4c86782e45b3b9f1cec93606a8b2df526ac13a000111725362726f6b65722e7369676e696e672e74657374a1054c62626262626262626262626258636ef3257aeea6c7b074fe3cf59ead2c64f70deac63e31b258d6a377ba57378a75cf81a92f498d0c69eef002689c9d568275f1f75ac3b09725bb4bb0214d9038440155bf2d5f6f142ce9420d860b260a4dbbcd63cc171c0beaf6f2903f4ba873ff6b3b9d818344a1013818a20454636c69656e742e726573706f6e73652e7465737420a301012004215820f68b05ba03f7185e1ba88878682f8dd0b15158f6050889c9481d79c2d7d2fa07f65840289497abe5911317f757b24383c35b4bb34bede6a0e3a55d8c672bd6a6dafabd6e8153e41e0f5cf65a441d52e38cd0576f63fb86374b4c482b86b82a753ea500",
+      "kdf": {
+        "party_u_hex": null,
+        "party_v_hex": null
+      },
+      "name": "sign-response",
+      "parts": {
+        "ephemeral_private_hex": "5252525252525252525252525252525252525252525252525252525252525252",
+        "nonce_hex": "626262626262626262626262"
+      },
+      "recipient": "client-response-encryption",
+      "role": "response",
+      "signer": "broker-signing",
+      "verdict": "accept"
+    },
+    {
+      "body": {
+        "fields": {
+          "claims_json_hex": "7b2273636f7065223a2272656164227d",
+          "key_id": "app.jwt.test",
+          "subject": "svc-a",
+          "ttl_secs": 300
+        },
+        "plaintext_cbor_hex": "a4016c6170702e6a77742e7465737402657376632d610319012c04507b2273636f7065223a2272656164227d",
+        "schema": "MintJwtInvocationRequest"
+      },
+      "claims": {
+        "audience": "basil://broker.test",
+        "expires_at_unix": 1782740060,
+        "in_reply_to_hex": null,
+        "issued_at_unix": 1782740000,
+        "issuer": null,
+        "message_id_hex": "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2",
+        "request_hash_sha3_256_hex": null,
+        "response_key_id": "client.response.test",
+        "response_subject": null,
+        "sender_key_id": "client.signing.test"
+      },
+      "content_algorithm": 3,
+      "content_type": "application/basil.mint-jwt-request",
+      "cose_sign1_hex": "d2845818a201270453636c69656e742e7369676e696e672e74657374a0590146d86084589ea601030284030f3a000111723a000111730378226170706c69636174696f6e2f626173696c2e6d696e742d6a77742d726571756573740fa40373626173696c3a2f2f62726f6b65722e74657374041a6a42745c061a6a4274200750a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a23a0001117253636c69656e742e7369676e696e672e746573743a0001117374636c69656e742e726573706f6e73652e74657374a1054c636363636363636363636363583cc271e4f9887e1547af6d012517be8f190267bb2447297c4ad931b252770abb777aaea4ee056574f3e8c5283a19bc3bc9a584081cd13e3f1dd91cdb64818344a1013818a204582162726f6b65722e696e766f636174696f6e2d656e6372797074696f6e2e7465737420a301012004215820261cd9cd2e935f9c2455876a80f02a4d6786b8ab877f07227737ca0b577bf161f6584034b604f6780d5d08a2ccebbaeedc4ac029103f349e0302244c5cde397d430781e0bf5a3486ce7d82bb26e5f0e9300f026b4c8fe567ea859722aa571af279410a",
+      "kdf": {
+        "party_u_hex": null,
+        "party_v_hex": null
+      },
+      "name": "mint-jwt-request",
+      "parts": {
+        "ephemeral_private_hex": "5353535353535353535353535353535353535353535353535353535353535353",
+        "nonce_hex": "636363636363636363636363"
+      },
+      "recipient": "broker-encryption",
+      "role": "request",
+      "signer": "client-signing",
+      "verdict": "accept"
+    },
+    {
+      "body": {
+        "fields": {
+          "expires_at_unix": 1782740300,
+          "jwt": "eyJhbGciOiJFZERTQSJ9.test.jwt",
+          "policy_generation": 42,
+          "status": {
+            "code": 1,
+            "message": null,
+            "reason": "OK",
+            "retryable": false
+          }
+        },
+        "plaintext_cbor_hex": "a401a4010102624f4b03f604f402182a03781d65794a68624763694f694a465a45525451534a392e746573742e6a7774041a6a42754c",
+        "schema": "MintJwtInvocationResponse"
+      },
+      "claims": {
+        "audience": null,
+        "expires_at_unix": 1782740060,
+        "in_reply_to_hex": "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2",
+        "issued_at_unix": 1782740000,
+        "issuer": null,
+        "message_id_hex": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+        "request_hash_sha3_256_hex": "38066ec3339efc4946adc881b5946adbaff89eadf58ba5786ae1a1f04012f561",
+        "response_key_id": null,
+        "response_subject": null,
+        "sender_key_id": "broker.signing.test"
+      },
+      "content_algorithm": 3,
+      "content_type": "application/basil.mint-jwt-response",
+      "cose_sign1_hex": "d2845818a20127045362726f6b65722e7369676e696e672e74657374a0590156d8608458b2a701030285030f3a000111703a000111713a000111720378236170706c69636174696f6e2f626173696c2e6d696e742d6a77742d726573706f6e73650fa3041a6a42745c061a6a4274200750b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b23a0001117050a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a23a00011171582038066ec3339efc4946adc881b5946adbaff89eadf58ba5786ae1a1f04012f5613a000111725362726f6b65722e7369676e696e672e74657374a1054c6464646464646464646464645846357501894aceb61cb96a0dd8e92230fe77f2704a9fc63495460f862bd04405f122b43d48461d489cdeafc2f7c7517195496c8c0d189b3532f8d30abb512fc1535090fc101aab818344a1013818a20454636c69656e742e726573706f6e73652e7465737420a30101200421582094e9c71ccacddd2c6fbf529e263f0d39baf0fed469de0d227d24ad81a4394b70f658401c3de15c46793cd7a6aedd5ff9fce54e8ba9713ed97042f61400f8c71e657298fdc37b56953a2f7be88acf2ad13f1e33e812e61db7d11a05e8753ba5b90a1a02",
+      "kdf": {
+        "party_u_hex": null,
+        "party_v_hex": null
+      },
+      "name": "mint-jwt-response",
+      "parts": {
+        "ephemeral_private_hex": "5454545454545454545454545454545454545454545454545454545454545454",
+        "nonce_hex": "646464646464646464646464"
+      },
+      "recipient": "client-response-encryption",
+      "role": "response",
+      "signer": "broker-signing",
+      "verdict": "accept"
+    },
+    {
+      "body": {
+        "fields": {
+          "account_key_id": "nats.account.test",
+          "issuer_account": "ADXU4RCSJNZOIQHZNWXHXORDPRTGNJAHAHFRGZNEEJCPQTT2M7NLCNF4",
+          "name": "svc-a",
+          "ttl_secs": 300,
+          "user_nkey": "UDXU4RCSJNZOIQHZNWXHXORDPRTGNJAHAHFRGZNEEJCPQTT2M7NLCNF4"
+        },
+        "plaintext_cbor_hex": "a501716e6174732e6163636f756e742e7465737402783855445855345243534a4e5a4f4951485a4e575848584f5244505254474e4a414841484652475a4e45454a4350515454324d374e4c434e463403657376632d610419012c05783841445855345243534a4e5a4f4951485a4e575848584f5244505254474e4a414841484652475a4e45454a4350515454324d374e4c434e4634",
+        "schema": "MintNatsUserInvocationRequest"
+      },
+      "claims": {
+        "audience": "basil://broker.test",
+        "expires_at_unix": 1782740060,
+        "in_reply_to_hex": null,
+        "issued_at_unix": 1782740000,
+        "issuer": null,
+        "message_id_hex": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3",
+        "request_hash_sha3_256_hex": null,
+        "response_key_id": "client.response.test",
+        "response_subject": null,
+        "sender_key_id": "client.signing.test"
+      },
+      "content_algorithm": 24,
+      "content_type": "application/basil.mint-nats-user-request",
+      "cose_sign1_hex": "d2845818a201270453636c69656e742e7369676e696e672e74657374a05901dad8608458a5a60118180284030f3a000111723a000111730378286170706c69636174696f6e2f626173696c2e6d696e742d6e6174732d757365722d726571756573740fa40373626173696c3a2f2f62726f6b65722e74657374041a6a42745c061a6a4274200750a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a33a0001117253636c69656e742e7369676e696e672e746573743a0001117374636c69656e742e726573706f6e73652e74657374a1054c65656565656565656565656558a531b18fa366a4b8b7e2866d4d3e3f2f86e477de825ba47c3f2ede6d3310e7e522a80f5f9d16a16f5f5aab7be16e4d9d2d0f10c08559f65cdeaad8eee01c9fd0d448d41b70128157318f3e59255d02dd21209ca0845db0168ecb5416a11c4509e7751ff94b46505a3250b1c871bc38e89e4038b0d05e1691198534f954c84cdcd98cd09b9414ff53fbd1ec49f27dfc2550336526025c523c6ad9d91001697edf68049b00d52981835827a401381802823437344a7376632d612e746573743751626173696c2d62726f6b65722e74657374a204582162726f6b65722e696e766f636174696f6e2d656e6372797074696f6e2e7465737420a30101200421582038ab664bd86f77d7e66bdd9ae0792913a94fd8b33a1260027e4b46c1f4884c67f658401c2f02ed1c95fbd6b6f98bb3addb74c960a7acdb7ee16833d8a427a099504058a9fa15a9b2e821989ad675b09fab84e31cd0e78d2b83f8d9602e8bd4c35d160f",
+      "kdf": {
+        "party_u_hex": "7376632d612e74657374",
+        "party_v_hex": "626173696c2d62726f6b65722e74657374"
+      },
+      "name": "mint-nats-user-request",
+      "parts": {
+        "ephemeral_private_hex": "5555555555555555555555555555555555555555555555555555555555555555",
+        "nonce_hex": "656565656565656565656565"
+      },
+      "recipient": "broker-encryption",
+      "role": "request",
+      "signer": "client-signing",
+      "verdict": "accept"
+    },
+    {
+      "body": {
+        "fields": {
+          "expires_at_unix": 1782740300,
+          "jwt": "eyJ0eXAiOiJKV1QifQ.natsuser.jwt",
+          "policy_generation": 42,
+          "status": {
+            "code": 1,
+            "message": null,
+            "reason": "OK",
+            "retryable": false
+          }
+        },
+        "plaintext_cbor_hex": "a401a4010102624f4b03f604f402182a03781f65794a30655841694f694a4b5631516966512e6e617473757365722e6a7774041a6a42754c",
+        "schema": "MintNatsUserInvocationResponse"
+      },
+      "claims": {
+        "audience": null,
+        "expires_at_unix": 1782740060,
+        "in_reply_to_hex": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3",
+        "issued_at_unix": 1782740000,
+        "issuer": null,
+        "message_id_hex": "b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3",
+        "request_hash_sha3_256_hex": "07adb5116335e3cbc2589484db1faefd429ee9b9b284a0e6adca2074993957ca",
+        "response_key_id": null,
+        "response_subject": null,
+        "sender_key_id": "broker.signing.test"
+      },
+      "content_algorithm": 24,
+      "content_type": "application/basil.mint-nats-user-response",
+      "cose_sign1_hex": "d2845818a20127045362726f6b65722e7369676e696e672e74657374a0590183d8608458b9a70118180285030f3a000111703a000111713a000111720378296170706c69636174696f6e2f626173696c2e6d696e742d6e6174732d757365722d726573706f6e73650fa3041a6a42745c061a6a4274200750b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b33a0001117050a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a33a00011171582007adb5116335e3cbc2589484db1faefd429ee9b9b284a0e6adca2074993957ca3a000111725362726f6b65722e7369676e696e672e74657374a1054c66666666666666666666666658485f171c712a08dd59a90921399b66cb8a025f613b4e00515a74b1c2f33816c36403636f2073c595b9040af67e88e8f9f4ee5bd889b96272459f1d37c68e57edd050d7bb72c9d4494381835827a401381802823437344a7376632d612e746573743751626173696c2d62726f6b65722e74657374a20454636c69656e742e726573706f6e73652e7465737420a301012004215820dccf9fc001b345c77474e76e1021bde04f7ea0ed8ee61f7f6f1a4e47a5af2f54f658401f658d669f1853b3eaf73ba4b487194d6d4fcb21420877e163806a4f4a282a7cb442f8bf91edf6198bbd28d703d11aa7a26e36cf457e468078a4a2c39d2bde02",
+      "kdf": {
+        "party_u_hex": "7376632d612e74657374",
+        "party_v_hex": "626173696c2d62726f6b65722e74657374"
+      },
+      "name": "mint-nats-user-response",
+      "parts": {
+        "ephemeral_private_hex": "5656565656565656565656565656565656565656565656565656565656565656",
+        "nonce_hex": "666666666666666666666666"
+      },
+      "recipient": "client-response-encryption",
+      "role": "response",
+      "signer": "broker-signing",
+      "verdict": "accept"
+    }
+  ],
+  "version": 1
+}

@@ -1,0 +1,21 @@
+/target
+/result
+/result-*
+examples/**/target
+**/*.rs.bk
+*.sock
+.vault-token
+.agent-notes
+.orchestrator-notes
+.codebase-memory
+graphify-out
+
+.claude
+.codex
+.codebase
+# bv (beads viewer) local config and caches
+.bv/
+.work/
+
+# Playwright MCP browser artifacts (snapshots/traces can capture on-screen secrets)
+.playwright-mcp/

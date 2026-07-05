@@ -1,0 +1,54 @@
+# Maintainer: Basil maintainers <info@openbasil.org>
+#
+# Arch Linux package for the Basil binaries. This is a BINARY package: it
+# repackages the official prebuilt x86_64 release archives produced by dist
+# (cargo-dist), hence the `-bin` suffix per Arch/AUR convention.
+#
+# In CI (.github/workflows/release.yml -> arch-package job):
+#   * `pkgver` is patched from the release tag,
+#   * `updpkgsums` fills in the real sha256 of the downloaded release tarball,
+#   * `makepkg` builds the .pkg.tar.zst, which is attached to the GitHub Release.
+#
+# For an AUR push (manual, needs AUR credentials): bump `pkgver`/`pkgrel`, run
+# `updpkgsums` then `makepkg --printsrcinfo > .SRCINFO`, and push both files.
+
+pkgname=basil-bin
+pkgver=0.5.0
+pkgrel=1
+pkgdesc="Basil broker/CLI and NATS bridge: attestation, secrets, identity, and leases (prebuilt binaries)"
+arch=('x86_64')
+url="https://github.com/openbasil/basil"
+license=('Apache-2.0')
+provides=('basil')
+conflicts=('basil')
+# The payloads are already-built, already-stripped binaries; do not re-strip them.
+options=('!strip' '!debug')
+source=("basil-${pkgver}-x86_64.tar.xz::${url}/releases/download/v${pkgver}/basil-bin-x86_64-unknown-linux-gnu.tar.xz")
+# Placeholder: replaced by `updpkgsums` in CI and before every AUR push.
+# 'SKIP' is intentionally NOT used, so releases are checksum-verified.
+sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
+
+package() {
+  # dist archives may unpack either flat or under a versioned directory, so
+  # locate the executable rather than assuming a fixed path.
+  local basil_bin bridge_bin
+  basil_bin="$(find "${srcdir}" -type f -name basil -perm -u+x -print -quit)"
+  bridge_bin="$(find "${srcdir}" -type f -name basil-nats-bridge -perm -u+x -print -quit)"
+  if [ -z "${basil_bin}" ]; then
+    echo "could not find the 'basil' binary in the release archive" >&2
+    return 1
+  fi
+  if [ -z "${bridge_bin}" ]; then
+    echo "could not find the 'basil-nats-bridge' binary in the release archive" >&2
+    return 1
+  fi
+  install -Dm755 "${basil_bin}" "${pkgdir}/usr/bin/basil"
+  install -Dm755 "${bridge_bin}" "${pkgdir}/usr/bin/basil-nats-bridge"
+
+  # Ship the license from the archive if present.
+  local licpath
+  licpath="$(find "${srcdir}" -type f -iname 'LICENSE*' -print -quit)"
+  if [ -n "${licpath}" ]; then
+    install -Dm644 "${licpath}" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  fi
+}

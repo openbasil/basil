@@ -1,0 +1,39 @@
+[package]
+name = "basil-nats-bridge"
+description = "NATS request/reply courier for Basil sealed invocation envelopes."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version = "1.88"
+publish = true
+autobins = false
+
+[[bin]]
+name = "basil-nats-bridge"
+path = "src/main.rs"
+
+[dependencies]
+basil-proto = { workspace = true }
+
+anyhow = { workspace = true }
+async-nats = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true }
+futures = { workspace = true }
+hyper-util = { workspace = true }
+prost = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tonic = { workspace = true }
+tower = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

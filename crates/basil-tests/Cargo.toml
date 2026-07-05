@@ -1,0 +1,159 @@
+[package]
+name = "basil-tests"
+description = "Basil live and interop integration tests."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version = "1.88"
+publish = false
+
+[features]
+default = []
+live-e2e = []
+# Harness opt-in for live tests that need the broker's JWKS/OIDC HTTP surface.
+# This forwards to the separately built `basil-bin` process in `ensure_binaries_built`.
+http = []
+# BIP39 break-glass unlock: enables `boot_basil_bip39` + `seal_bip39_bundle` in the
+# harness and the `bip39_unlock_e2e` live test (basil-bp30). Additive; on under
+# `--all-features`. The harness-built `basil` binary carries `unlock-bip39` by default.
+unlock-bip39 = ["basil-core/unlock-bip39"]
+
+[dependencies]
+basil-core = { workspace = true, features = ["http", "unlock-age-yubikey", "unlock-bip39"] }
+# Not a dev-dep: the shared harness (`src/lib.rs`) installs the pure-Rust `ring`
+# rustls `CryptoProvider` before any test builds a `reqwest` client (see
+# `ensure_crypto_provider`). `reqwest` itself stays test-only below.
+rustls = { workspace = true }
+spiffe = { workspace = true }
+zero-secrets = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+basil = { workspace = true }
+basil-cose = { workspace = true }
+basil-nats-bridge = { workspace = true }
+basil-proto = { workspace = true }
+
+async-nats = { workspace = true }
+base64 = { workspace = true }
+bytes = { workspace = true }
+cose_minicbor = { version = "0.1.1", default-features = false, features = ["suit-sha256-ed25519"] }
+ed25519-dalek = { workspace = true }
+hyper-util = { workspace = true }
+minicbor = { workspace = true, features = ["alloc", "std"] }
+jsonwebtoken = { workspace = true }
+pkcs8 = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+spiffe-rustls = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+tower = { workspace = true }
+x509-parser = { workspace = true }
+
+[[test]]
+name = "jwks_oidc_e2e"
+path = "tests/jwks_oidc_e2e.rs"
+required-features = ["live-e2e", "http"]
+
+[[test]]
+name = "kv2_sign_e2e"
+path = "tests/kv2_sign_e2e.rs"
+required-features = ["live-e2e"]
+
+[[test]]
+name = "pki_leaf_san_e2e"
+path = "tests/pki_leaf_san_e2e.rs"
+required-features = ["live-e2e"]
+
+[[test]]
+name = "ecdsa_p384_p521_e2e"
+path = "tests/ecdsa_p384_p521_e2e.rs"
+required-features = ["live-e2e"]
+
+[[test]]
+name = "pqc_e2e"
+path = "tests/pqc_e2e.rs"
+required-features = ["live-e2e"]
+
+[[test]]
+name = "spiffe_interop"
+path = "tests/spiffe_interop.rs"
+required-features = ["live-e2e"]
+
+[[test]]
+name = "go_spiffe_interop"
+path = "tests/go_spiffe_interop.rs"
+required-features = ["live-e2e"]
+
+[[test]]
+name = "spiffe_jwt_login_e2e"
+path = "tests/spiffe_jwt_login_e2e.rs"
+required-features = ["live-e2e"]
+
+[[test]]
+name = "spiffe_rustls_interop"
+path = "tests/spiffe_rustls_interop.rs"
+required-features = ["live-e2e"]
+
+[[test]]
+name = "spiffe_wire_compat"
+path = "tests/spiffe_wire_compat.rs"
+required-features = ["live-e2e"]
+
+[[test]]
+name = "spiffe_x509_svid_e2e"
+path = "tests/spiffe_x509_svid_e2e.rs"
+required-features = ["live-e2e"]
+
+[[test]]
+name = "openbao_vault_jwt_auth_interop"
+path = "tests/openbao_vault_jwt_auth_interop.rs"
+required-features = ["live-e2e", "http"]
+
+[[test]]
+name = "envoy_sds_e2e"
+path = "tests/envoy_sds_e2e.rs"
+required-features = ["live-e2e"]
+
+[[test]]
+name = "reload_e2e"
+path = "tests/reload_e2e.rs"
+required-features = ["live-e2e"]
+
+[[test]]
+name = "health_ready_e2e"
+path = "tests/health_ready_e2e.rs"
+required-features = ["live-e2e"]
+
+[[test]]
+name = "doctor_e2e"
+path = "tests/doctor_e2e.rs"
+required-features = ["live-e2e"]
+
+[[test]]
+name = "init_flow_e2e"
+path = "tests/init_flow_e2e.rs"
+required-features = ["live-e2e"]
+
+[[test]]
+name = "jwt_svid_revocation_e2e"
+path = "tests/jwt_svid_revocation_e2e.rs"
+required-features = ["live-e2e"]
+
+[[test]]
+name = "bip39_unlock_e2e"
+path = "tests/bip39_unlock_e2e.rs"
+required-features = ["live-e2e", "unlock-bip39"]
+
+[[test]]
+name = "nats_bridge_cose_e2e"
+path = "tests/nats_bridge_cose_e2e.rs"
+required-features = ["live-e2e"]
+
+[lints]
+workspace = true

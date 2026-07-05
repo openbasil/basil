@@ -1,0 +1,15 @@
+{
+  "content_type": "application/basil.es256-interop",
+  "cose_sign1_hex": "d284583ba4012602810303781f6170706c69636174696f6e2f626173696c2e65733235362d696e7465726f700451636c69656e742e65733235362e74657374a055657332353620696e7465726f70207061796c6f61645840dd9951af3d194301b3dfc6992fef5f7242b4b408b0ccf77ef90ebeaafaf283ff1ebe7e142e1ea9f2d9a5221818ddf54821df67eadd267a9715ce7825e9192104",
+  "description": "Bare signed COSE_Sign1 under ES256 (ECDSA P-256 + SHA-256, COSE alg -7), built with basil-cose's deterministic RFC 6979 local signer. Test key only. Consumers must reproduce and verify these bytes byte-for-byte.",
+  "external_aad_hex": "",
+  "format": "basil-cose-es256-sign1-fixture",
+  "key": {
+    "algorithm": "es256",
+    "key_id": "client.es256.test",
+    "private_scalar_hex": "1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c",
+    "public_sec1_hex": "043351051faea550356310a7cfafc5f752d61b5bb02bd7e6842771f5ed783b9b655e54c95bad9fc70158dbe567e388ca3fd41597083906faf14e937f82f1d66dc2"
+  },
+  "payload_hex": "657332353620696e7465726f70207061796c6f6164",
+  "version": 1
+}

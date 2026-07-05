@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design: Unify into a single `basil` binary</title>
+<style>
+  :root { --fg:#1a1a1a; --muted:#666; --line:#ddd; --accent:#3b5; --warn:#b50; --code-bg:#f6f8fa; }
+  body { font: 15px/1.55 -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+         color: var(--fg); max-width: 60rem; margin: 2rem auto; padding: 0 1.2rem; }
+  h1 { font-size: 1.7rem; margin-bottom: .2rem; }
+  h2 { font-size: 1.25rem; margin-top: 2rem; border-bottom: 1px solid var(--line); padding-bottom: .25rem; }
+  h3 { font-size: 1.05rem; margin-top: 1.3rem; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  code { background: var(--code-bg); padding: .1rem .3rem; border-radius: 3px; font-size: .9em; }
+  pre { background: var(--code-bg); padding: .8rem 1rem; border-radius: 6px; overflow-x: auto;
+        border: 1px solid var(--line); font-size: .85rem; line-height: 1.45; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-size: .92rem; }
+  th, td { border: 1px solid var(--line); padding: .45rem .6rem; text-align: left; vertical-align: top; }
+  th { background: var(--code-bg); }
+  .meta { color: var(--muted); font-size: .9rem; margin-bottom: 1.2rem; }
+  .pill { display: inline-block; padding: .05rem .5rem; border-radius: 999px; font-size: .75rem;
+          font-weight: 600; vertical-align: middle; }
+  .pill.proposal { background: #eef; color: #338; }
+  .pill.ratified { background: #e7f6ec; color: #1a7f37; }
+  .pill.q { background: #fee9d6; color: var(--warn); }
+  .pill.d { background: #e7f6ec; color: #1a7f37; }
+  .rec { color: var(--accent); font-weight: 600; }
+  .dec { color: #1a7f37; font-weight: 600; }
+  .muted { color: var(--muted); }
+  ul.tight li { margin: .15rem 0; }
+  .danger { color: var(--warn); }
+  blockquote { border-left: 3px solid var(--accent); margin: .8rem 0; padding: .2rem 1rem; color: #333;
+               background: #f8fdf9; }
+</style>
+</head>
+<body>
+
+<h1>Unify into a single <code>basil</code> binary</h1>
+<div class="meta">
+  <span class="pill ratified">RATIFIED: decisions recorded (§8); ready to implement</span><br>
+  Tracking: <code>br basil-ju4s</code> &nbsp;·&nbsp; Related: <code>br basil-8hws</code> (OTLP feature-gate)<br>
+  Date: 2026-06-25 &nbsp;·&nbsp; Pre-release; flag-day migration (no backwards-compat shims, per repo policy).
+</div>
+
+<h2>1. Summary</h2>
+<p>
+Collapse the two human-facing binaries (<code>basil</code> from <code>basil-cli</code>, and <code>basil-agent</code>)
+into <strong>one <code>basil</code> binary</strong>, following the <code>vault</code>/<code>consul</code> model:
+the long-running daemon becomes a subcommand (<code>basil agent</code>), and every other command (the
+over-socket client commands <em>and</em> the offline config commands) lives on the same binary. The bulk of the
+code moves into a new <code>basil-core</code> library; a thin <code>basil-bin</code> clap crate produces the
+binary; the published <code>basil</code> <em>client library</em> stays lean (proto-only); and the cross-crate
+live/interop test suite + harness move into a dedicated <code>basil-tests</code> crate.
+</p>
+<blockquote>
+<strong>Primary driver is ergonomics</strong>: one binary in <code>$PATH</code> for every admin/dev operation.
+Today the split is by <em>implementation</em> (does the command need server-side core?), which leaks into the
+user's mental model: <code>basil list</code> talks to the broker, but <code>basil-agent check</code> validates
+its config. Users should not have to remember which binary hosts which command.
+</blockquote>
+
+<h2>2. Goals &amp; non-goals</h2>
+<h3>Goals</h3>
+<ul class="tight">
+  <li>One <code>basil</code> binary for all admin/dev operations; <code>basil agent</code> launches the daemon.</li>
+  <li>A clean, acyclic crate topology with the bulk in <code>basil-core</code> and a thin binary crate.</li>
+  <li>Keep the published <code>basil</code> <em>client library</em> exactly as lean as today (proto-only): embedders unaffected.</li>
+  <li>A dedicated home for the cross-crate live/interop suite + the shared harness.</li>
+  <li><em>Bonus, secondary:</em> reduce total shipped bytes by compiling the gRPC/async/clap stack <strong>once</strong>
+      (it is currently duplicated across both binaries), and coordinate with OTLP feature-gating (<code>br basil-8hws</code>).</li>
+</ul>
+<h3>Non-goals</h3>
+<ul class="tight">
+  <li>No change to the gRPC contract (<code>basil-proto</code>) or the client library's public API.</li>
+  <li>No backwards-compat aliases/dual-paths: this is a flag-day rename (repo policy).</li>
+  <li>The OTLP feature-gating itself is a <em>separate</em> ticket (<code>basil-8hws</code>); independent, coordinate only.</li>
+  <li>Not chasing binary size via crate-splitting: <code>cargo bloat</code> shows the per-command glue is kilobytes
+      against a ~10&nbsp;MiB <code>.text</code>; size lives in the framework/crypto/OTEL generics, not the subcommands.</li>
+</ul>
+
+<h2>3. Current state (the problem)</h2>
+<table>
+  <tr><th>Binary</th><th>Crate</th><th>Commands</th><th>Needs</th></tr>
+  <tr>
+    <td><code>basil</code></td><td><code>basil-cli</code></td>
+    <td>sign, verify, encrypt, decrypt, get, set, list, import-set, mint-jwt, mint-nats-user, issue-cert,
+        status, health, ready, reload</td>
+    <td>the <code>basil</code> client (gRPC over the socket)</td>
+  </tr>
+  <tr>
+    <td><code>basil-agent</code></td><td><code>basil-agent</code></td>
+    <td><strong>run</strong> (daemon), init, check, explain, doctor, bundle</td>
+    <td>server-side core (loader/PDP/schema, seal/unlock, backend probe)</td>
+  </tr>
+</table>
+<p>
+The seam is "does it need server-side core", an implementation fact, not a user-meaningful one.
+Two relevant findings from <code>cargo bloat</code> on release builds:
+</p>
+<ul class="tight">
+  <li>Both binaries are dominated by monomorphized generics from the shared framework stack
+      (<code>h2</code>/<code>tonic</code>/<code>tokio</code>/<code>clap</code>) plus crypto and OTEL, spread across
+      thousands of small methods, not in the subcommands. The biggest command-specific symbol is ~20&nbsp;KiB against
+      a ~10&nbsp;MiB <code>.text</code>.</li>
+  <li>The "lean" CLI is already ~10&nbsp;MiB because it carries the full gRPC client stack (<code>tonic</code>/<code>h2</code>/<code>hyper</code>/<code>tokio</code>)
+      to talk to the broker. "Keep the CLI lean" was protecting a binary that is already large for unavoidable reasons.</li>
+</ul>
+<p>So the topology decision is essentially <em>free</em> to optimize for UX. Size is a profile/codegen + feature-gating
+problem (strip/LTO; gate OTLP via <code>basil-8hws</code>), not a crate-topology one.</p>
+
+<h2>4. Target architecture</h2>
+<h3>Crates</h3>
+<table>
+  <tr><th>Directory</th><th>Package</th><th>Role</th></tr>
+  <tr><td><code>crates/basil-proto</code></td><td><code>basil-proto</code></td><td>the gRPC contract; dependency floor (unchanged)</td></tr>
+  <tr><td><code>crates/basil-client</code></td><td><strong><code>basil</code></strong></td><td>lean <em>published</em> client library (proto only). <span class="muted">Dir renamed from <code>crates/basil</code>; package name stays <code>basil</code> so <code>cargo add basil</code> / <code>use basil::Client</code> are unchanged.</span></td></tr>
+  <tr><td><code>crates/basil-nats</code></td><td><code>basil-nats</code></td><td>NATS NKey/JWT (unchanged)</td></tr>
+  <tr><td><code>crates/basil-core</code></td><td><code>basil-core</code></td><td><strong>THE BULK</strong> (library, no bin): backends / manager / catalog+PDP / peer / seal / unlock / audit / state + services + transport + the daemon <code>serve</code> fn + the offline-command impls (init/check/explain/doctor/bundle) as library fns.</td></tr>
+  <tr><td><code>crates/basil-bin</code></td><td><code>basil-bin</code></td><td>THIN clap crate: the unified command tree + <code>main</code> + dispatch. <code>[[bin]] name = "basil"</code>.</td></tr>
+  <tr><td><code>crates/basil-tests</code></td><td><code>basil-tests</code></td><td><code>publish = false</code>. The cross-crate live/interop suite + harness (harness in <code>src/lib.rs</code>, compiled once). Gated behind the <code>live-e2e</code> feature.</td></tr>
+</table>
+<p class="muted">(<code>basil-keystore-backend</code> unchanged.)</p>
+
+<h3>Dependency edges (a clean DAG)</h3>
+<pre>
+basil (client)  -&gt; basil-proto
+basil-core      -&gt; basil-proto, basil-nats, (backends/crypto/seal)        # NOT the client crate
+basil-bin       -&gt; basil-core, basil (client), clap
+basil-tests     -&gt; basil-core, basil (client), basil-proto, (interop deps)
+
+Bulk = basil-core.  Bin = thin.  Client lib = lean.  No cycle.
+</pre>
+
+<h3>Command split (by what each needs)</h3>
+<ul class="tight">
+  <li><strong>Offline / server commands</strong> (init, check, explain, doctor, bundle) + the daemon <code>serve</code>
+      logic &rarr; <code>basil-core</code> as library fns; <code>basil-bin</code> dispatches into them.</li>
+  <li><strong>Over-socket client commands</strong> (sign, verify, encrypt, decrypt, get, set, list, import-set,
+      mint-jwt, mint-nats-user, issue-cert, status, health, ready, reload, <span class="muted">+ future revoke</span>)
+      call a running broker &rarr; they need only the <code>basil</code> <em>client</em>, so they live in
+      <code>basil-bin</code> (thin <code>basil::Client</code> wrappers).</li>
+</ul>
+<p>This keeps <code>basil-core</code> a pure server/offline library: no "server depends on client" smell.
+<code>basil-bin</code> is the one crate that wires both halves, which is exactly its job as the unified frontend.</p>
+
+<h3>Folded-in cleanup</h3>
+<p>Today <code>basil-agent</code> imports proto types <em>through</em> the client crate (<code>use basil::proto::…</code>):
+the server reaching through the client. In <code>basil-core</code>, import from <code>basil-proto</code>
+<strong>directly</strong> (sweep <code>basil::proto::</code> &rarr; <code>basil_proto::</code>) and drop the client-crate
+dependency. Only <code>basil-bin</code> touches the client crate.</p>
+
+<h3>Tests</h3>
+<p><code>basil-tests</code> holds only the <em>system/interop</em> tests (boot the binary + a dev backend, drive over the
+socket, shell the Go OIDC verifier). The harness becomes the crate's <code>src/lib.rs</code> (a real, documented API:
+<code>boot_basil</code>, <code>boot_dev_backend</code>, <code>alloc_addr</code>, the dev-server semaphore,
+<code>fetch_jwt_svid</code>, <code>rotate_transit_key</code>, <code>kill_backend</code>, <code>Harness</code>), compiled
+once and linked by all test binaries (better than today's per-binary <code>mod common;</code>). <strong>Unit tests stay
+inline</strong> in <code>basil-core</code>'s modules (they need internals). Wins: isolates heavy dev-deps
+(<code>spiffe</code>, <code>spiffe-rustls</code>, <code>jsonwebtoken</code>, <code>reqwest</code>, <code>x509-parser</code>,
+the Go driving) off the production crates, and collapses the justfile recipe to
+<code>cargo test -p basil-tests --features live-e2e</code> (no more <code>--test foo --test bar</code> enumeration).</p>
+<p>Per <strong>D-7</strong>, <code>basil-tests</code> is also where the CLI/command coverage lives: no mock server and
+no dedicated unit tests for the <code>basil-bin</code> command bodies. Instead: every over-socket command gets a gRPC
+client test (positive + negative); every CLI command with flag variations is driven by invoking the <code>basil</code>
+binary in a subshell; and authorization is exercised against the running uid/gid via a small root-only set that is
+normally <code>#[ignore]</code>d.</p>
+<p class="muted">Wrinkle: a separate crate gets no free <code>CARGO_BIN_EXE_basil</code>; the harness already builds +
+locates <code>target/debug/&lt;bin&gt;</code> via <code>ensure_binaries_built</code>, so this keeps working (or use
+<code>escargot</code>).</p>
+
+<h2>5. Command surface (the unified <code>basil</code>)</h2>
+<pre>
+basil agent                # the daemon (long-running)         [basil-core::serve]
+basil config init          # scaffold a first-run deployment   [basil-core]
+basil config check         # validate catalog/policy           [basil-core]
+basil config explain       # offline PDP explain / --effective [basil-core]
+basil config bundle &lt;…&gt;    # seal/unseal the bundle             [basil-core]
+basil doctor               # preflight environment checks      [basil-core]
+basil sign|verify|encrypt|decrypt|get|set|list|import-set      # data plane  [client]
+basil mint-jwt|mint-nats-user|issue-cert                       # minting     [client]
+basil status|health|ready|reload                              # admin/probe [client]
+basil revoke               # (future, br basil-3wnn)           [client]
+</pre>
+<p>Per the decisions in §8: <code>basil agent</code> (bare) does one thing (start the service) so there is no way to
+accidentally launch the daemon while inspecting config. The offline <em>config</em> commands group under
+<code>basil config {init,check,explain,bundle}</code> (D-1, D-2). <code>doctor</code> stays top-level because it is
+broader than config validation (it checks dependencies, socket permissions, the environment). Data-plane, minting and
+admin commands stay top-level. A later CLI reorg may group some other level-1 commands (D-1).</p>
+
+<h2>6. Proposed subtask split</h2>
+<p>Sequenced so each step keeps the workspace building and the gates green. The user-facing flag-day is isolated to
+one phase (P2).</p>
+<table>
+  <tr><th>Task</th><th>What</th><th>Depends on</th><th>User-visible?</th></tr>
+  <tr>
+    <td><strong>ju4s.1</strong><br>client dir rename</td>
+    <td>Rename <code>crates/basil</code> &rarr; <code>crates/basil-client</code>; keep package name <code>basil</code>.
+        Update workspace member paths + any path deps. No code change.</td>
+    <td>none</td><td>No</td>
+  </tr>
+  <tr>
+    <td><strong>ju4s.2</strong><br>extract <code>basil-core</code></td>
+    <td>Move the <em>library</em> of <code>basil-agent</code> (core/service/transport) into a new
+        <code>basil-core</code> crate; make the daemon <code>serve</code> fn + the offline-command logic
+        <em>public lib fns</em>; switch <code>basil::proto</code> &rarr; <code>basil_proto</code>. For this phase,
+        <code>basil-agent</code> becomes a <em>thin bin</em> &rarr; <code>basil-core</code> (still named
+        <code>basil-agent</code>, no user change yet). The big mechanical lift; everything stays green.</td>
+    <td>none</td><td>No</td>
+  </tr>
+  <tr>
+    <td><strong>ju4s.3</strong><br>create <code>basil-bin</code> (flag-day)</td>
+    <td>New thin clap crate emitting <code>[[bin]] name = "basil"</code>. Merge <code>basil-cli</code>'s over-socket
+        commands + <code>basil-agent</code>'s command tree into one tree per the §8 surface: <code>basil agent</code>
+        (bare) = daemon, config commands under <code>basil config …</code>, <code>doctor</code> + data-plane/admin
+        top-level. <strong>Retire the <code>basil-agent</code> and <code>basil-cli</code> crates.</strong> Binary is now
+        <code>basil</code>.</td>
+    <td>ju4s.2</td><td><span class="danger">Yes (flag-day)</span></td>
+  </tr>
+  <tr>
+    <td><strong>ju4s.4</strong><br><code>basil-tests</code></td>
+    <td>Move the live/interop suite + harness into <code>basil-tests</code>; harness &rarr; <code>src/lib.rs</code>;
+        collapse the <code>cargo-live-e2e</code> recipe; gate behind <code>live-e2e</code>.</td>
+    <td>ju4s.3</td><td>No (CI)</td>
+  </tr>
+  <tr>
+    <td><strong>ju4s.5</strong><br>deployment + docs</td>
+    <td>nix/systemd <code>ExecStart</code>: <code>basil-agent run</code> &rarr; <code>basil agent</code>.
+        Rewrite AGENTS.md crate-layout + retire the lean-CLI rule. CHANGELOG, runbook, README.</td>
+    <td>ju4s.3</td><td>Yes (ops)</td>
+  </tr>
+</table>
+<h3>Dependency DAG</h3>
+<pre>
+ju4s.1 (client rename) ──────────────┐   (independent; do anytime)
+                                      │
+ju4s.2 (extract basil-core) ── ju4s.3 (basil-bin, flag-day) ──┬── ju4s.4 (basil-tests)
+                                                              └── ju4s.5 (deploy + docs)
+
+Coordinate (independent, any time): basil-8hws (OTLP feature-gate)
+</pre>
+<p class="muted">ju4s.1 and ju4s.2 are independent of each other and can run in parallel. ju4s.3 is the only
+user-facing flag-day. ju4s.4 and ju4s.5 can run in parallel after ju4s.3.</p>
+
+<h2>7. Migration &amp; rollout (flag-day)</h2>
+<ul class="tight">
+  <li><strong>Deployment:</strong> <code>nix/basil-agent.nix</code> + the systemd unit <code>ExecStart</code> change
+      from <code>basil-agent run</code> to <code>basil agent</code>. <code>ExecReload</code> (<code>kill -HUP</code>)
+      and <code>reloadTriggers</code> are unaffected.</li>
+  <li><strong>Test suite:</strong> <code>scripts/prefill-test-store.sh</code> and the live-e2e files shell
+      <code>target/debug/basil-agent</code> and <code>basil</code>: all become the unified <code>basil</code> binary
+      with the new subcommand paths. <span class="danger">Real rework: this suite was just built (jwks_oidc_e2e,
+      reload_e2e, health_ready_e2e, doctor_e2e, init_flow_e2e, spiffe_*, kv2_sign_e2e).</span></li>
+  <li><strong>Docs:</strong> AGENTS.md crate-layout + the (now-retired) lean-CLI rule; CHANGELOG entry documenting the
+      break; the operations runbook command examples; README.</li>
+  <li><strong>No parallel old+new</strong>. The repo policy is a clean break, and D-3 ratifies it: a clean flag-day
+      rename with <em>no</em> <code>basil-agent</code> compat symlink. The Nix unit is updated in the same change.</li>
+</ul>
+
+<h2 id="oq">8. Decisions</h2>
+<p class="muted">These were the open questions; all are now resolved. Identifiers map to the original questions
+(<code>D-1</code> = <code>OQ-1</code>, etc.) for traceability.</p>
+<ol>
+  <li>
+    <span class="pill d">D-1</span> <strong>Command namespacing.</strong>
+    <br><span class="dec">Decision:</span> <code>basil agent</code> (bare) starts the service, and does nothing else.
+    The offline <em>config</em> commands group under a dedicated <code>basil config</code> namespace:
+    <code>basil config init</code>, <code>basil config check</code>, <code>basil config bundle</code>,
+    <code>basil config explain</code>. <em>Rationale:</em> reserving <code>basil agent</code> solely for launching the
+    service means there is no risk of accidentally starting a long-running daemon while merely checking the config.
+    <code>doctor</code> is top-level (<code>basil doctor</code>) because it is broader than config checking: it probes
+    dependencies, socket permissions, and the environment. Data-plane, minting and admin commands
+    (<code>basil sign</code>, <code>basil reload</code>, <code>basil revoke</code>, …) stay top-level. A later CLI
+    reorg may group some other level-1 commands; that is deferred.
+    <br><span class="muted">(Differs from the original recommendation, which nested config/lifecycle under
+    <code>basil agent …</code>; the ratified choice is a separate <code>basil config</code> namespace with a bare
+    <code>basil agent</code>.)</span>
+  </li>
+  <li>
+    <span class="pill d">D-2</span> <strong>Daemon invocation.</strong>
+    <br><span class="dec">Decision:</span> <code>basil agent</code> (bare) launches the daemon: no <code>run</code>
+    subcommand, no <code>server</code>. Reinforces D-1: the <code>basil agent</code> verb is the daemon and only the
+    daemon.
+  </li>
+  <li>
+    <span class="pill d">D-3</span> <strong>Clean rename vs a <code>basil-agent</code> compat shim.</strong>
+    <br><span class="dec">Decision:</span> clean flag-day rename, no <code>basil-agent</code> symlink/alias (repo
+    policy: no compat layers; pre-release, no external users). The Nix unit is updated in the same change.
+  </li>
+  <li>
+    <span class="pill d">D-4</span> <strong>Binary crate name.</strong>
+    <br><span class="dec">Decision:</span> <code>basil-bin</code>. The crate hosts the daemon dispatch too, so
+    "cli"/"agent" would both mislead.
+  </li>
+  <li>
+    <span class="pill d">D-5</span> <strong>Default feature set of the unified binary.</strong>
+    <br><span class="dec">Decision:</span> keep the current defaults (<code>spiffe</code> on; OTLP off once
+    <code>basil-8hws</code> lands; <code>unlock-disk</code>/<code>live-e2e</code> test-only). <code>basil-bin</code>
+    re-exposes the meaningful features so distro/Nix can toggle them. See D-8 for how a feature is declared across the
+    <code>basil-bin</code> &rarr; <code>basil-core</code> edge.
+  </li>
+  <li>
+    <span class="pill d">D-6</span> <strong>Daemon-only artifact.</strong>
+    <br><span class="dec">Decision:</span> defer. The daemon retains core regardless, so the savings are just the tool
+    glue (small). Treat as a later packaging knob, not part of this change.
+  </li>
+  <li>
+    <span class="pill d">D-7</span> <strong>Testing the CLI / over-socket command bodies.</strong>
+    <br><span class="dec">Decision:</span> do <strong>not</strong> build a mock server, and we do not need dedicated
+    Rust unit tests for the socket-command bodies in <code>basil-bin</code>, <em>provided</em> the following coverage
+    exists (it lives in <code>basil-tests</code>):
+    <ul class="tight">
+      <li>Every over-socket command has a test where a client connects over gRPC and runs both positive and negative
+          cases.</li>
+      <li>Every CLI command with flag variations is exercised by an automated test that invokes the <code>basil</code>
+          binary in a subshell.</li>
+      <li>Authorization is tested against the running uid/gid: one small set of tests must run as root and is normally
+          <code>#[ignore]</code>d.</li>
+    </ul>
+    <span class="muted">(Supersedes the original recommendation to factor the command bodies into render-into-Writer
+    free fns; the ratified approach tests them end-to-end via gRPC + subshell instead.)</span>
+  </li>
+  <li>
+    <span class="pill d">D-8</span> <strong>Coordination with <code>basil-8hws</code> (OTLP feature-gate).</strong>
+    <br><span class="dec">Decision:</span> land <code>basil-8hws</code> first, or at the same time as the unification.
+    The OTLP feature must be declared in <strong>both</strong> <code>basil-bin</code> and <code>basil-core</code>:
+    normally off in <code>basil-core</code>, and enabling it in <code>basil-bin</code> enables it in
+    <code>basil-core</code> (the bin propagates the feature down). This is the template for how any meaningful feature
+    flows <code>basil-bin</code> &rarr; <code>basil-core</code> (D-5).
+  </li>
+  <li>
+    <span class="pill d">D-9</span> <strong>One <code>basil-core</code>, or split later?</strong>
+    <br><span class="dec">Decision:</span> one <code>basil-core</code> now; revisit only if compile times or boundaries
+    demand it.
+  </li>
+</ol>
+
+<h2>9. Related work &amp; notes</h2>
+<ul class="tight">
+  <li><code>br basil-8hws</code>: feature-gate the OpenTelemetry/OTLP exporter (default off). The one lever that
+      actually carves a chunk out of the agent. Land it first or concurrently; the feature is declared in both
+      <code>basil-bin</code> and <code>basil-core</code> (D-8).</li>
+  <li>Independent size win not requiring any of the above: add a <code>[profile.release]</code> with
+      <code>strip = true</code> + <code>lto = "thin"</code> + <code>codegen-units = 1</code>. The 24&nbsp;MiB file vs
+      ~10&nbsp;MiB <code>.text</code> gap is debug/symbol metadata; stripping alone is a large free win. (Not in scope
+      here; file separately if desired.)</li>
+  <li>Acyclicity is preserved throughout; the only rule retired is AGENTS.md's "<code>basil-cli</code> is a lean
+      binary." The load-bearing boundary, the lean published <em>client library</em>, is preserved.</li>
+</ul>
+
+</body>
+</html>

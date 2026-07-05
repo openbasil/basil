@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 2,
+  "roles": {
+    "demo-user": ["list", "get_public_key", "sign", "verify", "encrypt", "decrypt", "mint"],
+    "demo-operator": ["new_key", "import", "rotate", "set"]
+  },
+  "subjects": {
+    "current-user": { "allOf": [ { "kind": "unix", "uid": __UID__ } ] }
+  },
+  "rules": [
+    {
+      "id": "current-user-can-use-demo-keys",
+      "subjects": ["current-user"],
+      "action": ["role:demo-user", "role:demo-operator"],
+      "target": ["demo.*"],
+      "comment": "The user running the example may exercise every demo operation."
+    }
+  ],
+  "config": {
+    "names": {
+      "users": {
+        "__UID__": "__USER_NAME__"
+      },
+      "groups": {}
+    },
+    "memberships": {
+      "__UID__": []
+    }
+  }
+}

@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package envoy.config.core.v3;
+
+// Minimal xDS Node shape required by DiscoveryRequest.
+message Node {
+  string id = 1;
+  string cluster = 2;
+}
+
+// Minimal Envoy DataSource shape used by SDS secrets.
+message DataSource {
+  oneof specifier {
+    string filename = 1;
+    bytes inline_bytes = 2;
+    string inline_string = 3;
+    string environment_variable = 4;
+  }
+}
+
+// Minimal ControlPlane shape carried by DiscoveryResponse.
+message ControlPlane {
+  string identifier = 1;
+}

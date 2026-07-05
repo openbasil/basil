@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package xds.core.v3;
+
+import "google/protobuf/any.proto";
+
+message Resource {
+  string name = 3;
+  repeated string aliases = 4;
+  string version = 1;
+  google.protobuf.Any resource = 2;
+}

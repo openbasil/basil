@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "backends": {
+    "local-db": {
+      "kind": "keystore",
+      "addr": "__DB_PATH__",
+      "engines": ["transit", "kv2"],
+      "capabilities": [],
+      "mintKeyTypes": ["ed25519"]
+    }
+  },
+  "keys": {
+    "demo.signing_key": {
+      "class": "asymmetric",
+      "keyType": "ed25519",
+      "backend": "local-db",
+      "engine": "transit",
+      "path": "demo/signing-key",
+      "writable": true,
+      "missing": "generate",
+      "labels": ["tier=example"],
+      "description": "db-keystore-backed Ed25519 signing key."
+    },
+    "demo.aead_key": {
+      "class": "symmetric",
+      "keyType": "aes-256-gcm",
+      "backend": "local-db",
+      "engine": "transit",
+      "path": "demo/aead-key",
+      "writable": true,
+      "missing": "generate",
+      "labels": ["tier=example"],
+      "description": "db-keystore-backed AES-256-GCM key."
+    }
+  }
+}

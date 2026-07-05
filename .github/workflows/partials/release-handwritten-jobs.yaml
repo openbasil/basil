@@ -1,0 +1,175 @@
+# release-handwritten-jobs.yaml -- GitHub Actions jobs appended to release.yml.
+#
+# cargo-dist OWNS ../release.yml: `dist generate` rewrites it from
+# dist-workspace.toml and DROPS anything hand-added. dist 0.32.0 has no native
+# `.deb` or Arch packaging, so the two jobs below live here and are re-appended
+# to release.yml by `just gen-release-workflow` after every regeneration.
+#
+# This is NOT a runnable workflow. It sits in a subdirectory of
+# .github/workflows/, which GitHub Actions never scans (only files directly in
+# .github/workflows/ are loaded), so GitHub will not try to execute this partial.
+#
+# INDENTATION ANCHOR: the `jobs:` key on line 16 exists ONLY so a YAML
+# auto-formatter keeps every job at its correct 2-space indent instead of
+# flushing it to column 0. `just gen-release-workflow` skips this 16-line header
+# (through `jobs:`) and appends only the job definitions that follow.
+jobs:
+
+  # ===========================================================================
+  # HAND-WRITTEN JOBS (not managed by dist). Regenerate release.yml with
+  # `just gen-release-workflow` -- do not hand-edit the copy inside release.yml.
+  # ===========================================================================
+
+  # Debian .deb packages for amd64 + arm64. dist 0.32.0 has no native .deb
+  # support, so we assemble a package directly with dpkg-deb on NATIVE runners
+  # (arm64 uses GitHub's hosted arm64 Linux runner -- no cross toolchain needed).
+  # Each .deb contains both shipped binaries (`basil` and `basil-nats-bridge`)
+  # plus their man pages, gets its own build-provenance attestation, and is
+  # attached to the Release that the `host` job created.
+  debian-packages:
+    name: debian-package (${{ matrix.arch }})
+    needs:
+      - plan
+      - host
+    if: ${{ needs.plan.outputs.publishing == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      "contents": "write" # attach the .deb asset to the Release
+      "id-token": "write" # build-provenance attestation
+      "attestations": "write"
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.96.0
+      - name: Build stripped release binaries and man pages
+        # No --target: the runner arch matches the package arch, so this is a
+        # native build. basil-bin's DEFAULT features (spiffe + db-keystore +
+        # onepassword + unlock-age-yubikey + unlock-bip39 + pqc) are the
+        # supported release build. Optional HTTP, TPM, AWS KMS, and GCP KMS
+        # surfaces are deliberately outside the default release build. The
+        # profile strips symbols and uses fat LTO for shipped artifacts. `xtask`
+        # emits roff man pages for both shipped binaries.
+        run: |
+          cargo build --profile dist -p basil-bin -p xtask
+          target/dist/xtask -o target/dist/man
+      - name: Assemble .deb
+        id: deb
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          version="${{ needs.plan.outputs.tag }}"
+          version="${version#v}"
+          deb="target/debian/basil_${version}-1_${ARCH}.deb"
+          root="target/debian/root"
+          rm -rf "$root"
+          mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/usr/share/man/man1"
+
+          install -Dm755 target/dist/basil "$root/usr/bin/basil"
+          install -Dm755 target/dist/basil-nats-bridge "$root/usr/bin/basil-nats-bridge"
+          cp target/dist/man/*.1 "$root/usr/share/man/man1/"
+          gzip -9 -n "$root/usr/share/man/man1"/*.1
+
+          cat > "$root/DEBIAN/control" <<EOF
+          Package: basil
+          Version: ${version}-1
+          Section: utils
+          Priority: optional
+          Architecture: ${ARCH}
+          Maintainer: Basil maintainers <info@openbasil.org>
+          Homepage: https://github.com/openbasil/basil
+          Depends: libc6
+          Description: Broker for Attestation, Secrets, Identity and Leases
+           Basil brokers cryptographic operations, workload identity (SPIFFE),
+           and short-lived leases, with keys kept in the backend and used in
+           place. Ships the unified basil broker/CLI and the basil-nats-bridge
+           NATS courier, plus their man pages.
+          EOF
+
+          mkdir -p target/debian
+          dpkg-deb --root-owner-group --build "$root" "$deb"
+          echo "path=$deb" >> "$GITHUB_OUTPUT"
+      - name: Attest build provenance for the .deb
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ steps.deb.outputs.path }}
+      - name: Attach the .deb to the GitHub Release
+        run: gh release upload "${{ needs.plan.outputs.tag }}" "${{ steps.deb.outputs.path }}" --clobber
+
+  # Arch Linux .pkg.tar.zst, built from the PUBLISHED x86_64 release archive
+  # inside an archlinux container (dist has no native Arch support). The PKGBUILD
+  # lives at packaging/arch/PKGBUILD; CI patches pkgver from the tag and runs
+  # `updpkgsums` so the sha256 matches the real release tarball (correct sha256
+  # handling -- no blind 'SKIP'). AUR publication is a separate MANUAL step that
+  # needs AUR credentials (see docs/runbooks/release.md).
+  arch-package:
+    name: arch-package (x86_64)
+    needs:
+      - plan
+      - host
+    if: ${{ needs.plan.outputs.publishing == 'true' }}
+    runs-on: ubuntu-22.04
+    permissions:
+      "contents": "write"
+      "id-token": "write"
+      "attestations": "write"
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Derive pkgver from the tag
+        id: ver
+        shell: bash
+        run: |
+          tag="${{ needs.plan.outputs.tag }}"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+      - name: Build .pkg.tar.zst in an archlinux container
+        env:
+          PKGVER: ${{ steps.ver.outputs.version }}
+        # makepkg refuses to run as root, so we create an unprivileged `builder`
+        # user. `updpkgsums` downloads the release tarball and rewrites the
+        # sha256sums in PKGBUILD before makepkg re-downloads and verifies it.
+        run: |
+          docker run --rm \
+            -e PKGVER \
+            -v "$PWD/packaging/arch:/pkg" \
+            -w /pkg \
+            archlinux:base-devel \
+            bash -euo pipefail -c '
+              pacman -Syu --noconfirm --needed base-devel git pacman-contrib
+              useradd -m builder
+              chown -R builder:builder /pkg
+              sed -i "s/^pkgver=.*/pkgver=${PKGVER}/" PKGBUILD
+              sudo -u builder updpkgsums
+              sudo -u builder makepkg -f --noconfirm
+            '
+      - name: Locate the built package
+        id: pkg
+        shell: bash
+        run: |
+          pkg=$(find packaging/arch -maxdepth 1 -name '*.pkg.tar.zst' -print -quit)
+          if [ -z "$pkg" ]; then
+            echo "no .pkg.tar.zst produced" >&2
+            exit 1
+          fi
+          echo "path=$pkg" >> "$GITHUB_OUTPUT"
+      - name: Attest build provenance for the Arch package
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ steps.pkg.outputs.path }}
+      - name: Attach the Arch package to the GitHub Release
+        run: gh release upload "${{ needs.plan.outputs.tag }}" "${{ steps.pkg.outputs.path }}" --clobber

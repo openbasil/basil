@@ -1,0 +1,563 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Catalog + Policy Schema (provider-neutral) for Basil</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --font-sans: "Noto Sans", ui-sans-serif, system-ui, -apple-system,
+          BlinkMacSystemFont, "Segoe UI", sans-serif;
+        --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas,
+          "Liberation Mono", monospace;
+        --weight-body: 400;
+        --weight-heading: 600;
+        --weight-strong: 600;
+        --code-font-size: 0.875em;
+        --code-block-font-size: 0.875rem;
+
+        --bg: #f7f8fa;
+        --fg: #1f2933;
+        --muted: #5b6776;
+        --panel: #ffffff;
+        --border: #d8dee7;
+        --accent: #1d6f8f;
+        --accent-soft: #e7f4f8;
+        --warn: #7a4d00;
+        --warn-soft: #fff4d6;
+        --review: #6b21a8;
+        --review-soft: #f5ecfb;
+        --code-bg: #eef2f6;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #11161d;
+          --fg: #e6edf3;
+          --muted: #a8b3c1;
+          --panel: #171e27;
+          --border: #2d3948;
+          --accent: #6cc4e0;
+          --accent-soft: #102832;
+          --warn: #ffd37a;
+          --warn-soft: #302610;
+          --review: #d8b4fe;
+          --review-soft: #2a1f38;
+          --code-bg: #202a36;
+          --weight-body: 300;
+          --weight-heading: 500;
+          --weight-strong: 500;
+        }
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--fg);
+        font-family: var(--font-sans);
+        font-weight: var(--weight-body);
+        line-height: 1.55;
+      }
+
+      header, main, footer { width: min(1180px, 90%); margin: 0 auto; }
+      header { padding: 40px 0 18px; }
+      main { padding-bottom: 48px; }
+
+      h1, h2, h3, h4 { line-height: 1.2; letter-spacing: 0; font-weight: var(--weight-heading); }
+      h1 { margin: 0 0 12px; font-size: clamp(2rem, 4vw, 3.2rem); }
+      h2 { margin: 36px 0 14px; padding-top: 8px; font-size: 1.65rem; border-top: 1px solid var(--border); }
+      h3 { margin: 24px 0 10px; font-size: 1.18rem; }
+      h4 { margin: 18px 0 8px; font-size: 1rem; }
+
+      a { color: var(--accent); }
+      strong { font-weight: var(--weight-strong); }
+      p, ul, ol { margin: 0 0 14px; }
+
+      code, pre { font-family: var(--font-mono); }
+      code { padding: 0.08rem 0.24rem; border-radius: 4px; background: var(--code-bg); font-size: var(--code-font-size); }
+      pre code { font-size: inherit; padding: 0; background: none; }
+      pre {
+        overflow-x: auto; padding: 14px 16px; border: 1px solid var(--border);
+        border-radius: 8px; background: var(--code-bg); font-size: var(--code-block-font-size);
+      }
+
+      table { width: 100%; border-collapse: collapse; margin: 14px 0 22px; background: var(--panel); }
+      th, td { vertical-align: top; padding: 10px 12px; border: 1px solid var(--border); text-align: left; }
+      th { background: var(--accent-soft); font-size: 1.05rem; font-weight: 500; }
+
+      dl { display: grid; grid-template-columns: minmax(160px, 260px) 1fr; gap: 8px 18px; margin: 14px 0 22px; }
+      dt { font-weight: var(--weight-strong); }
+      dd { margin: 0; }
+
+      .lede { max-width: 880px; color: var(--muted); font-size: 1.08rem; }
+
+      .note, .warning { border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; background: var(--panel); }
+      .note { border-left: 4px solid var(--accent); }
+      .warning { border-left: 4px solid var(--warn); background: var(--warn-soft); }
+
+      .doc-status {
+        display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+        gap: 10px 18px; align-items: start; margin-top: 18px; padding: 14px 16px;
+        border: 1px solid var(--border); border-left: 4px solid var(--accent);
+        border-radius: 8px; background: var(--panel);
+      }
+      .doc-status-badge {
+        grid-column: 1 / -1; justify-self: start; display: inline-block;
+        font-size: 0.74rem; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase;
+        border-radius: 999px; padding: 2px 12px; border: 1px solid currentColor;
+      }
+      .doc-status.is-plan { border-left-color: var(--review); }
+      .doc-status.is-plan .doc-status-badge { color: var(--review); }
+
+      .toc { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 8px 18px; padding: 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); }
+      .toc ol { margin: 0; padding-left: 20px; }
+
+      footer { padding: 24px 0 40px; color: var(--muted); border-top: 1px solid var(--border); }
+
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Catalog + Policy Schema (provider-neutral)</h1>
+      <p class="lede">
+        Provider-neutral catalog and policy schema for the broker's key inventory,
+        backend routing, authorization rules, Nix-to-JSON export contract, and Rust
+        type contract.
+      </p>
+      <div class="doc-status is-plan" aria-label="Document status">
+        <span class="doc-status-badge">Design</span>
+        <div><strong>Status</strong><br>design</div>
+        <div><strong>Issue</strong><br><code>vault-c4o</code> (P1)</div>
+        <div><strong>Review gate</strong><br><code>vault-0tq</code></div>
+        <div><strong>Downstream impl</strong><br><code>vault-flk</code>, <code>vault-1l8</code></div>
+      </div>
+    </header>
+
+    <main>
+      <nav aria-labelledby="toc-heading">
+        <h2 id="toc-heading">Contents</h2>
+        <div class="toc">
+          <ol>
+            <li><a href="#1-problem-statement-constraints">1. Problem statement &amp; constraints</a></li>
+            <li><a href="#2-catalog-schema">2. Catalog schema</a></li>
+            <li><a href="#3-policy-schema">3. Policy schema</a></li>
+            <li><a href="#4-user-group-resolution-logging">4. User/group resolution &amp; logging</a></li>
+          </ol>
+          <ol start="5">
+            <li><a href="#5-export-contract-nix-json">5. Export contract (Nix → JSON)</a></li>
+            <li><a href="#6-rust-type-sketch-contract-for-vault-flk">6. Rust-type sketch (contract for <code>vault-flk</code>)</a></li>
+            <li><a href="#7-decisions">7. Decisions</a></li>
+          </ol>
+        </div>
+      </nav>
+<div class="note">
+<p>The broker <strong>loads JSON</strong> (the export-tool output). Throughout this document the schema is shown in <strong>Nix</strong> (the form an operator <em>authors</em>) and §5 specifies the Nix→JSON export. The JSON the broker consumes is the mechanical projection of the Nix below (symbolic names resolved to numbers; see §4–§5).</p>
+</div>
+<hr>
+<h2 id="1-problem-statement-constraints">1. Problem statement &amp; constraints</h2>
+<p>The broker is the <strong>policy decision point (PDP)</strong> for a Unix-socket signing/secrets service that fronts a Vault-compatible backend (OpenBao or HashiCorp Vault). Today it can sign, verify, and mint, but it has <strong>no declarative source of truth</strong> for (a) which keys exist, (b) which backend/engine serves each key, or (c) who may do what to which key. This document specifies that source of truth: a <strong>catalog</strong> (key inventory + backend routing) and a <strong>policy</strong> (authorization rules) that the broker loads at startup.</p>
+<p>The schema is <strong>generic and provider-neutral</strong>: no <code>edge</code>/<code>realm</code>/host-specific terms appear in the broker&#x27;s view. Realm semantics and catalog wiring live in the consuming layer, which <em>emits</em> the JSON this broker consumes (§5).</p>
+<p>Two constraints drive every default (README &quot;Principles&quot;, §17):</p>
+<ul>
+<li><strong>Secure by default (default-deny).</strong> Nothing is permitted until a policy <em>rule</em> grants it. An empty policy authorizes nothing. There is no ambient authority from &quot;the backend is unlocked.&quot; A <code>public</code> key is world-readable, but only for read ops and only because the catalog explicitly classed it public (§3.5).</li>
+<li><strong>Least privilege (PLP).</strong> Every grant is the narrowest that works: a rule binds <strong>explicit</strong> principals to an <strong>explicit</strong> action over an <strong>explicit</strong> target. Writes (<code>set</code>/<code>rotate</code>/<code>import</code>/<code>new_key</code>) live in a separate <code>operator</code> role and are <strong>never</strong> implied by any read/use/mint grant. <code>mint</code> is its own capability, never implied by <code>sign</code> (§3.1).</li>
+</ul>
+<p>Authorization binds to the connecting peer&#x27;s <strong><code>SO_PEERCRED</code> uid/gid</strong> (a kernel-captured snapshot, §17.3). The catalog destination <code>owner</code> becomes the allowed caller uid. <code>/proc/&lt;pid&gt;/exe</code> is <strong>advisory only</strong> and never a decision input.</p>
+<div class="warning">
+<p>⚠️ <strong>Always isolate runtime environments: never mix development and production keys in the same server.</strong> Mixing keys from multiple environments can increase the risk of accidental data breaches or accidental data destruction. One broker instance serves exactly one environment; environment is therefore <strong>not</strong> encoded in key names.</p>
+</div>
+<h3 id="scope">Scope</h3>
+<p>In scope: the schema for catalog + policy, glob-match semantics, user/group resolution, the Nix→JSON export contract, and the Rust type contract for <code>vault-flk</code>. Out of scope (other issues): the PDP evaluation engine internals (<code>vault-1l8</code>), multi-backend manager wiring (<code>vault-jso</code>), startup reconcile execution (<code>vault-zrg</code>), audit log (<code>vault-vq5</code>), master-unlock (<code>vault-er3</code>).</p>
+<hr>
+<h2 id="2-catalog-schema">2. Catalog schema</h2>
+<p>The catalog is the <strong>key inventory + backend routing table</strong>: one document loaded at startup, per-generation immutable (a new generation = a new file = a restart).</p>
+<h3 id="2-1-key-names">2.1 Key names</h3>
+<p>Keys are <strong>dotted, lowercase</strong> segment paths, e.g. <code>web.tls.signing_key</code>. Grammar:</p>
+<pre><code>key      = segment (&quot;.&quot; segment)*
+segment  = [a-z0-9] [a-z0-9_-]*          # lowercase; no dots inside a segment</code></pre>
+<p>A segment may contain <code>_</code> and <code>-</code> but <strong>never</strong> <code>.</code>: the dot is the only separator, so glob matching (§3.4) is unambiguous. Names are the broker&#x27;s stable identifiers, decoupled from backend paths (the backend path is an opaque routing detail that can change without renaming the key). Environment prefixes (<code>prod.</code>/<code>dev.</code>) are forbidden by convention; one broker = one environment (§1).</p>
+<h3 id="2-2-per-key-backend-routing">2.2 Per-key backend routing</h3>
+<p>Each key routes to <strong>exactly one</strong> backend instance (named in the top-level <code>backends</code> table). <code>engine</code> selects the sub-engine within that backend; it is <strong>optional</strong> and <strong>inferred from <code>class</code></strong> for the Vault-compatible backend kind (<code>asymmetric</code>/<code>symmetric</code> → <code>transit</code>; <code>value</code>/<code>public</code> → <code>kv2</code>). Set <code>engine</code> explicitly only to override the inference or when a backend exposes multiple engines that the class cannot disambiguate. The <code>pki</code> engine is <strong>never inferred</strong>: set it explicitly on a <code>class:asymmetric</code> CA key whose <code>mint</code> issues X.509-SVID leaves or broker TLS leaves (the CA key signs in place; see <code>designs/spiffe-workload-api.html</code> §4). <code>path</code> is the backend-native locator, opaque to policy.</p>
+<h3 id="2-3-concrete-example-nix">2.3 Concrete example (Nix)</h3>
+<pre><code class="language-nix">{
+  schemaVersion = 1;
+
+  backends = {
+    bao = {
+      implementation = OPENBAO_2_5;
+      addr = &quot;https://127.0.0.1:8200&quot;;
+      requires = [ ];
+    };
+  };
+
+  keys = {
+    &quot;nats.account&quot; = {
+      class = &quot;asymmetric&quot;;
+      keyType = &quot;ed25519-nkey&quot;;
+      backend = &quot;bao&quot;;                 # engine omitted -&gt; inferred &quot;transit&quot;
+      path = &quot;nats-account&quot;;            # transit key NAME (the backend builds transit/&lt;verb&gt;/&lt;name&gt;)
+      writable = true;
+      missing = &quot;error&quot;;
+      labels = [ &quot;nats_type=A&quot; ];       # NKey account prefix (§2.6)
+      description = &quot;NATS account signing key; mints user JWTs in place (seed never leaves transit).&quot;;
+    };
+
+    &quot;web.tls.signing_key&quot; = {
+      class = &quot;asymmetric&quot;;
+      keyType = &quot;ed25519&quot;;
+      backend = &quot;bao&quot;;
+      path = &quot;web-tls&quot;;                 # transit key NAME, not the keys/ HTTP path
+      writable = true;
+      missing = &quot;error&quot;;
+      description = &quot;Signing key for the web TLS leaf; signs in place.&quot;;
+    };
+
+    &quot;backups.aead_key&quot; = {
+      class = &quot;symmetric&quot;;
+      keyType = &quot;aes-256-gcm&quot;;
+      backend = &quot;bao&quot;;
+      path = &quot;backups-aead&quot;;            # transit key NAME
+      writable = true;
+      missing = &quot;generate&quot;;            # crypto key: created in transit from keyType (no recipe block)
+      description = &quot;Symmetric AEAD key for ENCRYPT_PAYLOAD/DECRYPT_PAYLOAD of backup blobs.&quot;;
+    };
+
+    &quot;web.tls.ca_cert&quot; = {
+      class = &quot;public&quot;;                # world-readable by definition (§3.5)
+      backend = &quot;bao&quot;;
+      engine = &quot;kv2&quot;;
+      path = &quot;secret/data/web/tls/ca-cert&quot;;
+      writable = false;                # externally managed; replaced out-of-band (§2.4.2)
+      missing = &quot;warn&quot;;
+      description = &quot;Public CA certificate (PEM); readable by every TLS client.&quot;;
+    };
+
+    &quot;grafana.admin_password&quot; = {
+      class = &quot;value&quot;;
+      backend = &quot;bao&quot;;
+      engine = &quot;kv2&quot;;
+      path = &quot;secret/data/grafana/admin&quot;;
+      writable = true;
+      missing = &quot;generate&quot;;
+      generate = { format = &quot;ascii-printable&quot;; bytes = 24; };
+      description = &quot;Opaque config value a service cannot take as a token; RAM-only GET.&quot;;
+    };
+  };
+}</code></pre>
+<h3 id="2-3-1-backend-capability-enforcement">2.3.1 Backend capability enforcement</h3>
+<p>In the Nix module, <code>implementation</code> is a preset such as <code>OPENBAO_2_5</code>, <code>VAULT_2_0</code>, or <code>VAULT_2_0_ENT</code>. The export expands that preset into the JSON <code>kind = "vault"</code>, <code>engines</code>, <code>capabilities</code>, and <code>mintKeyTypes</code> fields; hand-authored JSON supplies those fields directly.</p>
+<p>Each backend may declare what it <strong>provides</strong> through <code>engines</code>, <code>capabilities</code>, and <code>mintKeyTypes</code>. Basil derives what the catalog <strong>requires</strong> from the routed keys (their effective engine, any algorithm-specific capability such as future PQC transit support, and any <code>missing=generate</code> transit key type) and unions that with explicit backend-level <code>requires</code>. Startup and <code>check</code> enforce <code>required ⊆ provided</code> without backend I/O.</p>
+<p>A backend with <code>engines = []</code>, <code>capabilities = []</code>, and <code>mintKeyTypes = []</code> is <strong>capability-unknown</strong>: enforcement is skipped for that backend with a warning. Once a provides set is declared, <code>--capability-policy</code> / <code>BASIL_CAPABILITY_POLICY</code> controls gaps: <code>strict</code> (default, fail closed), <code>degraded</code> (defer to each key's <code>missing</code> policy; required-key gaps remain fatal), or <code>off</code>.</p>
+<h3 id="2-4-keys-field-reference">2.4 <code>keys.&lt;name&gt;</code> field reference</h3>
+<table>
+<thead><tr><th>Field</th><th>Type</th><th>Required</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><code>class</code></td><td>enum (§2.4.1)</td><td>yes</td><td><code>asymmetric</code> | <code>symmetric</code> | <code>value</code> | <code>public</code>. Selects the default op surface and whether a public half exists; <strong>never grants</strong> (policy is always authoritative).</td></tr>
+<tr><td><code>keyType</code></td><td>enum <code>KeyAlgorithm</code></td><td>for <code>asymmetric</code>/<code>symmetric</code></td><td><code>ed25519</code> | <code>ed25519-nkey</code> | <code>rsa-2048</code> | <code>ecdsa-p256</code> | <code>aes-256-gcm</code> | <code>chacha20-poly1305</code>. <strong>Omitted</strong> for <code>value</code> (not a crypto key; <code>generate</code> describes it). <strong>Optional</strong> for <code>public</code> (present iff it is a public key, absent for an opaque blob like a cert).</td></tr>
+<tr><td><code>backend</code></td><td>string</td><td>yes</td><td>Names a <code>backends.&lt;name&gt;</code>. Exactly one.</td></tr>
+<tr><td><code>engine</code></td><td>enum</td><td>no</td><td><code>transit</code> | <code>kv2</code> | <code>pki</code>. Inferred from <code>class</code> (§2.2) when omitted; <code>pki</code> is <strong>never</strong> inferred: explicit only, for an X.509-SVID issuer CA (§2.2).</td></tr>
+<tr><td><code>path</code></td><td>string</td><td>yes</td><td>Backend-native locator (transit key name / KV path). Opaque to policy.</td></tr>
+<tr><td><code>writable</code></td><td>bool</td><td>yes</td><td>Catalog-level <strong>hard cap</strong> on broker-mediated writes; see §2.4.2.</td></tr>
+<tr><td><code>missing</code></td><td>enum</td><td>no (default <code>error</code>)</td><td><code>error</code> | <code>warn</code> | <code>generate</code>. See §3.7.</td></tr>
+<tr><td><code>generate</code></td><td>object</td><td>only if <code>missing=&quot;generate&quot;</code> <strong>and</strong> <code>class</code> ∈ {<code>value</code>,<code>public</code>}</td><td>Generation recipe (§2.5). Crypto keys (<code>asymmetric</code>/<code>symmetric</code>) with <code>missing=&quot;generate&quot;</code> are created in the backend from <code>keyType</code> and need <strong>no</strong> recipe block.</td></tr>
+<tr><td><code>labels</code></td><td>list of string</td><td>no (default <code>[]</code>)</td><td><code>name=value</code> or bare-slug tags (§2.6).</td></tr>
+<tr><td><code>description</code></td><td>string</td><td><strong>yes, non-empty</strong></td><td>Human note for the lint CLI and audit. Blank/absent = load error.</td></tr>
+</tbody></table>
+<h4 id="2-4-1-class">2.4.1 <code>class</code></h4>
+<table>
+<thead><tr><th>class</th><th>public half?</th><th>default ops</th><th><code>keyType</code></th></tr></thead>
+<tbody>
+<tr><td><code>asymmetric</code></td><td>yes</td><td>sign, verify, mint, get_public_key</td><td>required (ed25519, ed25519-nkey, rsa-2048, ecdsa-p256)</td></tr>
+<tr><td><code>symmetric</code></td><td>no</td><td>encrypt, decrypt</td><td>required (aes-256-gcm, chacha20-poly1305)</td></tr>
+<tr><td><code>value</code></td><td>n/a</td><td>get, set, rotate</td><td>omitted</td></tr>
+<tr><td><code>public</code></td><td>n/a (it <em>is</em> the public half)</td><td>get, get_public_key</td><td>optional</td></tr>
+</tbody></table>
+<p>There is no <code>credential</code> class: a credential a service merely reads is a <code>value</code>; a NATS <code>.creds</code> is an <strong>API</strong> mint output (a JWT, decomposable to a keypair + JWT for BYOK), not a stored catalog key. There is no <code>public:true</code> flag: public material is the <code>public</code> <em>class</em> (§3.5).</p>
+<h4 id="2-4-2-writable-semantics">2.4.2 <code>writable</code> semantics</h4>
+<p><code>writable</code> is a <strong>catalog-level hard cap</strong>: &quot;the broker may mediate writes (<code>set</code>/<code>rotate</code>/<code>import</code>/<code>new_key</code>) to this key.&quot; A write is allowed only if <strong>both</strong> <code>writable = true</code> <strong>and</strong> the <code>operator</code> role grants it (defense-in-depth). <code>writable = false</code> ⇒ the key is <strong>externally managed</strong>: no broker-mediated write is ever permitted, even for an operator. Replacement happens <strong>out-of-band</strong>: directly in the backend (e.g. an operator rotates a CA key in bao) or via re-provisioning/import at deploy time. The flag makes externally-managed keys explicit and enforced.</p>
+<h3 id="2-5-generate-recipes-value-public-material">2.5 <code>generate</code> recipes (<code>value</code> / <code>public</code> material)</h3>
+<p>Formats mirror the edge catalog generators (<code>secret-defs.nix</code>). The recipe applies only to non-crypto material; crypto keys generate from <code>keyType</code>.</p>
+<table>
+<thead><tr><th><code>format</code></th><th>params</th><th>produces</th></tr></thead>
+<tbody>
+<tr><td><code>ascii-printable</code></td><td><code>bytes</code></td><td>random printable password</td></tr>
+<tr><td><code>base64</code></td><td><code>bytes</code></td><td>random bytes, base64</td></tr>
+<tr><td><code>hex</code></td><td><code>bytes</code></td><td>random bytes, hex</td></tr>
+<tr><td><code>age-x25519</code></td><td>none</td><td>an age identity (x25519), stored as a <code>value</code></td></tr>
+<tr><td><code>self-signed-tls</code></td><td><code>commonName</code>, <code>validity</code></td><td>self-signed cert via <code>step-cli</code>, <strong>test/dev only</strong>, feature-gated</td></tr>
+<tr><td><code>self-signed-tls-pair-of</code></td><td><code>pairOf</code> (another key name)</td><td>the key paired with a <code>self-signed-tls</code> cert, <strong>test/dev only</strong></td></tr>
+</tbody></table>
+<p><code>generate</code> never fabricates material that must be imported (an existing CA key, an <code>nsc</code> bundle), so those keys are <code>error</code> or <code>warn</code>.</p>
+<h3 id="2-6-labels">2.6 <code>labels</code></h3>
+<p><code>labels</code> is an optional list of tags, each either <code>name=value</code> or a bare slug. It captures distinctions the structural schema cannot. Reserved convention:</p>
+<ul>
+<li><strong><code>nats_type=&lt;letter&gt;</code></strong>: for <code>asymmetric</code> keys used as NATS NKeys, where <code>&lt;letter&gt;</code> is the single NKey <strong>prefix letter</strong>: <code>A</code> account, <code>O</code> operator, <code>U</code> user, <code>N</code> server, <code>C</code> cluster, <code>X</code> curve. The raw Ed25519 public is identical across NATS roles; the NKey-encoded form differs only by this prefix letter, which the <strong>minter must prepend</strong> when building <code>iss</code> (and the subject). An <code>ed25519-nkey</code> key without a <code>nats_type</code> label is a load-time warning (mint will fail for it).</li>
+<li><strong>PQC/provider metadata labels</strong>: reserved for provider-agile keys and validated by the broker loader. Each reserved label may appear at most once per key and must use <code>name=value</code> form:</li>
+<li><code>crypto_provider=vault-transit|local-software</code></li>
+<li><code>crypto_provider_version=&lt;non-empty backend or software-provider version&gt;</code></li>
+<li><code>pqc_algorithm=ml-dsa-44|ml-dsa-65|ml-dsa-87|ml-kem-512|ml-kem-768|ml-kem-1024</code></li>
+<li><code>pqc_custody=backend-native|software-encrypted</code></li>
+<li><code>crypto_provider_policy=backend-preferred|backend-required|local-software</code></li>
+<li><code>migration_target=&lt;non-empty catalog key name&gt;</code></li>
+</ul>
+<p>Labels are otherwise free-form and reserved for future policy use (e.g. a rule targeting keys by label). Unknown labels are preserved, not rejected, and may repeat.</p>
+<hr>
+<h2 id="3-policy-schema">3. Policy schema</h2>
+<p>The policy is the <strong>authorization allow-list</strong>. Default-deny: a request is permitted only if some rule matches <code>(principal, action, target)</code>. Authored in Nix; exported to JSON (§5). Catalog and policy are <strong>separate</strong> documents.</p>
+<h3 id="3-1-operations">3.1 Operations</h3>
+<pre><code>read ops :  get | list | get_public_key | verify
+use  ops :  sign | encrypt | decrypt                     # use the key in place; no export, no mutation
+mint op  :  mint                                          # capability emission (§3.1.1)
+validate :  validate                                      # verify a presented JWT-SVID vs the issuer JWKS (§3.1.2)
+write ops:  set | rotate | import | new_key               # operator-only; never implied</code></pre>
+<h4 id="3-1-1-mint-is-its-own-capability">3.1.1 <code>mint</code> is its own capability</h4>
+<p><code>mint</code> (e.g. a NATS user JWT, a JWT-SVID) is internally the <strong>atomic</strong> combination of <em>sign the signing input</em> + <em>assemble the credential</em>, but in the authorization model it is a <strong>distinct grant, separate from raw <code>sign</code>, and neither implies the other</strong>. This is the least-privilege point: a service that mints NATS user JWTs from an account key must <strong>not</strong> thereby gain raw <code>sign</code> over that key (raw sign is strictly more powerful: it could forge any signature or any JWT). <code>mint</code> is therefore neither a read, a use-<code>sign</code>, nor a write op; it is its own category, granted explicitly (typically via the <code>minter</code> role).</p>
+<h4 id="3-1-2-validate">3.1.2 <code>validate</code></h4>
+<p><code>validate</code> authorizes a caller to have the broker <strong>verify a presented JWT-SVID</strong> for an audience against the issuer&#x27;s published JWKS, the SPIFFE Workload API <code>ValidateJWTSVID</code> (see <code>designs/spiffe-workload-api.html</code> §9). It reads only <strong>public</strong> key material (never a private key, never a stored value), so it neither signs, mints, nor mutates. It is a <strong>separately grantable</strong> capability (its own <code>validator</code> role), gated on the <strong>issuer key</strong> <code>(uid, validate, issuer_key)</code>, so the policy names exactly which callers may use Basil as a token verifier rather than making validation ambient. (It is not folded into <code>reader</code>: a caller that reads values is not thereby a token verifier.)</p>
+<h3 id="3-2-roles">3.2 Roles</h3>
+<p>A <strong>role</strong> is a reusable named op set, referenced from a rule&#x27;s <code>action</code> as <code>role:&lt;name&gt;</code>. Roles carry only ops. The <code>operator</code> role is the canonical home for write ops and is <strong>never</strong> merged into a read/use/mint role.</p>
+<pre><code class="language-nix">roles = {
+  reader    = [ &quot;op:get&quot; &quot;op:list&quot; &quot;op:get_public_key&quot; ];
+  signer    = [ &quot;op:sign&quot; &quot;op:verify&quot; &quot;op:get_public_key&quot; ];
+  verifier  = [ &quot;op:verify&quot; &quot;op:get_public_key&quot; ];
+  minter    = [ &quot;op:mint&quot; &quot;op:get_public_key&quot; ];
+  validator = [ &quot;op:validate&quot; ];
+  encrypter = [ &quot;op:encrypt&quot; &quot;op:decrypt&quot; ];
+  operator  = [ &quot;op:set&quot; &quot;op:rotate&quot; &quot;op:import&quot; &quot;op:new_key&quot; ];
+};</code></pre>
+<h3 id="3-3-rules">3.3 Rules</h3>
+<p>A <strong>rule</strong> binds <code>principal</code> → <code>action</code> → <code>target</code>, with an optional <code>comment</code>. All three are <strong>flat prefix lists</strong> (URI-like terms); field names are <strong>singular</strong>.</p>
+<ul>
+<li><code>principal</code> terms: <code>user:&lt;name&gt;</code> | <code>group:&lt;name&gt;</code> | <code>*</code> (any caller, §3.6).</li>
+<li><code>action</code> terms: <code>role:&lt;name&gt;</code> | <code>op:&lt;op&gt;</code> | <code>*</code> (any op). The effective op set is the union of inline <code>op:</code> terms and the ops of referenced <code>role:</code>s.</li>
+<li><code>target</code> terms: <strong>bare dotted key names or globs</strong> (targets are always keys, so no qualifier prefix) | <code>*</code> (any key, §3.6, root-only).</li>
+<li><code>comment</code>: optional free text (recommended for auditability).</li>
+</ul>
+<pre><code class="language-nix">rules = [
+  { id = &quot;nats-account-minter&quot;;
+    principal = [ &quot;user:svc-nats&quot; ];
+    action    = [ &quot;role:minter&quot; ];
+    target    = [ &quot;nats.account&quot; ];
+    comment   = &quot;the nats service mints user JWTs from the account key&quot;; }
+
+  { id = &quot;grafana-value-reader&quot;;
+    principal = [ &quot;user:svc-grafana&quot; ];
+    action    = [ &quot;role:reader&quot; ];
+    target    = [ &quot;grafana.**&quot; ];
+    comment   = &quot;grafana reads its own opaque values&quot;; }
+
+  { id = &quot;root-ssh-keys-writer&quot;;
+    principal = [ &quot;group:wheel&quot; ];
+    action    = [ &quot;role:operator&quot; ];
+    target    = [ &quot;user.root.ssh.authorized_keys&quot; ];
+    comment   = &quot;users in wheel group can replace root ssh keys&quot;; }
+
+  { id = &quot;root-all&quot;;
+    principal = [ &quot;user:root&quot; ];
+    action    = [ &quot;*&quot; ];
+    target    = [ &quot;*&quot; ];                 # any-key target -&gt; principal must be root (§3.6)
+    comment   = &quot;root may do anything&quot;; }
+];</code></pre>
+<p>A request <code>(uid/gid, op, key)</code> is <strong>allowed</strong> iff some rule&#x27;s resolved principal matches the caller, its action lists the op, and any of its target globs matches the key. Otherwise denied. Rules never deny: denial is the absence of an allow (no explicit <code>deny</code> rules; default-deny makes them redundant and avoids precedence ambiguity).</p>
+<p>Every term must carry a known prefix (<code>user:</code>/<code>group:</code>/<code>role:</code>/<code>op:</code>) or be the bare-key / <code>*</code> form valid for its position; an unknown or missing prefix, or an unknown referenced name/role, is a <strong>fatal load error</strong> (no silent miss).</p>
+<h3 id="3-4-glob-target-matching-semantics">3.4 Glob (target) matching semantics</h3>
+<p>A target glob matches a <strong>dotted key</strong> segment-by-segment. Globs are only valid in the <strong>last</strong> position. Load-bearing definition (must match across export tool, PDP, and tests):</p>
+<ul>
+<li><code>*</code> <strong>as the entire term</strong> is the any-wildcard; see §3.6 (matches any key, subject to the root-only safety rule).</li>
+<li><code>*</code> <strong>in the last segment</strong> matches <strong>exactly one</strong> segment, any value; it does not cross a dot. (<code>web.tls.*</code> matches <code>web.tls.signing_key</code>, not <code>web.tls.a.b</code>.)</li>
+<li><code>**</code> <strong>in the last segment</strong> matches <strong>one or more</strong> segments (a non-empty tail). It is valid <strong>only</strong> as the last segment. (<code>web.**</code> matches <code>web.tls</code>, <code>web.tls.signing_key</code>; it does <strong>not</strong> match bare <code>web</code>.)</li>
+<li>A literal segment matches that segment exactly (lowercase, case-sensitive).</li>
+<li><strong>No intra-segment wildcards.</strong> <code>web*</code> is a <strong>fatal syntax error</strong> (not a literal, not a partial match): it is too easy to write an accidentally-broad grant. Per-system patterns like <code>user.*.ssh.authorized_keys</code> (glob not in last position) are likewise rejected; that is system-level policy, not secrets policy.</li>
+</ul>
+<table>
+<thead><tr><th>Glob</th><th><code>web.tls.signing_key</code></th><th>Why</th></tr></thead>
+<tbody>
+<tr><td><code>web.tls.signing_key</code></td><td>yes</td><td>exact</td></tr>
+<tr><td><code>web.tls.*</code></td><td>yes</td><td><code>*</code> = <code>signing_key</code> (one segment)</td></tr>
+<tr><td><code>web.*</code></td><td>no</td><td><code>*</code> = <code>tls</code>, leaves <code>signing_key</code> unmatched</td></tr>
+<tr><td><code>web.**</code></td><td>yes</td><td><code>**</code> = tail <code>tls.signing_key</code></td></tr>
+<tr><td><code>web</code></td><td>no</td><td>shorter than key, no <code>**</code></td></tr>
+<tr><td><code>web*</code></td><td><strong>load error</strong></td><td>intra-segment wildcard</td></tr>
+</tbody></table>
+<h3 id="3-5-public-keys-are-world-readable">3.5 <code>public</code> keys are world-readable</h3>
+<p>A key of <code>class: public</code> is <strong>readable by every caller</strong> for <code>get</code> / <code>get_public_key</code>, by definition of the class: no rule, and no <code>users:[&quot;*&quot;]</code>, is required or written. This replaces the former <code>public_read</code> stanza. Only <code>public</code>-class keys get this; every other key is default-deny. (A <code>public</code> key is still subject to default-deny for any <strong>non-read</strong> op: nobody writes it through the broker unless <code>writable</code> + an <code>operator</code> rule allow.)</p>
+<h3 id="3-6-safety-rules-for">3.6 Safety rules for <code>*</code></h3>
+<p><code>*</code> as a whole term means &quot;any of that type,&quot; bounded by:</p>
+<ul>
+<li><strong><code>*</code> target ⇒ root-only.</strong> A rule whose <code>target</code> contains <code>*</code> (any key) is valid <strong>only</strong> if its <code>principal</code> is exactly <code>user:root</code> (uid 0). Any other principal with a <code>*</code> target is a fatal load error. This prevents an accidentally catch-all grant.</li>
+<li><strong><code>*</code> principal</strong> (any caller) is permitted but is read-only in spirit (most &quot;everyone may read&quot; needs are already met by the <code>public</code> class, §3.5); the engine still applies default-deny elsewhere.</li>
+<li><strong><code>*</code> action</strong> (any op) is permitted only on a root rule (it pairs naturally with the root-only <code>*</code> target).</li>
+</ul>
+<h3 id="3-7-missing-key-policy">3.7 Missing-key policy</h3>
+<p>At startup the broker reconciles the catalog against its backends (executed by <code>vault-zrg</code>). Each key&#x27;s <code>missing</code> decides behavior when the backend has no material:</p>
+<table>
+<thead><tr><th><code>missing</code></th><th>Behavior when absent</th></tr></thead>
+<tbody>
+<tr><td><code>error</code> (default)</td><td>Hard error. With a <code>--require</code> lint flag the process exits non-zero (§17.7).</td></tr>
+<tr><td><code>warn</code></td><td>Log a warning, continue; the key&#x27;s ops fail at request time until it exists.</td></tr>
+<tr><td><code>generate</code></td><td>Create material: crypto keys from <code>keyType</code>; <code>value</code>/<code>public</code> from the <code>generate</code> recipe (§2.5). A <code>value</code>/<code>public</code> key with <code>missing=&quot;generate&quot;</code> but no <code>generate</code> block is a <strong>load error</strong>.</td></tr>
+</tbody></table>
+<hr>
+<h2 id="4-user-group-resolution-logging">4. User/group resolution &amp; logging</h2>
+<p>Policy is <strong>authored</strong> with symbolic names (<code>svc-nats</code>, <code>wheel</code>). The broker <strong>decides</strong> on <strong>numeric</strong> uid/gid from <code>SO_PEERCRED</code>. The <strong>export tool resolves names → numbers at export time</strong>: that is exactly when the mapping is known, which avoids drift (a name resolved at any later time risks disagreeing with the system the policy was built for).</p>
+<p>The export therefore emits, alongside the numeric rules, two tables (§5):</p>
+<ul>
+<li><strong><code>names</code></strong>: <code>uid → name</code> and <code>gid → name</code>, used <strong>only for logging</strong>. The broker logs principals as <code>name(num)</code>, e.g. <code>svc-nats(9002)</code> or <code>wheel(10)</code>: the number is what the kernel passes (authoritative), the name is for human readers.</li>
+<li><strong><code>memberships</code></strong>: <code>uid → [gid]</code>, each uid&#x27;s <strong>full declared group set</strong> (primary + <strong>supplementary</strong>). Supplementary groups are needed for service permissions and for group rules like <code>group:wheel</code>. <code>SO_PEERCRED</code> yields only uid + primary gid, so the broker expands the kernel-trustworthy <strong>uid</strong> to its declared group set via this table. Keeping memberships in the <strong>declarative export</strong> (rather than reading <code>/etc/group</code> at runtime) keeps the whole model declarative and auditable; on a system built from the same source, declared == actual.</li>
+</ul>
+<div class="warning">
+<p>⚠️ <strong>NixOS containers / VMs: mind where the exporter runs.</strong> If the export is invoked in the <strong>host</strong> config, it will not see user/group mappings that exist only <strong>inside</strong> a container; an export run inside <code>container.&lt;name&gt;.config</code> will not see <strong>host</strong> mappings. Scope the exporter to the same boundary as the users the policy references.</p>
+</div>
+<h3 id="4-1-pdp-decision-per-request">4.1 PDP decision (per request)</h3>
+<p>The PDP (<code>vault-1l8</code>) reads the peer&#x27;s <code>SO_PEERCRED</code> → <code>(uid, gid, pid)</code> and decides on <strong>uid</strong> plus the <strong>declared group set</strong> for that uid:</p>
+<ol>
+<li>resolve the request&#x27;s <code>(op, key)</code>;</li>
+<li>allow iff <code>uid</code> matches a rule&#x27;s <code>user:</code> principal, <strong>or</strong> any gid in the uid&#x27;s declared group set matches a rule&#x27;s <code>group:</code> principal, <strong>or</strong> the key is <code>class: public</code> and the op is a public read (§3.5);</li>
+<li>else deny.</li>
+</ol>
+<p><code>pid</code> / <code>/proc/&lt;pid&gt;/exe</code> are recorded for audit but are <strong>advisory only</strong> (the exe read is racy; <code>SO_PEERCRED</code> is the kernel snapshot). The kernel-trustworthy anchor is the <strong>uid</strong>; group membership is expanded from the declarative table keyed on that uid.</p>
+<hr>
+<h2 id="5-export-contract-nix-json">5. Export contract (Nix → JSON)</h2>
+<p>The export tool projects the authored Nix into the JSON the broker loads. Everything not listed here is a straight pass-through of the §2/§3 fields; the export tool&#x27;s <strong>non-obvious</strong> jobs are:</p>
+<ol>
+<li><strong>Resolve</strong> every symbolic <code>user:</code>/<code>group:</code> name to a numeric uid/gid, and emit the numeric rules <strong>plus</strong> the <code>names</code> table (for <code>name(num)</code> logging, §4).</li>
+<li><strong>Emit <code>memberships</code></strong>: each uid&#x27;s full declared group set (primary + supplementary), from <code>users.users.&lt;n&gt;</code> / <code>users.groups.&lt;n&gt;</code> (§4).</li>
+<li><strong>Derive read/use/mint rules</strong> from each catalog destination&#x27;s <code>owner</code> (the uid that may read/use the key), with the role chosen by <code>class</code> (<code>asymmetric</code> → <code>signer</code>/<code>minter</code>, <code>symmetric</code> → <code>encrypter</code>, <code>value</code> → <code>reader</code>, <code>public</code> → covered by §3.5). A destination <code>group</code> becomes an optional <code>group:</code> grant for the same role.</li>
+<li><strong>Derive the <code>operator</code> rule</strong> from an <strong>explicit operators declaration</strong> (e.g. <code>xyz.secrets.operators = [ &quot;secret-operators&quot; ]</code>), <strong>never</strong> from a key&#x27;s <code>owner</code>: a service that reads a key must not thereby gain write authority (PLP).</li>
+<li><strong>Drop file <code>mode</code></strong>: a <code>/run/secrets</code> filesystem concept; the broker has no files.</li>
+<li><strong>Rename</strong> legacy <code>UPPER_SNAKE</code> catalog keys to dotted-lowercase.</li>
+</ol>
+<p>The broker loads the result once, validates it (unknown name, <code>**</code> not last, intra-segment glob, non-root <code>*</code> target, <code>generate</code> without recipe on value/public, missing <code>nats_type</code> on an <code>ed25519-nkey</code> key, duplicate key, unknown backend/role/engine reference, blank description → hard errors), and treats it as immutable for the process lifetime.</p>
+<hr>
+<h2 id="6-rust-type-sketch-contract-for-vault-flk">6. Rust-type sketch (contract for <code>vault-flk</code>)</h2>
+<p>Names the implementer creates; all <code>serde</code>-derived, loaded from the exported JSON. No code is written by this task; this is the contract.</p>
+<pre><code class="language-rust">// ---- Catalog ------------------------------------------------------------
+pub struct Catalog {
+    pub schema_version: u32,
+    pub backends: BTreeMap&lt;String, BackendRef&gt;,
+    pub keys: BTreeMap&lt;String, KeyEntry&gt;,        // dotted-lowercase name -&gt; entry
+}
+pub struct BackendRef {
+    pub kind: BackendKind,
+    pub addr: String,
+    pub engines: Vec&lt;Engine&gt;,
+    pub capabilities: Vec&lt;Capability&gt;,
+    pub requires: Vec&lt;Capability&gt;,
+}
+pub enum BackendKind { Vault /* HashiCorp Vault or OpenBao */ }
+
+pub enum Class { Asymmetric, Symmetric, Value, Public }
+pub enum Engine { Transit, Kv2, Pki }   // Pki: X.509-SVID / TLS issuer CA; never inferred (§2.2)
+pub enum Capability { ByokImport, PrehashSign, PqcTransit, PkiCrl, Other(String) }
+
+// Union of crypto algorithms across asymmetric + symmetric keys. The wire layer
+// (vault-9j9) splits this by op into KeyType (asym) + AeadAlgorithm (sym);
+// catalog `keyType` maps onto those. Keep the mapping explicit; do not conflate
+// `Class` with `KeyAlgorithm`.
+pub enum KeyAlgorithm { Ed25519, Ed25519Nkey, Rsa2048, Aes256Gcm, ChaCha20Poly1305 }
+
+pub struct KeyEntry {
+    pub class: Class,
+    pub key_type: Option&lt;KeyAlgorithm&gt;,          // required for asym/sym; None for value; optional for public
+    pub backend: String,                         // -&gt; Catalog.backends key
+    pub engine: Option&lt;Engine&gt;,                  // inferred from class when None
+    pub path: String,
+    pub writable: bool,
+    pub missing: MissingPolicy,                  // default Error
+    pub generate: Option&lt;GenerateSpec&gt;,
+    pub labels: Labels,                          // &quot;name=value&quot; | &quot;slug&quot;
+    pub description: String,                      // validated non-empty
+}
+pub enum MissingPolicy { Error, Warn, Generate }
+pub enum GenerateSpec {
+    AsciiPrintable { bytes: u32 },
+    Base64 { bytes: u32 },
+    Hex { bytes: u32 },
+    AgeX25519,
+    SelfSignedTls { common_name: String, validity: String },        // test/dev, feature-gated
+    SelfSignedTlsPairOf { pair_of: String },                        // test/dev
+}
+
+// Parsed labels; the reserved nats_type accessor returns the single NKey prefix letter.
+pub struct Labels(Vec&lt;String&gt;);
+impl Labels {
+    pub fn get(&amp;self, key: &amp;str) -&gt; Option&lt;&amp;str&gt;;   // &quot;name=value&quot; lookup
+    pub fn nats_type(&amp;self) -&gt; Option&lt;char&gt;;        // &#x27;A&#x27;|&#x27;O&#x27;|&#x27;U&#x27;|&#x27;N&#x27;|&#x27;C&#x27;|&#x27;X&#x27; (§2.6)
+}
+
+// ---- Policy -------------------------------------------------------------
+pub struct Policy {
+    pub roles: BTreeMap&lt;String, BTreeSet&lt;Op&gt;&gt;,
+    pub rules: Vec&lt;Rule&gt;,
+    pub config: Config,
+}
+pub struct Rule {
+    pub id: String,
+    pub principal: Vec&lt;Principal&gt;,               // parsed from &quot;user:&quot;/&quot;group:&quot;/&quot;*&quot;
+    pub action: Vec&lt;ActionTerm&gt;,                 // parsed from &quot;role:&quot;/&quot;op:&quot;/&quot;*&quot;
+    pub target: Vec&lt;KeyGlob&gt;,                     // bare key/glob, or AnyKey (&quot;*&quot;)
+    pub comment: Option&lt;String&gt;,
+}
+pub enum Principal { User(u32) /* uid */, Group(u32) /* gid */, Any }
+pub enum ActionTerm { Role(String), Op(Op), AnyOp }
+pub enum Op { Sign, Verify, Get, List, GetPublicKey, Validate, Mint,
+              Encrypt, Decrypt, Set, Rotate, Import, NewKey }
+impl Op { pub fn is_write(self) -&gt; bool; /* Set|Rotate|Import|NewKey */ }
+
+// ---- Glob ---------------------------------------------------------------
+pub enum KeyGlob { AnyKey, Pattern(Vec&lt;GlobSeg&gt;) }     // AnyKey = &quot;*&quot;, root-only at validation
+pub enum GlobSeg { Literal(String), Star, DoubleStar } // Star/DoubleStar only in tail
+impl KeyGlob {
+    pub fn parse(s: &amp;str) -&gt; Result&lt;Self, GlobError&gt;;  // rejects mid-glob **, intra-segment *
+    pub fn matches(&amp;self, dotted_key: &amp;str) -&gt; bool;   // §3.4 semantics (** = one-or-more)
+}
+
+// ---- Resolution / config (export-resolved) ------------------------------
+pub struct Config {
+    pub names: NameTable,                        // uid-&gt;name, gid-&gt;name (logging: name(num))
+    pub memberships: BTreeMap&lt;u32, BTreeSet&lt;u32&gt;&gt;,// uid -&gt; full declared gid set
+}
+pub struct NameTable { pub users: BTreeMap&lt;u32, String&gt;, pub groups: BTreeMap&lt;u32, String&gt; }
+
+// resolved, ready-for-PDP form (built by the loader; consumed by vault-1l8)
+pub struct ResolvedPolicy {
+    pub by_uid: BTreeMap&lt;u32, Vec&lt;(Op, KeyGlob)&gt;&gt;,
+    pub by_gid: BTreeMap&lt;u32, Vec&lt;(Op, KeyGlob)&gt;&gt;,
+    pub any_principal: Vec&lt;(Op, KeyGlob)&gt;,       // from &quot;*&quot; principal rules
+}
+
+pub fn load(catalog_json: &amp;str, policy_json: &amp;str)
+    -&gt; Result&lt;(Catalog, ResolvedPolicy, Config), LoadError&gt;;
+//   validates: §5 hard-error list (unknown name, ** not last, intra-segment glob,
+//   non-root `*` target, generate-without-recipe, missing nats_type, duplicate key,
+//   unknown backend/role/engine ref, blank description).</code></pre>
+<p><code>vault-1l8</code> consumes <code>ResolvedPolicy</code> + <code>Catalog</code> + <code>Config</code> and implements the <code>(uid, gid_set, Op, &amp;dotted_key) -&gt; Allow|Deny</code> decision per §3/§4. <code>vault-jso</code> reads <code>Catalog.keys[k].{backend,engine,path}</code> for routing; the minter reads <code>labels.nats_type()</code>; <code>vault-zrg</code> reads <code>{missing,generate,key_type}</code> for reconcile.</p>
+<hr>
+<h2 id="7-decisions">7. Decisions</h2>
+<ul>
+<li><strong>Key naming</strong>: dotted-lowercase, no environment prefix (one broker = one environment). The export tool renames legacy <code>UPPER_SNAKE</code> keys.</li>
+<li><strong>Classes (4)</strong>: <code>asymmetric</code> / <code>symmetric</code> / <code>value</code> / <code>public</code>, encoding crypto shape and whether a public half exists. No <code>credential</code> class (a read credential is a <code>value</code>; <code>nats_creds</code> is an API mint output). No <code>public:true</code> flag, since <code>public</code> is a class, and such keys are world-readable for reads by definition (no <code>public_read</code> stanza).</li>
+<li><strong><code>keyType</code></strong>: <code>KeyAlgorithm</code> union {ed25519, ed25519-nkey, rsa-2048, ecdsa-p256, aes-256-gcm, chacha20-poly1305}; required for crypto classes, omitted for <code>value</code>, optional for <code>public</code>. No <code>opaque</code>.</li>
+<li><strong><code>engine</code></strong>: optional, inferred from class for the Vault-compatible backend kind; <code>pki</code> is explicit-only (never inferred), for an X.509-SVID issuer CA or broker TLS certificate issuer (§2.2).</li>
+<li><strong><code>writable</code></strong>: kept, as a catalog-level hard cap; <code>false</code> = externally managed, replaced out-of-band; both <code>writable</code> and the <code>operator</code> role must allow a write.</li>
+<li><strong><code>missing</code></strong>: <code>error | warn | generate</code>. <strong>Generators</strong>: <code>ascii-printable</code>, <code>base64</code>, <code>hex</code>, <code>age-x25519</code>, <code>self-signed-tls</code>(+<code>pair-of</code>) (step-cli, test/dev).</li>
+<li><strong><code>labels</code></strong>: optional <code>name=value</code>/slug list; reserved <code>nats_type=&lt;letter&gt;</code> (single NKey prefix letter) drives the prefix on <code>iss</code>; open for future policy use.</li>
+<li><strong><code>description</code></strong>: required, non-empty.</li>
+<li><strong><code>mint</code></strong>: its own capability category, separate grant from <code>sign</code>, neither implies the other (least privilege). Writes are the <code>operator</code> role, never implied.</li>
+<li><strong><code>validate</code></strong>: its own separately-grantable capability (the <code>validator</code> role), gated on the issuer key; verifies a presented JWT-SVID against the JWKS using public material only, for the SPIFFE Workload API <code>ValidateJWTSVID</code> (§3.1.2).</li>
+<li><strong>Rules</strong>: singular fields <code>principal</code>/<code>action</code>/<code>target</code> (+ <code>comment</code>), prefix/URI-form flat lists (<code>user:</code>/<code>group:</code>/<code>role:</code>/<code>op:</code>), bare-key targets, strict prefix validation.</li>
+<li><strong>Globs</strong>: last-position only; <code>*</code> = one segment, <code>**</code> = one-or-more tail segments, <code>web*</code> = fatal, whole-term <code>*</code> = any (root-only for targets).</li>
+<li><strong>Resolution authority</strong>: the <strong>export tool</strong> resolves names → numbers (avoids drift); the broker evaluates on numbers and logs <code>name(num)</code> via the emitted <code>names</code> table.</li>
+<li><strong>Supplementary groups</strong>: declared in the JSON export (<code>memberships</code>), expanded from the trustworthy uid; not read from <code>/etc/group</code>.</li>
+<li><strong>Catalog and policy</strong>: separate documents.</li>
+</ul>
+    </main>
+
+    <footer>
+      Basil design document.
+    </footer>
+  </body>
+</html>

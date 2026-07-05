@@ -1,0 +1,40 @@
+[package]
+name = "basil-cose"
+description = "Strict deterministic COSE (RFC 9052/9053) profile for basil sealed invocations: signed, sealed, and seal-only constructions with in-place signer/recipient traits"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords = ["cose", "cbor", "cryptography", "security"]
+categories = ["cryptography", "no-std"]
+publish = true
+
+[features]
+# Deterministic build variants (`build_sealed_with_parts`,
+# `build_encrypted_with_parts`) for test vectors only. Never enable in
+# production code paths: it admits caller-supplied ephemerals and nonces.
+fixtures = []
+# Enable `getrandom`'s JavaScript host binding so the crate builds for
+# `wasm32-unknown-unknown` in a JS environment (browser / Node).
+wasm-js = ["getrandom/js"]
+
+# Dependencies are declared crate-locally (not `workspace = true`) because this
+# crate is `no_std` + `alloc`: it must switch off the `std` default features
+# that the rest of the workspace relies on. Cargo feature unification still
+# collapses these to single copies in a workspace build.
+[dependencies]
+aes-gcm = { workspace = true }
+chacha20poly1305 = { workspace = true, features = ["alloc"] }
+ed25519-dalek = { workspace = true }
+getrandom = { workspace = true }
+hkdf = { workspace = true }
+minicbor = { workspace = true }
+p256 = { workspace = true }
+sha2 = { workspace = true }
+sha3 = { workspace = true }
+x25519-dalek = { workspace = true }
+zeroize = { workspace = true, features = ["alloc"] }
+
+[lints]
+workspace = true

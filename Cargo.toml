@@ -1,0 +1,176 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/basil-client",
+  "crates/basil-cose",
+  "crates/basil-proto",
+  "crates/basil-nats",
+  "crates/basil-nats-bridge",
+  "crates/basil-keystore-backend",
+  "crates/basil-core",
+  "crates/basil-bin",
+  "crates/basil-tests",
+  "xtask",
+]
+
+[workspace.package]
+version = "0.5.4"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["info@openbasil.org"]
+repository = "https://github.com/openbasil/basil"
+homepage = "https://github.com/openbasil/basil"
+
+[workspace.dependencies]
+basil = { path = "crates/basil-client" }
+basil-cose = { path = "crates/basil-cose" }
+basil-proto = { path = "crates/basil-proto" }
+basil-nats = { path = "crates/basil-nats" }
+basil-nats-bridge = { path = "crates/basil-nats-bridge" }
+basil-keystore-backend = { path = "crates/basil-keystore-backend" }
+basil-core = { path = "crates/basil-core", default-features = false }
+basil-bin = { path = "crates/basil-bin" }
+
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+aes-kw = "0.3"
+age = { version = "0.11", features = ["plugin"] }
+anyhow = "1"
+argon2 = "0.5"
+async-trait = "0.1"
+async-nats = { version = "0.49", default-features = false, features = ["nkeys", "ring", "server_2_10", "server_2_11", "server_2_12", "server_2_14"] }
+# AWS KMS transit backend (feature `aws-kms`). No-C-toolchain constraint forbids
+# aws-lc-sys, so we must avoid the `default-https-client` feature (it forces
+# `aws-smithy-http-client/rustls-aws-lc`). The `rustls` feature instead routes to
+# `legacy-rustls-ring` (pure-Rust ring). Pinned to the version pair known to
+# resolve this way; older 1.x differ.
+aws-config = { version = "=1.8.18", default-features = false, features = ["rt-tokio"] }
+aws-sdk-kms = { version = "=1.111.0", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+base64 = "0.22"
+bip39 = "2"
+bytes = "1"
+chacha20poly1305 = { version = "0.10", default-features = false }
+clap = { version = "4", features = ["derive", "env"] }
+crypto_secretbox = "0.1.1"
+data-encoding = "2"
+db-keystore = "0.4.3"
+ed25519-dalek = { version = "2", default-features = false, features = ["zeroize"] }
+futures = "0.3"
+getrandom = { version = "0.2", default-features = false }
+# GCP Cloud KMS transit backend (feature `gcp-kms`). yoshidan crate: gRPC/HTTP-2
+# (tonic + prost) for low-latency in-place KMS ops. `default-features = false` +
+# `rustls-tls` avoids the default `default-tls` path (reqwest native-tls →
+# openssl-sys, a forbidden C dependency).
+google-cloud-kms = { version = "=0.6.0", default-features = false, features = ["auth", "rustls-tls"] }
+# gRPC status/code types for the gcp-kms backend (matches google-cloud-kms 0.6).
+google-cloud-gax = "0.19.2"
+hex = "0.4"
+hkdf = { version = "0.12", default-features = false }
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["http1", "server-auto", "service", "tokio"] }
+# jsonwebtoken 10 requires selecting a crypto backend; `rust_crypto` uses the
+# pure-Rust RustCrypto stack (no C toolchain), matching this workspace. Without
+# it the crate cannot determine a provider and panics at sign/verify time.
+jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
+keyring-core = "1.0"
+minicbor = { version = "2.2.2", default-features = false, features = ["alloc"] }
+ml-dsa = { version = "0.1.1", features = ["zeroize"] }
+ml-kem = { version = "0.3", features = ["getrandom", "zeroize"] }
+nkeys = { version = "0.4", features = ["xkeys"] }
+opentelemetry-appender-tracing = "0.32"
+opentelemetry-otlp = { version = "0.32", features = ["logs", "http-proto", "http-json", "grpc-tonic", "reqwest-blocking-client"] }
+opentelemetry_sdk = { version = "0.32", features = ["logs"] }
+# ECDSA P-256 / ES256 (COSE -7) signatures. `p256` is shared with the `no_std`
+# `basil-cose` crate, so it is kept `default-features = false` (the `ecdsa`
+# feature signs deterministically per RFC 6979, pulling no RNG, which preserves
+# the wasm build). `p384`/`p521` are used only by the `std` `basil-core` crate,
+# so they keep their default features (needed for the full-message `Signer`).
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+p384 = { version = "0.13", features = ["ecdsa"] }
+p521 = { version = "0.13", features = ["ecdsa"] }
+percent-encoding = "2.3"
+pkcs8 = "0.10"
+prost = "0.14.4"
+prost-types = "0.14.4"
+rand = "0.8"
+# reqwest 0.13's `rustls` feature forces the `aws-lc-rs` provider (a C build dep,
+# forbidden here); `rustls-no-provider` pulls rustls with its default `ring`
+# provider and no C toolchain. `default-features = false` drops the native-tls
+# (openssl) default path.
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }
+rsa = { version = "0.9", features = ["pem"] }
+rustix = { version = "1", features = ["process"] }
+rustls = { version = "0.23.41", default-features = false, features = ["ring", "std"] }
+salsa20 = { version = "0.10", features = ["zeroize"] }
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+sha2 = { version = "0.10", default-features = false }
+sha3 = { version = "0.10", default-features = false }
+spiffe = { version = "0.16", features = ["x509-source", "jwt-source"] }
+spiffe-rustls = "0.7"
+thiserror = "2.0.18"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "time", "signal", "sync"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+toml = "1.1.2"
+tonic = "0.14.6"
+tonic-build = "0.14.6"
+# tonic 0.14 split prost support out of `tonic`/`tonic-build`: the generated
+# code now uses the `tonic-prost` runtime codec and `tonic-prost-build` codegen.
+tonic-prost = "0.14.6"
+tonic-prost-build = "0.14.6"
+tower = "0.5.3"
+tracing = "0.1.44"
+tracing-journald = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2.5"
+uuid = { version = "1", features = ["v4"] }
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
+x509-parser = "0.18"
+zero-secrets = "0.2.0"
+zeroize = { version = "1", default-features = false, features = ["derive"] }
+
+# TPM sealed-bundle unlock slot (basil-lpj, feature `unlock-tpm`). Pure-Rust, no
+# C build dependency: `tpm2-protocol` is a no_std, alloc-free, zero-dependency
+# TPM2 command/response codec ("panics disallowed"). basil owns the
+# `/dev/tpmrm0` transport (plain `std::fs::File` transceive) and the session /
+# `PolicyPCR` / seal / unseal orchestrator on top of it. We deliberately do NOT
+# pull `tpm2-device`/`tpm2-crypto`, which bring an OpenSSL (C) build dependency
+# which would violate the no-C-toolchain constraint. Pinned exact so a
+# wire-format bump can't silently change the on-disk slot.
+tpm2-protocol = "=1.0.0"
+
+# Release builds are stripped for installable artifacts. Dist inherits this, and
+# the hand-written Debian/Arch packaging jobs consume these binaries.
+[profile.release]
+strip = true
+lto = "fat"
+codegen-units = 1
+
+# Release build profile used by dist (cargo-dist). Inherits the tuned, stripped
+# `release` profile for shipped binaries. See dist-workspace.toml.
+[profile.dist]
+inherits = "release"
+
+[workspace.lints.rust]
+unsafe_code = { level = "forbid", priority = 1 }
+
+[workspace.lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+missing_errors_doc = { level = "allow", priority = 0 }
+# No-panic hardening (vault-g9n): the broker is an UNRESTARTABLE service. Any
+# runtime panic halts everything. These are `restriction`-group lints, set
+# individually at default priority so they coexist with the pedantic/nursery
+# groups above (priority -1). unwrap/expect/panic are allowed in tests via
+# clippy.toml; indexing_slicing in tests via #![cfg_attr(test, allow(...))].
+unwrap_used = { level = "deny", priority = 0 }
+expect_used = { level = "deny", priority = 0 }
+panic = { level = "deny", priority = 0 }
+unreachable = { level = "deny", priority = 0 }
+todo = { level = "deny", priority = 0 }
+unimplemented = { level = "deny", priority = 0 }
+indexing_slicing = { level = "deny", priority = 0 }
+get_unwrap = { level = "deny", priority = 0 }
+panic_in_result_fn = { level = "deny", priority = 0 }

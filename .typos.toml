@@ -1,0 +1,27 @@
+# typos (spell checker) configuration
+
+[files]
+# ignore these files
+extend-exclude = [
+  "docs/archive",
+  "**/vendor/github.com/**",
+]
+
+[default]
+extend-ignore-identifiers-re = [
+  ".*(cose|Cose|COSE).*",
+  ".*Encrypter.*",
+  "Tpm.*",
+]
+
+[default.extend-identifiers]
+# overrides: if right side of equals is same as left side, no change is made
+AOTHER = "AOTHER"
+HashiCorp = "HashiCorp"
+PNGs = "PNGs"
+encrypter = "encrypter"
+fals = "fals"
+keyedhash_parms = "keyedhash_parms"
+stateFals = "stateFals"
+stateTru = "stateTru"
+tru = "tru"

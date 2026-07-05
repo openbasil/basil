@@ -1,0 +1,1066 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>COSE Sealed Invocation Conversion - Basil</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --font-sans: "Noto Sans", ui-sans-serif, system-ui, -apple-system,
+          BlinkMacSystemFont, "Segoe UI", sans-serif;
+        --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas,
+          "Liberation Mono", monospace;
+        --weight-body: 400;
+        --weight-heading: 600;
+        --weight-strong: 600;
+        --code-font-size: 0.875em;
+        --code-block-font-size: 0.875rem;
+
+        --bg: #f7f8fa;
+        --fg: #1f2933;
+        --muted: #5b6776;
+        --panel: #ffffff;
+        --border: #d8dee7;
+        --accent: #1d6f8f;
+        --accent-soft: #e7f4f8;
+        --warn: #7a4d00;
+        --warn-soft: #fff4d6;
+        --review: #6b21a8;
+        --review-soft: #f5ecfb;
+        --code-bg: #eef2f6;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #11161d;
+          --fg: #e6edf3;
+          --muted: #a8b3c1;
+          --panel: #171e27;
+          --border: #2d3948;
+          --accent: #6cc4e0;
+          --accent-soft: #102832;
+          --warn: #ffd37a;
+          --warn-soft: #302610;
+          --review: #d8b4fe;
+          --review-soft: #2a1f38;
+          --code-bg: #202a36;
+          --weight-body: 300;
+          --weight-heading: 500;
+          --weight-strong: 500;
+        }
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--fg);
+        font-family: var(--font-sans);
+        font-weight: var(--weight-body);
+        line-height: 1.55;
+      }
+
+      header, main, footer { width: min(1180px, 90%); margin: 0 auto; }
+      header { padding: 40px 0 18px; }
+      main { padding-bottom: 48px; }
+
+      h1, h2, h3, h4 {
+        line-height: 1.2;
+        letter-spacing: 0;
+        font-weight: var(--weight-heading);
+      }
+      h1 { margin: 0 0 12px; font-size: clamp(2rem, 4vw, 3.2rem); }
+      h2 {
+        margin: 36px 0 14px;
+        padding-top: 8px;
+        font-size: 1.65rem;
+        border-top: 1px solid var(--border);
+      }
+      h3 { margin: 24px 0 10px; font-size: 1.18rem; }
+      h4 { margin: 18px 0 8px; font-size: 1rem; }
+
+      a { color: var(--accent); }
+      strong { font-weight: var(--weight-strong); }
+      p, ul, ol { margin: 0 0 14px; }
+      li { margin-bottom: 5px; }
+
+      code, pre { font-family: var(--font-mono); }
+      code {
+        padding: 0.08rem 0.24rem;
+        border-radius: 4px;
+        background: var(--code-bg);
+        font-size: var(--code-font-size);
+      }
+      pre code { font-size: inherit; padding: 0; background: none; }
+      pre {
+        overflow-x: auto;
+        padding: 14px 16px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--code-bg);
+        font-size: var(--code-block-font-size);
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 14px 0 22px;
+        background: var(--panel);
+      }
+      th, td {
+        vertical-align: top;
+        padding: 10px 12px;
+        border: 1px solid var(--border);
+        text-align: left;
+      }
+      th { background: var(--accent-soft); font-size: 1.05rem; font-weight: 500; }
+
+      .lede { max-width: 920px; color: var(--muted); font-size: 1.08rem; }
+
+      .note, .warning {
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 14px 16px;
+        background: var(--panel);
+      }
+      .note { border-left: 4px solid var(--accent); }
+      .warning { border-left: 4px solid var(--warn); background: var(--warn-soft); }
+
+      .doc-status {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+        gap: 10px 18px;
+        align-items: start;
+        margin-top: 18px;
+        padding: 14px 16px;
+        border: 1px solid var(--border);
+        border-left: 4px solid var(--accent);
+        border-radius: 8px;
+        background: var(--panel);
+      }
+      .doc-status-badge {
+        grid-column: 1 / -1;
+        justify-self: start;
+        display: inline-block;
+        font-size: 0.74rem;
+        font-weight: 700;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+        border-radius: 999px;
+        padding: 2px 12px;
+        border: 1px solid currentColor;
+      }
+      .doc-status.is-plan { border-left-color: var(--review); }
+      .doc-status.is-plan .doc-status-badge { color: var(--review); }
+
+      .toc {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        gap: 8px 18px;
+        padding: 16px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--panel);
+      }
+      .toc ol { margin: 0; padding-left: 20px; }
+
+      .decision {
+        padding: 12px 14px;
+        border: 1px solid var(--border);
+        border-left: 4px solid var(--review);
+        border-radius: 8px;
+        background: var(--review-soft);
+      }
+
+      footer {
+        padding: 24px 0 40px;
+        color: var(--muted);
+        border-top: 1px solid var(--border);
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>COSE Sealed Invocation Conversion</h1>
+      <p class="lede">
+        A plan for replacing the bespoke <code>SecureMessage</code> sealed
+        invocation envelope with COSE (RFC 9052 / RFC 9053): standard signed and
+        encrypted CBOR messages carried through a deliberately thin gRPC and NATS
+        envelope. This is a complete replacement of the wire format shipped by
+        the subject-based-authentication milestones M2&ndash;M5, with no
+        backwards-compatibility path.
+      </p>
+      <div class="doc-status is-plan" aria-label="Document status">
+        <span class="doc-status-badge">Plan</span>
+        <div><strong>Status</strong><br>approved</div>
+        <div><strong>Date</strong><br>2026-07-01</div>
+        <div><strong>Scope</strong><br>proto, core, client, nats-bridge, tests</div>
+        <div><strong>Compatibility</strong><br>intentional breaking change</div>
+      </div>
+      <p class="note" style="margin-top:14px">
+        This plan supersedes the wire format in
+        <a href="subject-based-authentication.html">subject-based-authentication</a>
+        &sect;7.1&ndash;7.4 and &sect;8.1 (the <code>Header</code> /
+        <code>SecureMessage</code> envelope, canonical BLAKE3 transcript, and
+        <code>Invoke(SecureMessage)</code> RPC). Everything else in that design
+        &mdash; subjects, principals, PDP, audit, replay semantics, broker
+        identity keys, and the courier bridge model &mdash; is unchanged and
+        remains authoritative.
+      </p>
+    </header>
+
+    <main>
+      <nav aria-labelledby="toc-heading">
+        <h2 id="toc-heading">Contents</h2>
+        <div class="toc">
+          <ol>
+            <li><a href="#1-summary">Summary</a></li>
+            <li><a href="#2-what-changes-what-stays">What changes, what stays</a></li>
+            <li><a href="#3-message-format">Target message format</a></li>
+            <li><a href="#4-thin-envelope">Thin gRPC and NATS envelope</a></li>
+          </ol>
+          <ol start="5">
+            <li><a href="#5-what-we-give-up">What we give up</a></li>
+            <li><a href="#6-what-we-gain">What we gain</a></li>
+            <li><a href="#7-implementation">Implementation and rip-out inventory</a></li>
+            <li><a href="#8-interop">Interop test suite</a></li>
+          </ol>
+          <ol start="9">
+            <li><a href="#9-security-tests">Security tests</a></li>
+            <li><a href="#10-milestones">Milestones</a></li>
+            <li><a href="#11-decisions">Decisions and deferred features</a></li>
+          </ol>
+        </div>
+      </nav>
+
+      <h2 id="1-summary">1. Summary</h2>
+      <p>
+        The shipped sealed invocation path invented three things COSE already
+        standardizes: a signed header structure (<code>Header</code> +
+        the canonical little-endian transcript), an AEAD binding rule (AAD =
+        header transcript), and a signed-ciphertext envelope
+        (<code>SecureMessage</code>). Each invention needs its own specification,
+        fixtures, and cross-language reimplementation. COSE gives the same
+        properties with registered algorithms, published test vectors, and
+        third-party verifiers.
+      </p>
+      <div class="decision">
+        <p>
+          <strong>Core decision:</strong> a sealed invocation becomes a tagged
+          <code>COSE_Sign1</code> whose payload is a tagged
+          <code>COSE_Encrypt</code>. Basil claims ride in the
+          <code>COSE_Encrypt</code> protected header, so one placement is covered
+          by both the sender signature and the AEAD tag and remains readable
+          before decryption for replay and expiry preflight. The gRPC envelope
+          shrinks to opaque COSE bytes plus one clear routing field
+          (<code>response_subject</code>); the NATS payload becomes the raw COSE
+          bytes with no protobuf wrapper at all.
+        </p>
+      </div>
+      <p>
+        The v1 cipher suite is the one the short-term use case needs:
+        <code>EdDSA</code> (Ed25519, including NATS NKey-encoded principals) for
+        signatures and <code>ECDH-ES + HKDF-256</code> over X25519 with
+        <code>A256GCM</code> for encryption. ML-KEM sealing is dropped from the
+        invocation path until COSE codepoints exist (it survives unchanged in the
+        separate <code>WrapEnvelope</code>/<code>UnwrapEnvelope</code> AEAD API).
+        Interop is proven against the independent <code>cose_minicbor</code>
+        crate plus imported COSE working-group vectors.
+      </p>
+
+      <h2 id="2-what-changes-what-stays">2. What changes, what stays</h2>
+      <table>
+        <thead>
+          <tr><th>Area</th><th>Disposition</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Subjects, principals, policy schema v2, PDP, actor vs presenter, audit v2</td>
+            <td><strong>Unchanged.</strong> <code>signature-key</code> principals still name
+            <code>ed25519</code> / <code>nats-nkey</code> public keys; resolution now verifies a
+            <code>COSE_Sign1</code> instead of a BLAKE3 transcript digest.</td>
+          </tr>
+          <tr>
+            <td><code>[invocation]</code> / <code>[broker-identity]</code> config, Nix module surface</td>
+            <td><strong>Unchanged keys.</strong> <code>audience</code> values now match the CWT
+            <code>aud</code> claim; TTL, skew, and replay-cache bounds keep their semantics.</td>
+          </tr>
+          <tr>
+            <td>Replay protection, expiry defaults, preflight-before-policy ordering</td>
+            <td><strong>Unchanged semantics.</strong> Cache key becomes signer <code>kid</code> +
+            CWT <code>cti</code>; omitted <code>exp</code> still means effective
+            <code>iat + 60s</code>; broker still enforces max TTL and skew.</td>
+          </tr>
+          <tr>
+            <td>Response protection (signed success, denial, and error; encrypt to requester key)</td>
+            <td><strong>Unchanged semantics</strong>, re-expressed as a COSE response message
+            (&sect;3.5). Fail-closed <code>INVOCATION_RESPONSE_PROTECTION_FAILED</code> behavior kept.</td>
+          </tr>
+          <tr>
+            <td>CBOR body schemas (<code>SignInvocationRequest</code>, mint bodies, <code>InvocationStatus</code>)</td>
+            <td><strong>Kept.</strong> The plaintext bodies are already deterministic CBOR;
+            they become the COSE plaintext, selected by the content type header
+            instead of the <code>MessageType</code> proto enum.</td>
+          </tr>
+          <tr>
+            <td><code>WrapEnvelope</code> / <code>UnwrapEnvelope</code> RPCs, <code>KemEnvelope</code>, ML-KEM key types</td>
+            <td><strong>Out of scope.</strong> That is a separate client-facing AEAD surface;
+            it keeps ML-KEM and is not converted by this plan.</td>
+          </tr>
+          <tr>
+            <td><code>Header</code>, <code>SecureMessage</code>, <code>MessageType</code>, BLAKE3 transcript,
+            canonical AAD encoding, <code>invocation-secure-message-v1.json</code></td>
+            <td><strong>Deleted.</strong> No aliases, no dual-path readers, no migration shim.</td>
+          </tr>
+          <tr>
+            <td>NATS bridge courier model, <code>op:invoke</code> presenter grant, <code>Basil-Bridge-*</code> error headers</td>
+            <td><strong>Unchanged model.</strong> Payload handling gets simpler: raw COSE bytes
+            on NATS, thin protobuf wrapper only on the gRPC hop (&sect;4).</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2 id="3-message-format">3. Target message format</h2>
+      <h3>3.1 Structure</h3>
+      <pre><code>18(                                ; COSE_Sign1 (RFC 9052 tag 18)
+  [
+    protected:   { 1: -8,                     ; alg = EdDSA
+                   4: 'publisher.signing.2026q3' } ; kid = sender_sign_id
+    unprotected: {},
+    payload:     &lt;&lt; 96(                       ; COSE_Encrypt (tag 96), embedded
+      [
+        protected: {
+          1: 3,                               ; alg = A256GCM (content)
+          3: "basil.sign-request",            ; content type of the plaintext body
+          15: { 1: "content.publisher",       ; CWT claims: iss = sender subject (optional)
+                3: "basil://prod/use1/agent-a", ; aud = recipient subject (optional)
+                4: 1782740060,                ; exp (optional; effective iat+60 when absent)
+                6: 1782740000,                ; iat
+                7: h'0197...'&nbsp;},              ; cti = message id (bstr, sender-unique)
+          -70003: "publisher.signing.2026q3", ; basil: sender key id (MUST equal outer kid)
+          -70004: "publisher.response_encryption.2026q3", ; basil: response key id (requests)
+          -70005: "_INBOX.abc123",            ; basil: response subject (requests, optional)
+          2: [3, 15, -70003, -70004]          ; crit: all present basil-critical labels
+        },
+        unprotected: { 5: h'&lt;12-byte IV&gt;' },  ; AEAD nonce
+        ciphertext:  h'&lt;encrypted CBOR body&gt;',
+        recipients: [[
+          protected:   { 1: -25 },            ; alg = ECDH-ES + HKDF-256
+          unprotected: { -1: { 1: 1, -1: 4,   ; ephemeral COSE_Key: OKP, crv X25519
+                               -2: h'&lt;ephemeral public&gt;' },
+                         4: 'broker.request_encryption.2026q3' }, ; kid = recipient_key_id
+          ciphertext:  h''                    ; empty: direct key agreement derives the CEK
+        ]]
+      ]
+    ) &gt;&gt;,
+    signature: h'&lt;Ed25519 over Sig_structure&gt;'
+  ]
+)</code></pre>
+      <p>
+        Sign-over-ciphertext is preserved: the broker verifies the outer
+        signature and runs replay, expiry, and audience preflight before any
+        decryption, exactly like today. The claims sit in the
+        <code>COSE_Encrypt</code> protected header, which is plaintext CBOR
+        (readable pre-decrypt), authenticated by the AEAD tag through
+        <code>Enc_structure</code>, and covered by the outer signature because
+        the whole <code>COSE_Encrypt</code> is the <code>COSE_Sign1</code>
+        payload. Nothing needs the old external transcript: <code>Sig_structure</code>
+        and <code>Enc_structure</code> (both with empty <code>external_aad</code>)
+        replace it.
+      </p>
+
+      <h3>3.2 Header parameter and claim registry</h3>
+      <table>
+        <thead>
+          <tr><th>Old <code>Header</code> field</th><th>COSE home</th><th>Notes</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>version</code></td><td><em>dropped</em></td>
+            <td>COSE has no envelope version. Evolution is carried by <code>alg</code>,
+            the content type registry, and <code>crit</code>-gated new labels.</td></tr>
+          <tr><td><code>message_id</code></td><td>CWT <code>cti</code> (7), bstr</td>
+            <td>1&ndash;64 bytes, sender-unique within the replay window. UUIDv7 bytes or an
+            encoded counter both work, as today.</td></tr>
+          <tr><td><code>request_id</code></td><td><code>-70001</code> in-reply-to, bstr</td>
+            <td>Responses only; equals the request's <code>cti</code>.</td></tr>
+          <tr><td><code>message_type</code></td><td>content type (3), tstr</td>
+            <td>Registry: <code>basil.sign-request</code>, <code>basil.sign-response</code>,
+            <code>basil.mint-jwt-request</code>, <code>basil.mint-jwt-response</code>,
+            <code>basil.mint-nats-user-request</code>, <code>basil.mint-nats-user-response</code>.
+            Selects the plaintext CBOR body schema, exactly as <code>MessageType</code> did.</td></tr>
+          <tr><td><code>issued_at_unix</code></td><td>CWT <code>iat</code> (6)</td><td>Same skew check.</td></tr>
+          <tr><td><code>expires_at_unix</code></td><td>CWT <code>exp</code> (4)</td>
+            <td>Optional; absent means effective <code>iat + 60</code> seconds; max-TTL still enforced.</td></tr>
+          <tr><td><code>sender_sign_id</code></td><td>outer <code>kid</code> (4) <strong>and</strong> <code>-70003</code></td>
+            <td>Duplicated inside the encrypted layer's protected header; the broker rejects
+            any mismatch. This is the strip-and-re-sign defense (&sect;3.4).</td></tr>
+          <tr><td><code>sender_subject</code></td><td>CWT <code>iss</code> (1), tstr</td>
+            <td>Optional; derivable only when the sender key id maps to exactly one subject,
+            as today.</td></tr>
+          <tr><td><code>recipient_key_id</code></td><td>recipient <code>kid</code> (4)</td>
+            <td>In the recipient structure of the <code>COSE_Encrypt</code> layer.</td></tr>
+          <tr><td><code>recipient_subject</code></td><td>CWT <code>aud</code> (3), tstr</td>
+            <td>Optional with the same unambiguous-derivation rule; checked against the
+            configured <code>audience</code> list before policy.</td></tr>
+          <tr><td><code>response_encryption_key_id</code></td><td><code>-70004</code>, tstr</td>
+            <td>Requests only; broker validates existence, use, and revocation before
+            executing, then seals the response to it.</td></tr>
+          <tr><td><em>(new)</em></td><td><code>-70005</code> response subject, tstr</td>
+            <td>Requests only, optional. The carrier subject (for NATS: often the sender's
+            inbox) where the requester wants the sealed response published. Signed and
+            AEAD-bound here; surfaced in clear on the thin envelope (&sect;4) so the
+            courier never parses COSE.</td></tr>
+          <tr><td><em>(new)</em></td><td><code>-70002</code> request hash, bstr</td>
+            <td>Responses only: SHA3-256 of the complete request <code>COSE_Sign1</code> bytes.
+            Replaces the BLAKE3 <code>request_hash</code> binding.</td></tr>
+          <tr><td><code>encapsulated_key</code></td><td>ephemeral key (<code>-1</code>) in the recipient structure</td>
+            <td>X25519 ephemeral public key as a <code>COSE_Key</code>; fresh per message.
+            The ML-KEM arm is dropped (&sect;5).</td></tr>
+          <tr><td><code>nonce</code></td><td>IV (5), unprotected</td>
+            <td>Fresh 12-byte nonce per message, generated by whichever side encrypts,
+            never caller-supplied to the other side. Tampering fails AEAD decryption.</td></tr>
+          <tr><td><code>body</code></td><td><code>COSE_Encrypt.ciphertext</code></td><td>Same plaintext CBOR schemas.</td></tr>
+          <tr><td><code>signature</code></td><td><code>COSE_Sign1.signature</code></td>
+            <td>Over <code>Sig_structure</code> (context <code>"Signature1"</code>).</td></tr>
+        </tbody>
+      </table>
+      <p>
+        Private labels use the RFC 9052 private-use range (below &minus;65536),
+        allocated in one place as a Rust constant registry. All basil labels
+        present in a message, plus content type (3) and CWT claims (15), are
+        listed in <code>crit</code> (2) so any conforming third-party consumer
+        fails closed rather than silently ignoring them.
+      </p>
+
+      <h3>3.3 Algorithms</h3>
+      <table>
+        <thead>
+          <tr><th>Purpose</th><th>COSE algorithm</th><th>Codepoint</th><th>Notes</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Envelope signature</td><td><code>EdDSA</code></td><td>&minus;8</td>
+            <td>Covers both <code>ed25519</code> and <code>nats-nkey</code> principals: an NKey
+            is an Ed25519 key in a different at-rest encoding, so on the wire there is one
+            algorithm and the NKey encoding remains a policy-side public-key decoding detail.</td></tr>
+          <tr><td>Key agreement</td><td><code>ECDH-ES + HKDF-256</code></td><td>&minus;25</td>
+            <td>X25519 (OKP, crv 4), direct CEK derivation, fresh ephemeral per message.
+            Matches the existing X25519 arm (ECDH + HKDF-SHA256 + AEAD) almost 1:1.</td></tr>
+          <tr><td>Content encryption</td><td><code>A256GCM</code></td><td>3</td>
+            <td>Single suite for v1. ChaCha20/Poly1305 (24) can return later as a pure
+            <code>alg</code> value change with no format break.</td></tr>
+          <tr><td>Request binding hash</td><td>SHA3-256</td><td>&mdash;</td>
+            <td>Not a COSE codepoint; used only inside the <code>-70002</code> response claim,
+            so the choice is ours &mdash; take the newer primitive per the strict-validation
+            decision (&sect;11).</td></tr>
+        </tbody>
+      </table>
+      <p>
+        The broker validates that the wire <code>alg</code> values equal the
+        algorithms implied by the catalog records for the named key ids and
+        rejects mismatches before use. This preserves the old rule that
+        algorithms resolve from configured key records: the wire field exists
+        because COSE requires it, but it is checked, never trusted (&sect;5,
+        item 7).
+      </p>
+      <p>
+        ES256/ES384/ES512 (&minus;7/&minus;35/&minus;36) are standard COSE and the
+        catalog already has P-256/P-384/P-521 key types, but envelope principals
+        stay Ed25519-family in v1, matching what is implemented today. Adding
+        ECDSA envelope signing later is a policy/catalog change, not a format
+        change.
+      </p>
+
+      <h3>3.4 Verification order and cross-checks</h3>
+      <ol>
+        <li>Strict decode: tagged <code>COSE_Sign1</code>, definite lengths,
+          RFC 8949 &sect;4.2 deterministic encoding, no unknown labels outside the
+          registry, all <code>crit</code> labels understood. Payload must be a tagged
+          <code>COSE_Encrypt</code>; any other nesting is rejected.</li>
+        <li>Resolve the outer <code>kid</code> against <code>signature-key</code>
+          principals; verify the wire <code>alg</code> against the configured key;
+          verify the signature over <code>Sig_structure</code>.</li>
+        <li>Read claims from the (now signature-trusted) inner protected header:
+          check <code>aud</code> against the configured audience, <code>iat</code>
+          against skew, effective <code>exp</code> against max TTL, and
+          <code>cti</code> against the replay cache. All before decryption, as today.</li>
+        <li>Enforce <code>-70003</code> (sender key id) equals the outer
+          <code>kid</code>. A courier or attacker who strips the signature and
+          re-signs the untouched ciphertext under its own key now fails here
+          (and would additionally fail subject cross-checks), so
+          signature-stripping cannot re-attribute a sealed request.</li>
+        <li>Authorize <code>Op::Decrypt</code> for the resolved actor on the
+          recipient key id; ECDH-decapsulate and AEAD-decrypt (the AEAD tag
+          authenticates the protected headers via <code>Enc_structure</code>,
+          so ciphertext transplant under altered claims fails).</li>
+        <li>Strictly decode the plaintext body by content type (unknown body
+          fields still rejected), then dispatch the operation and authorize it
+          normally (<code>Op::Sign</code>, mint ops, &hellip;).</li>
+      </ol>
+
+      <h3>3.5 Responses</h3>
+      <p>
+        Same shape, roles swapped: the broker signs a <code>COSE_Sign1</code>
+        with the configured response-signing key (outer <code>kid</code> =
+        response signing key id) over a <code>COSE_Encrypt</code> sealed to the
+        request's validated <code>-70004</code> response key. Response claims:
+        <code>iss</code> = broker identity id, <code>aud</code> = requester
+        subject when known, fresh <code>iat</code>/<code>cti</code>,
+        <code>-70001</code> = request <code>cti</code>, and <code>-70002</code> =
+        SHA3-256 of the exact request bytes. Content type selects the response
+        body schema; <code>InvocationStatus</code> (OK / DENIED / INVALID_REQUEST /
+        INTERNAL_ERROR), <code>policy_generation</code>, and operation results
+        stay inside the encrypted body. Denials and errors are signed and
+        encrypted; gRPC status stays transport-only; the
+        fail-closed response-protection-failed path is unchanged.
+      </p>
+      <p>
+        Client verification: check broker signature against pinned trust, check
+        <code>alg</code>, match <code>-70001</code> to the sent <code>cti</code>,
+        recompute and match <code>-70002</code>, confirm the recipient key is the
+        requested response key, decrypt, then trust only the signed decrypted
+        status. A response never reuses the request's nonce, and the fresh
+        ephemeral per message replaces the old fresh-encapsulation rule.
+      </p>
+
+      <h2 id="4-thin-envelope">4. Thin gRPC and NATS envelope</h2>
+      <p>
+        The old envelope forced every carrier hop through a structured protobuf
+        <code>Header</code> even though the carrier routes on none of it. The
+        replacement carries opaque COSE bytes plus the one field a courier
+        genuinely needs for response routing:
+      </p>
+      <pre><code>service InvocationService {
+  // Submit a sealed COSE invocation message.
+  rpc Invoke(SealedRequest) returns (SealedResponse);
+}
+
+message SealedRequest {
+  // Tagged COSE_Sign1 request bytes.
+  bytes message = 1;
+}
+
+message SealedResponse {
+  // Tagged COSE_Sign1 response bytes.
+  bytes message = 1;
+  // Carrier subject to publish `message` to (for NATS, often the
+  // requester's inbox). Echoed from the signed request's response-subject
+  // claim; absent when the request named none.
+  optional string response_subject = 2;
+}</code></pre>
+      <ul>
+        <li><strong>NATS payloads are raw COSE bytes</strong> in both directions
+          &mdash; no protobuf wrapper on the message bus at all. Any COSE/CBOR
+          tool can inspect the (public) envelope structure of a captured message.</li>
+        <li><strong>Response routing:</strong> the requester states its response
+          subject inside the signed, AEAD-bound request claim (<code>-70005</code>);
+          Basil echoes it in clear on <code>SealedResponse</code>. The bridge
+          publishes the response bytes there, falling back to the NATS
+          request/reply inbox when absent. The bridge never parses COSE; a
+          misrouting bridge is equivalent to a message-dropping bridge because
+          payloads stay sealed either way.</li>
+        <li><strong>Bridge behavior otherwise unchanged:</strong> size limit
+          checks, queue-group subscription, <code>op:invoke</code> presenter
+          grant, and the <code>Basil-Bridge-Error/-Message/-Retryable</code>
+          headers for bridge-level failures without a sealed response.</li>
+        <li><strong>gRPC status stays transport-only:</strong> disabled service,
+          malformed/oversized envelope, or response-protection failure.</li>
+      </ul>
+
+      <h2 id="5-what-we-give-up">5. What we give up</h2>
+      <p>
+        Ordered roughly by weight. Items 1&ndash;3 are real capability or
+        property changes; the rest are invariants that must be deliberately
+        re-established in the new format rather than losses.
+      </p>
+      <ol>
+        <li>
+          <strong>ML-KEM sealing on the invocation path.</strong> The
+          <code>KemAlgorithm</code> ML-KEM-512/768/1024 arms are removed from
+          request/response sealing because COSE has no final ML-KEM or HPKE
+          codepoints (only Internet-Drafts, e.g. draft-ietf-cose-hpke, as of
+          this writing). Accepted for v1; the general-purpose
+          <code>WrapEnvelope</code>/<code>UnwrapEnvelope</code> API keeps ML-KEM,
+          so post-quantum envelope wrapping remains available outside
+          invocation. When COSE HPKE/ML-KEM codepoints land, PQC sealing returns
+          as a new recipient <code>alg</code> with no format redesign.
+        </li>
+        <li>
+          <strong>Post-quantum signature headroom on the envelope.</strong>
+          Nothing shipped uses it (envelope principals are Ed25519/NKey only),
+          but the old bespoke format could have adopted ML-DSA-44/65/87 from the
+          crypto provider at any time. Under COSE, ML-DSA envelope signatures
+          and a PQC broker response-signing key wait on draft-ietf-cose-dilithium
+          becoming an RFC, or on us knowingly shipping draft codepoints.
+        </li>
+        <li>
+          <strong>BLAKE3, and digest-only signing.</strong> COSE registers no
+          BLAKE3 codepoint. ECDSA arms use SHA-2 (matching the ES256/384/512
+          transit shaping that already exists), and Ed25519 becomes PureEdDSA
+          over the full <code>Sig_structure</code> &mdash; so the sign-in-place
+          call to the backend carries the whole structure (bounded by the
+          existing max message size, ~1&nbsp;MiB) instead of a 32-byte BLAKE3
+          digest. OpenBao/Vault transit signs arbitrary-length Ed25519 input, so
+          this is a bandwidth/latency cost per bridged call, not a capability
+          loss. The response request-binding hash moves from BLAKE3 to SHA3-256.
+        </li>
+        <li>
+          <strong>The single flat transcript invariant.</strong> Today one
+          canonical transcript is simultaneously the signature input and the
+          AAD, so every header field is trivially covered by both. COSE splits
+          coverage across <code>Sig_structure</code> and
+          <code>Enc_structure</code>; the equivalent guarantee comes from
+          deliberate placement (claims in the encrypted layer's protected
+          header) plus the <code>-70003</code>-equals-outer-<code>kid</code>
+          cross-check. Equivalent strength, but it is a design discipline to
+          maintain rather than a structural given &mdash; hence the new
+          adversarial tests in &sect;9.
+        </li>
+        <li>
+          <strong>Fail-closed unknown-field rejection by construction.</strong>
+          The v1 envelope rejected unknown fields everywhere. COSE convention is
+          to ignore unrecognized non-critical header parameters, and third-party
+          libraries (including <code>cose_minicbor</code>) follow that. We keep
+          the property by policy: our decoder rejects labels outside the
+          registry, and every basil label rides in <code>crit</code> so
+          conforming external consumers fail closed too. Body decoding stays
+          strict and unchanged.
+        </li>
+        <li>
+          <strong>The explicit envelope <code>version</code> field.</strong>
+          COSE structures carry no version; discrimination collapses into
+          <code>alg</code> values, the content-type registry, and
+          <code>crit</code>-gated labels. Acceptable pre-release; a future
+          incompatible profile would introduce new content-type strings.
+        </li>
+        <li>
+          <strong>&ldquo;No caller-supplied algorithm fields.&rdquo;</strong>
+          The old design resolved every algorithm from catalog key records and
+          put none on the wire. COSE requires <code>alg</code> in protected
+          headers. The invariant is preserved in weakened form: wire
+          <code>alg</code> must equal the catalog-derived algorithm or the
+          message is rejected, and algorithm-confusion becomes an explicit test
+          class instead of an unrepresentable state.
+        </li>
+        <li>
+          <strong>Protobuf-native envelope introspection.</strong>
+          <code>Header</code> was inspectable with protobuf tooling and typed Go
+          stubs. The envelope is now CBOR; debugging shifts to standard CBOR
+          diagnostic tooling, which is arguably a net gain but is a tooling
+          change for anyone scripting against the old shape.
+        </li>
+        <li>
+          <strong>Sunk M2&ndash;M5 format artifacts.</strong> The canonical
+          transcript specification, <code>invocation-secure-message-v1.json</code>
+          fixture, transcript documentation in basil-doc, and the Go proto stubs
+          for <code>Header</code>/<code>SecureMessage</code> are all discarded
+          and replaced. Rework, not capability loss.
+        </li>
+      </ol>
+      <p>
+        Explicitly <em>not</em> lost: replay protection, short expiry with
+        signed defaults, audience binding, requester-selected response
+        encryption keys, signed denials and errors, verify-before-decrypt
+        preflight ordering, courier opacity (bridge never sees plaintext bodies
+        in either direction), actor-vs-presenter audit, and the
+        <code>nats-nkey</code> principal kind (it simply signs as EdDSA on the
+        wire).
+      </p>
+
+      <h2 id="6-what-we-gain">6. What we gain</h2>
+      <ul>
+        <li>Two RFCs replace three bespoke constructions (transcript encoding,
+          AAD derivation rule, envelope struct) that each needed spec text,
+          fixtures, and a promised cross-language port.</li>
+        <li>Independent verification: third-party COSE implementations can
+          decode and verify basil messages, which is the basis of the
+          &sect;8 interop suite &mdash; something impossible for a bespoke format.</li>
+        <li>One CBOR encoder for envelope and bodies (bodies were already
+          deterministic CBOR; the protobuf/CBOR split inside one message
+          disappears).</li>
+        <li>Future room without format breaks: multi-recipient sealing is a
+          recipients-array feature (via <code>ECDH-ES + A256KW</code>), ChaCha20
+          and ECDSA are alg-value changes, PQC returns via future registered
+          codepoints.</li>
+        <li>Cheaper Go client parity later: mature Go COSE libraries
+          (e.g. veraison/go-cose) replace a hand-ported transcript encoder.</li>
+        <li>Cross-project convergence: <code>edgebox-rs</code>'s bespoke RPC
+          uses the same two shapes (Ed25519-signed, and X25519-encrypted +
+          Ed25519-signed). Converting it to COSE lets it consume
+          <code>basil-cose</code> directly &mdash; one implementation, one
+          interop suite, and shared fixtures guarding both projects instead of
+          two bespoke formats evolving apart.</li>
+      </ul>
+
+      <h2 id="7-implementation">7. Implementation and rip-out inventory</h2>
+      <h3>7.1 Foundation</h3>
+      <div class="decision">
+        <p>
+          <strong>Decision:</strong> build basil's COSE layer on the
+          <code>coset</code> crate (structure encode/decode only, crypto-agnostic
+          &mdash; keys stay in providers/backends, nonces stay basil-generated),
+          with basil-side strict-decode validation on top. C1 must verify that
+          <code>coset</code> emits deterministic bytes for our structures; if it
+          cannot, fall back to extending the existing hand-rolled deterministic
+          CBOR encoder in <code>basil-proto</code> to the COSE structures. Do
+          <em>not</em> build on <code>cose_minicbor</code>: it is the interop
+          counterparty and must stay independent.
+        </p>
+        <p>
+          <strong>Decision:</strong> the profile lives in a new broker-free,
+          publishable crate <code>crates/basil-cose</code> (precedent:
+          <code>basil-nats</code>), not a module inside <code>basil-proto</code>.
+          It provides exactly two constructions &mdash; <em>signed</em>
+          (<code>COSE_Sign1</code>) and <em>sealed</em> (<code>COSE_Sign1</code>
+          over <code>COSE_Encrypt</code>) &mdash; under the strict deterministic
+          profile, with signing and decryption behind traits so the broker backs
+          them with backend sign-in-place while clients and external consumers
+          use local keys. The crate owns the generic sealed-RPC machinery: the
+          private label registry and claim structs (<code>in-reply-to</code>,
+          <code>request-hash</code>, <code>sender-key-id</code>,
+          <code>response-key-id</code>, <code>response-subject</code>), the
+          skew/TTL/audience validation (bounds passed as parameters), the
+          <code>crit</code> and strip-and-re-sign cross-checks, and the
+          deterministic-encoding enforcement. Basil-specific values &mdash; the
+          content-type strings, body schemas, and catalog key-id semantics
+          &mdash; stay in <code>basil-proto</code>. Motivation:
+          <code>edgebox-rs</code> carries a bespoke RPC with these same two
+          shapes (Ed25519-signed; X25519-encrypted + Ed25519-signed) and should
+          be able to adopt this implementation directly instead of maintaining a
+          parallel format.
+        </p>
+        <p>
+          A review of the edgebox-rs protocol surfaces (the signed control
+          RPC/push draft, the downloader command envelope, the enrollment sealed
+          framing, and hub-endpoints) fixes four crate requirements:
+          (1) caller-supplied <code>external_aad</code> on both
+          <code>Sig_structure</code> and <code>Enc_structure</code> &mdash;
+          edgebox binds the delivery NATS subject into control-RPC signatures and
+          a purpose/version context into enrollment AEAD; basil invocation passes
+          empty; (2) a seal-only bare <code>COSE_Encrypt</code> as a third
+          construction &mdash; enrollment's outer layer is encrypt-only, with
+          tamper evidence from the AEAD plus an inner signed envelope;
+          (3) exposed PartyU/PartyV identity in the ECDH KDF context structure,
+          the standard home for enrollment's direction-separating
+          <code>d2h</code>/<code>h2d</code> HKDF info strings; (4) ChaCha20/Poly1305
+          content encryption from the start (&sect;11). Detached payloads (nil
+          COSE payload, supplied externally at verify time) are available in COSE
+          if a future consumer needs to sign stored artifacts without embedding
+          them; not a v1 requirement.
+        </p>
+      </div>
+
+      <h3>7.2 File-by-file</h3>
+      <table>
+        <thead>
+          <tr><th>Path</th><th>Today</th><th>Action</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>crates/basil-proto/proto/basil/broker/v1/broker.proto</code></td>
+            <td><code>Header</code>, <code>SecureMessage</code>, <code>MessageType</code>,
+              <code>Invoke(SecureMessage)</code></td>
+            <td>Delete all three messages/enums; replace the RPC with
+              <code>Invoke(SealedRequest) returns (SealedResponse)</code> (&sect;4).
+              <code>KemEnvelope</code>/<code>KemAlgorithm</code>/<code>EnvelopeAlgorithm</code>
+              stay (AEAD surface). Regenerate Rust and Go stubs.</td>
+          </tr>
+          <tr>
+            <td><code>crates/basil-proto/src/invocation.rs</code> (1,230 lines)</td>
+            <td>Transcript/AAD/BLAKE3 canonicalization, header validation, CBOR body
+              codecs, fixture check</td>
+            <td>Delete <code>transcript_bytes</code>/<code>transcript_hash</code>/
+              <code>aad_bytes</code>/<code>request_hash</code>/<code>validate_header</code>/
+              <code>ValidatedHeader</code> and the transcript fixture test. Keep the CBOR
+              body structs, <code>InvocationStatus</code>, and add the basil
+              content-type registry values.</td>
+          </tr>
+          <tr>
+            <td><code>crates/basil-cose/</code> <em>(new)</em></td>
+            <td>&mdash;</td>
+            <td>New broker-free published crate (&sect;7.1): the strict deterministic
+              COSE profile &mdash; signed and sealed constructions
+              (<code>coset</code>-backed), label/claim registry and validation with
+              parameterized bounds, signer/recipient traits, crypto-free
+              deterministic-encoding checks. Sized for direct reuse by
+              <code>edgebox-rs</code>; depends only on <code>coset</code>, RustCrypto
+              primitives, and <code>zeroize</code>.</td>
+          </tr>
+          <tr>
+            <td><code>crates/basil-core/src/service/invocation.rs</code> (1,833 lines)</td>
+            <td><code>prepare_invocation</code>, <code>execute_invocation</code>,
+              <code>protect_response</code>, signature actor resolution, 21 in-file tests</td>
+            <td>Rewrite the preflight to &sect;3.4 order and response protection to
+              &sect;3.5; port all 21 tests to COSE mutations and add the new classes in
+              &sect;9. Replay cache, audit emission, and op authorization logic carry over
+              structurally.</td>
+          </tr>
+          <tr>
+            <td><code>crates/basil-client/src/sealed_invocation.rs</code> (975 lines)</td>
+            <td><code>prepare_sealed_invocation_with_parts</code>,
+              <code>verify_and_decrypt_sign_response</code>, proto message builders</td>
+            <td>Rewrite around COSE build/verify; same public API shape (seal request /
+              verify+decrypt response), new names free of the old envelope vocabulary.
+              Client generates the request nonce and ephemeral key; response verification
+              gains the <code>-70001</code>/<code>-70002</code> checks.</td>
+          </tr>
+          <tr>
+            <td><code>crates/basil-nats-bridge/</code> (1,108 lines)</td>
+            <td>Decodes protobuf <code>SecureMessage</code> from NATS, forwards over gRPC</td>
+            <td>Simplify: NATS payload is opaque COSE bytes; wrap into
+              <code>SealedRequest</code>, publish <code>SealedResponse.message</code> to
+              <code>response_subject</code> or the reply inbox. Error headers, size limits,
+              queue group, presenter grant unchanged. Update crate README.</td>
+          </tr>
+          <tr>
+            <td><code>crates/basil-proto/fixtures/invocation-secure-message-v1.json</code></td>
+            <td>Transcript/AAD/BLAKE3/signature vectors</td>
+            <td>Delete. Replaced by COSE fixtures (&sect;8.3).</td>
+          </tr>
+          <tr>
+            <td><code>clients/go/</code></td>
+            <td>Generated <code>Header</code>/<code>SecureMessage</code> stubs only; no sealed
+              invocation helpers (deferred)</td>
+            <td>Regenerate stubs (old messages disappear, thin envelope appears). Helper
+              work remains deferred; when it lands it uses a Go COSE library instead of a
+              transcript port.</td>
+          </tr>
+          <tr>
+            <td>Docs: <code>README.md</code>, bridge README, <code>docs/design-CHANGELOG.md</code>,
+              <code>CHANGELOG.md</code>, basil-doc</td>
+            <td>Describe the <code>SecureMessage</code> wire format</td>
+            <td>Update READMEs and CHANGELOG with the break; add a superseded-by note to
+              <code>subject-based-authentication.html</code> &sect;7/&sect;8; file a br
+              ticket labeled <code>docs</code> for the basil-doc invocation/bridge pages.</td>
+          </tr>
+        </tbody>
+      </table>
+      <p>
+        Config (<code>[invocation]</code>, <code>[broker-identity]</code>, Nix
+        module) is intentionally untouched: same key ids, audience, TTL, skew,
+        and capacity fields. Workspace deps gain <code>coset</code> and
+        <code>sha3</code> (runtime) and <code>cose_minicbor</code> (dev/test); the
+        <code>blake3</code> dependency stays only if other subsystems still use
+        it, otherwise it is removed with the transcript.
+      </p>
+
+      <h2 id="8-interop">8. Interop test suite</h2>
+      <h3>8.1 Counterparty and scope</h3>
+      <p>
+        Primary counterparty: <code>cose_minicbor</code> (v0.1.x, from the
+        suit-rs project) as a dev-dependency in the <code>basil-tests</code>
+        crate (publish=false). It is a decode-and-verify-first, no_std COSE
+        implementation on an unrelated codebase &mdash; exactly what an interop
+        counterparty should be. Its current coverage shapes the suite:
+        <code>CoseSign1</code> verification with Ed25519 and ES256 features,
+        structural decode, and feature-gated ECDH-ES/AES-KW decryption. Its
+        X25519 ECDH-ES support must be confirmed at implementation time; its
+        signing/encryption (produce) side is limited, so interop is primarily
+        one-directional: <strong>basil produces, cose_minicbor independently
+        consumes</strong>.
+      </p>
+      <h3>8.2 Test matrix</h3>
+      <ul>
+        <li><strong>Structural decode:</strong> every message type in the
+          content-type registry, request and response, round-trips
+          basil-encode &rarr; <code>cose_minicbor</code>-decode with matching
+          header parameters, claims, and recipient structure.</li>
+        <li><strong>Signature interop:</strong> <code>cose_minicbor</code>
+          verifies basil-produced Ed25519 <code>COSE_Sign1</code> messages;
+          every basil tamper vector (&sect;9) must also fail verification in
+          <code>cose_minicbor</code>, proving the two implementations agree on
+          what is covered by the signature.</li>
+        <li><strong>Decryption interop:</strong> if <code>cose_minicbor</code>'s
+          ECDH-ES feature supports X25519, it decrypts basil-sealed messages
+          given the recipient private key. If it is P-256-only, this leg is
+          covered by checked-in known-answer vectors instead, and we note the
+          gap (or contribute upstream) rather than weakening our suite.</li>
+        <li><strong>Inbound vectors:</strong> basil verifies/decrypts selected
+          vectors from the COSE working group Examples repository (EdDSA
+          <code>COSE_Sign1</code>, ECDH-ES cases with published key material),
+          checked into fixtures, so basil is tested as a consumer of
+          externally-produced COSE, not only of its own output.</li>
+        <li><strong>Determinism:</strong> byte-identical re-encoding of every
+          fixture (encode&rarr;decode&rarr;encode), guarding the deterministic
+          profile that signatures depend on.</li>
+      </ul>
+      <h3>8.3 Fixtures</h3>
+      <p>
+        JSON fixtures replace <code>invocation-secure-message-v1.json</code>:
+        hex of complete tagged COSE bytes per message type, the claim set,
+        signer/recipient key material (test keys only), plaintext body hex,
+        expected accept/reject verdict and rejection reason. These serve the
+        same role the transcript fixtures served for the deferred Go client:
+        the future Go implementation must consume them byte-for-byte.
+      </p>
+
+      <h2 id="9-security-tests">9. Security tests</h2>
+      <p>
+        Every adversarial property from subject-based-authentication &sect;12.3&ndash;12.5
+        is ported by re-expressing the mutation against COSE fields: tampering
+        with content type, claims (<code>iss</code>/<code>aud</code>/<code>iat</code>/
+        <code>exp</code>/<code>cti</code>), key ids, ciphertext, ephemeral key,
+        IV, or the response correlation claims must break the signature, the
+        AEAD tag, or an explicit cross-check; replay, expiry, TTL, skew,
+        audience, disabled-service, unknown-signer indistinguishability, and
+        signed-denial coverage all carry over. New classes required by the
+        format change:
+      </p>
+      <ul>
+        <li><strong>Strip-and-re-sign:</strong> re-signing an intact
+          <code>COSE_Encrypt</code> payload under a different valid principal's
+          key is rejected by the <code>-70003</code>/outer-<code>kid</code>
+          equality check (and never reaches policy as the new subject).</li>
+        <li><strong>Algorithm confusion:</strong> wire <code>alg</code> values
+          that disagree with the catalog key (signature, recipient, or content)
+          are rejected before use; unknown or absent <code>alg</code> is rejected.</li>
+        <li><strong>Nesting confusion:</strong> a <code>COSE_Sign1</code> whose
+          payload is not a tagged <code>COSE_Encrypt</code> (plain body,
+          <code>COSE_Encrypt0</code>, <code>COSE_Mac0</code>, double-wrapped
+          Sign1) is rejected at decode.</li>
+        <li><strong>Criticality enforcement:</strong> messages missing
+          <code>crit</code>, missing a basil label listed in <code>crit</code>,
+          or carrying unknown labels (critical or not) are rejected; claims
+          placed in unprotected headers are rejected.</li>
+        <li><strong>Encoding strictness:</strong> indefinite lengths,
+          non-deterministic map ordering, untagged structures, and duplicate
+          labels are rejected.</li>
+        <li><strong>Response subject abuse:</strong> <code>SealedResponse.response_subject</code>
+          equals the signed request claim exactly; a response to a request
+          without the claim carries none.</li>
+      </ul>
+
+      <h2 id="10-milestones">10. Milestones</h2>
+      <h3>C1. COSE codec layer</h3>
+      <ul>
+        <li>Add <code>coset</code>; implement the <code>basil-cose</code> crate
+          (label registry, strict build/parse, claim validation with
+          parameterized bounds, signer/recipient traits, deterministic-encoding
+          checks) and the basil content-type registry in <code>basil-proto</code>.
+          Confirm or replace <code>coset</code> serialization determinism.</li>
+        <li>Generate the new fixtures; unit-test tamper/encoding classes that need
+          no broker (crypto via workspace primitives: ed25519, x25519-dalek, hkdf,
+          aes-gcm).</li>
+      </ul>
+      <h3>C2. Broker path swap</h3>
+      <ul>
+        <li>Rewrite <code>service/invocation.rs</code> preflight, dispatch, and
+          response protection; delete transcript code and old fixture; port all 21
+          in-file tests and add the &sect;9 new classes.</li>
+        <li>Proto change: <code>SealedRequest</code>/<code>SealedResponse</code>;
+          delete <code>Header</code>/<code>SecureMessage</code>/<code>MessageType</code>;
+          regenerate stubs.</li>
+      </ul>
+      <h3>C3. Client and bridge</h3>
+      <ul>
+        <li>Rewrite <code>basil-client</code> seal/verify helpers on the COSE layer.</li>
+        <li>Bridge: raw COSE NATS payloads, <code>response_subject</code> routing with
+          inbox fallback; update bridge README and its opacity regression tests.</li>
+      </ul>
+      <h3>C4. Interop suite</h3>
+      <ul>
+        <li><code>cose_minicbor</code> decode/verify matrix, shared-tamper-vector
+          agreement, COSE WG inbound vectors, determinism round-trips; document any
+          counterparty algorithm gaps discovered.</li>
+      </ul>
+      <h3>C5. Docs and closeout</h3>
+      <ul>
+        <li>README/CHANGELOG breaking entries; superseded-by note in
+          subject-based-authentication.html; basil-doc protocol section replacing
+          the existing invocation-service page plus updates to other affected
+          pages and excalidraw diagrams; design-CHANGELOG note; add
+          <code>basil-cose</code> to the module-boundary lists (AGENTS.md, README).</li>
+        <li>Removal sweep: verify the old envelope (<code>Header</code>,
+          <code>SecureMessage</code>, <code>MessageType</code>, transcript/AAD code,
+          old fixture) is gone from non-test code and docs, and the runtime
+          exercises the COSE path end to end.</li>
+        <li>Mandatory gates (build/clippy/test/rustfmt, serial), then jj snapshot.</li>
+      </ul>
+      <h3>C6. End-to-end demo</h3>
+      <ul>
+        <li>Components: two Rust programs (<code>alice</code>, <code>bob</code>),
+          <code>nats-server</code>, <code>basil-agent</code>,
+          <code>basil-nats-bridge</code>, OpenBao.</li>
+        <li>Flow: Alice builds a signed &amp; sealed peer message with
+          <code>basil-cose</code> using agent-backed (transit) signing and sends
+          it to Bob over NATS; Bob verifies and unseals via the broker
+          unseal-in-place operation (backend-custodied X25519 recipient key,
+          <code>Op::Decrypt</code>), builds a signed &amp; sealed reply the same
+          way, and Alice unseals and verifies the response.</li>
+        <li>Requires a broker COSE-unseal RPC (given <code>COSE_Encrypt</code>
+          bytes and a catalog key id, return the plaintext under
+          <code>Op::Decrypt</code>) and a <code>basil-cose</code> Recipient
+          implementation backed by it; the RPC shape is settled in the C1 API
+          design document. The bridge is deployed in the demo environment so at
+          least one leg (recommended: Alice's transit-sign as a bridged sealed
+          invocation) exercises the NATS courier path.</li>
+      </ul>
+
+      <h2 id="11-decisions">11. Decisions and deferred features</h2>
+      <h3>Resolved decisions</h3>
+      <ol>
+        <li>Nesting is <code>COSE_Sign1</code> over embedded tagged
+          <code>COSE_Encrypt</code>: keeps verify-before-decrypt preflight and
+          courier-visible-but-sealed structure.</li>
+        <li>Claims live in the <code>COSE_Encrypt</code> protected header (one
+          placement covered by signature and AEAD, readable pre-decrypt), with the
+          sender key id duplicated there and checked against the outer
+          <code>kid</code>.</li>
+        <li>v1 suite: EdDSA / ECDH-ES+HKDF-256 (X25519) / A256GCM, single suite,
+          no negotiation. Wire <code>alg</code> is validated against catalog
+          records, never trusted.</li>
+        <li><strong>Strict validation wherever the RFCs allow flexibility &mdash;
+          assume nothing.</strong> Enum-shaped fields (<code>alg</code>,
+          <code>kty</code>, <code>crv</code>, content types, claim labels, tags)
+          reject unknown variants; there are no forward-compatible
+          <code>Unknown</code> arms in the profile's decoders. Unknown or
+          duplicate header labels, claims in unprotected headers, indefinite
+          lengths, non-deterministic encodings, untagged structures, and
+          wrong CBOR types for a known label are all rejected. Where the RFCs
+          leave a primitive choice open, take the more conservative option:
+          the private request-hash claim uses SHA3-256 rather than SHA-2
+          (registered COSE signature/KDF codepoints fix their own hashes and
+          offer no choice). This carries basil's secure-by-default,
+          least-privilege, fail-closed principles into the profile.</li>
+        <li>The carrier envelope carries exactly one routing field
+          (<code>response_subject</code>), echoed from a signed request claim;
+          NATS payloads are raw COSE bytes.</li>
+        <li>Basil's implementation builds on <code>coset</code> (or the in-tree
+          deterministic encoder if coset fails the determinism check) and lives
+          in the standalone broker-free <code>basil-cose</code> crate, scoped to
+          profile machinery so <code>edgebox-rs</code> can adopt it for its RPC;
+          interop tests use <code>cose_minicbor</code> as an independent
+          counterparty.</li>
+        <li>Complete replacement: the <code>SecureMessage</code> format, transcript
+          spec, and fixtures are deleted, not deprecated.</li>
+      </ol>
+      <h3>Deferred features</h3>
+      <ol>
+        <li>ML-KEM / HPKE sealing for invocation &mdash; blocked on COSE
+          codepoints (draft-ietf-cose-hpke et al.); returns as a recipient
+          <code>alg</code> addition.</li>
+        <li>ML-DSA envelope signatures &mdash; blocked on draft-ietf-cose-dilithium.</li>
+        <li>ECDSA (ES256/384/512) envelope principals and broker response signing
+          &mdash; standard already; policy/catalog work when needed.</li>
+        <li>ChaCha20/Poly1305 (24) content encryption as a second suite. Likely
+          wanted early: <code>edgebox-rs</code>'s existing seal suite
+          (<code>x25519-hkdf-sha256-chacha20poly1305-v1</code>) is exactly
+          <code>ECDH-ES + HKDF-256</code> with ChaCha20/Poly1305 content, so
+          edgebox parity needs it; the <code>basil-cose</code> API should treat
+          the content <code>alg</code> as a parameter from the start.</li>
+        <li>Multi-recipient sealing via <code>ECDH-ES + A256KW</code>.</li>
+        <li>Go sealed-invocation helpers (unchanged deferral; now targets a Go
+          COSE library plus the &sect;8.3 fixtures).</li>
+      </ol>
+    </main>
+
+    <footer>
+      <p>
+        This is a conversion plan for Basil's pre-release sealed invocation API.
+        It intentionally favors a clean breaking change over compatibility
+        shims.
+      </p>
+    </footer>
+  </body>
+</html>
