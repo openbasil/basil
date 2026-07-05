@@ -18,6 +18,7 @@ use crate::seal::{self, BackendCred, CredBundle, MethodRegistry, SlotSpec, Unloc
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use serde::Deserialize;
+use url::Url;
 use zero_secrets::{SecretArray, SecretString};
 use zeroize::Zeroizing;
 
@@ -799,6 +800,9 @@ fn backend_cred(backend: &BackendArg) -> Result<(String, BackendCred)> {
 
 fn vault_cred(backend: &BackendArg, fields: &mut BTreeMap<String, String>) -> Result<BackendCred> {
     let addr = take_optional(fields, "addr")?;
+    if let Some(addr) = &addr {
+        validate_backend_addr(addr)?;
+    }
     let token_file = take_optional(fields, "token-file")?;
     let role_id = take_optional(fields, "role-id")?;
     let secret_id_file = take_optional(fields, "secret-id-file")?;
@@ -834,6 +838,26 @@ fn vault_cred(backend: &BackendArg, fields: &mut BTreeMap<String, String>) -> Re
         _ => bail!(
             "openbao/vault backend requires exactly one credential source: \
              token-file; role-id plus secret-id-file; or spiffe-key-file plus spiffe-id"
+        ),
+    }
+}
+
+/// Reject a backend `addr` that isn't a usable base address before it is sealed
+/// into a bundle. Without this, a schemeless value like `127.0.0.1:8200` is
+/// accepted here and only surfaces much later — as an opaque reqwest "builder
+/// error" — when the agent first probes the backend.
+fn validate_backend_addr(addr: &str) -> Result<()> {
+    let url = Url::parse(addr).with_context(|| {
+        format!(
+            "backend `addr` `{addr}` is not a valid URL \
+             (expected e.g. `https://vault.example.com:8200`)"
+        )
+    })?;
+    match url.scheme() {
+        "http" | "https" => Ok(()),
+        other => bail!(
+            "backend `addr` `{addr}` has unsupported scheme `{other}`; \
+             expected `http` or `https` (e.g. `https://vault.example.com:8200`)"
         ),
     }
 }
@@ -1239,6 +1263,49 @@ mod tests {
             }
             other => panic!("wrong cred: {}", other.kind()),
         }
+    }
+
+    #[test]
+    fn validate_backend_addr_accepts_http_and_https() {
+        validate_backend_addr("http://127.0.0.1:8200").expect("plain http ok");
+        validate_backend_addr("https://vault.example.com:8200").expect("https ok");
+    }
+
+    #[test]
+    fn validate_backend_addr_rejects_missing_scheme() {
+        // The footgun: `127.0.0.1:8200` parses as a relative URL with no scheme,
+        // which reqwest later rejects as an opaque "builder error".
+        let err = validate_backend_addr("127.0.0.1:8200")
+            .expect_err("schemeless addr rejected")
+            .to_string();
+        assert!(err.contains("not a valid URL"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validate_backend_addr_rejects_non_http_scheme() {
+        let err = validate_backend_addr("ftp://vault.example.com:8200")
+            .expect_err("ftp scheme rejected")
+            .to_string();
+        assert!(err.contains("unsupported scheme"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn vault_backend_rejects_schemeless_addr_at_parse_time() {
+        let token = temp_path("schemeless-token");
+        write_secret_file(&token, b"s.root\n");
+        let backend: BackendArg = format!(
+            "id=bao,type=openbao,addr=127.0.0.1:8200,token-file={}",
+            token.display()
+        )
+        .parse()
+        .expect("backend arg parses");
+
+        let err = backend_cred(&backend).expect_err("schemeless addr rejected");
+        let _ = std::fs::remove_file(&token);
+        assert!(
+            err.to_string().contains("not a valid URL"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

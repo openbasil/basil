@@ -15,14 +15,14 @@ man-pages out="target/man":
 # Regenerate .github/workflows/release.yml from the cargo-dist config, then
 # re-append the hand-written jobs (debian-packages + arch-package) that dist
 # 0.32.0 cannot emit. `dist generate` OWNS release.yml and would otherwise wipe
-# them. The jobs live in .github/workflows/partials/release-handwritten-jobs.yaml
+# them. The jobs live in .github/workflows/partials/release-handwritten-jobs.yml
 # under a `jobs:` indentation anchor (a subdir, so GitHub Actions ignores it).
 # Run this after bumping cargo-dist-version or editing the hand-written jobs.
 gen-release-workflow:
     #!/usr/bin/env bash
     set -euo pipefail
     workflow=.github/workflows/release.yml
-    fragment=.github/workflows/partials/release-handwritten-jobs.yaml
+    fragment=.github/workflows/partials/release-handwritten-jobs.yml
     # Lines to skip in the fragment: its header through the `jobs:` anchor. The
     # header exists only to keep a YAML auto-formatter from de-indenting the jobs.
     header_lines=16
@@ -148,30 +148,4 @@ ubs:
     ~/.local/bin/ubs-rust.sh -v --ci  --exclude-tests  --exclude=.work \
         --strict-gitignore \
         --emit-findings-json=/tmp/ubs-basil.json  . >/tmp/ubs-basil.out
-
-_spdx PATH="." CHECK="":
-    @addlicense \
-      {{CHECK}} \
-      -y 2026 \
-      -c "OpenBasil Contributors" \
-      -l "apache" \
-      -s \
-      -ignore '**/*.lock' \
-      -ignore '.github/**' \
-      -ignore '.git/**' \
-      -ignore '.beads/**'  \
-      -ignore '.gitmodules'  \
-      -ignore '**/vendor/**' \
-      -ignore '**/*.pem' \
-      -ignore '**/Cargo.lock' \
-      -ignore '**/go.dum' \
-      -ignore '**/*.json' \
-      -ignore 'target/**' \
-      -ignore 'clippy.toml' \
-      {{PATH}}
-    
-check-spdx PATH=".": (_spdx PATH "-check")
-
-# add SPDX copyright and license headers
-add-spdx PATH=".": (_spdx  PATH "")
 

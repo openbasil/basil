@@ -1,0 +1,58 @@
+version = 1
+
+# Licensing declaration for basil (REUSE 3.3 / SPDX).
+#
+
+# Vendored third-party sources: any `vendor/` tree (Go module vendoring used by
+# the interop tests) is out of scope for our licensing. Basil makes no copyright
+# claim over these files; the upstream projects' own terms govern the code.
+# `override` forces this marker across the whole subtree regardless of whatever
+# per-file headers the upstream sources do or don't carry, and the recursive
+# `**` on both sides matches every file under any `vendor/` directory (not just
+# `*.go`). Requires LICENSES/CC0-1.0.txt to be present.
+[[annotations]]
+path = "**/vendor/**"
+precedence = "override"
+SPDX-FileCopyrightText = "NONE"
+SPDX-License-Identifier = "CC0-1.0"
+
+# Code and other first-party project files.
+[[annotations]]
+path = [
+  "**/Cargo.toml",
+  "**/*.rs",
+  "**/*.nix",
+  "**/justfile",
+  "clippy.toml",
+  "AGENTS.md",
+  "CLAUDE.md",
+  "packaging/**",
+  ".github/workflows/ci.yml",
+  ".github/workflows/partials/**",
+  "crates/basil-proto/fixtures/**",
+  "examples/db-keystore/*.template.json",
+  "examples/db-keystore/*.env",
+  "interop-tests/**/*.md",
+  "examples/**/*.md",
+  "examples/**/*.sh",
+  "README.md",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 OpenBasil Contributors"
+SPDX-License-Identifier = "Apache-2.0"
+
+# Generated, lock, and data files: no original authorship — copyright disclaimed.
+# `closest` so any of these that later grows its own header keeps it.
+[[annotations]]
+path = [
+  "**/Cargo.lock",
+  "flake.lock",
+  "**/go.sum",
+  ".gitmodules",
+  ".beads/**",
+  "crates/basil-core/testdata/*.pem",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = "NONE"
+SPDX-License-Identifier = "CC0-1.0"
+

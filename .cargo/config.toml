@@ -6,3 +6,8 @@
 # cargo-xtask convention: `cargo xtask <args>` runs the workspace automation
 # crate. Today its only job is man-page generation (`cargo xtask -o <dir>`).
 xtask = "run --package xtask --"
+
+# install binaries
+install-basil = "install --path crates/basil-bin"
+install-bridge = "install --path crates/basil-nats-bridge"
+

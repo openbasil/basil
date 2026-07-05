@@ -21,8 +21,7 @@ live-e2e = []
 keystore-backend = ["dep:basil-keystore-backend"]
 db-keystore = ["keystore-backend", "basil-keystore-backend/db-keystore"]
 onepassword = ["keystore-backend", "basil-keystore-backend/onepassword"]
-# In-place cloud KMS transit backends (keys never leave the KMS). Heavy SDKs;
-# pulled into `--all-features` builds.
+# In-place cloud KMS transit backends. AWS and GCP have large SDKs;
 aws-kms = ["dep:aws-config", "dep:aws-sdk-kms"]
 gcp-kms = ["dep:google-cloud-kms", "dep:google-cloud-gax"]
 unlock-age-yubikey = []
@@ -96,6 +95,7 @@ tpm2-protocol = { workspace = true, optional = true }
 tracing = { workspace = true }
 tracing-journald = { workspace = true }
 tracing-subscriber = { workspace = true }
+url = { workspace = true }
 uuid = { workspace = true }
 x25519-dalek = { workspace = true }
 zero-secrets = { workspace = true }

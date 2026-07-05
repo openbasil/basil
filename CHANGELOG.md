@@ -12,6 +12,8 @@ SPDX-License-Identifier: Apache-2.0
 
 - 2026-07-05
   - SPDX headers
+  - cargo aliases: 'cargo install-basil','cargo install-bridge' installs basil binary & basil-nats-bridge
+
 - 2026-07-04
   - added SECURITY.md, CODE_OF_CONDUCT.md
 
