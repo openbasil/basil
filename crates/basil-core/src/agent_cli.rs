@@ -2059,10 +2059,14 @@ pub async fn run_doctor_command(args: DoctorArgs) -> Result<()> {
     }
 }
 
-/// Run first-run config scaffolding behind `basil config init`.
-pub fn run_config_init(args: &init::InitArgs) -> Result<()> {
+/// Run first-run config scaffolding behind top-level `basil init`.
+///
+/// `socket` is the resolved global `--socket <path>` flag (clap folds
+/// `BASIL_SOCKET` into it); it is threaded into the generated config's
+/// `socket = ...` line. See [`init::run`] for the full precedence.
+pub fn run_init(socket: Option<&str>, args: &init::InitArgs) -> Result<()> {
     let logging_guards = init_logging(&LoggingConfigFile::default())?;
-    let result = init::run(args);
+    let result = init::run(args, socket);
     logging_guards.shutdown();
     result
 }

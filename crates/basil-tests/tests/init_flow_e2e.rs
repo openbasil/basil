@@ -3,10 +3,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Cross-engine LIVE e2e for the full first-run onboarding flow (basil-mil0.7):
-//! `basil config init` → `bundle create` → `doctor --keys` → `run` → sign with
+//! `basil init` → `bundle create` → `doctor --keys` → `run` → sign with
 //! the scaffolded example key, against a live dev `bao` AND a live dev `vault`.
 //!
-//! `basil config init` (src/init.rs) scaffolds a "valid by construction" starter
+//! `basil init` (src/init.rs) scaffolds a "valid by construction" starter
 //! deployment into a target dir: a `catalog.json` with ONE example key (a transit
 //! Ed25519 signing key, `missing=generate` so startup reconcile creates it in
 //! place), a least-privilege `policy.json` granting ONLY the running uid a narrow
@@ -104,7 +104,6 @@ fn scaffold_and_seal(engine: Engine, backend: &DevBackend, tag: &str) -> PathBuf
     let pass_str = pass_file.to_str().expect("pass path is UTF-8");
     let (ok, out) = run_agent(
         &[
-            "config",
             "init",
             "--backend",
             backend_flag,
@@ -123,7 +122,7 @@ fn scaffold_and_seal(engine: Engine, backend: &DevBackend, tag: &str) -> PathBuf
     );
     assert!(
         ok,
-        "[{}] basil config init failed:\n{out}",
+        "[{}] basil init failed:\n{out}",
         engine.prefill_name()
     );
 

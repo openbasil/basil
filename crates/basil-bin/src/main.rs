@@ -16,10 +16,10 @@ use clap::Parser;
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Command::Init(args) => agent_cli::run_init(cli.socket.as_deref(), &args),
         Command::Agent(args) => agent_cli::run_agent(args).await,
         Command::Bundle(command) => agent_cli::run_bundle(*command),
         Command::Config(command) => match *command {
-            ConfigCommand::Init(args) => agent_cli::run_config_init(&args),
             ConfigCommand::Explain(args) => agent_cli::run_config_explain(&args),
         },
         Command::Doctor(args) => agent_cli::run_doctor_command(args).await,

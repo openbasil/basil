@@ -635,7 +635,7 @@ impl Drop for Harness {
 
 /// A bare dev `bao`/`vault` server (transit + kv-v2 enabled) with **no** broker
 /// attached, for tests that drive a broker they stand up THEMSELVES against a
-/// live backend (e.g. the `basil config init` → `bundle create` → `run` onboarding
+/// live backend (e.g. the `basil init` → `bundle create` → `run` onboarding
 /// e2e, basil-mil0.7). [`boot_dev_backend`] reuses the prefill script's
 /// server-boot + engine-enable path (so it goes through the SAME dev-server
 /// concurrency semaphore + port allocation as [`boot_basil`]) but ignores the
@@ -673,7 +673,7 @@ impl DevBackend {
     }
 
     /// The `http://127.0.0.1:<port>` the dev server listens on. Feed it to the
-    /// broker config's `vault-addr` / `basil config init --addr`.
+    /// broker config's `vault-addr` / `basil init --addr`.
     #[must_use]
     pub fn addr(&self) -> &str {
         &self.addr

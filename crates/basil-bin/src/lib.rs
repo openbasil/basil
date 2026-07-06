@@ -31,6 +31,8 @@ pub struct Cli {
 /// Top-level `basil` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Scaffold a first-run starter set (config, catalog, policy).
+    Init(Box<init::InitArgs>),
     /// Run the broker daemon.
     Agent(agent_cli::RunArgs),
     /// Create and manage a sealed credential bundle.
@@ -48,8 +50,6 @@ pub enum Command {
 /// Offline `basil config` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum ConfigCommand {
-    /// Scaffold a first-run starter set.
-    Init(init::InitArgs),
     /// Evaluate a proposed policy decision offline.
     Explain(agent_cli::ExplainArgs),
 }

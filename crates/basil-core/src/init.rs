@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! `basil config init`: first-run scaffolding (basil-p50).
+//! `basil init`: first-run scaffolding (basil-p50).
 //!
 //! Generates a minimal, valid, **least-privilege** starter set into a target
 //! directory so a new operator can stand up a local broker without hand-authoring
@@ -157,14 +157,17 @@ struct Layout {
 }
 
 impl Layout {
-    fn new(dir: &Path) -> Self {
+    /// Build the target layout. `socket` is the caller-resolved socket path (see
+    /// [`resolve_socket`]); when `None` the socket falls back to
+    /// `<dir>/basil.sock`.
+    fn new(dir: &Path, socket: Option<&str>) -> Self {
         Self {
             dir: dir.to_path_buf(),
             catalog: dir.join("catalog.json"),
             policy: dir.join("policy.json"),
             config: dir.join("basil-agent.toml"),
             bundle: dir.join("bundle.sealed"),
-            socket: dir.join("basil.sock"),
+            socket: socket.map_or_else(|| dir.join("basil.sock"), PathBuf::from),
             keystore_db: dir.join("keystore.db"),
         }
     }
@@ -175,12 +178,20 @@ impl Layout {
     }
 }
 
-/// Run `basil config init`: build the scaffolding, refuse to clobber unless
-/// `--force`, write the files, and print the next-steps summary.
-pub fn run(args: &InitArgs) -> Result<()> {
+/// Run `basil init`: build the scaffolding, refuse to clobber unless `--force`,
+/// write the files, and print the next-steps summary.
+///
+/// `socket` is the resolved global `--socket <path>` flag. The socket written
+/// into `basil-agent.toml` follows this precedence (highest first): explicit
+/// `--socket <path>` > `BASIL_SOCKET` env var > `<dir>/basil.sock`. The clap
+/// global flag already folds `BASIL_SOCKET` into `socket`; the direct env read
+/// here keeps the precedence correct for non-clap callers too.
+pub fn run(args: &InitArgs, socket: Option<&str>) -> Result<()> {
     validate_args(args)?;
 
-    let layout = Layout::new(&args.dir);
+    let env_socket = std::env::var("BASIL_SOCKET").ok();
+    let socket = resolve_socket(socket, env_socket.as_deref());
+    let layout = Layout::new(&args.dir, socket.as_deref());
 
     std::fs::create_dir_all(&layout.dir)
         .with_context(|| format!("creating target dir {}", layout.dir.display()))?;
@@ -286,7 +297,7 @@ fn build_catalog(args: &InitArgs, layout: &Layout) -> Catalog {
             generate: None,
             sealing_pin: None,
             labels: Labels::default(),
-            description: "Example Ed25519 signing key scaffolded by `basil config init`."
+            description: "Example Ed25519 signing key scaffolded by `basil init`."
                 .to_string(),
         },
     );
@@ -314,7 +325,7 @@ fn build_policy(uid: u32) -> RawPolicy {
         action: vec![format!("role:{SIGNER_ROLE}")],
         target: vec![EXAMPLE_KEY.to_string()],
         comment: Some(
-            "Least-privilege: only the uid that ran `basil config init` may sign/verify \
+            "Least-privilege: only the uid that ran `basil init` may sign/verify \
              the one example key. Everything else is default-deny."
                 .to_string(),
         ),
@@ -352,7 +363,7 @@ fn build_policy(uid: u32) -> RawPolicy {
 /// real types); the keystore arm adds the `db-keystore-cipher` line.
 fn build_config_toml(args: &InitArgs, layout: &Layout) -> String {
     let mut out = String::new();
-    out.push_str("# basil-agent config scaffolded by `basil config init`.\n");
+    out.push_str("# basil-agent config scaffolded by `basil init`.\n");
     out.push_str("# Edit the placeholders, create the sealed bundle (see the printed\n");
     out.push_str(
         "# next-steps), then `basil doctor --keys -c this-file` and `run -c this-file`.\n\n",
@@ -534,6 +545,16 @@ fn bundle_init_slot_flag(args: &InitArgs) -> String {
     }
 }
 
+/// Resolve the unix-socket path written into the generated `basil-agent.toml`.
+///
+/// Precedence, highest first: `explicit` (the global `--socket <path>` flag),
+/// then `env` (the `BASIL_SOCKET` variable), then `None` so [`Layout::new`]
+/// falls back to `<dir>/basil.sock`. Kept as a pure two-argument function so the
+/// precedence is unit-testable without touching the process environment.
+fn resolve_socket(explicit: Option<&str>, env: Option<&str>) -> Option<String> {
+    explicit.or(env).map(str::to_owned)
+}
+
 /// Validate argument combinations before writing any scaffold files.
 fn validate_args(args: &InitArgs) -> Result<()> {
     if args.passphrase_file.is_some() && args.unlock != InitUnlock::Passphrase {
@@ -608,7 +629,7 @@ mod tests {
             InitBackend::Keystore,
         ] {
             let dir = temp_dir();
-            let layout = Layout::new(&dir);
+            let layout = Layout::new(&dir, None);
             let args = args_for(backend, InitUnlock::Bip39, &dir);
             let catalog = build_catalog(&args, &layout);
             let policy = build_policy(4242);
@@ -652,12 +673,12 @@ mod tests {
         let dir = temp_dir();
         let args = args_for(InitBackend::Openbao, InitUnlock::Bip39, &dir);
 
-        run(&args).expect("first init writes clean");
-        let layout = Layout::new(&dir);
+        run(&args, None).expect("first init writes clean");
+        let layout = Layout::new(&dir, None);
         assert!(layout.catalog.exists() && layout.policy.exists() && layout.config.exists());
 
         // Second run without --force must refuse (and name the offenders).
-        let err = run(&args).expect_err("second init must refuse");
+        let err = run(&args, None).expect_err("second init must refuse");
         let msg = err.to_string();
         assert!(msg.contains("refusing to overwrite"), "got: {msg}");
 
@@ -666,7 +687,7 @@ mod tests {
             force: true,
             ..args_for(InitBackend::Openbao, InitUnlock::Bip39, &dir)
         };
-        run(&forced).expect("forced init overwrites");
+        run(&forced, None).expect("forced init overwrites");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -677,8 +698,8 @@ mod tests {
     fn written_files_reload_through_the_loader() {
         let dir = temp_dir();
         let args = args_for(InitBackend::Keystore, InitUnlock::Passphrase, &dir);
-        run(&args).expect("init writes");
-        let layout = Layout::new(&dir);
+        run(&args, None).expect("init writes");
+        let layout = Layout::new(&dir, None);
 
         let catalog_json = std::fs::read_to_string(&layout.catalog).expect("read catalog");
         let policy_json = std::fs::read_to_string(&layout.policy).expect("read policy");
@@ -709,8 +730,8 @@ mod tests {
     fn generated_config_loads_through_agent_config_file() {
         let dir = temp_dir();
         let args = args_for(InitBackend::Openbao, InitUnlock::Bip39, &dir);
-        run(&args).expect("init writes");
-        let layout = Layout::new(&dir);
+        run(&args, None).expect("init writes");
+        let layout = Layout::new(&dir, None);
 
         let overrides = crate::agent_cli::ConfigOverrides {
             config: Some(layout.config.clone()),
@@ -741,8 +762,8 @@ mod tests {
     fn generated_keystore_config_loads_through_agent_config_file() {
         let dir = temp_dir();
         let args = args_for(InitBackend::Keystore, InitUnlock::AgeYubikey, &dir);
-        run(&args).expect("init writes");
-        let layout = Layout::new(&dir);
+        run(&args, None).expect("init writes");
+        let layout = Layout::new(&dir, None);
 
         let overrides = crate::agent_cli::ConfigOverrides {
             config: Some(layout.config),
@@ -763,7 +784,7 @@ mod tests {
     #[test]
     fn tpm_unlock_generates_config_and_bundle_command() {
         let dir = Path::new("/unused-init-dir");
-        let layout = Layout::new(dir);
+        let layout = Layout::new(dir, None);
         let args = args_for(InitBackend::Openbao, InitUnlock::Tpm, dir);
 
         let toml = build_config_toml(&args, &layout);
@@ -780,7 +801,7 @@ mod tests {
     #[test]
     fn passphrase_file_is_baked_into_config_and_bundle_command() {
         let dir = Path::new("/unused-init-dir");
-        let layout = Layout::new(dir);
+        let layout = Layout::new(dir, None);
         let passphrase = dir.join("passphrase.txt");
         let args = InitArgs {
             passphrase_file: Some(passphrase.clone()),
@@ -809,7 +830,7 @@ mod tests {
             ..args_for(InitBackend::Openbao, InitUnlock::Bip39, &dir)
         };
 
-        let err = run(&args).expect_err("invalid unlock combination must fail");
+        let err = run(&args, None).expect_err("invalid unlock combination must fail");
         assert!(
             err.to_string().contains("--unlock passphrase"),
             "got: {err}"
@@ -821,5 +842,40 @@ mod tests {
         // Smoke: the real-uid resolver returns *some* uid and never panics.
         // Mostly just asserting it ran; any u32 is acceptable.
         let _uid = current_uid();
+    }
+
+    /// Socket precedence in the generated `basil-agent.toml` (basil-u00):
+    /// explicit `--socket <path>` > `BASIL_SOCKET` env var > `<dir>/basil.sock`.
+    /// Driven through the pure `resolve_socket` + `build_config_toml` so no
+    /// process env is touched (env-var tests are otherwise order-sensitive).
+    #[test]
+    fn socket_precedence_in_generated_config() {
+        let dir = Path::new("/unused-init-dir");
+        // (explicit --socket flag, BASIL_SOCKET env, expected socket path)
+        let cases = [
+            (
+                Some("/run/explicit.sock"),
+                Some("/run/env.sock"),
+                "/run/explicit.sock",
+            ),
+            (None, Some("/run/env.sock"), "/run/env.sock"),
+            (None, None, "/unused-init-dir/basil.sock"),
+        ];
+        for (flag, env, expected) in cases {
+            let resolved = resolve_socket(flag, env);
+            let layout = Layout::new(dir, resolved.as_deref());
+            assert_eq!(
+                layout.socket,
+                PathBuf::from(expected),
+                "resolve for flag={flag:?} env={env:?}"
+            );
+            let args = args_for(InitBackend::Openbao, InitUnlock::Bip39, dir);
+            let toml = build_config_toml(&args, &layout);
+            assert!(
+                toml.contains(&format!("socket = \"{expected}\"")),
+                "generated TOML must write socket = \"{expected}\" \
+                 for flag={flag:?} env={env:?}, got:\n{toml}"
+            );
+        }
     }
 }
