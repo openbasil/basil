@@ -38,20 +38,18 @@ pub enum Command {
     /// Create and manage a sealed credential bundle.
     #[command(subcommand)]
     Bundle(Box<bundle_cli::BundleCommand>),
-    /// Offline config and policy operations.
-    #[command(subcommand)]
-    Config(Box<ConfigCommand>),
+    /// Explain a policy decision: why a subject would be allowed or denied an op
+    /// on a key. By DEFAULT this is an offline dry-run — it builds the PDP from
+    /// the catalog + policy FILES on disk and evaluates the tuple through the same
+    /// matcher enforcement uses (no socket, no backend, no secrets). With `--live`
+    /// it instead queries the RUNNING broker's serving generation over the global
+    /// `--socket` (needs the `explain` admin permission). `--effective` previews
+    /// every grant for the subject and is offline-only.
+    Explain(agent_cli::ExplainArgs),
     /// Preflight environment and deployment checks.
     Doctor(agent_cli::DoctorArgs),
     #[command(flatten)]
     Client(client_cli::Command),
-}
-
-/// Offline `basil config` subcommands.
-#[derive(Debug, Subcommand)]
-pub enum ConfigCommand {
-    /// Evaluate a proposed policy decision offline.
-    Explain(agent_cli::ExplainArgs),
 }
 
 /// Returns the fully assembled top-level clap [`Command`](clap::Command) for the

@@ -68,12 +68,20 @@ pub struct RunArgs {
     overrides: ConfigOverrides,
 }
 
-/// Arguments for the offline policy **`explain`** (dry-run) path (`basil-4vf`).
+/// Arguments for the unified policy **`explain`** verb (`basil-1zx.3`).
 ///
-/// Loads ONLY the catalog + policy JSON (no sealed bundle, no backend, no socket),
-/// builds the real [`Pdp`](crate::catalog::Pdp), and evaluates a proposed
-/// tuple through the SAME matcher enforcement uses. It NEVER performs the op,
-/// reads a secret, or talks to a backend: safe to run anywhere, before rollout.
+/// One command, two sources of truth for the same subject/op/key → allow/deny
+/// question:
+///
+/// * **Default (offline dry-run, `basil-4vf`):** loads ONLY the catalog + policy
+///   JSON (no sealed bundle, no backend, no socket), builds the real
+///   [`Pdp`](crate::catalog::Pdp), and evaluates the proposed tuple through the
+///   SAME matcher enforcement uses. It NEVER performs the op, reads a secret, or
+///   talks to a backend: safe to run anywhere, before rollout. `--effective`
+///   previews every grant for the subject.
+/// * **`--live`:** queries the RUNNING broker's serving generation over the
+///   global `--socket` (needs the `explain` admin permission). The offline
+///   config-override paths are irrelevant here, and `--effective` is offline-only.
 ///
 /// What the PDP matches on: authorization binds to a registered **subject**.
 /// The offline tool evaluates that subject name directly; Unix uid/gid
@@ -94,9 +102,16 @@ pub struct ExplainArgs {
     key: Option<String>,
 
     /// Preview EVERY `(key, op)` the subject is granted across the whole catalog,
-    /// instead of a single tuple. Ignores `--op`/`--key`.
+    /// instead of a single tuple. Ignores `--op`/`--key`. Offline-only.
     #[arg(long)]
     effective: bool,
+
+    /// Query the RUNNING broker's serving generation over the global `--socket`
+    /// (needs the `explain` admin permission) instead of an offline file dry-run.
+    /// The config-override paths (catalog/policy/config/bundle) are ignored on the
+    /// live path; `--effective` is offline-only and conflicts with `--live`.
+    #[arg(long, conflicts_with = "effective")]
+    live: bool,
 
     /// Emit a stable machine-readable JSON object instead of human-readable text.
     #[arg(long)]
@@ -104,6 +119,40 @@ pub struct ExplainArgs {
 
     #[command(flatten)]
     overrides: ConfigOverrides,
+}
+
+impl ExplainArgs {
+    /// True when `--live` was given: query the running broker rather than files.
+    #[must_use]
+    pub const fn is_live(&self) -> bool {
+        self.live
+    }
+
+    /// The registered subject to evaluate.
+    #[must_use]
+    pub fn subject(&self) -> &str {
+        &self.subject
+    }
+
+    /// The stable op token to evaluate, when `--op` was given. Always present on
+    /// the live path, where `--effective` (the only thing that makes `--op`
+    /// optional) is rejected by clap.
+    #[must_use]
+    pub fn op_token(&self) -> Option<&'static str> {
+        self.op.map(crate::catalog::Op::token)
+    }
+
+    /// The catalog key/target to evaluate, when `--key` was given.
+    #[must_use]
+    pub fn key(&self) -> Option<&str> {
+        self.key.as_deref()
+    }
+
+    /// Whether `--json` machine-readable output was requested.
+    #[must_use]
+    pub const fn json(&self) -> bool {
+        self.json
+    }
 }
 
 /// clap value parser for a policy [`Op`](crate::catalog::Op).
@@ -1798,11 +1847,16 @@ async fn doctor_key_material_rows(overrides: &ConfigOverrides) -> Vec<doctor::Ch
     }
 }
 
-/// Run the offline policy dry-run/explainer (`basil-4vf`): load catalog + policy
-/// from files, build the REAL PDP, evaluate the proposed tuple (or the effective
-/// preview), and print the result. Entirely offline: no bundle, no backend, no
-/// socket, no secret material. Default-deny holds exactly as in enforcement.
-fn run_explain(args: &ExplainArgs) -> Result<()> {
+/// Run the offline policy dry-run/explainer (`basil-4vf`).
+///
+/// Loads the catalog + policy from files, builds the REAL PDP, evaluates the
+/// proposed tuple (or the `--effective` preview), and prints the result.
+/// Entirely offline: no bundle, no backend, no socket, no secret material.
+/// Default-deny holds exactly as in enforcement.
+///
+/// This is the default (non-`--live`) path of `basil explain`; the live path is
+/// `client_cli::explain_live`, which queries the running broker over the socket.
+pub fn run_explain(args: &ExplainArgs) -> Result<()> {
     use crate::catalog::Pdp;
 
     let file = load_config_file(&args.overrides)?;
@@ -2033,15 +2087,6 @@ pub async fn run_agent(args: RunArgs) -> Result<()> {
     // `Box::pin`: with the cloud-KMS features the daemon future is large; this is
     // a once-per-process cold path, so the heap indirection is free.
     Box::pin(run_with_config_logging(&overrides, run_daemon(args))).await
-}
-
-/// Run the offline policy explainer behind `basil config explain`.
-pub fn run_config_explain(args: &ExplainArgs) -> Result<()> {
-    let logging = logging_config_for_overrides(&args.overrides)?;
-    let logging_guards = init_logging(&logging)?;
-    let result = run_explain(args);
-    logging_guards.shutdown();
-    result
 }
 
 /// Run the preflight doctor behind `basil doctor`.
@@ -3131,6 +3176,7 @@ vault-addr = "http://cfg-vault:8200"
                 op: None,
                 key: None,
                 effective: false,
+                live: false,
                 json: true,
                 overrides: ConfigOverrides {
                     config: None,

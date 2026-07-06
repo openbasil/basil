@@ -31,6 +31,7 @@ SPDX-License-Identifier: Apache-2.0
   - breaking (pre-announcement): `basil doctor` adopts a fatal-vs-warning exit model: non-zero exit only for FATAL conditions (those that would stop the broker from starting — catalog won't load, backend unreachable, bundle won't unlock/is stale, a `missing=error` key reconcile cannot satisfy); everything else (a `missing=generate` key, an optional key absent, `bao` not on PATH, loose bundle perms) is a report-only WARNING. `--strict` also fails on warnings. `DOCTOR_SCHEMA_VERSION` bumps to 2 (`status` token `fail` → `fatal`; summary gains a `fatal` count)
   - breaking (pre-announcement): CLI: `basil config init` is promoted to the first-tier `basil init` (idiomatic, like `git init` / `cargo init`); `basil config init` no longer exists (`basil config explain` is unchanged)
   - fix: `basil init` now honors the socket path (basil-u00): the generated `basil-agent.toml` `socket = ...` line follows precedence explicit `--socket <path>` > `BASIL_SOCKET` env var > `<dir>/basil.sock`, instead of always writing `<dir>/basil.sock`
+  - breaking (pre-announcement): unified `explain`: `basil explain` now runs an offline policy dry-run against catalog+policy files by default and `--live` queries the running broker; removed `basil config explain` and the separate over-socket `explain` verb; the `basil config` namespace is gone
 
 - 2026-07-04
   - renamed basil to basil-client to avoid crates.io name collision

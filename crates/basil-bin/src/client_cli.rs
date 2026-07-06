@@ -18,6 +18,7 @@ use basil::{
     AeadAlgorithm, CiphertextEnvelope, Client, ImportEntry, KeyMaterial, KeyType, NatsJwtType,
     NatsUserPermissions, SignNatsJwtOptions,
 };
+use basil_core::agent_cli::ExplainArgs;
 use clap::{Subcommand, ValueEnum};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -447,23 +448,6 @@ pub enum Command {
         json: bool,
     },
 
-    /// Ask the running agent why a subject would be allowed or denied for a
-    /// given operation and key. Requires the dedicated `explain` admin permission.
-    Explain {
-        /// Subject name to evaluate.
-        #[arg(long)]
-        subject: String,
-        /// Policy op token to evaluate (`get`, `sign`, `set`, ...).
-        #[arg(long)]
-        op: String,
-        /// Catalog key/target to evaluate.
-        #[arg(long)]
-        key: String,
-        /// Emit a machine-readable JSON object instead of human lines.
-        #[arg(long)]
-        json: bool,
-    },
-
     /// Revoke a JWT-SVID by trust-domain and jti. Requires the dedicated
     /// `revoke` admin permission over `broker.revoke` and a configured
     /// persistent `revocation_store=jwt-svid` value key.
@@ -671,12 +655,6 @@ async fn dispatch(client: &mut Client, command: Command) -> Result<()> {
         Command::Health { json } => health(client, json).await,
         Command::Ready { json } => ready(client, json).await,
         Command::Reload { check, json } => reload(client, check, json).await,
-        Command::Explain {
-            subject,
-            op,
-            key,
-            json,
-        } => explain(client, &subject, &op, &key, json).await,
         Command::Revoke {
             trust_domain,
             jti,
@@ -1307,6 +1285,30 @@ const fn reload_exit_code(r: &basil::AgentReload) -> i32 {
     if r.succeeded() { 0 } else { 1 }
 }
 
+/// The `--live` path of `basil explain` (`basil-1zx.3`).
+///
+/// Connects over the global `--socket` and asks the RUNNING broker's serving
+/// generation the same subject/op/key question the offline dry-run answers from
+/// files. Requires the dedicated `explain` admin permission. The offline
+/// config-override paths on [`ExplainArgs`] are irrelevant here and are ignored;
+/// clap guarantees `--op` and `--key` are present (`--effective`, the only thing
+/// that makes them optional, conflicts with `--live`).
+pub async fn explain_live(socket: Option<&str>, args: &ExplainArgs) -> Result<()> {
+    let (Some(op), Some(key)) = (args.op_token(), args.key()) else {
+        bail!("--op and --key are required for `explain --live`");
+    };
+    let socket = socket.map_or_else(
+        || basil::constants::DEFAULT_SOCKET_PATH.to_string(),
+        str::to_owned,
+    );
+    let mut client = Client::connect(&socket)
+        .await
+        .with_context(|| format!("connecting to agent at {socket}"))?;
+    let result = explain(&mut client, args.subject(), op, key, args.json()).await;
+    drop(client);
+    result
+}
+
 /// Live policy explanation against the running broker's serving generation.
 async fn explain(
     client: &mut Client,
@@ -1341,8 +1343,8 @@ async fn explain(
     Ok(())
 }
 
-/// Stable JSON shape for `basil explain --json`, mirroring
-/// `basil config explain --json` for the single-tuple path.
+/// Stable JSON shape for `basil explain --live --json`, byte-for-byte mirroring
+/// the offline `basil explain --json` single-tuple shape.
 fn explain_json(explanation: &basil::AgentExplanation) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     obj.insert("subject".into(), explanation.subject.clone().into());
@@ -1624,7 +1626,7 @@ mod tests {
     }
 
     #[test]
-    fn explain_parses_subject_op_key_and_json() {
+    fn explain_is_top_level_and_parses_subject_op_key_and_json() {
         let cli = Cli::parse_from([
             "basil",
             "explain",
@@ -1637,16 +1639,12 @@ mod tests {
             "--json",
         ]);
         match cli.command {
-            crate::Command::Client(ClientCommand::Explain {
-                subject,
-                op,
-                key,
-                json,
-            }) => {
-                assert_eq!(subject, "svc.orders");
-                assert_eq!(op, "sign");
-                assert_eq!(key, "app.signing");
-                assert!(json, "--json flag parsed");
+            crate::Command::Explain(args) => {
+                assert_eq!(args.subject(), "svc.orders");
+                assert_eq!(args.op_token(), Some("sign"));
+                assert_eq!(args.key(), Some("app.signing"));
+                assert!(args.json(), "--json flag parsed");
+                assert!(!args.is_live(), "offline is the default path");
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -1663,11 +1661,64 @@ mod tests {
             "k",
         ]);
         match cli.command {
-            crate::Command::Client(ClientCommand::Explain { json, .. }) => {
-                assert!(!json, "--json defaults off");
+            crate::Command::Explain(args) => {
+                assert!(!args.json(), "--json defaults off");
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn explain_live_flag_selects_the_broker_path() {
+        let cli = Cli::parse_from([
+            "basil", "explain", "--subject", "s", "--op", "get", "--key", "k", "--live",
+        ]);
+        match cli.command {
+            crate::Command::Explain(args) => {
+                assert!(args.is_live(), "--live selects the running-broker path");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explain_effective_needs_no_op_or_key_offline() {
+        let cli = Cli::parse_from(["basil", "explain", "--subject", "s", "--effective"]);
+        match cli.command {
+            crate::Command::Explain(args) => {
+                assert!(!args.is_live());
+                assert_eq!(args.op_token(), None, "--effective makes --op optional");
+                assert_eq!(args.key(), None, "--effective makes --key optional");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explain_live_conflicts_with_effective() {
+        let err = Cli::try_parse_from(["basil", "explain", "--subject", "s", "--live", "--effective"])
+            .expect_err("--live has no effective mode; clap must reject the combination");
+        assert!(
+            err.to_string().contains("cannot be used with"),
+            "expected a clap conflict error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn config_namespace_is_gone() {
+        // The whole `basil config` tree was removed; `config explain` folded into
+        // the top-level `basil explain`.
+        let err = Cli::try_parse_from(["basil", "config", "explain", "--subject", "s"])
+            .expect_err("config namespace must be gone");
+        assert!(
+            err.to_string().contains("unrecognized subcommand")
+                || err.to_string().contains("invalid subcommand"),
+            "{err}"
+        );
+        assert!(
+            Cli::try_parse_from(["basil", "config"]).is_err(),
+            "bare `basil config` must not parse either"
+        );
     }
 
     #[test]
