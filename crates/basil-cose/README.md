@@ -68,21 +68,16 @@ shipped local implementations complete synchronously): `Ed25519Signer`,
 `Ed25519Verifier`, `X25519Recipient` (+ `X25519RecipientPublic` as the seal
 target).
 
-## no_std / WASM
+## no_std
 
-The crate is `#![no_std]` + `alloc`. For `wasm32-unknown-unknown` in a
-JavaScript host, enable the `wasm-js` feature (maps to `getrandom/js`):
-
-```sh
-cargo build -p basil-cose --target wasm32-unknown-unknown --features wasm-js
-```
+The crate is `#![no_std]` + `alloc` and obtains production randomness through
+`getrandom`.
 
 ## Features
 
 - `fixtures`: deterministic build variants (`build_sealed_with_parts`,
   `build_encrypted_with_parts`) that accept caller-supplied ephemeral/nonce
   parts, for test vectors only. Never enable on production paths.
-- `wasm-js` - `getrandom`'s JS host binding for browser/Node WASM.
 
 ## Design
 

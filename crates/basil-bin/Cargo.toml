@@ -40,6 +40,7 @@ unlock-tpm = ["basil-core/unlock-tpm"]
 # tpm2 is still experimental
 tpm2 = ["basil-core/tpm2"]
 otlp = ["basil-core/otlp"]
+secure-alloc = ["mimalloc/secure"]
 
 [dependencies]
 basil = { workspace = true }
@@ -47,11 +48,12 @@ basil-core = { workspace = true }
 basil-nats = { workspace = true }
 
 anyhow = { workspace = true }
-base64 = { workspace = true }
+base64 = { workspace = true, features = ["std"] }
 clap = { workspace = true }
 hex = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
+mimalloc = { workspace = true }
+serde = { workspace = true, features = ["std"] }
+serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
 

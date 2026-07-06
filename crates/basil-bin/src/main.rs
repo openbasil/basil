@@ -12,6 +12,9 @@ use basil_bin::{Cli, Command, client_cli};
 use basil_core::agent_cli;
 use clap::Parser;
 
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();

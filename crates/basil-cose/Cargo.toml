@@ -19,9 +19,6 @@ publish = true
 # `build_encrypted_with_parts`) for test vectors only. Never enable in
 # production code paths: it admits caller-supplied ephemerals and nonces.
 fixtures = []
-# Enable `getrandom`'s JavaScript host binding so the crate builds for
-# `wasm32-unknown-unknown` in a JS environment (browser / Node).
-wasm-js = ["getrandom/js"]
 
 # Dependencies are declared crate-locally (not `workspace = true`) because this
 # crate is `no_std` + `alloc`: it must switch off the `std` default features

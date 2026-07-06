@@ -13,10 +13,8 @@ rust-version = "1.85"
 publish = true
 
 # This crate's own source is `#![no_std]` + `extern crate alloc` (see the `std`
-# / `alloc` features below). The dependencies are inherited with their workspace
-# feature sets; making the whole dependency graph bare-metal `no_std` would need
-# workspace-wide `default-features = false` on serde/serde_json/base64/
-# data-encoding (they default to `std`), which is tracked separately.
+# / `alloc` features below). Its workspace-inherited dependencies are kept on
+# their `alloc` feature sets so the `alloc`-only build stays bare-metal no_std.
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -27,7 +25,7 @@ ed25519-dalek = { workspace = true }
 crypto_secretbox = { workspace = true }
 salsa20 = { workspace = true }
 x25519-dalek = { workspace = true }
-# `RngCore` trait only (no ambient RNG): `seal_nats_curve` takes the rng from the
+# `Rng` trait only (no ambient RNG): `seal_nats_curve` takes the rng from the
 # caller, so this crate pulls in no `getrandom`/`thread_rng` of its own.
 rand_core = { workspace = true }
 zeroize = { workspace = true }
@@ -35,8 +33,6 @@ zeroize = { workspace = true }
 [dev-dependencies]
 # Used only by tests to cross-check our wire format against a real NKey impl.
 nkeys = { workspace = true }
-# `thread_rng()` for the seal round-trip tests (std-only; tests always run std).
-rand = { workspace = true }
 
 [features]
 default = ["std"]
@@ -44,7 +40,14 @@ default = ["std"]
 # with only `alloc` (`--no-default-features --features alloc`), which is the
 # `no_std` build; `alloc` is mandatory (the crate always uses `extern crate
 # alloc`), so the feature is an explicit, minimal `no_std` target marker.
-std = ["alloc"]
+std = [
+  "alloc",
+  "base64/std",
+  "crypto_secretbox/std",
+  "data-encoding/std",
+  "serde/std",
+  "serde_json/std",
+]
 alloc = []
 
 [lints]

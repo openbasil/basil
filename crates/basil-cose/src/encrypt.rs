@@ -57,7 +57,7 @@ pub struct SealParts {
 /// Fill a fixed-size buffer with OS randomness.
 pub fn random_array<const N: usize>() -> Result<Zeroizing<[u8; N]>, BuildError> {
     let mut buf = Zeroizing::new([0u8; N]);
-    getrandom::getrandom(buf.as_mut_slice()).map_err(|_| BuildError::Rng)?;
+    getrandom::fill(buf.as_mut_slice()).map_err(|_| BuildError::Rng)?;
     Ok(buf)
 }
 

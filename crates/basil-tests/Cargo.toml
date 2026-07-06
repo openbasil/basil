@@ -40,7 +40,7 @@ basil-nats-bridge = { workspace = true }
 basil-proto = { workspace = true }
 
 async-nats = { workspace = true }
-base64 = { workspace = true }
+base64 = { workspace = true, features = ["std"] }
 bytes = { workspace = true }
 cose_minicbor = { version = "0.1.1", default-features = false, features = ["suit-sha256-ed25519"] }
 ed25519-dalek = { workspace = true }
@@ -49,8 +49,8 @@ minicbor = { workspace = true, features = ["alloc", "std"] }
 jsonwebtoken = { workspace = true }
 pkcs8 = { workspace = true }
 reqwest = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
+serde = { workspace = true, features = ["std"] }
+serde_json = { workspace = true, features = ["std"] }
 spiffe-rustls = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }

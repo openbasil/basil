@@ -21,6 +21,7 @@
 #![cfg_attr(test, allow(clippy::indexing_slicing))]
 
 use std::collections::BTreeMap;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,9 +32,9 @@ use crate::service::broker::{BrokerIdentityRuntimeConfig, InvocationRuntimeConfi
 use crate::{
     AuditLog, Backend, BackendKind, BackendManager, BrokerLimits, BrokerState, CapabilityPolicy,
     DEFAULT_MAX_ENCRYPT_SIZE, DEFAULT_MAX_PAYLOAD_SIZE, DEFAULT_ROTATION_GRACE_VERSIONS,
-    DEFAULT_SOCKET_MODE, DEFAULT_SVID_TTL_SECS, JwtRevocationStore, ReloadActor,
-    ReloadInputs, ServerConfig, SpiffeConfig, SpiffeVaultBackend, VaultBackend,
-    enforce_capabilities, load, reload_generation, run_grpc,
+    DEFAULT_SOCKET_MODE, DEFAULT_SVID_TTL_SECS, JwtRevocationStore, ReloadActor, ReloadInputs,
+    ServerConfig, SpiffeConfig, SpiffeVaultBackend, VaultBackend, enforce_capabilities, load,
+    reload_generation, run_grpc,
 };
 use crate::{bundle_cli, doctor, init, unlock};
 use anyhow::{Context, Result, bail};
@@ -554,19 +555,33 @@ pub(crate) struct AgentConfigFile {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub(crate) struct LoggingConfigFile {
-    stdout: LoggingSinkConfigFile,
+    stdout: StdoutLoggingSinkConfigFile,
     journald: LoggingSinkConfigFile,
+    file: FileLoggingConfigFile,
     opentelemetry: OpenTelemetryLoggingConfigFile,
 }
 
 impl Default for LoggingConfigFile {
     fn default() -> Self {
         Self {
-            stdout: LoggingSinkConfigFile { enable: true },
+            stdout: StdoutLoggingSinkConfigFile::default(),
             journald: LoggingSinkConfigFile { enable: true },
+            file: FileLoggingConfigFile::default(),
             opentelemetry: OpenTelemetryLoggingConfigFile::default(),
         }
     }
+}
+
+impl LoggingConfigFile {
+    fn stdout_enabled(&self) -> bool {
+        self.stdout.enable.unwrap_or(!self.file.enable)
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+struct StdoutLoggingSinkConfigFile {
+    enable: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -578,6 +593,47 @@ struct LoggingSinkConfigFile {
 impl Default for LoggingSinkConfigFile {
     fn default() -> Self {
         Self { enable: true }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+struct FileLoggingConfigFile {
+    enable: bool,
+    #[serde(alias = "path")]
+    dir: Option<PathBuf>,
+    prefix: String,
+    rotation: FileLoggingRotation,
+}
+
+impl Default for FileLoggingConfigFile {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            dir: None,
+            prefix: "basil-agent-".to_owned(),
+            rotation: FileLoggingRotation::Daily,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum FileLoggingRotation {
+    None,
+    Hourly,
+    Daily,
+    Weekly,
+}
+
+impl From<FileLoggingRotation> for tracing_appender::rolling::Rotation {
+    fn from(rotation: FileLoggingRotation) -> Self {
+        match rotation {
+            FileLoggingRotation::None => Self::NEVER,
+            FileLoggingRotation::Hourly => Self::HOURLY,
+            FileLoggingRotation::Daily => Self::DAILY,
+            FileLoggingRotation::Weekly => Self::WEEKLY,
+        }
     }
 }
 
@@ -1207,6 +1263,7 @@ pub(crate) fn load_config_file(overrides: &ConfigOverrides) -> Result<AgentConfi
 }
 
 struct LoggingGuards {
+    file_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
     #[cfg(feature = "otlp")]
     otel_provider: Option<SdkLoggerProvider>,
 }
@@ -1220,7 +1277,12 @@ type OptionalOtelLayer = (Option<OtelTracingLayer>, Option<SdkLoggerProvider>);
 #[cfg(feature = "otlp")]
 impl LoggingGuards {
     fn shutdown(self) {
-        if let Some(provider) = self.otel_provider
+        let Self {
+            file_guard,
+            otel_provider,
+        } = self;
+        drop(file_guard);
+        if let Some(provider) = otel_provider
             && let Err(err) = provider.shutdown()
         {
             warn!(error = %err, "failed to shut down OpenTelemetry logger provider");
@@ -1230,8 +1292,9 @@ impl LoggingGuards {
 
 #[cfg(not(feature = "otlp"))]
 impl LoggingGuards {
-    const fn shutdown(self) {
-        let Self {} = self;
+    fn shutdown(self) {
+        let Self { file_guard } = self;
+        drop(file_guard);
     }
 }
 
@@ -1239,16 +1302,15 @@ impl LoggingGuards {
 ///
 /// Journald is the right default for the systemd-managed daemon, but a journal
 /// socket is absent on minimal hosts (containers, initramfs, CI) where the
-/// offline `basil doctor`/`explain` commands run. An unavailable socket must be a
-/// non-fatal fall back to stderr, never an abort on logging init.
+/// offline `basil doctor`/`explain` commands run. An unavailable socket is
+/// reported once to stderr, but it must not install a duplicate stderr log sink.
 enum JournaldSink {
     /// Journald disabled in config; no journald sink.
     Disabled,
     /// Journald socket opened; emit through this layer.
     Active(tracing_journald::Layer),
-    /// Journald requested but the socket is unavailable. The caller must log to
-    /// stderr instead; the message carries the underlying error for one warning.
-    FellBackToStderr(String),
+    /// Journald requested but the socket is unavailable.
+    Unavailable(String),
 }
 
 fn journald_sink(enabled: bool) -> JournaldSink {
@@ -1257,22 +1319,22 @@ fn journald_sink(enabled: bool) -> JournaldSink {
     }
     match tracing_journald::layer() {
         Ok(layer) => JournaldSink::Active(layer),
-        Err(err) => JournaldSink::FellBackToStderr(err.to_string()),
+        Err(err) => JournaldSink::Unavailable(err.to_string()),
     }
 }
 
 fn init_logging(config: &LoggingConfigFile) -> Result<LoggingGuards> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let stdout_layer = config.stdout.enable.then(fmt::layer);
+    let stdout_layer = config.stdout_enabled().then(fmt::layer);
 
-    let (journald_layer, stderr_fallback) = match journald_sink(config.journald.enable) {
+    let (journald_layer, journald_error) = match journald_sink(config.journald.enable) {
         JournaldSink::Disabled => (None, None),
         JournaldSink::Active(layer) => (Some(layer), None),
-        JournaldSink::FellBackToStderr(err) => (None, Some(err)),
+        JournaldSink::Unavailable(err) => (None, Some(err)),
     };
-    let stderr_layer = stderr_fallback
-        .is_some()
-        .then(|| fmt::layer().with_writer(std::io::stderr));
+
+    let (file_writer, file_guard) = build_file_writer(&config.file)?;
+    let file_layer = file_writer.map(|writer| fmt::layer().with_writer(writer));
 
     #[cfg(feature = "otlp")]
     let (otel_layer, otel_provider) = build_otel_layer(&config.opentelemetry)?;
@@ -1283,21 +1345,87 @@ fn init_logging(config: &LoggingConfigFile) -> Result<LoggingGuards> {
         .with(env_filter)
         .with(stdout_layer)
         .with(journald_layer)
-        .with(stderr_layer);
+        .with(file_layer);
     #[cfg(feature = "otlp")]
     let subscriber = subscriber.with(otel_layer);
     subscriber
         .try_init()
         .context("initializing tracing subscriber")?;
 
-    if let Some(err) = stderr_fallback {
-        warn!(error = %err, "journald log sink unavailable; falling back to stderr");
+    if let Some(err) = journald_error {
+        eprintln!("journald log sink unavailable: {err}");
     }
 
     Ok(LoggingGuards {
+        file_guard,
         #[cfg(feature = "otlp")]
         otel_provider,
     })
+}
+
+type FileMakeWriter = tracing_appender::non_blocking::NonBlocking;
+
+fn build_file_writer(
+    config: &FileLoggingConfigFile,
+) -> Result<(
+    Option<FileMakeWriter>,
+    Option<tracing_appender::non_blocking::WorkerGuard>,
+)> {
+    if !config.enable {
+        return Ok((None, None));
+    }
+
+    let Some(dir) = config.dir.as_deref() else {
+        bail!("logging.file.dir is required when logging.file.enable=true");
+    };
+
+    let appender = match tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(config.rotation.into())
+        .filename_prefix(config.prefix.clone())
+        .build(dir)
+    {
+        Ok(appender) => appender,
+        Err(err) => {
+            eprintln!("file log sink unavailable at {}: {err}", dir.display());
+            return Ok((None, None));
+        }
+    };
+
+    let writer = ReportingWriter::new(appender);
+    let (non_blocking, guard) = tracing_appender::non_blocking(writer);
+    Ok((Some(non_blocking), Some(guard)))
+}
+
+struct ReportingWriter<W> {
+    inner: W,
+}
+
+impl<W> ReportingWriter<W> {
+    const fn new(inner: W) -> Self {
+        Self { inner }
+    }
+}
+
+impl<W: Write> Write for ReportingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self.inner.write(buf) {
+            Ok(size) => Ok(size),
+            Err(err) => {
+                eprintln!("failed to write to file log sink: {err}");
+                Err(err)
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self.inner.flush() {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                eprintln!("failed to flush file log sink: {err}");
+                Err(err)
+            }
+        }
+    }
 }
 
 #[cfg(not(feature = "otlp"))]
@@ -2094,7 +2222,7 @@ pub async fn run_doctor_command(args: DoctorArgs) -> Result<()> {
     let overrides = args.overrides.clone();
     if args.json {
         let mut logging = logging_config_for_overrides(&overrides)?;
-        logging.stdout.enable = false;
+        logging.stdout.enable = Some(false);
         let logging_guards = init_logging(&logging)?;
         let result = run_doctor(args).await;
         logging_guards.shutdown();
@@ -2249,6 +2377,12 @@ enable = false
 [logging.journald]
 enable = true
 
+[logging.file]
+enable = true
+dir = "/var/log/basil"
+prefix = "agent-"
+rotation = "weekly"
+
 [logging.opentelemetry]
 enable = true
 endpoint = "http://localhost:4317"
@@ -2301,8 +2435,19 @@ strict-bundle-perms = true
             Some(Path::new("/var/log/basil/audit.jsonl"))
         );
         assert!(loaded.no_reconcile);
-        assert!(!loaded_file.logging.stdout.enable);
+        assert_eq!(loaded_file.logging.stdout.enable, Some(false));
+        assert!(!loaded_file.logging.stdout_enabled());
         assert!(loaded_file.logging.journald.enable);
+        assert!(loaded_file.logging.file.enable);
+        assert_eq!(
+            loaded_file.logging.file.dir.as_deref(),
+            Some(Path::new("/var/log/basil"))
+        );
+        assert_eq!(loaded_file.logging.file.prefix, "agent-");
+        assert_eq!(
+            loaded_file.logging.file.rotation,
+            FileLoggingRotation::Weekly
+        );
         assert!(loaded_file.logging.opentelemetry.enable);
         assert_eq!(
             (
@@ -2393,8 +2538,13 @@ bundle = "/cfg/bundle.sealed"
     #[test]
     fn logging_defaults_stdout_and_journald_on_otel_off() {
         let config = AgentConfigFile::default();
-        assert!(config.logging.stdout.enable);
+        assert_eq!(config.logging.stdout.enable, None);
+        assert!(config.logging.stdout_enabled());
         assert!(config.logging.journald.enable);
+        assert!(!config.logging.file.enable);
+        assert!(config.logging.file.dir.is_none());
+        assert_eq!(config.logging.file.prefix, "basil-agent-");
+        assert_eq!(config.logging.file.rotation, FileLoggingRotation::Daily);
         assert!(!config.logging.opentelemetry.enable);
         assert_eq!(
             config.logging.opentelemetry.protocol,
@@ -2404,35 +2554,115 @@ bundle = "/cfg/bundle.sealed"
     }
 
     #[test]
+    fn stdout_defaults_off_when_file_logging_enabled() {
+        let config: AgentConfigFile = toml::from_str(
+            r#"
+[logging.file]
+enable = true
+dir = "/var/log/basil"
+"#,
+        )
+        .expect("parse config");
+        assert_eq!(config.logging.stdout.enable, None);
+        assert!(!config.logging.stdout_enabled());
+    }
+
+    #[test]
+    fn stdout_explicit_config_overrides_file_logging_default() {
+        let stdout_on: AgentConfigFile = toml::from_str(
+            r#"
+[logging.stdout]
+enable = true
+
+[logging.file]
+enable = true
+dir = "/var/log/basil"
+"#,
+        )
+        .expect("parse stdout-on config");
+        assert_eq!(stdout_on.logging.stdout.enable, Some(true));
+        assert!(stdout_on.logging.stdout_enabled());
+
+        let stdout_off: AgentConfigFile = toml::from_str(
+            r#"
+[logging.stdout]
+enable = false
+"#,
+        )
+        .expect("parse stdout-off config");
+        assert_eq!(stdout_off.logging.stdout.enable, Some(false));
+        assert!(!stdout_off.logging.stdout_enabled());
+    }
+
+    #[test]
+    fn file_logging_path_alias_populates_dir() {
+        let config: AgentConfigFile = toml::from_str(
+            r#"
+[logging.file]
+enable = true
+path = "/var/log/basil"
+"#,
+        )
+        .expect("parse file config");
+        assert_eq!(
+            config.logging.file.dir.as_deref(),
+            Some(Path::new("/var/log/basil"))
+        );
+    }
+
+    #[test]
+    fn file_logging_requires_dir_when_enabled() {
+        let config: AgentConfigFile = toml::from_str(
+            r#"
+[logging.file]
+enable = true
+"#,
+        )
+        .expect("parse file config");
+        let err = build_file_writer(&config.logging.file).expect_err("missing dir rejects");
+        assert!(
+            err.to_string()
+                .contains("logging.file.dir is required when logging.file.enable=true")
+        );
+    }
+
+    #[test]
+    fn file_logging_constructs_non_blocking_writer() {
+        let dir = std::env::temp_dir().join(format!(
+            "basil-agent-log-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&dir).expect("create log dir");
+        let config = FileLoggingConfigFile {
+            enable: true,
+            dir: Some(dir.clone()),
+            prefix: "agent-test".to_owned(),
+            rotation: FileLoggingRotation::None,
+        };
+        let (writer, guard) = build_file_writer(&config).expect("build file writer");
+        assert!(writer.is_some());
+        drop(writer);
+        drop(guard);
+        std::fs::remove_dir_all(dir).expect("remove log dir");
+    }
+
+    #[test]
     fn journald_disabled_produces_no_sink() {
         assert!(matches!(journald_sink(false), JournaldSink::Disabled));
     }
 
     #[test]
-    fn journald_without_socket_falls_back_instead_of_aborting() {
+    fn journald_without_socket_is_non_fatal_without_stderr_sink() {
         // Portability guarantee (basil-ftfj): requesting journald on a host with
         // no journal socket (containers, minimal VMs, CI) must NOT abort the
         // offline `basil doctor`/`explain` commands. It resolves to either an active
-        // journald layer (socket present) or a non-fatal stderr fall back (socket
-        // absent): never a hard error.
+        // journald layer (socket present) or a one-time stderr diagnostic (socket
+        // absent): never a hard error or duplicate stderr log sink.
         match journald_sink(true) {
-            JournaldSink::Active(_) | JournaldSink::FellBackToStderr(_) => {}
+            JournaldSink::Active(_) | JournaldSink::Unavailable(_) => {}
             JournaldSink::Disabled => panic!("enabled journald must not resolve to Disabled"),
         }
-    }
-
-    #[test]
-    fn stderr_fallback_subscriber_constructs_without_journal_socket() {
-        // The offline logging setup must yield a working stderr subscriber and
-        // return normally even with no journal socket present. Install it
-        // thread-locally (not globally) so the test does not contend for the
-        // process-wide dispatcher.
-        let subscriber = tracing_subscriber::registry()
-            .with(EnvFilter::new("info"))
-            .with(fmt::layer().with_writer(std::io::stderr));
-        tracing::subscriber::with_default(subscriber, || {
-            tracing::info!("offline logging falls back to stderr");
-        });
     }
 
     #[cfg(feature = "http")]

@@ -39,8 +39,8 @@
 //! private labels (`-70001..=-70005`, see [`label`]). [`ValidationParams`]
 //! parameterizes skew/TTL/audience bounds; `now` is injected, never sampled.
 //!
-//! The crate is `no_std` + `alloc` (randomness via `getrandom`; enable the
-//! `wasm-js` feature for `wasm32-unknown-unknown` in JS hosts).
+//! The crate is `no_std` + `alloc` and obtains production randomness through
+//! `getrandom`.
 
 #![no_std]
 #![cfg_attr(

@@ -51,12 +51,13 @@ async-trait = { workspace = true }
 aws-config = { workspace = true, optional = true }
 aws-sdk-kms = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
-base64 = { workspace = true }
+base64 = { workspace = true, features = ["std"] }
 bip39 = { workspace = true, optional = true }
 chacha20poly1305 = { workspace = true }
 clap = { workspace = true }
 ed25519-dalek = { workspace = true }
 futures = { workspace = true }
+getrandom = { workspace = true }
 google-cloud-gax = { workspace = true, optional = true }
 google-cloud-kms = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
@@ -75,6 +76,7 @@ p521 = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
 rand = { workspace = true }
+rand_core = { workspace = true }
 reqwest = { workspace = true }
 rsa = { workspace = true }
 rustix = { workspace = true }
@@ -82,8 +84,8 @@ rustix = { workspace = true }
 # install its `ring` crypto provider before building any client (see
 # `ensure_crypto_provider`). `http-tls` gates only the server-side tokio-rustls.
 rustls = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
+serde = { workspace = true, features = ["std"] }
+serde_json = { workspace = true, features = ["std"] }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
@@ -93,6 +95,7 @@ toml = { workspace = true }
 tonic = { workspace = true }
 tpm2-protocol = { workspace = true, optional = true }
 tracing = { workspace = true }
+tracing-appender = { workspace = true }
 tracing-journald = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = { workspace = true }

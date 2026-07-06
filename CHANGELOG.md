@@ -6,8 +6,20 @@ SPDX-License-Identifier: Apache-2.0
 
 # Changelog
 
-## Unreleased
+## 0.6.0 2026-07-06
 
+### basil-nats can build no_std
+
+- basil-nats can now build `no_std` + `alloc` compatible: the crate source is `#![no_std]` (`extern crate alloc`) and gains `std` (default) / `alloc` cargo features; build the minimal target with `cargo build -p basil-nats --no-default-features --features alloc`
+- **Breaking**: `basil_nats::seal_nats_curve` now takes an explicit `rng: &mut impl RngCore` parameter instead of calling `rand::thread_rng()` internally; pass `rand::thread_rng()` under `std`
+
+### basil-bin (cli & basil-agent) and basil-nats-bridge new allocator
+
+- basil and basil-nats-bridge use mimalloc as the global allocator.
+  A feature flat "secure-alloc" enables mimalloc's secure mode, which enables guard pages,
+  randomized allocation, and encrypted free lists; and is estimated to cause about 10% performance decrease
+  (mimalloc's estimate). We'll leave the feature flag off by default uniil we do more benchmarking and testing.
+  
 ### Updated Nix options & service definition
 
 - nix/basil-options.nix
@@ -27,12 +39,6 @@ SPDX-License-Identifier: Apache-2.0
 
 - nix/backend-capabilities.nix - added accurate AWS_KMS / GCP_KMS presets (algorithms cross-checked against aws_kms.rs/gcp_kms.rs).
 
-### basil-nats is now no_std
-
-- basil-nats is now `no_std` + `alloc` compatible: the crate source is `#![no_std]` (`extern crate alloc`) and gains `std` (default) / `alloc` cargo features; build the minimal target with `cargo build -p basil-nats --no-default-features --features alloc`
-
-- **Breaking**: `basil_nats::seal_nats_curve` now takes an explicit `rng: &mut impl RngCore` parameter instead of calling `rand::thread_rng()` internally; pass `rand::thread_rng()` under `std`
-
 #### github workflows
 
 - CI: Go unit tests and the Rust<->Go stream interop suite over the clients/go submodule (basil-ubd)
@@ -40,6 +46,14 @@ SPDX-License-Identifier: Apache-2.0
 - workflow `build.yml`: reproducible per-arch Nix builds — manual dispatch (choose architecture + branch) and automatic on `basil-v*` tags (all three platforms, tags must be on main)
 - Arch Linux aarch64 package alongside x86_64 (basil-60f)
 - `scripts/pin-github-actions.sh` and `just pin-actions`: pin GitHub Actions to commit SHAs, run automatically from `gen-release-workflow` (basil-yko)
+
+### File logging
+
+- New: option in basil-agent.toml: file logging using non-blocking, rolling file appender. Documented in basil-doc
+- logging.stdout is enabled by default, unless file logging is enabled.
+- Fix: If journald logger fails to connect to journald, it prints an error to stderr and stops logging.
+  Previously, if journald failed to connect, it redirected the entire stream to stderr, which would be redundant with stdout logging.
+
 
 ### Cli simplifications
 
@@ -50,6 +64,7 @@ SPDX-License-Identifier: Apache-2.0
 
 ### Other
 
+- bumped getrandom to 0.4.3, rand_core 0.10.1. Some crypto deps still transitively pull in getrandom 0.2.17
 - Added SPDX headers
 - added SECURITY.md, CODE_OF_CONDUCT.md
 - added cargo aliases: 'cargo install-basil','cargo install-bridge' installs basil binary & basil-nats-bridge

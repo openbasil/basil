@@ -57,6 +57,28 @@ use crate::ed25519_sign::{self, SignError};
 use crate::state::BrokerLimits;
 use crate::x25519_seal::{self, SealError, SealedEnvelope};
 
+struct GetrandomRng;
+
+impl rand_core::TryRng for GetrandomRng {
+    type Error = getrandom::Error;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        let mut bytes = [0u8; 4];
+        self.try_fill_bytes(&mut bytes)?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        let mut bytes = [0u8; 8];
+        self.try_fill_bytes(&mut bytes)?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+        getrandom::fill(dst)
+    }
+}
+
 /// An error from resolving or routing a catalog key. Fails closed; never panics.
 #[derive(Debug, thiserror::Error)]
 pub enum ManagerError {
@@ -229,6 +251,7 @@ const fn nats_curve_error(err: &basil_nats::Error) -> ManagerError {
         | basil_nats::Error::UnexpectedXKeyPrefix(_)
         | basil_nats::Error::BadXKeyVersion
         | basil_nats::Error::BadXKeyCiphertextLen(_)
+        | basil_nats::Error::XKeyRandomnessFailed
         | basil_nats::Error::XKeySealFailed
         | basil_nats::Error::Json(_)
         | basil_nats::Error::InvalidClaims(_)
@@ -1245,7 +1268,7 @@ impl BackendManager {
             &private,
             recipient_public_xkey,
             plaintext,
-            &mut rand::thread_rng(),
+            &mut GetrandomRng,
         )
         .map_err(|e| nats_curve_error(&e))
     }

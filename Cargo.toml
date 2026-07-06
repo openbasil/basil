@@ -18,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.5.4"
+version = "0.6.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["info@openbasil.org"]
@@ -27,14 +27,14 @@ homepage = "https://github.com/openbasil/basil"
 documentation = "https://docs.rs/basil-client"
 
 [workspace.dependencies]
-basil = { version = "0.5.4", path = "crates/basil-client", package = "basil-client" }
-basil-cose = { version = "0.5.4", path = "crates/basil-cose" }
-basil-proto = { version = "0.5.4", path = "crates/basil-proto" }
-basil-nats = { version = "0.5.4", path = "crates/basil-nats" }
-basil-nats-bridge = { version = "0.5.4", path = "crates/basil-nats-bridge" }
-basil-keystore-backend = { version = "0.5.4", path = "crates/basil-keystore-backend" }
-basil-core = { version = "0.5.4", path = "crates/basil-core", default-features = false }
-basil-bin = { version = "0.5.4", path = "crates/basil-bin" }
+basil = { version = "0.6.0", path = "crates/basil-client", package = "basil-client" }
+basil-cose = { version = "0.6.0", path = "crates/basil-cose" }
+basil-proto = { version = "0.6.0", path = "crates/basil-proto" }
+basil-nats = { version = "0.6.0", path = "crates/basil-nats" }
+basil-nats-bridge = { version = "0.6.0", path = "crates/basil-nats-bridge" }
+basil-keystore-backend = { version = "0.6.0", path = "crates/basil-keystore-backend" }
+basil-core = { version = "0.6.0", path = "crates/basil-core", default-features = false }
+basil-bin = { version = "0.6.0", path = "crates/basil-bin" }
 
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 aes-kw = "0.3"
@@ -51,17 +51,17 @@ async-nats = { version = "0.49", default-features = false, features = ["nkeys", 
 aws-config = { version = "=1.8.18", default-features = false, features = ["rt-tokio"] }
 aws-sdk-kms = { version = "=1.111.0", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
-base64 = "0.22"
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 bip39 = "2"
 bytes = "1"
 chacha20poly1305 = { version = "0.10", default-features = false }
 clap = { version = "4", features = ["derive", "env"] }
-crypto_secretbox = "0.1.1"
-data-encoding = "2"
+crypto_secretbox = { version = "0.1.1", default-features = false, features = ["alloc", "salsa20"] }
+data-encoding = { version = "2", default-features = false, features = ["alloc"] }
 db-keystore = "0.4.3"
 ed25519-dalek = { version = "2", default-features = false, features = ["zeroize"] }
 futures = "0.3"
-getrandom = { version = "0.2", default-features = false }
+getrandom = { version = "0.4.3", default-features = false }
 # GCP Cloud KMS transit backend (feature `gcp-kms`). yoshidan crate: gRPC/HTTP-2
 # (tonic + prost) for low-latency in-place KMS ops. `default-features = false` +
 # `rustls-tls` avoids the default `default-tls` path (reqwest native-tls →
@@ -81,6 +81,7 @@ keyring-core = "1.0"
 minicbor = { version = "2.2.2", default-features = false, features = ["alloc"] }
 ml-dsa = { version = "0.1.1", features = ["zeroize"] }
 ml-kem = { version = "0.3", features = ["getrandom", "zeroize"] }
+mimalloc = { version = "0.1.52", default-features = false }
 nkeys = { version = "0.4", features = ["xkeys"] }
 opentelemetry-appender-tracing = "0.32"
 opentelemetry-otlp = { version = "0.32", features = ["logs", "http-proto", "http-json", "grpc-tonic", "reqwest-blocking-client"] }
@@ -98,7 +99,7 @@ pkcs8 = "0.10"
 prost = "0.14.4"
 prost-types = "0.14.4"
 rand = "0.8"
-rand_core = "0.6"
+rand_core = "0.10.1"
 # reqwest 0.13's `rustls` feature forces the `aws-lc-rs` provider (a C build dep,
 # forbidden here); `rustls-no-provider` pulls rustls with its default `ring`
 # provider and no C toolchain. `default-features = false` drops the native-tls
@@ -108,9 +109,9 @@ rsa = { version = "0.9", features = ["pem"] }
 rustix = { version = "1", features = ["process"] }
 rustls = { version = "0.23.41", default-features = false, features = ["ring", "std"] }
 salsa20 = { version = "0.10", features = ["zeroize"] }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
 serde_bytes = "0.11"
-serde_json = { version = "1", features = ["arbitrary_precision"] }
+serde_json = { version = "1", default-features = false, features = ["alloc", "arbitrary_precision"] }
 sha2 = { version = "0.10", default-features = false }
 sha3 = { version = "0.10", default-features = false }
 spiffe = { version = "0.16", features = ["x509-source", "jwt-source"] }
@@ -128,6 +129,7 @@ tonic-prost = "0.14.6"
 tonic-prost-build = "0.14.6"
 tower = "0.5.3"
 tracing = "0.1.44"
+tracing-appender = "0.2.5"
 tracing-journald = "0.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.5"

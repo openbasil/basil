@@ -764,7 +764,7 @@ dependencies = [
 
 [[package]]
 name = "basil-bin"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -773,6 +773,7 @@ dependencies = [
  "basil-nats",
  "clap",
  "hex",
+ "mimalloc",
  "serde",
  "serde_json",
  "tokio",
@@ -781,7 +782,7 @@ dependencies = [
 
 [[package]]
 name = "basil-client"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "aes-gcm",
  "basil-cose",
@@ -808,7 +809,7 @@ dependencies = [
 
 [[package]]
 name = "basil-core"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "aes-gcm",
  "aes-kw",
@@ -831,6 +832,7 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "futures",
+ "getrandom 0.4.3",
  "google-cloud-gax",
  "google-cloud-kms",
  "hex",
@@ -851,6 +853,7 @@ dependencies = [
  "prost 0.14.4",
  "prost-types 0.14.4",
  "rand 0.8.6",
+ "rand_core 0.10.1",
  "reqwest 0.13.4",
  "rsa",
  "rustix 1.1.4",
@@ -867,6 +870,7 @@ dependencies = [
  "tower 0.5.3",
  "tpm2-protocol",
  "tracing",
+ "tracing-appender",
  "tracing-journald",
  "tracing-subscriber",
  "url",
@@ -878,12 +882,12 @@ dependencies = [
 
 [[package]]
 name = "basil-cose"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "aes-gcm",
  "chacha20poly1305",
  "ed25519-dalek",
- "getrandom 0.2.17",
+ "getrandom 0.4.3",
  "hkdf",
  "minicbor",
  "p256",
@@ -895,7 +899,7 @@ dependencies = [
 
 [[package]]
 name = "basil-keystore-backend"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "aes-gcm",
  "basil-client",
@@ -915,15 +919,14 @@ dependencies = [
 
 [[package]]
 name = "basil-nats"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "base64 0.22.1",
  "crypto_secretbox",
  "data-encoding",
  "ed25519-dalek",
  "nkeys",
- "rand 0.8.6",
- "rand_core 0.6.4",
+ "rand_core 0.10.1",
  "salsa20",
  "serde",
  "serde_json",
@@ -934,7 +937,7 @@ dependencies = [
 
 [[package]]
 name = "basil-nats-bridge"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -944,6 +947,7 @@ dependencies = [
  "clap",
  "futures",
  "hyper-util",
+ "mimalloc",
  "prost 0.14.4",
  "serde",
  "thiserror 2.0.18",
@@ -957,7 +961,7 @@ dependencies = [
 
 [[package]]
 name = "basil-proto"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "basil-cose",
  "prost 0.14.4",
@@ -972,7 +976,7 @@ dependencies = [
 
 [[package]]
 name = "basil-tests"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "async-nats",
  "base64 0.22.1",
@@ -6495,7 +6499,7 @@ checksum = "66fee0b777b0f5ac1c69bb06d361268faafa61cd4682ae064a171c16c433e9e4"
 
 [[package]]
 name = "xtask"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "basil-bin",

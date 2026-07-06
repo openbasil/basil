@@ -38,7 +38,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use crypto_secretbox::aead::{Aead, KeyInit};
 use crypto_secretbox::{Key as SecretboxKey, Nonce as SecretboxNonce, XSalsa20Poly1305};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use rand_core::RngCore;
+use rand_core::TryRng;
 use salsa20::cipher::consts::{U10, U16};
 use salsa20::hsalsa;
 use serde::de::DeserializeOwned;
@@ -179,6 +179,8 @@ pub enum Error {
     BadXKeyVersion,
     /// A NATS xkey ciphertext was too short to contain version, nonce, and tag.
     BadXKeyCiphertextLen(usize),
+    /// The caller-supplied RNG failed while generating a NATS xkey nonce.
+    XKeyRandomnessFailed,
     /// NATS xkey encryption failed.
     XKeySealFailed,
     /// NATS xkey authentication failed on open.
@@ -203,6 +205,7 @@ impl core::fmt::Display for Error {
             Self::BadXKeyCiphertextLen(n) => {
                 write!(f, "NATS xkey ciphertext is too short: {n} bytes")
             }
+            Self::XKeyRandomnessFailed => f.write_str("NATS xkey randomness failed"),
             Self::XKeySealFailed => f.write_str("NATS xkey seal failed"),
             Self::XKeyOpenFailed => f.write_str("NATS xkey open failed"),
         }
@@ -348,23 +351,25 @@ pub fn xkey_public_from_private(private: &Zeroizing<[u8; 32]>) -> [u8; 32] {
 /// XSalsa20-Poly1305 ciphertext`. The sender private is materialized by the
 /// caller and zeroized there; this function keeps ECDH and derived-key
 /// intermediates in zeroizing buffers. The 24-byte nonce is drawn from the
-/// caller-supplied `rng`, so the crate stays `no_std` (no ambient `thread_rng`);
-/// pass `rand::thread_rng()` under `std`.
+/// caller-supplied `rng`, so the crate stays `no_std` and does not choose an
+/// ambient OS or thread-local RNG for the caller.
 ///
 /// # Errors
 ///
 /// Returns [`Error::UnexpectedXKeyPrefix`] when `recipient_public_xkey` is not an
 /// `X...` public key, [`Error::BadPublicKeyLen`] for malformed nkeys, or
+/// [`Error::XKeyRandomnessFailed`] when the caller-supplied RNG fails, or
 /// [`Error::XKeySealFailed`] for low-order keys or an AEAD failure.
 pub fn seal_nats_curve(
     sender_private: &Zeroizing<[u8; 32]>,
     recipient_public_xkey: &str,
     plaintext: &[u8],
-    rng: &mut impl RngCore,
+    rng: &mut impl TryRng,
 ) -> Result<Vec<u8>, Error> {
     let recipient_public = decode_xkey_public(recipient_public_xkey)?;
     let mut nonce = [0u8; XKEY_NONCE_LEN];
-    rng.fill_bytes(&mut nonce);
+    rng.try_fill_bytes(&mut nonce)
+        .map_err(|_| Error::XKeyRandomnessFailed)?;
     let ciphertext = box_crypt(
         sender_private,
         &recipient_public,
@@ -1721,6 +1726,33 @@ mod tests {
     use nkeys::{KeyPair, XKey};
     use serde_json::json;
 
+    #[derive(Default)]
+    struct TestRng(u64);
+
+    impl rand_core::TryRng for TestRng {
+        type Error = core::convert::Infallible;
+
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            let mut bytes = [0u8; 4];
+            self.try_fill_bytes(&mut bytes)?;
+            Ok(u32::from_le_bytes(bytes))
+        }
+
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            let mut bytes = [0u8; 8];
+            self.try_fill_bytes(&mut bytes)?;
+            Ok(u64::from_le_bytes(bytes))
+        }
+
+        fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+            for byte in dst {
+                *byte = (self.0 as u8).wrapping_mul(37).wrapping_add(0x5a);
+                self.0 = self.0.wrapping_add(1);
+            }
+            Ok(())
+        }
+    }
+
     fn signed_token(signing_input: &str, signer: &KeyPair) -> String {
         let signature = signer.sign(signing_input.as_bytes()).expect("sign");
         assemble(signing_input, &signature)
@@ -1911,13 +1943,9 @@ mod tests {
         )
         .expect("receiver xkey encodes");
 
-        let boxed = seal_nats_curve(
-            &sender_private,
-            &receiver_public,
-            b"payload",
-            &mut rand::thread_rng(),
-        )
-        .expect("seal succeeds");
+        let mut rng = TestRng::default();
+        let boxed = seal_nats_curve(&sender_private, &receiver_public, b"payload", &mut rng)
+            .expect("seal succeeds");
         assert!(boxed.starts_with(XKEY_VERSION_V1));
         assert_eq!(
             boxed.len(),
@@ -1945,11 +1973,12 @@ mod tests {
         let sender = XKey::new_from_raw(*sender_private);
         let receiver = XKey::new_from_raw(*receiver_private);
 
+        let mut rng = TestRng::default();
         let basil_box = seal_nats_curve(
             &sender_private,
             &receiver.public_key(),
             b"from basil",
-            &mut rand::thread_rng(),
+            &mut rng,
         )
         .expect("basil seal succeeds");
         let nkeys_opened = receiver

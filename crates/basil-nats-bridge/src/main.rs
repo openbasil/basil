@@ -6,6 +6,9 @@ use anyhow::Context;
 use basil_nats_bridge::{Args, Config, run};
 use clap::Parser;
 
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()

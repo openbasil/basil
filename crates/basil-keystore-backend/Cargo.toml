@@ -27,8 +27,8 @@ ed25519-dalek = { workspace = true }
 keyring-core = { workspace = true, optional = true }
 percent-encoding = { workspace = true, optional = true }
 rand = { workspace = true }
-serde = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
+serde = { workspace = true, optional = true, features = ["std"] }
+serde_json = { workspace = true, optional = true, features = ["std"] }
 thiserror = { workspace = true }
 url = { workspace = true, optional = true }
 zero-secrets = { workspace = true }
