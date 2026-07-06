@@ -141,7 +141,7 @@ impl CheckReport {
 
     /// The dotted names of absent keys whose `missing` policy is `error`: the
     /// required keys whose absence would fail startup reconcile. This is the
-    /// predicate `--require` gates on: a CI check **should fail** iff this is
+    /// predicate `--strict` gates on: a CI check **should fail** iff this is
     /// non-empty.
     #[must_use]
     pub fn required_missing(&self) -> Vec<&str> {
@@ -151,7 +151,7 @@ impl CheckReport {
             .collect()
     }
 
-    /// Whether a `--require` gate should fail: true iff at least one absent key
+    /// Whether a `--strict` gate should fail: true iff at least one absent key
     /// carries the `error` (required) policy. `warn`/`generate`-absent keys do
     /// **not** trip this: they are not failures of a pre-deploy check.
     #[must_use]
@@ -231,7 +231,7 @@ impl BackendManager {
     /// "missing" that a caller might act on.
     ///
     /// Returns a [`CheckReport`] over every key in catalog name order. Use
-    /// [`CheckReport::should_fail_required`] to gate a `--require` CI check.
+    /// [`CheckReport::should_fail_required`] to gate a `--strict` CI check.
     ///
     /// # Errors
     ///
@@ -1132,7 +1132,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_should_fail_required_iff_an_error_class_key_is_absent() {
-        // All absent: req.signer is missing=error -> the --require gate must trip,
+        // All absent: req.signer is missing=error -> the --strict gate must trip,
         // and required_missing names exactly it (warn/generate-absent excluded).
         let (mgr, _rec) = manager_with(Probe::Absent);
         let report = mgr.check().await.expect("check ok");
@@ -1149,7 +1149,7 @@ mod tests {
     #[tokio::test]
     async fn check_warn_and_generate_absent_do_not_trip_require() {
         // A catalog with ONLY warn + generate keys, all absent: missing keys are
-        // reported, but NONE is error-class, so --require must NOT fail.
+        // reported, but NONE is error-class, so --strict must NOT fail.
         const WARN_GEN_ONLY: &str = r#"{
           "schemaVersion": 1,
           "backends": { "b": { "kind": "vault", "addr": "http://127.0.0.1:8200" } },
@@ -1182,7 +1182,7 @@ mod tests {
     #[tokio::test]
     async fn check_unreachable_backend_is_fatal_not_treated_as_absent() {
         // A down backend must FAIL check (Probe error), never be reported as a
-        // clean "missing" that a --require gate might then wrongly decide.
+        // clean "missing" that a --strict gate might then wrongly decide.
         let (mgr, _rec) = manager_with(Probe::Unreachable);
         let err = mgr
             .check()

@@ -237,7 +237,7 @@ pkgs.testers.nixosTest {
             "tpm2_pcrextend 7:sha256=$(echo basil-pcr-mismatch | sha256sum | cut -d' ' -f1)"
         )
         tpmnode.fail(
-            f"RUST_LOG=info {basil} config check -c /root/agent-tpm.toml >/root/pcr.log 2>&1"
+            f"RUST_LOG=info {basil} doctor -c /root/agent-tpm.toml >/root/pcr.log 2>&1"
         )
         tpmnode.fail("grep -q 'sealed bundle unlocked' /root/pcr.log")
 
@@ -250,12 +250,12 @@ pkgs.testers.nixosTest {
         notpm.succeed("printf 'recov-not-a-secret' > /root/pass")
         # TPM-only bundle, no TPM, no recovery slot -> fail closed.
         notpm.fail(
-            f"RUST_LOG=info {basil} config check -c /root/agent-tpm.toml >/root/tpmonly.log 2>&1"
+            f"RUST_LOG=info {basil} doctor -c /root/agent-tpm.toml >/root/tpmonly.log 2>&1"
         )
         notpm.fail("grep -q 'sealed bundle unlocked' /root/tpmonly.log")
         # The recovery bundle's passphrase slot opens it when no TPM exists.
         notpm.succeed(
-            f"RUST_LOG=info {basil} config check -c /root/agent-recov.toml >/root/recov.log 2>&1"
+            f"RUST_LOG=info {basil} doctor -c /root/agent-recov.toml >/root/recov.log 2>&1"
         )
         notpm.succeed("grep -q 'sealed bundle unlocked' /root/recov.log")
         # No TPM on this node, so the ONLY slot that can open the
@@ -265,7 +265,7 @@ pkgs.testers.nixosTest {
         # confirms a slot recovered the KEK; in the no-TPM topology that
         # slot is necessarily the passphrase one. (We match the message,
         # not the structured `method=` field, whose rendering differs
-        # between the agent and `config check` log formatters.)
+        # between the agent and `doctor` log formatters.)
         print("recov.log:\n" + notpm.execute("cat /root/recov.log")[1])
         notpm.succeed("grep -q 'unlock slot opened' /root/recov.log")
 
@@ -277,7 +277,7 @@ pkgs.testers.nixosTest {
         # The tpmnode-sealed blob cannot be loaded/unsealed by a foreign
         # TPM hierarchy -> fail closed (does-not-move-with-a-disk-image).
         othertpm.fail(
-            f"RUST_LOG=info {basil} config check -c /root/agent-tpm.toml >/root/foreign.log 2>&1"
+            f"RUST_LOG=info {basil} doctor -c /root/agent-tpm.toml >/root/foreign.log 2>&1"
         )
         othertpm.fail("grep -q 'sealed bundle unlocked' /root/foreign.log")
   '';

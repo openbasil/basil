@@ -84,7 +84,7 @@ fn run_agent(args: &[&str], addr: &str) -> (bool, String) {
 
 /// Steps 1–3: `init` the scaffold against the live `backend`, resolve the
 /// disk-unlock placeholder to a real passphrase, `bundle create` to seal the
-/// credential bundle (0600), and `check --require` it against the live backend.
+/// credential bundle (0600), and `doctor --keys` it against the live backend.
 /// Returns the scaffold dir (its `basil-agent.toml` + `basil.sock` drive step 4).
 // A linear step-1→2→3 onboarding script; kept as one narrative rather than split.
 #[allow(clippy::too_many_lines)]

@@ -920,7 +920,7 @@ message MatchedRule {
   string subject = 5;
 }
 
-// Live policy explanation. Its shape mirrors `basil config explain --json` for
+// Live policy explanation. Its shape mirrors `basil explain --json` for
 // the single-tuple path.
 message ExplainResponse {
   // Subject name evaluated.

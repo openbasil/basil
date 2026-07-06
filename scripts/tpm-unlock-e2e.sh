@@ -28,7 +28,7 @@
 #        wrapped under it. The on-disk bundle carries ONLY the sealed
 #        public/private areas + the PCR selection (asserted host-side); the slot
 #        key is never serialized.
-#     2. `basil config check` with `[unlock] unlock-tpm = true` and NO operator
+#     2. `basil doctor` with `[unlock] unlock-tpm = true` and NO operator
 #        secret TPM2_Unseals the slot under a PolicyPCR session and OPENS the
 #        bundle ("unlock slot opened method=tpm" / "sealed bundle unlocked").
 #     3. A full guest REBOOT reusing the SAME persistent swtpm state dir
@@ -57,7 +57,7 @@
 #   this minimal busybox initramfs. The CORE property, TPM auto-unlock opens the
 #   bundle with no operator secret, is proven here; the sign+verify serve
 #   assertion is DEFERRED to the Phase-4 nixosTest lane (it has journald + a real
-#   backend). `config check` reaching "catalog check: 0/0 key(s) present" after
+#   backend). `doctor` reaching "catalog check: 0/0 key(s) present" after
 #   the TPM unseal is the in-lane "reached serving readiness" proof.
 #
 # ---------------------------------------------------------------------------
@@ -253,7 +253,7 @@ fi
 
 # ---- host-side shared config (in-guest paths point at /mnt/bundleout) --------
 # A minimal but valid catalog: one Vault/OpenBao backend, zero keys. After the
-# TPM unseal, `config check` builds the manager and probes 0 keys -> exits 0
+# TPM unseal, `doctor` builds the manager and probes 0 keys -> exits 0
 # WITHOUT any backend I/O, so a clean exit code distinguishes "unlocked + ready"
 # from the fail-closed negatives (which never reach the unlock).
 
@@ -344,11 +344,11 @@ export RUST_LOG=info
 # Plain (no ANSI) logs so the host can parse "method=tpm" out of the sentinel.
 export NO_COLOR=1
 
-# Run `config check` against a toml; print a summary + the unlock evidence.
+# Run `doctor` against a toml; print a summary + the unlock evidence.
 # $1 = config toml, $2 = sentinel tag.
 check_unlock() {
   _toml="$1"; _tag="$2"
-  "$BAS" config check -c "$_toml" > /tmp/chk 2>&1; _ec=$?
+  "$BAS" doctor -c "$_toml" > /tmp/chk 2>&1; _ec=$?
   if grep -q "sealed bundle unlocked" /tmp/chk; then _op=yes; else _op=no; fi
   _method=$(sed -n 's/.*unlock slot opened.*method=\([a-z]*\).*/\1/p' /tmp/chk | head -1)
   _rc=$(sed -n 's/.*\(TPM_RC_[A-Z_]*\).*/\1/p' /tmp/chk | head -1)

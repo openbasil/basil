@@ -1239,7 +1239,7 @@ impl LoggingGuards {
 ///
 /// Journald is the right default for the systemd-managed daemon, but a journal
 /// socket is absent on minimal hosts (containers, initramfs, CI) where the
-/// offline `basil config ...` commands run. An unavailable socket must be a
+/// offline `basil doctor`/`explain` commands run. An unavailable socket must be a
 /// non-fatal fall back to stderr, never an abort on logging init.
 enum JournaldSink {
     /// Journald disabled in config; no journald sink.
@@ -2412,7 +2412,7 @@ bundle = "/cfg/bundle.sealed"
     fn journald_without_socket_falls_back_instead_of_aborting() {
         // Portability guarantee (basil-ftfj): requesting journald on a host with
         // no journal socket (containers, minimal VMs, CI) must NOT abort the
-        // offline `basil config ...` commands. It resolves to either an active
+        // offline `basil doctor`/`explain` commands. It resolves to either an active
         // journald layer (socket present) or a non-fatal stderr fall back (socket
         // absent): never a hard error.
         match journald_sink(true) {
