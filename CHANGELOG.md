@@ -6,6 +6,10 @@ SPDX-License-Identifier: Apache-2.0
 
 # Changelog
 
+## Unreleased
+
+- renamed basil-client crate to basil
+
 ## 0.6.0 2026-07-06
 
 ### basil-nats can build no_std
@@ -19,7 +23,7 @@ SPDX-License-Identifier: Apache-2.0
   A feature flat "secure-alloc" enables mimalloc's secure mode, which enables guard pages,
   randomized allocation, and encrypted free lists; and is estimated to cause about 10% performance decrease
   (mimalloc's estimate). We'll leave the feature flag off by default uniil we do more benchmarking and testing.
-  
+
 ### Updated Nix options & service definition
 
 - nix/basil-options.nix
@@ -53,7 +57,6 @@ SPDX-License-Identifier: Apache-2.0
 - logging.stdout is enabled by default, unless file logging is enabled.
 - Fix: If journald logger fails to connect to journald, it prints an error to stderr and stops logging.
   Previously, if journald failed to connect, it redirected the entire stream to stderr, which would be redundant with stdout logging.
-
 
 ### Cli simplifications
 

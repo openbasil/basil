@@ -15,7 +15,7 @@ name = "cose-nats-telemetry"
 path = "src/main.rs"
 
 [dependencies]
-basil = { path = "../../crates/basil-client", package = "basil-client" }
+basil = { path = "../../crates/basil-client" }
 basil-cose = { path = "../../crates/basil-cose" }
 basil-nats = { path = "../../crates/basil-nats" }
 

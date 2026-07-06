@@ -21,7 +21,8 @@
     system = builtins.currentSystem;
   },
   #basilPackage ? (builtins.getFlake (toString ../../.)).packages.${builtins.currentSystem}.basil,
-  basilPackage ? (builtins.getFlake "git+https://forgejo.pasilla.net/steve/basil").packages.${builtins.currentSystem}.basil,
+  basilPackage ?
+    (builtins.getFlake "github:openbasil/basil").packages.${builtins.currentSystem}.basil,
   # ?ref=refs/tags/basil-v0.4.0";
 }:
 
@@ -103,11 +104,37 @@ let
       # `breakGlass` lets a subject appear on a global `*`-target rule (below).
       root = {
         breakGlass = true;
-        allOf = [ { kind = "unix"; uid = 0; } ];
+        allOf = [
+          {
+            kind = "unix";
+            uid = 0;
+          }
+        ];
       };
-      svc-web = { allOf = [ { kind = "unix"; uid = 9001; } ]; };
-      svc-backup = { allOf = [ { kind = "unix"; uid = 9002; } ]; };
-      svc-grafana = { allOf = [ { kind = "unix"; uid = 9003; } ]; };
+      svc-web = {
+        allOf = [
+          {
+            kind = "unix";
+            uid = 9001;
+          }
+        ];
+      };
+      svc-backup = {
+        allOf = [
+          {
+            kind = "unix";
+            uid = 9002;
+          }
+        ];
+      };
+      svc-grafana = {
+        allOf = [
+          {
+            kind = "unix";
+            uid = 9003;
+          }
+        ];
+      };
     };
 
     # Roles are named op bundles a rule references as `role:<name>`.

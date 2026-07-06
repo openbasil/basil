@@ -523,7 +523,7 @@ fn pinned_broker_verifier(
 /// A transport that carries a prepared sealed invocation to the broker and
 /// returns the broker's raw response bytes.
 ///
-/// `basil-client` depends on no carrier itself (NATS, a direct socket, ...);
+/// `basil` depends on no carrier itself (NATS, a direct socket, ...);
 /// callers supply the transport. The bytes in and out are exact tagged COSE:
 /// the request is a `COSE_Sign1` over an embedded `COSE_Encrypt`, and the
 /// response is the broker's protected `COSE_Sign1`. Implementors forward the

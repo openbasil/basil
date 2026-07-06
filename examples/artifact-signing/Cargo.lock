@@ -137,18 +137,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
-name = "basil-artifact-signing"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "basil-client",
- "ed25519-dalek",
- "tokio",
- "tonic",
-]
-
-[[package]]
-name = "basil-client"
+name = "basil"
 version = "0.6.0"
 dependencies = [
  "aes-gcm",
@@ -170,6 +159,17 @@ dependencies = [
  "tower",
  "tracing",
  "zeroize",
+]
+
+[[package]]
+name = "basil-artifact-signing"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "basil",
+ "ed25519-dalek",
+ "tokio",
+ "tonic",
 ]
 
 [[package]]
