@@ -55,6 +55,13 @@ jobs:
       # version); `rustup show` installs the override-file channel if missing.
       - name: Install Rust toolchain (from rust-toolchain.toml)
         run: rustup show
+      # basil-proto's build script runs `protoc` via tonic-prost-build.
+      - name: Install protoc
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          protoc --version
       - name: Build stripped release binaries and man pages
         # No --target: the runner arch matches the package arch, so this is a
         # native build. basil-bin's DEFAULT features (spiffe + db-keystore +

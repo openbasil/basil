@@ -38,11 +38,13 @@ permissions:
 #
 # If there's a prerelease-style suffix to the version, then the release(s)
 # will be marked as a prerelease.
+# Runs ONLY on a pushed `basil-v*` release tag -- deliberately NOT on branch
+# pushes or pull requests. dist reads the version from the tag (github.ref_name),
+# so this pipeline has no manual `workflow_dispatch`: it always needs a real tag.
 on:
-  pull_request:
   push:
     tags:
-      - '**[0-9]+.[0-9]+.[0-9]+*'
+      - 'basil-v*'
 
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
@@ -143,6 +145,19 @@ jobs:
       - name: Install dependencies
         run: |
           ${{ matrix.packages_install }}
+      # basil-proto's build script runs `protoc` via tonic-prost-build. This is
+      # also declared in dist-workspace.toml ([dist.dependencies]) so a future
+      # `dist generate` folds it into the step above; kept explicit here until
+      # release.yml is regenerated.
+      - name: Install protoc
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RUNNER_OS" in
+            Linux) sudo apt-get update && sudo apt-get install -y protobuf-compiler ;;
+            macOS) brew install protobuf ;;
+          esac
+          protoc --version
       - name: Build artifacts
         run: |
           # Actually do builds and make zips and whatnot
@@ -390,6 +405,13 @@ jobs:
       # version); `rustup show` installs the override-file channel if missing.
       - name: Install Rust toolchain (from rust-toolchain.toml)
         run: rustup show
+      # basil-proto's build script runs `protoc` via tonic-prost-build.
+      - name: Install protoc
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          protoc --version
       - name: Build stripped release binaries and man pages
         # No --target: the runner arch matches the package arch, so this is a
         # native build. basil-bin's DEFAULT features (spiffe + db-keystore +

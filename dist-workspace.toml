@@ -63,3 +63,15 @@ github-attestations = true
 # dist will never auto-update release.yml; after bumping cargo-dist-version,
 # re-run `dist generate` and re-apply the custom jobs (see docs/runbooks/release.md).
 allow-dirty = ["ci"]
+
+# System build dependencies dist installs on the artifact-build runners before
+# `dist build`. basil-bin ships `basil-nats-bridge`, whose basil-proto dependency
+# runs `tonic-prost-build` in its build script -- that shells out to `protoc`.
+# `dist generate` turns these into the per-target "Install dependencies" step
+# (apt on Linux, Homebrew on macOS). Until release.yml is regenerated, the same
+# install is wired in by hand (see the "Install protoc" steps there).
+[dist.dependencies.apt]
+protobuf-compiler = '*'
+
+[dist.dependencies.homebrew]
+protobuf = '*'

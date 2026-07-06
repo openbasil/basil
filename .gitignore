@@ -18,7 +18,7 @@ graphify-out
 .claude
 .codex
 .codebase
-# bv (beads viewer) local config and caches
+.beads
 .bv/
 .work/
 

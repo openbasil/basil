@@ -5,16 +5,36 @@ name: CI
 # HashiCorp Vault (`vault`) on PATH. The e2e runner SKIPs cleanly when an
 # engine binary is absent, so CI installs both to get real coverage and to
 # fail the build on cross-engine regressions or capability/wire drift.
+#
+# Triggers (mirrors build.yml): this workflow deliberately does NOT run on
+# branch pushes or pull requests. It runs only on:
+#   * push of a `basil-v*` tag whose commit is on `main` -- a guard rejects tags
+#     that are not an ancestor of main; the full architecture matrix runs.
+#   * manual `workflow_dispatch` -> test one chosen architecture (or `all`).
+#
+# The cargo gates run on every selected architecture. The cross-engine e2e and
+# the Go / Rust<->Go interop suites run on the Linux architectures only, because
+# OpenBao and Vault ship release binaries for linux/{amd64,arm64} but not macOS.
 
 on:
   push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+    tags:
+      - 'basil-v*'
+  workflow_dispatch:
+    inputs:
+      architecture:
+        description: Architecture to test (dispatch only; tag runs are always all)
+        type: choice
+        default: all
+        options:
+          - all
+          - x86_64-linux
+          - aarch64-linux
+          - aarch64-darwin
 
 # Cancel superseded runs on the same ref to save CI minutes.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ github.event.inputs.architecture || 'all' }}
   cancel-in-progress: true
 
 permissions:
@@ -28,9 +48,66 @@ env:
   VAULT_VERSION: "1.17.6"
 
 jobs:
-  ci:
-    name: gates + cross-engine e2e
+  # Compute the architecture matrix and enforce the release-tag guard. A tag
+  # push tests all three platforms; a manual dispatch tests the single selected
+  # architecture, or all three when `all`. Two outputs are emitted: `all` (every
+  # selected arch, for the cargo gates) and `linux` (Linux arches only, for the
+  # engine e2e + Go interop, which have no macOS engine binaries). Each arch
+  # builds natively on its matching runner so nothing cross-compiles.
+  matrix:
     runs-on: ubuntu-latest
+    outputs:
+      all: ${{ steps.set.outputs.all }}
+      linux: ${{ steps.set.outputs.linux }}
+    steps:
+      # Full history so the "tag is on main" guard can check ancestry. Only a
+      # tag push needs the checkout; a manual dispatch just reads the arch input.
+      - name: Checkout
+        if: ${{ github.event_name == 'push' }}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Reject release tags not on main
+        if: ${{ github.event_name == 'push' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::tag ${{ github.ref_name }} (${GITHUB_SHA}) is not an ancestor of main; refusing to run CI" >&2
+            exit 1
+          fi
+
+      - id: set
+        shell: bash
+        env:
+          # Tag pushes (and any non-dispatch event) test everything.
+          ARCH: ${{ github.event_name == 'workflow_dispatch' && inputs.architecture || 'all' }}
+        run: |
+          all='[
+            {"arch":"x86_64-linux","runner":"ubuntu-latest","os":"linux","pkg_arch":"amd64"},
+            {"arch":"aarch64-linux","runner":"ubuntu-22.04-arm","os":"linux","pkg_arch":"arm64"},
+            {"arch":"aarch64-darwin","runner":"macos-14","os":"darwin","pkg_arch":""}
+          ]'
+          if [ "$ARCH" = "all" ]; then
+            sel=$(jq -c . <<<"$all")
+          else
+            sel=$(jq -c --arg a "$ARCH" '[ .[] | select(.arch == $a) ]' <<<"$all")
+          fi
+          linux=$(jq -c '[ .[] | select(.os == "linux") ]' <<<"$sel")
+          echo "all=$sel" >> "$GITHUB_OUTPUT"
+          echo "linux=$linux" >> "$GITHUB_OUTPUT"
+
+  ci:
+    name: gates + cross-engine e2e (${{ matrix.arch }})
+    needs: matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.matrix.outputs.all) }}
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -48,18 +125,44 @@ jobs:
       - name: Install just
         uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2
 
-      - name: Install OpenBao (bao) onto PATH
+      # basil-proto's build.rs drives `tonic-prost-build`, which shells out to
+      # `protoc`. The Nix build (build.yml) gets it from the flake; these native
+      # cargo builds need it installed on the runner.
+      - name: Install protoc (Linux)
+        if: ${{ runner.os == 'Linux' }}
         run: |
           set -euo pipefail
-          url="https://github.com/openbao/openbao/releases/download/v${OPENBAO_VERSION}/openbao_${OPENBAO_VERSION}_linux_amd64.deb"
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          protoc --version
+
+      - name: Install protoc (macOS)
+        if: ${{ runner.os == 'macOS' }}
+        run: |
+          set -euo pipefail
+          brew install protobuf
+          protoc --version
+
+      # OpenBao + Vault are only needed for the Linux-only e2e suite below and
+      # ship no macOS binaries, so these steps skip on the darwin runner.
+      - name: Install OpenBao (bao) onto PATH
+        if: ${{ matrix.os == 'linux' }}
+        env:
+          PKG_ARCH: ${{ matrix.pkg_arch }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/openbao/openbao/releases/download/v${OPENBAO_VERSION}/openbao_${OPENBAO_VERSION}_linux_${PKG_ARCH}.deb"
           curl -fsSL -o /tmp/bao.deb "$url"
           sudo dpkg -i /tmp/bao.deb
           bao version
 
       - name: Install HashiCorp Vault (vault) onto PATH
+        if: ${{ matrix.os == 'linux' }}
+        env:
+          PKG_ARCH: ${{ matrix.pkg_arch }}
         run: |
           set -euo pipefail
-          url="https://releases.hashicorp.com/vault/${VAULT_VERSION}/vault_${VAULT_VERSION}_linux_amd64.zip"
+          url="https://releases.hashicorp.com/vault/${VAULT_VERSION}/vault_${VAULT_VERSION}_linux_${PKG_ARCH}.zip"
           curl -fsSL -o /tmp/vault.zip "$url"
           sudo unzip -o /tmp/vault.zip -d /usr/local/bin
           sudo chmod +x /usr/local/bin/vault
@@ -80,17 +183,26 @@ jobs:
 
       # ---- Cross-engine acceptance suite (OpenBao + Vault) ----
       # Both engines are on PATH, so this exercises real coverage rather than
-      # SKIPping. Non-zero exit iff any engine's e2e FAILED.
+      # SKIPping. Non-zero exit iff any engine's e2e FAILED. Linux only: the
+      # engines ship no macOS release binaries.
       - name: Cross-engine e2e (OpenBao + Vault)
+        if: ${{ matrix.os == 'linux' }}
         run: just test-e2e both
 
   # Go unit tests plus the Rust<->Go streaming interop suite. Kept separate from
   # the cargo gates so the Go toolchain and the `clients/go` submodule are only
   # provisioned here. `test-stream-interop` builds the Rust `stream_cli` example
   # and drives it from the Go interop tests, so this job needs BOTH toolchains.
+  # Linux arches only (skipped when a dispatch selects macOS alone).
   go-tests:
-    name: go + rust<->go stream interop
-    runs-on: ubuntu-latest
+    name: go + rust<->go stream interop (${{ matrix.arch }})
+    needs: matrix
+    if: ${{ needs.matrix.outputs.linux != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.matrix.outputs.linux) }}
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout (with clients/go submodule)
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -112,6 +224,15 @@ jobs:
 
       - name: Install just
         uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2
+
+      # `test-stream-interop` builds the Rust `stream_cli` example, whose
+      # basil-proto dependency runs `protoc` in its build script.
+      - name: Install protoc
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          protoc --version
 
       # Every checked-in Go module: clients/go, the OIDC verifier, and go-spiffe.
       - name: Go unit tests
