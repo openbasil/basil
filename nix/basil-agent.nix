@@ -166,13 +166,18 @@ let
       "onepassword-profile" = settings.keystore.onepasswordProfile;
       unlock = {
         "age-yubikey" = settings.unlock.ageYubikey;
+        "unlock-tpm" = settings.unlock.unlockTpm;
         "bip39-phrase-file" =
           if settings.unlock.bip39PhraseFile == null then null else toString settings.unlock.bip39PhraseFile;
-        "passphrase-file" =
+        # The binary's [unlock] key is `unlock-passphrase-file` (AgentConfigFile is
+        # deny_unknown_fields, so the old `passphrase-file` spelling made a
+        # disk-passphrase config fail to parse at startup).
+        "unlock-passphrase-file" =
           if settings.unlock.diskPassphraseFile == null then
             null
           else
             toString settings.unlock.diskPassphraseFile;
+        "unlock-passphrase-no-wipe" = settings.unlock.unlockPassphraseNoWipe;
         "strict-bundle-perms" = settings.unlock.strictBundlePerms;
       };
       # Opt-in sealed invocation service ([invocation]). The service is compiled
@@ -297,7 +302,9 @@ in
     ];
 
     users.groups = lib.mkIf settings.createUser {
-      ${settings.group} = { };
+      ${settings.group} = lib.optionalAttrs (settings.gid != null) {
+        gid = settings.gid;
+      };
     };
 
     users.users = lib.mkIf settings.createUser {
@@ -305,7 +312,8 @@ in
         isSystemUser = true;
         group = settings.group;
         home = "/var/lib/${settings.stateDirectory}";
-      };
+      }
+      // lib.optionalAttrs (settings.uid != null) { uid = settings.uid; };
     };
 
     # Stable, hot-reloadable surface. The agent reads these paths at the fixed
@@ -347,6 +355,9 @@ in
         User = settings.user;
         Group = settings.group;
         StateDirectory = settings.stateDirectory;
+        # The state dir can hold a local keystore and other broker state; keep it
+        # owner-only rather than the systemd default 0755.
+        StateDirectoryMode = "0700";
         RuntimeDirectory = "basil";
         Restart = "on-failure";
         RestartSec = "5s";

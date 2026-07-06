@@ -10,6 +10,8 @@ let
   backendKindType = types.enum [
     "vault"
     "keystore"
+    "aws-kms"
+    "gcp-kms"
   ];
 
   classType = types.enum [
@@ -68,11 +70,20 @@ let
     "encrypt"
     "decrypt"
     "mint"
+    # NATS credential ops: JWT minting/validation and NATS xkey (curve) seal/open.
+    # Grant these to NATS-integrated subjects the same way as any other op.
+    "sign_nats_jwt"
+    "validate_nats_jwt"
+    "encrypt_nats_curve"
+    "decrypt_nats_curve"
     "validate"
     "set"
     "rotate"
     "import"
     "new_key"
+    # Explicit opt-in for a key's software-custody (materialize-to-use) arm; never
+    # implied by another grant.
+    "use_software_custody"
     # Broker-wide admin op (basil-atq): hot-reload the catalog/policy generation
     # from disk. NOT implied by any data-plane grant; grant it explicitly over the
     # reserved admin target `broker.reload`, e.g.
@@ -164,7 +175,13 @@ let
         type = backendKindType;
         default = "vault";
         example = "vault";
-        description = "Backend provider kind (the vault-compatible kind: HashiCorp Vault or OpenBao).";
+        description = ''
+          Backend provider kind. "vault" is the vault-compatible kind (HashiCorp
+          Vault or OpenBao); "keystore" is Basil's local encrypted keystore;
+          "aws-kms" and "gcp-kms" are in-place transit backends where the key
+          never leaves the cloud KMS and Basil brokers sign/verify/encrypt/decrypt
+          against it.
+        '';
       };
 
       engines = mkOption {
@@ -290,6 +307,17 @@ let
         description = ''
           Backend-native locator. For OpenBao this is a transit key name, KV v2
           path, or PKI issue endpoint, depending on engine.
+        '';
+      };
+
+      publicPath = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "secret/data/enroll/x25519-public";
+        description = ''
+          Backend-native locator for the public half of a materialize-to-use key.
+          Required for sealing X25519 keys and KV-backed Ed25519 signing keys,
+          whose private half is never get-able; null for all other keys.
         '';
       };
 
@@ -461,7 +489,8 @@ let
           Principal specs that must all match. Specs may be runtime-shaped
           `{ kind = "unix"; uid = 9001; }` values or source-shaped
           `{ unix.uid = 9001; }` / `{ signature = { algorithm = "ed25519"; public = "..."; }; }`
-          values.
+          values. Use `{ kind = "unauthenticated"; }` to match the explicit
+          unauthenticated actor (see policy.unauthenticatedSubject).
         '';
       };
 
@@ -530,8 +559,10 @@ let
         description = ''
           Action terms. Use role:<name>, op:<operation>, or * for any operation.
           Operations are the policy operation enum: get, list, get_public_key,
-          verify, sign, encrypt, decrypt, mint, validate, set, rotate, import,
-          and new_key.
+          verify, sign, encrypt, decrypt, mint, sign_nats_jwt, validate_nats_jwt,
+          encrypt_nats_curve, decrypt_nats_curve, validate, set, rotate, import,
+          new_key, and use_software_custody. Broker-wide admin ops (reload,
+          explain, revoke) are granted over their reserved broker.* targets.
         '';
       };
 
@@ -582,6 +613,19 @@ let
           }
         '';
         description = "Subject registry exported to policy.json.";
+      };
+
+      unauthenticatedSubject = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "guest";
+        description = ''
+          Name of the subject resolved for explicitly unauthenticated requests.
+          Must name a subject (in `subjects` or generated from `unixSubjects`)
+          whose principals include the `unauthenticated` kind. When null, an
+          unauthenticated request resolves to no subject and is default-denied
+          rather than falling through to public reads.
+        '';
       };
 
       unixSubjects = mkOption {
@@ -737,6 +781,30 @@ in
             description = "Create the configured Basil system user and group.";
           };
 
+          uid = mkOption {
+            type = types.nullOr types.ints.unsigned;
+            default = null;
+            example = 921;
+            description = ''
+              Stable numeric uid for the created Basil user. Pin this on hosts
+              where the broker owns persistent state (a local keystore, the sealed
+              bundle, the state directory) so file ownership stays correct across
+              rebuilds and migrations. Null lets NixOS allocate one dynamically.
+              Only applies when createUser is true.
+            '';
+          };
+
+          gid = mkOption {
+            type = types.nullOr types.ints.unsigned;
+            default = null;
+            example = 921;
+            description = ''
+              Stable numeric gid for the created Basil group. See uid; pin both
+              together. Null lets NixOS allocate one dynamically. Only applies
+              when createUser is true.
+            '';
+          };
+
           stateDirectory = mkOption {
             type = types.str;
             default = "basil";
@@ -869,32 +937,42 @@ in
             type = types.submodule {
               options = {
                 dbKeystoreCipher = mkOption {
-                  type = types.str;
-                  default = "aegis256";
-                  description = "db-keystore encryption cipher written as db-keystore-cipher.";
+                  type = types.nullOr types.str;
+                  default = null;
+                  example = "aegis256";
+                  description = ''
+                    db-keystore encryption cipher written as db-keystore-cipher.
+                    Null omits the key so the binary's own default applies; only
+                    set it for a basil build with the db-keystore feature.
+                  '';
                 };
 
                 onepasswordProviderUri = mkOption {
-                  type = types.str;
-                  default = "";
-                  description = "Default 1Password provider URI for OnePassword credentials with an empty provider_uri.";
+                  type = types.nullOr types.str;
+                  default = null;
+                  description = "Default 1Password provider URI for OnePassword credentials with an empty provider_uri. Null omits the key.";
                 };
 
                 onepasswordProject = mkOption {
-                  type = types.str;
-                  default = "";
-                  description = "Default 1Password project for OnePassword credentials with an empty project.";
+                  type = types.nullOr types.str;
+                  default = null;
+                  description = "Default 1Password project for OnePassword credentials with an empty project. Null omits the key.";
                 };
 
                 onepasswordProfile = mkOption {
-                  type = types.str;
-                  default = "";
-                  description = "Default 1Password profile for OnePassword credentials with an empty profile.";
+                  type = types.nullOr types.str;
+                  default = null;
+                  description = "Default 1Password profile for OnePassword credentials with an empty profile. Null omits the key.";
                 };
               };
             };
             default = { };
-            description = "Optional key-store backend defaults for enabled db-keystore or onepassword features.";
+            description = ''
+              Optional key-store backend defaults. These map to config keys the
+              basil binary only accepts when built with the db-keystore or
+              onepassword features; leave them null (the default) for a stock
+              build, whose config parser rejects unknown keys.
+            '';
           };
 
           unlock = mkOption {
@@ -906,6 +984,17 @@ in
                   description = "Enable age-yubikey unlock in the generated agent TOML config.";
                 };
 
+                unlockTpm = mkOption {
+                  type = types.bool;
+                  default = false;
+                  description = ''
+                    Enable TPM-sealed disk unlock (written as unlock-tpm). Requires
+                    a basil binary built with the unlock-tpm feature (e.g. the
+                    basil-tpm package); a stock build parses the key but cannot
+                    perform the unlock.
+                  '';
+                };
+
                 bip39PhraseFile = mkOption {
                   type = types.nullOr types.path;
                   default = null;
@@ -915,13 +1004,21 @@ in
                 diskPassphraseFile = mkOption {
                   type = types.nullOr types.path;
                   default = null;
-                  description = "Disk passphrase file path written to the generated agent TOML config.";
+                  description = ''
+                    Disk passphrase file path written as unlock-passphrase-file in
+                    the generated agent TOML config.
+                  '';
                 };
 
-                insecureTestUnlock = mkOption {
+                unlockPassphraseNoWipe = mkOption {
                   type = types.bool;
                   default = false;
-                  description = "Enable test-only disk unlock in the generated agent TOML config.";
+                  description = ''
+                    Keep (do not wipe) the disk passphrase file after reading it,
+                    written as unlock-passphrase-no-wipe. Default false wipes it;
+                    set true only when the file is managed externally and must
+                    persist.
+                  '';
                 };
 
                 strictBundlePerms = mkOption {

@@ -88,4 +88,32 @@ in
     capabilities = [ ];
     mintKeyTypes = [ "ed25519" ];
   };
+
+  # AWS KMS in-place transit: keys never leave KMS; Basil brokers
+  # sign/verify/encrypt/decrypt. Signing is ECDSA (Basil maps ES256/384/512);
+  # AWS KMS does not sign EdDSA, so ed25519 is intentionally absent. Extend
+  # mintKeyTypes inline for any additional algorithms your key policy allows.
+  AWS_KMS = {
+    kind = "aws-kms";
+    engines = [ "transit" ];
+    capabilities = [ ];
+    mintKeyTypes = [
+      "ecdsa-p256"
+      "ecdsa-p384"
+      "ecdsa-p521"
+    ];
+  };
+
+  # GCP Cloud KMS in-place transit: keys never leave Cloud KMS; Basil brokers
+  # sign/verify/encrypt/decrypt against the versioned crypto key.
+  GCP_KMS = {
+    kind = "gcp-kms";
+    engines = [ "transit" ];
+    capabilities = [ ];
+    mintKeyTypes = [
+      "ed25519"
+      "ecdsa-p256"
+      "ecdsa-p384"
+    ];
+  };
 }
