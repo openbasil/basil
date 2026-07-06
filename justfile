@@ -68,6 +68,11 @@ check:
     fd -e rs -x rustfmt --edition 2024
     typos
 
+# check status here and submodule
+st:
+    jj status
+    git -C clients/go status -s
+
 # Run the full default Rust test suite.
 test-rust:
     cargo test --workspace
