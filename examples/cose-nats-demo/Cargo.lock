@@ -113,7 +113,7 @@ dependencies = [
  "memchr",
  "pin-project",
  "portable-atomic",
- "rand 0.10.1",
+ "rand 0.10.2",
  "regex",
  "ring",
  "rustls-native-certs",
@@ -217,8 +217,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
-name = "basil"
-version = "0.5.0"
+name = "basil-client"
+version = "0.6.0"
 dependencies = [
  "aes-gcm",
  "basil-cose",
@@ -230,6 +230,7 @@ dependencies = [
  "prost",
  "prost-types",
  "rand 0.8.6",
+ "serde",
  "serde_json",
  "sha2",
  "thiserror",
@@ -242,12 +243,12 @@ dependencies = [
 
 [[package]]
 name = "basil-cose"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "aes-gcm",
  "chacha20poly1305",
  "ed25519-dalek",
- "getrandom 0.2.17",
+ "getrandom 0.4.3",
  "hkdf",
  "minicbor",
  "p256",
@@ -264,7 +265,7 @@ dependencies = [
  "anyhow",
  "async-nats",
  "base64",
- "basil",
+ "basil-client",
  "basil-cose",
  "basil-proto",
  "clap",
@@ -278,7 +279,7 @@ dependencies = [
 
 [[package]]
 name = "basil-proto"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "prost",
  "prost-types",
@@ -330,9 +331,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.2.65"
+version = "1.2.66"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e228eec9be7c17ccb640b59b36a5cd805ea2a564a4c5e162c2f659fea30d3b96"
+checksum = "f5d6cac793997bd970000024b2934968efe83b382de4fdcf4fcb46b6ee4ad996"
 dependencies = [
  "find-msvc-tools",
  "shlex",
@@ -1586,9 +1587,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2e8e8bcc7961af1fdac401278c6a831614941f6164ee3bf4ce61b7edb162207"
+checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
 dependencies = [
  "chacha20 0.10.1",
  "getrandom 0.4.3",

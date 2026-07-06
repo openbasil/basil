@@ -15,7 +15,7 @@ name = "cose-nats-demo"
 path = "src/main.rs"
 
 [dependencies]
-basil = { path = "../../crates/basil-client" }
+basil = { path = "../../crates/basil-client", package = "basil-client" }
 basil-cose = { path = "../../crates/basil-cose" }
 basil-proto = { path = "../../crates/basil-proto" }
 
