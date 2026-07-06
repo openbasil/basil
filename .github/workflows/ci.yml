@@ -24,7 +24,7 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   # Pin the engine versions installed below. Bump deliberately.
-  OPENBAO_VERSION: "2.5.4"
+  OPENBAO_VERSION: "2.5.5"
   VAULT_VERSION: "1.17.6"
 
 jobs:
@@ -51,7 +51,7 @@ jobs:
       - name: Install OpenBao (bao) onto PATH
         run: |
           set -euo pipefail
-          url="https://github.com/openbao/openbao/releases/download/v${OPENBAO_VERSION}/bao_${OPENBAO_VERSION}_linux_amd64.deb"
+          url="https://github.com/openbao/openbao/releases/download/v${OPENBAO_VERSION}/openbao_${OPENBAO_VERSION}_linux_amd64.deb"
           curl -fsSL -o /tmp/bao.deb "$url"
           sudo dpkg -i /tmp/bao.deb
           bao version
