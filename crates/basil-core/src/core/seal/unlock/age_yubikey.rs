@@ -96,10 +96,10 @@ impl UnlockMethod for AgeYubikeyMethod {
     }
 
     fn available(&self) -> bool {
-        // We can wrap whenever the recipient parses; we can recover only with an
-        // identity. Report available when an identity is present (recover-capable)
-        // or, conservatively, when the recipient is parseable for wrap-only use.
-        !self.identities.is_empty() || self.parse_recipient().is_ok()
+        // Availability is used for recovery attempts. Do not parse plugin
+        // recipients here: constructing plugin recipients can spawn helper
+        // binaries. Wrapping still validates the recipient in `wrap_kek`.
+        !self.identities.is_empty()
     }
 
     fn recover_kek(&self, slot: &Slot, _header_aad: &[u8]) -> Result<MasterKek, UnlockError> {
@@ -226,6 +226,23 @@ mod tests {
             method.recover_kek(&slot, &aad),
             Err(UnlockError::AuthFailed)
         ));
+    }
+
+    #[test]
+    fn wrap_only_method_is_not_recover_available() {
+        let identity = age::x25519::Identity::generate();
+        let method = AgeYubikeyMethod::for_recipient(identity.to_public().to_string());
+
+        assert!(!method.available());
+    }
+
+    #[test]
+    fn method_with_identity_is_available_without_recipient_parse() {
+        let identity = age::x25519::Identity::generate();
+        let method = AgeYubikeyMethod::for_recipient("not-an-age-recipient")
+            .with_identity(Box::new(identity));
+
+        assert!(method.available());
     }
 
     #[test]

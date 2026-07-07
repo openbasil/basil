@@ -152,6 +152,8 @@ impl core::fmt::Display for NkeyType {
 
 #[derive(Debug)]
 pub enum Error {
+    /// A public `NKey` was not valid base32-nopad text.
+    BadEncoding,
     /// A public key was not the expected 32 bytes.
     BadPublicKeyLen(usize),
     /// A decoded `NKey` carried a prefix letter that is not a known public
@@ -190,6 +192,7 @@ pub enum Error {
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::BadEncoding => f.write_str("invalid NKey base32 encoding"),
             Self::BadPublicKeyLen(n) => write!(f, "expected a 32-byte Ed25519 public key, got {n}"),
             Self::UnsupportedPrefix(c) => write!(f, "unsupported NKey prefix letter: {c}"),
             Self::UnexpectedPrefix { expected, actual } => {
@@ -271,14 +274,15 @@ pub fn encode_public(role: NkeyType, public: &[u8]) -> Result<String, Error> {
 ///
 /// # Errors
 ///
-/// - [`Error::BadPublicKeyLen`] if `nkey` is not a valid public `NKey` payload
-///   (bad base32, wrong length, or CRC mismatch).
+/// - [`Error::BadEncoding`] if `nkey` is not valid base32-nopad text.
+/// - [`Error::BadPublicKeyLen`] if `nkey` does not decode to a valid public
+///   `NKey` payload length or CRC.
 /// - [`Error::UnsupportedPrefix`] if the decoded prefix is not a known public
 ///   role.
 pub fn decode_public(nkey: &str) -> Result<(NkeyType, [u8; 32]), Error> {
     let raw = data_encoding::BASE32_NOPAD
         .decode(nkey.as_bytes())
-        .map_err(|_| Error::BadPublicKeyLen(0))?;
+        .map_err(|_| Error::BadEncoding)?;
     // Destructure the 35-byte layout (1 prefix + 32 key + 2 CRC) into
     // fixed-size chunks. `split_at_checked` proves each length to the compiler
     // so no slice index can panic; the CRC covers prefix+key (`body`).
@@ -306,7 +310,9 @@ pub fn decode_public(nkey: &str) -> Result<(NkeyType, [u8; 32]), Error> {
 ///
 /// # Errors
 ///
-/// - [`Error::BadPublicKeyLen`] if `nkey` is not a valid public `NKey` payload.
+/// - [`Error::BadEncoding`] if `nkey` is not valid base32-nopad text.
+/// - [`Error::BadPublicKeyLen`] if `nkey` does not decode to a valid public
+///   `NKey` payload length or CRC.
 /// - [`Error::UnsupportedPrefix`] if its prefix is not a supported public role.
 /// - [`Error::UnexpectedPrefix`] if the key is valid but has the wrong role.
 pub fn require_public_prefix(nkey: &str, expected: NkeyType) -> Result<[u8; 32], Error> {
@@ -352,12 +358,15 @@ pub fn xkey_public_from_private(private: &Zeroizing<[u8; 32]>) -> [u8; 32] {
 /// caller and zeroized there; this function keeps ECDH and derived-key
 /// intermediates in zeroizing buffers. The 24-byte nonce is drawn from the
 /// caller-supplied `rng`, so the crate stays `no_std` and does not choose an
-/// ambient OS or thread-local RNG for the caller.
+/// ambient OS or thread-local RNG for the caller. Pass a CSPRNG; nonce reuse
+/// with the same sender/recipient key pair breaks the xkey confidentiality and
+/// authenticity assumptions.
 ///
 /// # Errors
 ///
 /// Returns [`Error::UnexpectedXKeyPrefix`] when `recipient_public_xkey` is not an
-/// `X...` public key, [`Error::BadPublicKeyLen`] for malformed nkeys, or
+/// `X...` public key, [`Error::BadEncoding`] / [`Error::BadPublicKeyLen`] for
+/// malformed nkeys, or
 /// [`Error::XKeyRandomnessFailed`] when the caller-supplied RNG fails, or
 /// [`Error::XKeySealFailed`] for low-order keys or an AEAD failure.
 pub fn seal_nats_curve(
@@ -1826,6 +1835,19 @@ mod tests {
     }
 
     #[test]
+    fn decode_public_reports_bad_encoding_separately_from_bad_length() {
+        assert!(matches!(
+            decode_public("not-an-nkey"),
+            Err(Error::BadEncoding)
+        ));
+        let short = data_encoding::BASE32_NOPAD.encode(&[0]);
+        assert!(matches!(
+            decode_public(&short),
+            Err(Error::BadPublicKeyLen(_))
+        ));
+    }
+
+    #[test]
     fn user_jwt_verifies_under_issuer_account_key() {
         // Build a user JWT issued by an account key, sign it with that key
         // (standing in for the vault), then verify the signature decodes from
@@ -2587,7 +2609,7 @@ mod tests {
         ));
         assert!(matches!(
             verify_public_signature("not-an-nkey", message, &signature),
-            Err(Error::BadPublicKeyLen(_) | Error::UnsupportedPrefix(_))
+            Err(Error::BadEncoding | Error::BadPublicKeyLen(_) | Error::UnsupportedPrefix(_))
         ));
     }
 

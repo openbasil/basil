@@ -532,9 +532,6 @@ fn rewrap_slots(
     let mut slots = Vec::with_capacity(parsed.body.slots.len());
     for slot in &parsed.body.slots {
         let method = methods.get(slot.method).ok_or(SealError::NoSlotOpened)?;
-        if !method.available() {
-            return Err(SealError::NoSlotOpened);
-        }
         let (params, wrap) = method.wrap_kek(kek, header_aad, slot.slot_id)?;
         slots.push(Slot {
             slot_id: slot.slot_id,

@@ -71,6 +71,15 @@ SPDX-License-Identifier: Apache-2.0
   input arguments move into zeroizing storage immediately, stale Go client docs
   now reference `basil explain --json`, reload guidance correctly treats
   `class` as restart-only, and revoke requests cap `trust_domain` and `jti`.
+- low-priority security-review nits: reload rejects observed catalog/policy
+  races, policy load rejects duplicate subjects/roles/rule ids, `import_set`
+  authorizes against one pinned generation, YubiKey availability no longer
+  parses plugin recipients, BIP39 phrase files are wiped after read, doctor uses
+  random exclusive writable-dir probes, SDS and sealed invocation move authz
+  before issuer/response-key disclosures, transit URLs percent-encode path
+  components, ES256 verification rejects high-S signatures, keystore AEAD binds
+  algorithm/key-version into AAD, public enum evolution contracts are explicit,
+  and the COSE-over-NATS/Nix examples avoid sensitive env inheritance.
 
 ## 0.6.1 2026-07-07
 

@@ -224,8 +224,9 @@ impl SigningService for BrokerGrpc {
         // backend. A later failure leaves earlier keys provisioned.
         let mut parsed = Vec::with_capacity(body.entries.len());
         let mut total: usize = 0;
+        let generation = self.state.load_generation();
         for entry in &body.entries {
-            self.authorize(&request, Op::Import, &entry.key_id)?;
+            self.authorize_in_generation(&generation, &request, Op::Import, &entry.key_id)?;
             let material = entry
                 .material
                 .as_ref()
@@ -238,6 +239,7 @@ impl SigningService for BrokerGrpc {
                 material,
             ));
         }
+        drop(generation);
         if total > self.state.limits().max_payload_size {
             return Err(payload_too_large(
                 "import_set",

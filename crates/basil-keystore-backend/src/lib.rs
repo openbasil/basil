@@ -33,6 +33,7 @@ const KEY_LEN: usize = 32;
 const ED25519_SIG_LEN: usize = 64;
 const NONCE_LEN: usize = 12;
 const KEYSTORE_VERSION: u32 = 1;
+const AEAD_AAD_PREFIX: &[u8] = b"basil-keystore-aead-v1";
 
 /// Local materialize-to-use crypto failure.
 #[derive(Debug, thiserror::Error)]
@@ -78,6 +79,26 @@ fn key_from_slice(bytes: &[u8]) -> Result<Zeroizing<[u8; KEY_LEN]>, CryptoError>
         actual: bytes.len(),
     })?;
     Ok(Zeroizing::new(key))
+}
+
+fn envelope_aad(
+    algorithm: AeadAlgorithm,
+    key_version: u32,
+    external_aad: Option<&[u8]>,
+) -> Vec<u8> {
+    let external_aad = external_aad.unwrap_or_default();
+    let algorithm = match algorithm {
+        AeadAlgorithm::Chacha20Poly1305 => 1u8,
+        AeadAlgorithm::Aes256Gcm => 2u8,
+    };
+    let mut aad = Vec::with_capacity(
+        AEAD_AAD_PREFIX.len() + 1 + core::mem::size_of::<u32>() + external_aad.len(),
+    );
+    aad.extend_from_slice(AEAD_AAD_PREFIX);
+    aad.push(algorithm);
+    aad.extend_from_slice(&key_version.to_le_bytes());
+    aad.extend_from_slice(external_aad);
+    aad
 }
 
 /// Sign `message` as raw Ed25519 using a materialized 32-byte seed.
@@ -156,7 +177,7 @@ pub fn encrypt_aead(
     let key = key_from_slice(key)?;
     let mut nonce = [0u8; NONCE_LEN];
     rand::thread_rng().fill_bytes(&mut nonce);
-    let aad = aad.unwrap_or_default();
+    let aad = envelope_aad(algorithm, KEYSTORE_VERSION, aad);
     let ciphertext = match algorithm {
         AeadAlgorithm::Aes256Gcm => Aes256Gcm::new_from_slice(key.as_slice())
             .map_err(|_| CryptoError::EncryptFailed)?
@@ -164,7 +185,7 @@ pub fn encrypt_aead(
                 &AesNonce::from(nonce),
                 Payload {
                     msg: plaintext,
-                    aad,
+                    aad: &aad,
                 },
             )
             .map_err(|_| CryptoError::EncryptFailed)?,
@@ -174,7 +195,7 @@ pub fn encrypt_aead(
                 &ChaChaNonce::from(nonce),
                 Payload {
                     msg: plaintext,
-                    aad,
+                    aad: &aad,
                 },
             )
             .map_err(|_| CryptoError::EncryptFailed)?,
@@ -207,7 +228,7 @@ pub fn decrypt_aead(
                 expected: NONCE_LEN,
                 actual: envelope.nonce.len(),
             })?;
-    let aad = aad.unwrap_or_default();
+    let aad = envelope_aad(envelope.alg, envelope.key_version, aad);
     let plaintext = match envelope.alg {
         AeadAlgorithm::Aes256Gcm => Aes256Gcm::new_from_slice(key.as_slice())
             .map_err(|_| CryptoError::DecryptFailed)?
@@ -215,7 +236,7 @@ pub fn decrypt_aead(
                 &AesNonce::from(nonce),
                 Payload {
                     msg: envelope.ciphertext.as_slice(),
-                    aad,
+                    aad: &aad,
                 },
             )
             .map_err(|_| CryptoError::DecryptFailed)?,
@@ -225,7 +246,7 @@ pub fn decrypt_aead(
                 &ChaChaNonce::from(nonce),
                 Payload {
                     msg: envelope.ciphertext.as_slice(),
-                    aad,
+                    aad: &aad,
                 },
             )
             .map_err(|_| CryptoError::DecryptFailed)?,
@@ -483,12 +504,23 @@ mod tests {
     #[test]
     fn cross_algorithm_ciphertext_does_not_decrypt() {
         // An AES-GCM envelope opened as ChaCha (its alg field flipped) must fail
-        // closed rather than returning garbage.
+        // closed because the envelope algorithm is authenticated metadata.
         let mut envelope =
             encrypt_aead(&KEY_A, AeadAlgorithm::Aes256Gcm, b"payload", None).unwrap();
         envelope.alg = AeadAlgorithm::Chacha20Poly1305;
         let err = decrypt_aead(&KEY_A, &envelope, None).unwrap_err();
         assert!(matches!(err, CryptoError::DecryptFailed));
+    }
+
+    #[test]
+    fn aead_key_version_is_authenticated() {
+        let plaintext = b"versioned secret";
+        for alg in BOTH_ALGS {
+            let mut envelope = encrypt_aead(&KEY_A, alg, plaintext, Some(b"context")).unwrap();
+            envelope.key_version += 1;
+            let err = decrypt_aead(&KEY_A, &envelope, Some(b"context")).unwrap_err();
+            assert!(matches!(err, CryptoError::DecryptFailed));
+        }
     }
 
     #[test]

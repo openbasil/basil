@@ -855,6 +855,7 @@ dependencies = [
  "p256",
  "p384",
  "p521",
+ "percent-encoding",
  "prost 0.14.4",
  "prost-types 0.14.4",
  "rand 0.8.6",
@@ -971,6 +972,7 @@ name = "basil-proto"
 version = "0.6.1"
 dependencies = [
  "basil-cose",
+ "p256",
  "prost 0.14.4",
  "prost-types 0.14.4",
  "serde",

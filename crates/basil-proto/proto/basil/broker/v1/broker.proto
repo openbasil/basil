@@ -171,6 +171,7 @@ enum CatalogKind {
   CATALOG_KIND_VALUE = 2;
   // A symmetric AEAD encryption key.
   CATALOG_KIND_ENCRYPTION = 3;
+  reserved 4 to 31;
 }
 
 // BYOK key material for `Import`/`ImportSet`. Write-only: it is accepted into
@@ -920,6 +921,17 @@ message MatchedRule {
   string subject = 5;
 }
 
+// Policy decision result for `ExplainResponse`.
+enum ExplainDecision {
+  // Unset; not returned by the broker.
+  EXPLAIN_DECISION_UNSPECIFIED = 0;
+  // The tuple is authorized.
+  EXPLAIN_DECISION_ALLOW = 1;
+  // The tuple is denied.
+  EXPLAIN_DECISION_DENY = 2;
+  reserved 3 to 31;
+}
+
 // Live policy explanation. Its shape mirrors `basil explain --json` for
 // the single-tuple path.
 message ExplainResponse {
@@ -929,8 +941,8 @@ message ExplainResponse {
   string op = 2;
   // Catalog key/target evaluated.
   string key = 3;
-  // `allow` or `deny`.
-  string decision = 4;
+  // Authorization decision.
+  ExplainDecision decision = 4;
   // Allow scope (`subject:<name>` or `public_class`); empty on deny.
   string via = 5;
   // Deny reason token (`unknown_key`, `not_writable`, `not_permitted`); empty on allow.

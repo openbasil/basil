@@ -31,10 +31,34 @@ then replies with a transit-backed `bob.sign` COSE message sealed to Alice.
 Alice verifies and opens the reply through the broker.
 
 Runtime files are written under `/tmp/basil-cose-nats-demo` by default. Override
-with:
+any of these optional settings:
 
-```bash
-BASIL_COSE_NATS_DEMO_WORKDIR=/tmp/my-demo examples/cose-nats-demo/run.sh
-```
+- `BASIL_COSE_NATS_DEMO_WORKDIR` (default `/tmp/basil-cose-nats-demo`)
+- `BASIL_COSE_NATS_DEMO_VAULT_ADDR` (default `http://127.0.0.1:8228`)
+- `BASIL_COSE_NATS_DEMO_VAULT_TOKEN` (default `root`, used only for the dev
+  OpenBao setup and not inherited by `basil`, the bridge, or the demo binary)
+- `BASIL_COSE_NATS_DEMO_NATS_PORT` (default `4229`)
+- `BASIL_COSE_NATS_DEMO_NATS_URL` (default `nats://127.0.0.1:$NATS_PORT`)
+- `BASIL_COSE_NATS_DEMO_BRIDGE_SUBJECT` (default `basil.invoke`)
+- `BASIL_BIN` (path to a prebuilt `basil` binary; otherwise built from the repo
+  root)
+- `BASIL_NATS_BRIDGE_BIN` (path to a prebuilt `basil-nats-bridge`; otherwise
+  built from the repo root)
 
 Required commands on `PATH`: `bao`, `nats-server`, and `cargo`.
+
+## Expected output
+
+```
+== build ==
+== openbao ==
+== nats ==
+== agent ==
+== bridge ==
+== demo ==
+bob verified Alice message: hello Bob - signed through the NATS bridge
+alice verified Bob reply: hello Alice - Bob verified your message
+demo completed
+workdir: /tmp/basil-cose-nats-demo
+PASS
+```

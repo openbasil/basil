@@ -246,6 +246,7 @@ const fn nats_curve_error(err: &basil_nats::Error) -> ManagerError {
     let failure = match err {
         basil_nats::Error::XKeyOpenFailed => SealingFailure::OpenFailed,
         basil_nats::Error::BadPublicKeyLen(_)
+        | basil_nats::Error::BadEncoding
         | basil_nats::Error::UnsupportedPrefix(_)
         | basil_nats::Error::UnexpectedPrefix { .. }
         | basil_nats::Error::UnexpectedXKeyPrefix(_)

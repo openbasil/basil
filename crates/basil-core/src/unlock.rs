@@ -164,6 +164,13 @@ fn build_bip39_method(args: &UnlockArgs) -> Result<Option<Bip39Method>> {
             .map_err(|_| anyhow::anyhow!("bip39 phrase file is not valid UTF-8"))?,
     );
     let phrase = Zeroizing::new(phrase.trim().to_string());
+    wipe_secret_file(path).unwrap_or_else(|err| {
+        warn!(
+            path = %path.display(),
+            error = %err,
+            "bip39 phrase file wipe failed; continuing after successful read"
+        );
+    });
     info!("bip39 break-glass unlock enabled");
     Ok(Some(Bip39Method::new(phrase)))
 }
@@ -377,6 +384,17 @@ mod tests {
         }
     }
 
+    fn bip39_args(path: PathBuf) -> UnlockArgs {
+        UnlockArgs {
+            age_yubikey: false,
+            bip39_phrase_file: Some(path),
+            tpm: false,
+            passphrase_file: None,
+            passphrase_no_wipe: false,
+            strict_bundle_perms: false,
+        }
+    }
+
     #[test]
     fn passphrase_read_wipes_file_by_default() {
         let path = temp_path("wipe");
@@ -402,6 +420,21 @@ mod tests {
         assert!(method.available());
         assert!(path.exists());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "unlock-bip39")]
+    #[test]
+    fn bip39_phrase_read_wipes_file_by_default() {
+        let path = temp_path("bip39-wipe");
+        let phrase = Bip39Method::generate_phrase().expect("generate phrase");
+        write_secret(&path, phrase.as_bytes());
+
+        let method = build_bip39_method(&bip39_args(path.clone()))
+            .expect("build bip39 method")
+            .expect("method present");
+
+        assert!(method.available());
+        assert!(!path.exists());
     }
 
     #[cfg(unix)]

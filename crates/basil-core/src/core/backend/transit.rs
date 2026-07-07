@@ -13,6 +13,7 @@ use aes_kw::KwpAes256;
 use aes_kw::cipher::KeyInit;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use rand::RngCore;
 use rsa::pkcs8::DecodePublicKey;
 use rsa::{Oaep, RsaPublicKey};
@@ -28,6 +29,19 @@ use super::{BackendError, KeyMetadata, NewKey, PublicKey, SignOptions};
 
 /// Wire version assumed for transit signatures (v1 keys are never rotated).
 const SIG_VERSION: u32 = 1;
+
+const VAULT_PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'/');
 
 /// Raw Ed25519 seed length for the CLI seed shortcut; RSA/ECDSA BYOK import uses
 /// caller-supplied PKCS#8 DER private material.
@@ -117,19 +131,36 @@ impl TransitClient {
     /// (e.g. `secret/data/web/value`), so the transit mount must NOT be prepended
     /// or the request would route to `/v1/transit/secret/data/...` (vault-0js).
     fn url(&self, mount: Mount, path: &str) -> String {
-        match mount {
-            Mount::Transit => format!("{}/v1/{}/{}", self.addr, self.mount, path),
-            Mount::KvAbsolute => format!("{}/v1/{}", self.addr, path),
-        }
+        self.url_with_query(mount, path, None)
     }
 
-    async fn post(
-        &self,
-        token: &str,
-        path: &str,
-        body: Value,
-    ) -> Result<Option<Value>, BackendError> {
-        self.post_at(Mount::Transit, token, path, body).await
+    fn url_with_query(&self, mount: Mount, path: &str, query: Option<&str>) -> String {
+        let mut url = match mount {
+            Mount::Transit => format!(
+                "{}/v1/{}/{}",
+                self.addr,
+                encode_path(&self.mount),
+                encode_path(path)
+            ),
+            Mount::KvAbsolute => format!("{}/v1/{}", self.addr, encode_path(path)),
+        };
+        if let Some(query) = query {
+            url.push('?');
+            url.push_str(query);
+        }
+        url
+    }
+
+    fn url_segments(&self, mount: Mount, segments: &[&str]) -> String {
+        match mount {
+            Mount::Transit => format!(
+                "{}/v1/{}/{}",
+                self.addr,
+                encode_path(&self.mount),
+                encode_segments(segments)
+            ),
+            Mount::KvAbsolute => format!("{}/v1/{}", self.addr, encode_segments(segments)),
+        }
     }
 
     async fn post_at(
@@ -142,6 +173,24 @@ impl TransitClient {
         let resp = self
             .http
             .post(self.url(mount, path))
+            .header("X-Vault-Token", token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| BackendError::Transport(e.to_string()))?;
+        read_body(resp).await
+    }
+
+    async fn post_at_segments(
+        &self,
+        mount: Mount,
+        token: &str,
+        segments: &[&str],
+        body: Value,
+    ) -> Result<Option<Value>, BackendError> {
+        let resp = self
+            .http
+            .post(self.url_segments(mount, segments))
             .header("X-Vault-Token", token)
             .json(&body)
             .send()
@@ -167,6 +216,43 @@ impl TransitClient {
             .ok_or_else(|| BackendError::Protocol("empty body where JSON expected".into()))
     }
 
+    async fn get_at_segments(
+        &self,
+        mount: Mount,
+        token: &str,
+        segments: &[&str],
+    ) -> Result<Value, BackendError> {
+        let resp = self
+            .http
+            .get(self.url_segments(mount, segments))
+            .header("X-Vault-Token", token)
+            .send()
+            .await
+            .map_err(|e| BackendError::Transport(e.to_string()))?;
+        read_body(resp)
+            .await?
+            .ok_or_else(|| BackendError::Protocol("empty body where JSON expected".into()))
+    }
+
+    async fn get_at_query(
+        &self,
+        mount: Mount,
+        token: &str,
+        path: &str,
+        query: Option<&str>,
+    ) -> Result<Value, BackendError> {
+        let resp = self
+            .http
+            .get(self.url_with_query(mount, path, query))
+            .header("X-Vault-Token", token)
+            .send()
+            .await
+            .map_err(|e| BackendError::Transport(e.to_string()))?;
+        read_body(resp)
+            .await?
+            .ok_or_else(|| BackendError::Protocol("empty body where JSON expected".into()))
+    }
+
     /// Like [`Self::get_at`], but returns the **raw** response body as a
     /// [`Zeroizing`] `String` instead of a parsed `Value`. Used by the SECRET KV
     /// read ([`Self::kv_get_secret`]): when the body carries key material, the big
@@ -179,10 +265,11 @@ impl TransitClient {
         mount: Mount,
         token: &str,
         path: &str,
+        query: Option<&str>,
     ) -> Result<Zeroizing<String>, BackendError> {
         let resp = self
             .http
-            .get(self.url(mount, path))
+            .get(self.url_with_query(mount, path, query))
             .header("X-Vault-Token", token)
             .send()
             .await
@@ -216,9 +303,10 @@ impl TransitClient {
 
         // Server assigns the id; transit key names must be path-safe.
         let key_id = format!("sv-{}", Uuid::new_v4().simple());
-        self.post(
+        self.post_at_segments(
+            Mount::Transit,
             token,
-            &format!("keys/{key_id}"),
+            &["keys", &key_id],
             json!({ "type": vault_type }),
         )
         .await?;
@@ -240,9 +328,10 @@ impl TransitClient {
     ) -> Result<NewKey, BackendError> {
         let vault_type =
             transit_key_type(key_type).ok_or(BackendError::UnsupportedKeyType(key_type))?;
-        self.post(
+        self.post_at_segments(
+            Mount::Transit,
             token,
-            &format!("keys/{key_id}"),
+            &["keys", key_id],
             json!({ "type": vault_type }),
         )
         .await?;
@@ -264,9 +353,10 @@ impl TransitClient {
         key_id: &str,
         vault_type: &str,
     ) -> Result<(), BackendError> {
-        self.post(
+        self.post_at_segments(
+            Mount::Transit,
             token,
-            &format!("keys/{key_id}"),
+            &["keys", key_id],
             json!({ "type": vault_type }),
         )
         .await?;
@@ -279,7 +369,9 @@ impl TransitClient {
         token: &str,
         key_id: &str,
     ) -> Result<Vec<u8>, BackendError> {
-        let info = self.get(token, &format!("keys/{key_id}")).await?;
+        let info = self
+            .get_at_segments(Mount::Transit, token, &["keys", key_id])
+            .await?;
         let data = key_data(&info)?;
         public_key_bytes(data)
     }
@@ -296,7 +388,9 @@ impl TransitClient {
         token: &str,
         key_id: &str,
     ) -> Result<std::collections::BTreeMap<u32, Vec<u8>>, BackendError> {
-        let info = self.get(token, &format!("keys/{key_id}")).await?;
+        let info = self
+            .get_at_segments(Mount::Transit, token, &["keys", key_id])
+            .await?;
         let data = key_data(&info)?;
         public_keys_by_version(data)
     }
@@ -307,7 +401,9 @@ impl TransitClient {
         token: &str,
         key_id: &str,
     ) -> Result<PublicKey, BackendError> {
-        let info = self.get(token, &format!("keys/{key_id}")).await?;
+        let info = self
+            .get_at_segments(Mount::Transit, token, &["keys", key_id])
+            .await?;
         let data = key_data(&info)?;
         Ok(PublicKey {
             public_key: public_key_bytes(data)?,
@@ -322,7 +418,9 @@ impl TransitClient {
         token: &str,
         key_id: &str,
     ) -> Result<KeyMetadata, BackendError> {
-        let info = self.get(token, &format!("keys/{key_id}")).await?;
+        let info = self
+            .get_at_segments(Mount::Transit, token, &["keys", key_id])
+            .await?;
         let data = key_data(&info)?;
         Ok(KeyMetadata {
             // Some transit key types (e.g. raw AEAD) have no wire `KeyType`; a key
@@ -356,9 +454,10 @@ impl TransitClient {
         let wrapping_pem = self.wrapping_key(token).await?;
         let ciphertext = wrap_for_import(&wrapping_pem, &pkcs8_der)?;
 
-        self.post(
+        self.post_at_segments(
+            Mount::Transit,
             token,
-            &format!("keys/{key_id}/import"),
+            &["keys", key_id, "import"],
             json!({
                 "type": vault_type,
                 "hash_function": "SHA256",
@@ -403,7 +502,7 @@ impl TransitClient {
     ) -> Result<Vec<u8>, BackendError> {
         let body = sign_body(message, options);
         let resp = self
-            .post(token, &format!("sign/{key_id}"), body)
+            .post_at_segments(Mount::Transit, token, &["sign", key_id], body)
             .await?
             .ok_or_else(|| BackendError::Protocol("empty sign response".into()))?;
         let sig = resp
@@ -445,7 +544,7 @@ impl TransitClient {
         let vault_sig = format!("vault:v{}:{}", SIG_VERSION, B64.encode(signature));
         let body = verify_body(message, &vault_sig, options);
         let resp = self
-            .post(token, &format!("verify/{key_id}"), body)
+            .post_at_segments(Mount::Transit, token, &["verify", key_id], body)
             .await?
             .ok_or_else(|| BackendError::Protocol("empty verify response".into()))?;
         resp.get("data")
@@ -476,7 +575,7 @@ impl TransitClient {
             insert(&mut body, "associated_data", Value::String(B64.encode(aad)));
         }
         let resp = self
-            .post(token, &format!("encrypt/{key_id}"), body)
+            .post_at_segments(Mount::Transit, token, &["encrypt", key_id], body)
             .await?
             .ok_or_else(|| BackendError::Protocol("empty encrypt response".into()))?;
         let wrapped = resp
@@ -517,7 +616,10 @@ impl TransitClient {
         if let Some(aad) = aad {
             insert(&mut body, "associated_data", Value::String(B64.encode(aad)));
         }
-        let resp = match self.post(token, &format!("decrypt/{key_id}"), body).await {
+        let resp = match self
+            .post_at_segments(Mount::Transit, token, &["decrypt", key_id], body)
+            .await
+        {
             Ok(resp) => {
                 resp.ok_or_else(|| BackendError::Protocol("empty decrypt response".into()))?
             }
@@ -536,9 +638,16 @@ impl TransitClient {
 
     /// `ROTATE`: bump the transit key version, returning the new latest version.
     pub(crate) async fn rotate(&self, token: &str, key_id: &str) -> Result<u32, BackendError> {
-        self.post(token, &format!("keys/{key_id}/rotate"), json!({}))
+        self.post_at_segments(
+            Mount::Transit,
+            token,
+            &["keys", key_id, "rotate"],
+            json!({}),
+        )
+        .await?;
+        let info = self
+            .get_at_segments(Mount::Transit, token, &["keys", key_id])
             .await?;
-        let info = self.get(token, &format!("keys/{key_id}")).await?;
         Ok(latest_version(key_data(&info)?))
     }
 
@@ -559,7 +668,7 @@ impl TransitClient {
         if let Some(v) = min_available_version {
             insert(&mut body, "min_available_version", Value::from(v));
         }
-        self.post(token, &format!("keys/{key_id}/config"), body)
+        self.post_at_segments(Mount::Transit, token, &["keys", key_id, "config"], body)
             .await?;
         Ok(())
     }
@@ -578,12 +687,12 @@ impl TransitClient {
         key_id: &str,
         version: Option<u32>,
     ) -> Result<super::KvValue, BackendError> {
-        // KV-v2 selects a specific version with a `?version=` query; omit for
-        // latest. The path itself carries no `:` so a query suffix is unambiguous.
-        let path = version.map_or_else(|| key_id.to_string(), |v| format!("{key_id}?version={v}"));
+        let query = version.map(|v| format!("version={v}"));
         // `key_id` is the catalog KV path (`secret/data/<p>`), already
         // mount-qualified: resolve it absolutely, NOT under the transit mount.
-        let resp = self.get_at(Mount::KvAbsolute, token, &path).await?;
+        let resp = self
+            .get_at_query(Mount::KvAbsolute, token, key_id, query.as_deref())
+            .await?;
         // KV-v2 read shape: { data: { data: { value: <b64> }, metadata: { version } } }.
         let data = resp
             .get("data")
@@ -625,9 +734,11 @@ impl TransitClient {
         key_id: &str,
         version: Option<u32>,
     ) -> Result<super::KvSecret, BackendError> {
-        let path = version.map_or_else(|| key_id.to_string(), |v| format!("{key_id}?version={v}"));
+        let query = version.map(|v| format!("version={v}"));
         // Read the body as zeroizing text (wipes the JSON, which holds the b64 key).
-        let body = self.get_at_text(Mount::KvAbsolute, token, &path).await?;
+        let body = self
+            .get_at_text(Mount::KvAbsolute, token, key_id, query.as_deref())
+            .await?;
         // Extract the base64 value into a zeroizing String, then drop the Value
         // immediately so the transient b64 residue inside serde's tree is wiped as
         // soon as possible (the body text is wiped when `body` drops at fn end).
@@ -728,6 +839,28 @@ pub const fn transit_aead_type(aead: AeadAlgorithm) -> &'static str {
         AeadAlgorithm::Aes256Gcm => "aes256-gcm96",
         AeadAlgorithm::Chacha20Poly1305 => "chacha20-poly1305",
     }
+}
+
+fn encode_path(path: &str) -> String {
+    let mut encoded = String::new();
+    for (index, segment) in path.split('/').enumerate() {
+        if index > 0 {
+            encoded.push('/');
+        }
+        encoded.push_str(&utf8_percent_encode(segment, VAULT_PATH_SEGMENT_ENCODE_SET).to_string());
+    }
+    encoded
+}
+
+fn encode_segments(segments: &[&str]) -> String {
+    let mut encoded = String::new();
+    for (index, segment) in segments.iter().enumerate() {
+        if index > 0 {
+            encoded.push('/');
+        }
+        encoded.push_str(&utf8_percent_encode(segment, VAULT_PATH_SEGMENT_ENCODE_SET).to_string());
+    }
+    encoded
 }
 
 /// The transit key `type` string for asymmetric wire key types, or `None` for a
@@ -1109,12 +1242,43 @@ mod tests {
     #[test]
     fn kv_path_with_version_query_keeps_its_mount() {
         let c = client();
-        let url = c.url(Mount::KvAbsolute, "secret/data/web/value?version=3");
+        let url = c.url_with_query(
+            Mount::KvAbsolute,
+            "secret/data/web/value",
+            Some("version=3"),
+        );
         assert_eq!(
             url,
             "http://127.0.0.1:8200/v1/secret/data/web/value?version=3"
         );
         assert!(!url.contains("/v1/transit/"));
+    }
+
+    #[test]
+    fn transit_key_ids_are_encoded_as_single_path_segments() {
+        let c = client();
+        let key = "team/key 1?active#frag";
+        assert_eq!(
+            c.url_segments(Mount::Transit, &["sign", key]),
+            "http://127.0.0.1:8200/v1/transit/sign/team%2Fkey%201%3Factive%23frag"
+        );
+        assert_eq!(
+            c.url_segments(Mount::Transit, &["keys", key, "config"]),
+            "http://127.0.0.1:8200/v1/transit/keys/team%2Fkey%201%3Factive%23frag/config"
+        );
+    }
+
+    #[test]
+    fn kv_absolute_paths_encode_components_but_keep_query_separate() {
+        let c = client();
+        assert_eq!(
+            c.url_with_query(
+                Mount::KvAbsolute,
+                "secret/data/team key?literal",
+                Some("version=3")
+            ),
+            "http://127.0.0.1:8200/v1/secret/data/team%20key%3Fliteral?version=3"
+        );
     }
 
     #[test]

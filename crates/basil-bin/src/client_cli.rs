@@ -1327,12 +1327,12 @@ async fn explain(
 
     println!(
         "{} {} {} for subject {}",
-        explanation.decision.to_uppercase(),
+        explanation.decision.as_str().to_uppercase(),
         explanation.op,
         explanation.key,
         explanation.subject
     );
-    if explanation.decision == "allow" {
+    if explanation.decision.is_allow() {
         println!("via: {}", explanation.via);
         if let Some(rule) = &explanation.matched_rule {
             println!("matched_rule: {}", rule.rule);
@@ -1352,8 +1352,8 @@ fn explain_json(explanation: &basil::AgentExplanation) -> serde_json::Value {
     obj.insert("subject".into(), explanation.subject.clone().into());
     obj.insert("op".into(), explanation.op.clone().into());
     obj.insert("key".into(), explanation.key.clone().into());
-    obj.insert("decision".into(), explanation.decision.clone().into());
-    if explanation.decision == "allow" {
+    obj.insert("decision".into(), explanation.decision.as_str().into());
+    if explanation.decision.is_allow() {
         obj.insert("via".into(), explanation.via.clone().into());
         let matched = explanation
             .matched_rule
@@ -1431,8 +1431,8 @@ mod tests {
     };
     use crate::Cli;
     use basil::{
-        AgentExplanation, AgentHealth, AgentReadiness, AgentReload, AgentRevocation, MatchedRule,
-        ReadinessReason, ReloadRejection,
+        AgentDecision, AgentExplanation, AgentHealth, AgentReadiness, AgentReload, AgentRevocation,
+        MatchedRule, ReadinessReason, ReloadRejection,
     };
     use clap::Parser;
     use std::path::Path;
@@ -1744,7 +1744,7 @@ mod tests {
             subject: "svc.orders".into(),
             op: "sign".into(),
             key: "app.signing".into(),
-            decision: "allow".into(),
+            decision: AgentDecision::Allow,
             via: "user".into(),
             reason: String::new(),
             matched_rule: Some(MatchedRule {
@@ -1775,7 +1775,7 @@ mod tests {
             subject: "svc.orders".into(),
             op: "sign".into(),
             key: "app.signing".into(),
-            decision: "deny".into(),
+            decision: AgentDecision::Deny,
             via: String::new(),
             reason: "no_matching_rule".into(),
             matched_rule: None,

@@ -34,6 +34,7 @@ tonic-prost-build = { workspace = true }
 # raise the published dependency floor. The COSE fixtures test round-trips
 # the checked-in vectors through the strict profile.
 basil-cose = { workspace = true, features = ["fixtures"] }
+p256 = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
 
 [lints]

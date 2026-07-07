@@ -97,6 +97,7 @@ impl std::fmt::Display for AeadAlgorithm {
 /// The kind of a catalog entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum CatalogKind {
     /// A signing/asymmetric key.
     Signing,

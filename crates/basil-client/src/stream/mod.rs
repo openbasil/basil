@@ -54,6 +54,7 @@ use format::{
 
 /// A symmetric AEAD suite for streaming encryption.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AeadSuite {
     /// AES-256-GCM with a 96-bit nonce and 128-bit tag.
     Aes256Gcm,
@@ -87,6 +88,7 @@ impl AeadSuite {
 
 /// An ML-KEM (FIPS 203) parameter set for post-quantum streaming encryption.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MlKemSuite {
     /// ML-KEM-512.
     MlKem512,
@@ -141,6 +143,7 @@ impl MlKemSuite {
 }
 
 /// How the content-encryption key for an AEAD stream is established.
+#[non_exhaustive]
 pub enum CekSource {
     /// Generate a fresh random 256-bit CEK (secure default). [`encrypt_aead`]
     /// returns the generated key so the caller can persist or transmit it.

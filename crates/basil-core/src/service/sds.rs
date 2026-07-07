@@ -92,6 +92,16 @@ impl EnvoySdsGrpc {
         requested: &[String],
     ) -> Result<Vec<SdsResourcePlan>, Status> {
         let generation = self.state.load_generation();
+        let actor = generation
+            .pdp()
+            .resolve_local_actor(peer)
+            .map_err(|err| sds_resolution_status(&err))?;
+        let uid = actor.unix_uid().ok_or_else(|| {
+            Status::new(
+                Code::Unauthenticated,
+                "Envoy SDS requires local peer credentials",
+            )
+        })?;
         let issuers: Vec<_> = generation
             .catalog()
             .keys
@@ -104,16 +114,6 @@ impl EnvoySdsGrpc {
                 "no Envoy SDS resource matched the request",
             ));
         }
-        let actor = generation
-            .pdp()
-            .resolve_local_actor(peer)
-            .map_err(|err| sds_resolution_status(&err))?;
-        let uid = actor.unix_uid().ok_or_else(|| {
-            Status::new(
-                Code::Unauthenticated,
-                "Envoy SDS requires local peer credentials",
-            )
-        })?;
         let requested = requested_set(requested);
         let mut plans = Vec::new();
         for (key_name, entry) in issuers {
@@ -544,14 +544,19 @@ mod tests {
         }
     }
 
-    fn service() -> EnvoySdsGrpc {
-        let (catalog, policy, config, warnings) = load(CATALOG, POLICY).expect("fixture loads");
+    fn service_with_catalog(catalog_json: &str) -> EnvoySdsGrpc {
+        let (catalog, policy, config, warnings) =
+            load(catalog_json, POLICY).expect("fixture loads");
         assert!(warnings.is_empty());
         let mut backends: BTreeMap<String, Box<dyn Backend>> = BTreeMap::new();
         backends.insert("bao".to_string(), Box::<SdsBackend>::default());
         let manager = BackendManager::new(catalog.clone(), backends).expect("manager builds");
         let state = Arc::new(BrokerState::new(catalog, policy, config, manager, "dummy"));
         EnvoySdsGrpc::new(state)
+    }
+
+    fn service() -> EnvoySdsGrpc {
+        service_with_catalog(CATALOG)
     }
 
     fn request(uid: u32, resource_names: Vec<&str>) -> Request<DiscoveryRequest> {
@@ -635,5 +640,27 @@ mod tests {
             .await
             .expect_err("denied");
         assert_eq!(status.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn fetch_secrets_authenticates_before_reporting_no_sds_issuers() {
+        let catalog = r#"{
+          "schemaVersion": 1,
+          "backends": { "bao": { "kind": "vault", "addr": "https://127.0.0.1:8200" } },
+          "keys": {}
+        }"#;
+        let service = service_with_catalog(catalog);
+        let status = service
+            .fetch_secrets(Request::new(DiscoveryRequest {
+                version_info: String::new(),
+                node: None,
+                resource_names: vec!["default".to_string()],
+                type_url: SECRET_TYPE_URL.to_string(),
+                response_nonce: String::new(),
+                error_detail: None,
+            }))
+            .await
+            .expect_err("missing peer credentials fail before issuer inventory");
+        assert_eq!(status.code(), Code::Unauthenticated);
     }
 }

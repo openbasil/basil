@@ -15,6 +15,7 @@ VAULT_TOKEN="${BASIL_COSE_NATS_DEMO_VAULT_TOKEN:-root}"
 NATS_PORT="${BASIL_COSE_NATS_DEMO_NATS_PORT:-4229}"
 NATS_URL="${BASIL_COSE_NATS_DEMO_NATS_URL:-nats://127.0.0.1:$NATS_PORT}"
 BRIDGE_SUBJECT="${BASIL_COSE_NATS_DEMO_BRIDGE_SUBJECT:-basil.invoke}"
+export -n VAULT_TOKEN
 
 FIXTURES="$WORKDIR/fixtures"
 CATALOG="$FIXTURES/catalog.json"
@@ -31,6 +32,8 @@ AGENT_LOG="$WORKDIR/agent.log"
 BRIDGE_LOG="$WORKDIR/bridge.log"
 DEMO_TARGET_DIR="$ROOT/target/cose-nats-demo"
 DEMO_BIN="$DEMO_TARGET_DIR/debug/cose-nats-demo"
+BASIL=""
+BRIDGE=""
 
 BAO_PID=""
 NATS_PID=""
@@ -42,6 +45,10 @@ need() {
     echo "missing required command: $1" >&2
     exit 1
   }
+}
+
+bao_cmd() {
+  VAULT_ADDR="$VAULT_ADDR" VAULT_TOKEN="$VAULT_TOKEN" bao "$@"
 }
 
 cleanup() {
@@ -89,7 +96,7 @@ wait_for_nats() {
 write_kv_value() {
   local path="$1" value="$2" logical
   logical="${path/\/data\//\/}"
-  bao kv put "$logical" "value=$value" >/dev/null
+  bao_cmd kv put "$logical" "value=$value" >/dev/null
 }
 
 write_catalog() {
@@ -257,30 +264,41 @@ TOML
 main() {
   need bao
   need nats-server
+  need cargo
 
   rm -rf "$WORKDIR"
   mkdir -p "$FIXTURES"
   chmod 700 "$WORKDIR"
 
-  echo "build"
-  cargo build --manifest-path "$ROOT/Cargo.toml" -p basil-bin -p basil-nats-bridge --bin basil --bin basil-nats-bridge >/dev/null
+  echo "== build =="
+  if [[ -n "${BASIL_BIN:-}" ]]; then
+    BASIL="$BASIL_BIN"
+  else
+    cargo build --manifest-path "$ROOT/Cargo.toml" -p basil-bin --bin basil >/dev/null
+    BASIL="$ROOT/target/debug/basil"
+  fi
+  if [[ -n "${BASIL_NATS_BRIDGE_BIN:-}" ]]; then
+    BRIDGE="$BASIL_NATS_BRIDGE_BIN"
+  else
+    cargo build --manifest-path "$ROOT/Cargo.toml" -p basil-nats-bridge --bin basil-nats-bridge >/dev/null
+    BRIDGE="$ROOT/target/debug/basil-nats-bridge"
+  fi
   CARGO_TARGET_DIR="$DEMO_TARGET_DIR" cargo build --manifest-path "$SCRIPT_DIR/Cargo.toml" >/dev/null
 
   eval "$("$DEMO_BIN" print-fixtures)"
 
-  echo "openbao"
+  echo "== openbao =="
   LISTEN="${VAULT_ADDR#http://}"
-  bao server -dev -dev-root-token-id="$VAULT_TOKEN" -dev-listen-address="$LISTEN" >"$BAO_LOG" 2>&1 &
+  env -u VAULT_TOKEN bao server -dev -dev-root-token-id="$VAULT_TOKEN" -dev-listen-address="$LISTEN" >"$BAO_LOG" 2>&1 &
   BAO_PID="$!"
   for _ in $(seq 1 80); do
-    VAULT_ADDR="$VAULT_ADDR" VAULT_TOKEN="$VAULT_TOKEN" bao status >/dev/null 2>&1 && break
+    bao_cmd status >/dev/null 2>&1 && break
     sleep 0.1
   done
-  VAULT_ADDR="$VAULT_ADDR" VAULT_TOKEN="$VAULT_TOKEN" bao status >/dev/null
-  export VAULT_ADDR VAULT_TOKEN
+  bao_cmd status >/dev/null
 
-  bao secrets enable transit >/dev/null 2>&1 || true
-  bao secrets enable -path=secret -version=2 kv >/dev/null 2>&1 || true
+  bao_cmd secrets enable transit >/dev/null 2>&1 || true
+  bao_cmd secrets enable -path=secret -version=2 kv >/dev/null 2>&1 || true
   write_kv_value "secret/data/demo/broker-request" "$BROKER_REQUEST_PRIVATE"
   write_kv_value "secret/data/demo/broker-request-public" "$BROKER_REQUEST_PUBLIC"
   write_kv_value "secret/data/demo/alice-seal" "$ALICE_SEAL_PRIVATE"
@@ -290,41 +308,41 @@ main() {
   write_kv_value "secret/data/demo/alice-response" "$ALICE_RESPONSE_PRIVATE"
   write_kv_value "secret/data/demo/alice-response-public" "$ALICE_RESPONSE_PUBLIC"
 
-  bao policy write basil-cose-nats-demo - >/dev/null <<HCL
+  bao_cmd policy write basil-cose-nats-demo - >/dev/null <<HCL
 path "transit/*" { capabilities = ["create", "read", "update", "delete", "list"] }
 path "secret/*" { capabilities = ["create", "read", "update", "delete", "list"] }
 HCL
-  bao auth enable approle >/dev/null 2>&1 || true
-  bao write auth/approle/role/basil-cose-nats-demo \
+  bao_cmd auth enable approle >/dev/null 2>&1 || true
+  bao_cmd write auth/approle/role/basil-cose-nats-demo \
     token_policies=basil-cose-nats-demo \
     token_ttl=1h \
     token_max_ttl=4h >/dev/null
-  role_id="$(bao read -field=role_id auth/approle/role/basil-cose-nats-demo/role-id)"
-  bao write -f -field=secret_id auth/approle/role/basil-cose-nats-demo/secret-id >"$APPROLE_SECRET_FILE"
+  role_id="$(bao_cmd read -field=role_id auth/approle/role/basil-cose-nats-demo/role-id)"
+  bao_cmd write -f -field=secret_id auth/approle/role/basil-cose-nats-demo/secret-id >"$APPROLE_SECRET_FILE"
   chmod 600 "$APPROLE_SECRET_FILE"
 
   printf 'cose-nats-demo-passphrase\n' >"$PASS_FILE"
   chmod 600 "$PASS_FILE"
   write_catalog
   write_policy
-  "$ROOT/target/debug/basil" bundle create "$BUNDLE" \
+  env -u VAULT_TOKEN "$BASIL" bundle create "$BUNDLE" \
     --slot passphrase:file="$PASS_FILE" \
     --backend "id=bao,type=openbao,addr=$VAULT_ADDR,role-id=$role_id,secret-id-file=$APPROLE_SECRET_FILE" >/dev/null
   write_agent_config
 
-  echo "nats"
+  echo "== nats =="
   nats-server -p "$NATS_PORT" >"$NATS_LOG" 2>&1 &
   NATS_PID="$!"
   wait_for_nats
 
-  echo "agent"
-  "$ROOT/target/debug/basil" agent --config "$AGENT_CONFIG" >"$AGENT_LOG" 2>&1 &
+  echo "== agent =="
+  env -u VAULT_TOKEN "$BASIL" agent --config "$AGENT_CONFIG" >"$AGENT_LOG" 2>&1 &
   AGENT_PID="$!"
   wait_for_file_socket "$SOCKET" "$AGENT_LOG" "$AGENT_PID"
 
-  echo "bridge"
+  echo "== bridge =="
   write_bridge_config
-  "$ROOT/target/debug/basil-nats-bridge" --config "$BRIDGE_CONFIG" >"$BRIDGE_LOG" 2>&1 &
+  env -u VAULT_TOKEN "$BRIDGE" --config "$BRIDGE_CONFIG" >"$BRIDGE_LOG" 2>&1 &
   BRIDGE_PID="$!"
   sleep 0.5
   kill -0 "$BRIDGE_PID" >/dev/null 2>&1 || {
@@ -333,12 +351,13 @@ HCL
     exit 1
   }
 
-  echo "demo"
-  "$DEMO_BIN" run \
+  echo "== demo =="
+  env -u VAULT_TOKEN "$DEMO_BIN" run \
     --socket "$SOCKET" \
     --nats-url "$NATS_URL" \
     --bridge-subject "$BRIDGE_SUBJECT"
   echo "workdir: $WORKDIR"
+  echo "PASS"
 }
 
 main "$@"

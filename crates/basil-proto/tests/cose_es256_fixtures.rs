@@ -27,6 +27,7 @@ use basil_cose::{
     ContentType, Es256Signer, ExternalAad, KeyId, P256Verifier, SignParams, VerifySignedParams,
     Zeroizing, build_signed, verify_signed,
 };
+use p256::elliptic_curve::PrimeField;
 use serde_json::{Value, json};
 
 /// Poll a ready-immediately future to completion (local key implementations
@@ -120,6 +121,31 @@ fn verifier() -> P256Verifier {
     .unwrap()
 }
 
+fn high_s_sign1(mut bytes: Vec<u8>) -> Vec<u8> {
+    const SIG_LEN: usize = 64;
+    let signature_header = bytes.len() - SIG_LEN - 2;
+    assert_eq!(
+        &bytes[signature_header..signature_header + 2],
+        &[0x58, 0x40],
+        "fixture signature is the final 64-byte COSE bstr"
+    );
+    let signature_offset = bytes.len() - SIG_LEN;
+    let sig = p256::ecdsa::Signature::from_slice(&bytes[signature_offset..]).unwrap();
+    assert!(
+        sig.normalize_s().is_none(),
+        "Basil emits low-S ES256 signatures"
+    );
+    let (r, s) = sig.split_scalars();
+    let high_s = -s;
+    let high_sig = p256::ecdsa::Signature::from_scalars(r.to_repr(), high_s.to_repr()).unwrap();
+    assert!(
+        high_sig.normalize_s().is_some(),
+        "test mutation must produce high-S"
+    );
+    bytes[signature_offset..].copy_from_slice(&high_sig.to_bytes());
+    bytes
+}
+
 #[test]
 fn checked_in_es256_fixture_matches_generated_bytes() {
     let doc = build_doc();
@@ -172,6 +198,21 @@ fn es256_fixture_round_trips_through_verify_signed() {
 fn es256_fixture_rejects_tampered_signature() {
     let mut bytes = build_sign1();
     *bytes.last_mut().unwrap() ^= 0x01;
+    let err = block_on(verify_signed(
+        &bytes,
+        &verifier(),
+        &VerifySignedParams {
+            external_aad: ExternalAad::empty(),
+            validation: None,
+        },
+    ))
+    .unwrap_err();
+    assert_eq!(err, basil_cose::VerifyError::SignatureInvalid);
+}
+
+#[test]
+fn es256_fixture_rejects_high_s_signature_variant() {
+    let bytes = high_s_sign1(build_sign1());
     let err = block_on(verify_signed(
         &bytes,
         &verifier(),

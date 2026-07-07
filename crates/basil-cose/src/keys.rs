@@ -256,6 +256,9 @@ impl Verifier for P256Verifier {
         // wrong-length signature is rejected here.
         let sig = P256Signature::from_slice(signature.as_bytes())
             .map_err(|_| VerifyError::SignatureInvalid)?;
+        if sig.normalize_s().is_some() {
+            return Err(VerifyError::SignatureInvalid);
+        }
         key.verify(sig_structure, &sig)
             .map_err(|_| VerifyError::SignatureInvalid)
     }

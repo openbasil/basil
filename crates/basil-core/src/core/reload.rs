@@ -43,6 +43,7 @@
 //! path beyond what startup reconcile already settled.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::catalog::loader::LoadError;
@@ -101,6 +102,15 @@ pub enum ReloadError {
         source: std::io::Error,
     },
 
+    /// The catalog or policy file changed while reload was reading the pair.
+    /// The previous generation keeps serving so the broker never installs a
+    /// catalog/policy pair assembled across an observed writer race.
+    #[error("catalog/policy reload input changed while reading {path}; retry reload")]
+    TornSnapshot {
+        /// The path whose fingerprint changed during candidate assembly.
+        path: String,
+    },
+
     /// The candidate catalog/policy failed the full startup/`check` validation
     /// (`load`, including the JWT-SVID issuer-alg and `publicPath` guardrails).
     #[error("validating reloaded catalog/policy: {0}")]
@@ -127,6 +137,7 @@ impl ReloadError {
         match self {
             Self::ReadCatalog { .. } => "catalog_read_failed",
             Self::ReadPolicy { .. } => "policy_read_failed",
+            Self::TornSnapshot { .. } => "inputs_changed_during_read",
             Self::Validate(_) => "validation_failed",
             Self::RoutingShapeChanged(_) => "routing_shape_changed",
             Self::NoInputs => "no_reload_inputs",
@@ -262,6 +273,107 @@ fn bundle_changed_trust_domains(current: &Catalog, candidate: &Catalog) -> Vec<S
         .collect()
 }
 
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileFingerprint {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime_sec: i64,
+    mtime_nsec: i64,
+    ctime_sec: i64,
+    ctime_nsec: i64,
+}
+
+#[cfg(unix)]
+fn file_fingerprint(path: &Path) -> std::io::Result<FileFingerprint> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(path)?;
+    Ok(FileFingerprint {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        len: metadata.len(),
+        mtime_sec: metadata.mtime(),
+        mtime_nsec: metadata.mtime_nsec(),
+        ctime_sec: metadata.ctime(),
+        ctime_nsec: metadata.ctime_nsec(),
+    })
+}
+
+#[cfg(not(unix))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileFingerprint {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+#[cfg(not(unix))]
+fn file_fingerprint(path: &Path) -> std::io::Result<FileFingerprint> {
+    let metadata = std::fs::metadata(path)?;
+    Ok(FileFingerprint {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+fn read_reload_inputs_with_observer(
+    inputs: &ReloadInputs,
+    observer: impl FnOnce(),
+) -> Result<(String, String), ReloadError> {
+    let catalog_before =
+        file_fingerprint(&inputs.catalog_path).map_err(|source| ReloadError::ReadCatalog {
+            path: inputs.catalog_path.display().to_string(),
+            source,
+        })?;
+    let policy_before =
+        file_fingerprint(&inputs.policy_path).map_err(|source| ReloadError::ReadPolicy {
+            path: inputs.policy_path.display().to_string(),
+            source,
+        })?;
+
+    let catalog_json = std::fs::read_to_string(&inputs.catalog_path).map_err(|source| {
+        ReloadError::ReadCatalog {
+            path: inputs.catalog_path.display().to_string(),
+            source,
+        }
+    })?;
+    let policy_json =
+        std::fs::read_to_string(&inputs.policy_path).map_err(|source| ReloadError::ReadPolicy {
+            path: inputs.policy_path.display().to_string(),
+            source,
+        })?;
+
+    observer();
+
+    let catalog_after =
+        file_fingerprint(&inputs.catalog_path).map_err(|source| ReloadError::ReadCatalog {
+            path: inputs.catalog_path.display().to_string(),
+            source,
+        })?;
+    if catalog_before != catalog_after {
+        return Err(ReloadError::TornSnapshot {
+            path: inputs.catalog_path.display().to_string(),
+        });
+    }
+    let policy_after =
+        file_fingerprint(&inputs.policy_path).map_err(|source| ReloadError::ReadPolicy {
+            path: inputs.policy_path.display().to_string(),
+            source,
+        })?;
+    if policy_before != policy_after {
+        return Err(ReloadError::TornSnapshot {
+            path: inputs.policy_path.display().to_string(),
+        });
+    }
+
+    Ok((catalog_json, policy_json))
+}
+
+fn read_reload_inputs(inputs: &ReloadInputs) -> Result<(String, String), ReloadError> {
+    read_reload_inputs_with_observer(inputs, || {})
+}
+
 /// The fully-validated candidate generation produced by [`validate_candidate`]:
 /// the loaded surface (ready to install) plus the [`ReloadOutcome`] the swap would
 /// report. The dry-run path discards the surface and keeps only the outcome; the
@@ -294,18 +406,7 @@ struct ValidatedCandidate {
 /// dimension ([`ReloadError::RoutingShapeChanged`]).
 fn validate_candidate(state: &BrokerState) -> Result<ValidatedCandidate, ReloadError> {
     let inputs = state.reload_inputs().ok_or(ReloadError::NoInputs)?;
-
-    let catalog_json = std::fs::read_to_string(&inputs.catalog_path).map_err(|source| {
-        ReloadError::ReadCatalog {
-            path: inputs.catalog_path.display().to_string(),
-            source,
-        }
-    })?;
-    let policy_json =
-        std::fs::read_to_string(&inputs.policy_path).map_err(|source| ReloadError::ReadPolicy {
-            path: inputs.policy_path.display().to_string(),
-            source,
-        })?;
+    let (catalog_json, policy_json) = read_reload_inputs(inputs)?;
 
     // Full startup/`check` validation: load() runs every §5 hard-error check
     // including validate_jwt_svid_issuer_alg and the publicPath guardrail.
@@ -408,7 +509,10 @@ mod tests {
     use async_trait::async_trait;
     use basil_proto::KeyType;
 
-    use super::{ReloadError, ReloadInputs, check_reload, reload_generation};
+    use super::{
+        ReloadError, ReloadInputs, check_reload, read_reload_inputs_with_observer,
+        reload_generation,
+    };
     use crate::backend::{Backend, BackendError, NewKey};
     use crate::catalog::load;
     use crate::manager::BackendManager;
@@ -574,6 +678,28 @@ mod tests {
         assert_eq!(err.audit_reason(), "validation_failed");
         // Previous generation untouched.
         assert_eq!(state.active_generation_id(), INITIAL_GENERATION_ID);
+    }
+
+    #[test]
+    fn reload_input_change_during_read_is_rejected() {
+        let (state, inputs) = state_with_files(&catalog_json(true), &policy_json(true));
+
+        let err = read_reload_inputs_with_observer(&inputs, || {
+            std::fs::write(
+                &inputs.policy_path,
+                policy_json(true).replace("\"rules\"", "\"rules_changed\""),
+            )
+            .expect("race policy rewrite");
+        })
+        .expect_err("changed policy fingerprint rejects torn read");
+
+        assert!(matches!(err, ReloadError::TornSnapshot { .. }));
+        assert_eq!(err.audit_reason(), "inputs_changed_during_read");
+        assert_eq!(
+            state.active_generation_id(),
+            INITIAL_GENERATION_ID,
+            "helper rejection leaves the serving generation untouched"
+        );
     }
 
     /// A non-profile JWT-SVID issuer candidate is rejected: the loader's fail-closed

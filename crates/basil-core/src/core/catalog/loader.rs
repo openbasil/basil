@@ -9,9 +9,11 @@
 //! up front so a bad export fails fast at startup rather than at request time.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::marker::PhantomData;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
 use super::glob::{GlobError, KeyGlob};
@@ -164,6 +166,14 @@ pub enum LoadError {
         rule: String,
         /// The unknown subject name.
         subject: String,
+    },
+
+    /// Two rules used the same stable audit id. Rule provenance must be
+    /// unambiguous in `decide`/`explain` output and audit records.
+    #[error("duplicate policy rule id `{rule}`")]
+    DuplicateRuleId {
+        /// The duplicated rule id.
+        rule: String,
     },
 
     /// A key's `description` is blank or absent (§2.4).
@@ -400,7 +410,11 @@ pub struct RawPolicy {
     #[serde(rename = "schemaVersion", default = "default_policy_schema_version")]
     pub schema_version: u32,
     /// Named subject registry.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_unique_btree_map",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub subjects: BTreeMap<SubjectName, RawSubjectDefinition>,
     /// Subject used for explicitly unauthenticated access, when configured.
     #[serde(
@@ -410,7 +424,11 @@ pub struct RawPolicy {
     )]
     pub unauthenticated_subject: Option<SubjectName>,
     /// Named role → op-set table; an action `role:<name>` expands to its ops.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_unique_btree_map",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub roles: BTreeMap<String, BTreeSet<Op>>,
     /// The allow-rules (default-deny is the absence of a match).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -422,6 +440,50 @@ pub struct RawPolicy {
 
 const fn default_policy_schema_version() -> u32 {
     2
+}
+
+fn deserialize_unique_btree_map<'de, D, K, V>(deserializer: D) -> Result<BTreeMap<K, V>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    K: Deserialize<'de> + Ord + std::fmt::Display,
+    V: Deserialize<'de>,
+{
+    struct UniqueMapVisitor<K, V>(PhantomData<(K, V)>);
+
+    impl<'de, K, V> Visitor<'de> for UniqueMapVisitor<K, V>
+    where
+        K: Deserialize<'de> + Ord + std::fmt::Display,
+        V: Deserialize<'de>,
+    {
+        type Value = BTreeMap<K, V>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a JSON object with unique keys")
+        }
+
+        fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut map = BTreeMap::new();
+            while let Some((key, value)) = access.next_entry::<K, V>()? {
+                match map.entry(key) {
+                    std::collections::btree_map::Entry::Vacant(slot) => {
+                        slot.insert(value);
+                    }
+                    std::collections::btree_map::Entry::Occupied(slot) => {
+                        return Err(de::Error::custom(format!(
+                            "duplicate policy key `{}`",
+                            slot.key()
+                        )));
+                    }
+                }
+            }
+            Ok(map)
+        }
+    }
+
+    deserializer.deserialize_map(UniqueMapVisitor(PhantomData))
 }
 
 /// One raw subject definition. Exactly one of `allOf` or `anyOf` must be set.
@@ -1086,8 +1148,14 @@ fn parse_rules(
     raw: Vec<RawRule>,
     subjects: &BTreeMap<SubjectName, SubjectDefinition>,
 ) -> Result<Vec<Rule>, LoadError> {
+    let mut seen = BTreeSet::new();
     raw.into_iter()
-        .map(|rule| parse_rule(rule, subjects))
+        .map(|rule| {
+            if !seen.insert(rule.id.clone()) {
+                return Err(LoadError::DuplicateRuleId { rule: rule.id });
+            }
+            parse_rule(rule, subjects)
+        })
         .collect()
 }
 
@@ -1890,6 +1958,72 @@ mod tests {
         assert!(matches!(
             load(&cat, &pol),
             Err(LoadError::UnknownRole { .. })
+        ));
+    }
+
+    #[test]
+    fn duplicate_subject_key_is_fatal() {
+        let cat = catalog_json(ASYM_KEY);
+        let pol = r#"{
+          "schemaVersion": 2,
+          "subjects": {
+            "svc.nats": { "allOf": [ { "kind": "unix", "uid": 9002 } ] },
+            "svc.nats": { "allOf": [ { "kind": "unix", "uid": 9003 } ] }
+          },
+          "roles": {},
+          "rules": [],
+          "config": {}
+        }"#;
+        let err = load(&cat, pol).expect_err("duplicate subject key rejected");
+        assert!(
+            matches!(err, LoadError::Json { what: "policy", .. }),
+            "duplicate subject keys fail during policy JSON decode: {err}"
+        );
+        assert!(
+            err.to_string().contains("duplicate policy key `svc.nats`"),
+            "error names the duplicate subject: {err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_role_key_is_fatal() {
+        let cat = catalog_json(ASYM_KEY);
+        let pol = r#"{
+          "schemaVersion": 2,
+          "subjects": {
+            "svc.nats": { "allOf": [ { "kind": "unix", "uid": 9002 } ] }
+          },
+          "roles": {
+            "reader": ["get"],
+            "reader": ["sign"]
+          },
+          "rules": [],
+          "config": {}
+        }"#;
+        let err = load(&cat, pol).expect_err("duplicate role key rejected");
+        assert!(
+            matches!(err, LoadError::Json { what: "policy", .. }),
+            "duplicate role keys fail during policy JSON decode: {err}"
+        );
+        assert!(
+            err.to_string().contains("duplicate policy key `reader`"),
+            "error names the duplicate role: {err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_rule_id_is_fatal() {
+        let cat = catalog_json(ASYM_KEY);
+        let pol = policy_json(
+            READER_ROLE,
+            r#"
+            { "id": "r1", "subjects": ["svc.nats"], "action": ["role:reader"], "target": ["nats.account"] },
+            { "id": "r1", "subjects": ["svc.nats"], "action": ["op:get"], "target": ["nats.account"] }
+            "#,
+        );
+        assert!(matches!(
+            load(&cat, &pol),
+            Err(LoadError::DuplicateRuleId { rule }) if rule == "r1"
         ));
     }
 

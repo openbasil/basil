@@ -175,13 +175,6 @@ impl BrokerGrpc {
             .as_ref()
             .ok_or_else(|| invalid_request(INVOKE_OP, "missing response encryption key"))?;
         let response_key_id = catalog_key_id(response_key_id, "response encryption key")?;
-        self.validate_response_encryption_key(response_key_id)
-            .await?;
-        self.check_replay(
-            &sealed.signer_key_id,
-            &sealed.claims.message_id,
-            effective_expires_at_unix(&sealed.claims)?,
-        )?;
 
         let generation = self.state.load_generation();
         let decision = generation
@@ -199,6 +192,14 @@ impl BrokerGrpc {
             return Err(unauthorized_invocation());
         }
         drop(generation);
+
+        self.validate_response_encryption_key(response_key_id)
+            .await?;
+        self.check_replay(
+            &sealed.signer_key_id,
+            &sealed.claims.message_id,
+            effective_expires_at_unix(&sealed.claims)?,
+        )?;
 
         let opened = sealed
             .open(
@@ -1141,6 +1142,23 @@ mod tests {
         content_type: &str,
         plaintext: &[u8],
     ) -> Vec<u8> {
+        sealed_request_with_signer(
+            fixture,
+            claims,
+            content_type,
+            plaintext,
+            &fixture.client_signer,
+        )
+        .await
+    }
+
+    async fn sealed_request_with_signer(
+        fixture: &Fixture,
+        claims: Claims,
+        content_type: &str,
+        plaintext: &[u8],
+        signer: &Ed25519Signer,
+    ) -> Vec<u8> {
         build_sealed(
             &SealParams {
                 content_type: self::content_type(content_type),
@@ -1152,7 +1170,7 @@ mod tests {
                 aad: SealedAad::empty(),
                 kdf_parties: KdfParties::anonymous(),
             },
-            &fixture.client_signer,
+            signer,
         )
         .await
         .unwrap()
@@ -1503,6 +1521,25 @@ mod tests {
         )
         .await;
         assert!(status.message().contains("recipient key mismatch"));
+
+        let mut unauthorized_unknown_response_key =
+            request_claims(b"unauthorized-unknown-response-key");
+        unauthorized_unknown_response_key.issuer = Some(subject("mallory"));
+        unauthorized_unknown_response_key.sender_key_id = Some(key_id(MALLORY_SIGNING_KEY));
+        unauthorized_unknown_response_key.response_key_id = Some(key_id("unknown.response"));
+        assert_prepare_code(
+            &fixture,
+            sealed_request_with_signer(
+                &fixture,
+                unauthorized_unknown_response_key,
+                CONTENT_TYPE_SIGN_REQUEST,
+                &sign_body(),
+                &fixture.mallory_signer,
+            )
+            .await,
+            Code::PermissionDenied,
+        )
+        .await;
 
         let mut forged_subject = request_claims(b"forged-subject");
         forged_subject.issuer = Some(subject("mallory"));

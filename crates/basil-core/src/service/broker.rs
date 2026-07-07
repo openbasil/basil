@@ -20,8 +20,8 @@ use tonic::{Code, Request, Response, Status};
 
 use crate::actor::AuthenticatedActor;
 use crate::catalog::policy::Op;
-use crate::state::BrokerState;
-use crate::transport::{authorize, broker_status};
+use crate::state::{BrokerState, Generation};
+use crate::transport::{authorize, authorize_in_generation, broker_status};
 
 pub(super) type GrpcResult<T> = Result<Response<T>, Status>;
 pub(super) type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -135,6 +135,16 @@ impl BrokerGrpc {
         key: &str,
     ) -> Result<AuthenticatedActor, Status> {
         authorize(&self.state, request, op, key)
+    }
+
+    pub(super) fn authorize_in_generation<T>(
+        &self,
+        generation: &Generation,
+        request: &Request<T>,
+        op: Op,
+        key: &str,
+    ) -> Result<AuthenticatedActor, Status> {
+        authorize_in_generation(&self.state, generation, request, op, key)
     }
 
     pub(super) fn visible(&self, actor: &AuthenticatedActor, key: &str) -> bool {

@@ -17,11 +17,9 @@
 # into a NixOS configuration and applying it with `nixos-rebuild`, not `nix run`.
 
 {
-  pkgs ? import (builtins.getFlake "github:NixOS/nixpkgs/nixpkgs-unstable") {
-    system = builtins.currentSystem;
-  },
-  basilPackage ?
-    (builtins.getFlake (toString ../../.)).packages.${builtins.currentSystem}.basil,
+  repoFlake ? builtins.getFlake (toString ../../.),
+  pkgs ? repoFlake.inputs.nixpkgs.legacyPackages.${builtins.currentSystem},
+  basilPackage ? repoFlake.packages.${builtins.currentSystem}.basil,
 }:
 
 let
@@ -241,7 +239,7 @@ let
       : "''${BASIL_EXAMPLE_SOCKET:=/tmp/basil-example.sock}"
       : "''${BASIL_EXAMPLE_VAULT_ADDR:=https://127.0.0.1:8200}"
 
-      exec ${basilPackage}/bin/basil agent \
+      exec env -u VAULT_TOKEN ${basilPackage}/bin/basil agent \
         --config ${agentRunConfig} \
         --catalog ${catalogJson} \
         --policy ${policyJson} \

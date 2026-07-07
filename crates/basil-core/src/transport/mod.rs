@@ -22,7 +22,7 @@ use crate::actor::{AuthenticatedActor, SubjectResolutionError};
 use crate::catalog::policy::Op;
 use crate::decision::{DecisionRecord, op_token};
 use crate::peer::PeerInfo;
-use crate::state::BrokerState;
+use crate::state::{BrokerState, Generation};
 
 /// Resolve the attested peer from a tonic request.
 #[must_use]
@@ -42,7 +42,28 @@ pub fn authorize<T>(
     op: Op,
     key: &str,
 ) -> Result<AuthenticatedActor, Status> {
-    authorize_extensions(state, request.extensions(), op, key)
+    let generation = state.load_generation();
+    authorize_extensions_in_generation(state, &generation, request.extensions(), op, key)
+}
+
+/// Authorize one key-scoped operation against a caller-pinned generation.
+///
+/// Use this when a multi-entry operation must validate every entry against the
+/// same catalog/policy/config snapshot even if reload swaps the active
+/// generation while the operation is still validating.
+///
+/// # Errors
+///
+/// Returns `UNAUTHENTICATED` when no peer uid is present and
+/// `PERMISSION_DENIED` when policy denies the operation.
+pub fn authorize_in_generation<T>(
+    state: &BrokerState,
+    generation: &Generation,
+    request: &Request<T>,
+    op: Op,
+    key: &str,
+) -> Result<AuthenticatedActor, Status> {
+    authorize_extensions_in_generation(state, generation, request.extensions(), op, key)
 }
 
 fn peer_from_extensions(extensions: &Extensions) -> PeerInfo {
@@ -58,15 +79,13 @@ fn peer_from_extensions(extensions: &Extensions) -> PeerInfo {
         })
 }
 
-fn authorize_extensions(
+fn authorize_extensions_in_generation(
     state: &BrokerState,
+    generation: &Generation,
     extensions: &Extensions,
     op: Op,
     key: &str,
 ) -> Result<AuthenticatedActor, Status> {
-    // Pin one generation snapshot for the whole authorization decision so a
-    // concurrent reload can never mix an old catalog with a new policy.
-    let generation = state.load_generation();
     let peer = peer_from_extensions(extensions);
     let actor = generation.pdp().resolve_local_actor(&peer).map_err(|err| {
         record_resolution_error(state, generation.id(), &peer, op, key, &err);
@@ -168,6 +187,7 @@ pub fn broker_status(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     use async_trait::async_trait;
     use basil_proto::KeyType;
@@ -202,6 +222,19 @@ mod tests {
       "rules": [
         { "id": "reader", "subjects": ["svc.app"], "action": ["role:reader"], "target": ["app.secret"] }
       ],
+      "config": {
+        "names": { "users": { "42": "svc-app" }, "groups": {} },
+        "memberships": { "42": [42] }
+      }
+    }"#;
+
+    const DENY_POLICY: &str = r#"{
+      "schemaVersion": 2,
+      "subjects": {
+        "svc.app": { "allOf": [ { "kind": "unix", "uid": 42 } ] }
+      },
+      "roles": {},
+      "rules": [],
       "config": {
         "names": { "users": { "42": "svc-app" }, "groups": {} },
         "memberships": { "42": [42] }
@@ -274,6 +307,26 @@ mod tests {
         let state = state();
         let request = request_with_uid(7);
         let status = authorize(&state, &request, Op::Get, "app.secret").expect_err("denied");
+        assert_eq!(status.code(), Code::PermissionDenied);
+    }
+
+    #[test]
+    fn authorize_in_generation_uses_pinned_policy_after_active_swap() {
+        let state = state();
+        let request = request_with_uid(42);
+        let pinned = state.load_generation();
+
+        let (catalog, policy, config, warnings) =
+            load(CATALOG, DENY_POLICY).expect("deny fixture loads");
+        assert!(warnings.is_empty());
+        state.swap_generation(Arc::new(Generation::new(2, catalog, policy, config)));
+
+        let actor = authorize_in_generation(&state, &pinned, &request, Op::Get, "app.secret")
+            .expect("pinned allow generation still authorizes");
+        assert_eq!(actor.subject, "svc.app");
+
+        let status = authorize(&state, &request, Op::Get, "app.secret")
+            .expect_err("fresh active generation denies");
         assert_eq!(status.code(), Code::PermissionDenied);
     }
 

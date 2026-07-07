@@ -68,6 +68,7 @@ pub struct SignNatsJwtOptions {
 
 /// One candidate signer to trust when validating a presented NATS JWT.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AllowedNatsSigner {
     /// Catalog key name; Basil resolves the public `NKey` and authorizes access.
     KeyId(String),
@@ -103,6 +104,7 @@ impl AllowedNatsSigner {
 
 /// Machine-readable result of NATS JWT validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NatsJwtValidationReason {
     /// Token is valid under the supplied candidate signer set.
     Valid,
@@ -228,6 +230,7 @@ pub struct AgentHealth {
 
 /// Why the broker is not ready to serve (a coarse, non-secret category).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ReadinessReason {
     /// The broker can serve: every backend reachable, no `missing=error` key absent.
     Ready,
@@ -360,6 +363,50 @@ pub struct MatchedRule {
     pub subject: String,
 }
 
+/// Authorization decision returned by [`Client::explain`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AgentDecision {
+    /// The tuple is authorized.
+    Allow,
+    /// The tuple is denied.
+    Deny,
+    /// The broker returned a future decision this client does not know.
+    Unknown,
+}
+
+impl AgentDecision {
+    /// Stable token used by CLI and JSON output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Whether this decision is an allow.
+    #[must_use]
+    pub const fn is_allow(self) -> bool {
+        matches!(self, Self::Allow)
+    }
+
+    const fn from_proto(decision: pb::ExplainDecision) -> Self {
+        match decision {
+            pb::ExplainDecision::Allow => Self::Allow,
+            pb::ExplainDecision::Deny => Self::Deny,
+            pb::ExplainDecision::Unspecified => Self::Unknown,
+        }
+    }
+}
+
+impl std::fmt::Display for AgentDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A live policy explanation from the currently serving broker generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentExplanation {
@@ -369,8 +416,8 @@ pub struct AgentExplanation {
     pub op: String,
     /// Catalog key/target evaluated.
     pub key: String,
-    /// `allow` or `deny`.
-    pub decision: String,
+    /// Authorization decision.
+    pub decision: AgentDecision,
     /// Allow scope; empty on deny.
     pub via: String,
     /// Deny reason token; empty on allow.
@@ -1192,7 +1239,10 @@ impl Client {
             subject: body.subject,
             op: body.op,
             key: body.key,
-            decision: body.decision,
+            decision: AgentDecision::from_proto(
+                pb::ExplainDecision::try_from(body.decision)
+                    .unwrap_or(pb::ExplainDecision::Unspecified),
+            ),
             via: body.via,
             reason: body.reason,
             matched_rule: body.matched_rule.map(|m| MatchedRule {

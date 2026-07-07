@@ -258,6 +258,7 @@ pub(super) fn catalog_entry(value: basil_proto::CatalogEntry) -> pb::CatalogEntr
             basil_proto::CatalogKind::Signing => pb::CatalogKind::Signing,
             basil_proto::CatalogKind::Value => pb::CatalogKind::Value,
             basil_proto::CatalogKind::Encryption => pb::CatalogKind::Encryption,
+            _ => pb::CatalogKind::Unspecified,
         }
         .into(),
         key_type: value.key_type.map(proto_key_type),

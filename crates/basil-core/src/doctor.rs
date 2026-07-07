@@ -49,6 +49,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use rand::RngCore;
 use serde::Serialize;
 
 use crate::catalog::BackendKind;
@@ -664,18 +665,42 @@ fn socket_check(socket: &str, mode: u32, group: Option<&str>) -> CheckResult {
     )
 }
 
-/// Can we create an entry under `dir`? Probe with a temp file we immediately
-/// remove (never binds a socket). On non-unix or any error, fall back to a
-/// permissions-bit heuristic.
+/// Can we create an entry under `dir`? Probe with an exclusively-created temp
+/// file we immediately remove (never binds a socket).
 fn dir_is_writable(dir: &Path) -> bool {
-    let probe = dir.join(format!(".basil-doctor-{}.tmp", std::process::id()));
-    match std::fs::File::create(&probe) {
-        Ok(_) => {
-            let _ = std::fs::remove_file(&probe);
-            true
+    for _ in 0..8 {
+        let mut random = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut random);
+        let name = format!(
+            ".basil-doctor-{}-{}.tmp",
+            std::process::id(),
+            hex_lower(&random)
+        );
+        let probe = dir.join(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+        {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&probe);
+                return true;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return false,
         }
-        Err(_) => false,
     }
+    false
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
 }
 
 /// Does `group` (a name or numeric gid) resolve? A numeric gid always resolves;
@@ -1084,6 +1109,29 @@ mod tests {
         let sock = dir.join("basil.sock");
         let res = socket_check(&sock.to_string_lossy(), 0o600, None);
         assert_eq!(res.status, CheckStatus::Ok);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dir_writable_probe_does_not_follow_predictable_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = unique_dir();
+        let target = dir.join("target");
+        let predictable = dir.join(format!(".basil-doctor-{}.tmp", std::process::id()));
+        std::fs::write(&target, b"keep").expect("write target");
+        symlink(&target, &predictable).expect("create symlink");
+
+        assert!(dir_is_writable(&dir));
+        assert_eq!(
+            std::fs::read(&target).expect("read target"),
+            b"keep",
+            "probe must not truncate a predictable symlink target"
+        );
+
+        let _ = std::fs::remove_file(predictable);
+        let _ = std::fs::remove_file(target);
+        let _ = std::fs::remove_dir(dir);
     }
 
     #[test]

@@ -604,7 +604,7 @@ fn explain_response(
             subject: subject.to_string(),
             op: op.token().to_string(),
             key: key.to_string(),
-            decision: "allow".to_string(),
+            decision: pb::ExplainDecision::Allow.into(),
             via: allow_via_token(via),
             reason: String::new(),
             matched_rule: explanation.matched.as_ref().map(matched_rule),
@@ -613,7 +613,7 @@ fn explain_response(
             subject: subject.to_string(),
             op: op.token().to_string(),
             key: key.to_string(),
-            decision: "deny".to_string(),
+            decision: pb::ExplainDecision::Deny.into(),
             via: String::new(),
             reason: deny_reason_token(*reason),
             matched_rule: None,
@@ -1550,7 +1550,7 @@ mod tests {
         assert_eq!(resp.subject, "svc.app");
         assert_eq!(resp.op, "sign");
         assert_eq!(resp.key, "web.signer");
-        assert_eq!(resp.decision, "allow");
+        assert_eq!(resp.decision, pb::ExplainDecision::Allow as i32);
         assert_eq!(resp.via, "subject:svc.app");
         assert_eq!(resp.reason, "");
         let matched = resp.matched_rule.expect("matched rule");

@@ -27,9 +27,9 @@ pub use basil_proto::broker::v1::{
     SigningAlgorithm,
 };
 pub use client::{
-    AgentExplanation, AgentHealth, AgentReadiness, AgentReload, AgentRevocation, AgentStatus,
-    AllowedNatsSigner, Client, ImportEntry, IssuedCertificate, KeyHandle, MatchedRule, MintedJwt,
-    NatsJwtValidation, NatsJwtValidationReason, NatsUserPermissions, ReadinessReason,
+    AgentDecision, AgentExplanation, AgentHealth, AgentReadiness, AgentReload, AgentRevocation,
+    AgentStatus, AllowedNatsSigner, Client, ImportEntry, IssuedCertificate, KeyHandle, MatchedRule,
+    MintedJwt, NatsJwtValidation, NatsJwtValidationReason, NatsUserPermissions, ReadinessReason,
     ReloadRejection, SecretValue, SignNatsJwtOptions,
 };
 pub use client_sync::BlockingClient;
