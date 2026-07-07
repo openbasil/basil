@@ -30,6 +30,9 @@ A service can sign a release, terminate TLS, mint a short-lived JWT, or decrypt
 a backup, while the private key never appears in its memory, its environment,
 or on its disk.
 
+ 
+[![asciicast](https://asciinema.org/a/Dwz9uMVw6y1IfP6U)](https://asciinema.org/a/Dwz9uMVw6y1IfP6U)
+
 ## Try it in two minutes
 
 The repository ships a self-contained example that needs no external backend.
