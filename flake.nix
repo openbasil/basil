@@ -160,6 +160,8 @@
               "-p"
               "basil-bin"
               "-p"
+              "basil-nats-bridge"
+              "-p"
               "xtask"
             ];
             doCheck = false;

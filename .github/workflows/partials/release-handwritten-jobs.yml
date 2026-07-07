@@ -48,7 +48,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       # Provision the toolchain pinned by rust-toolchain.toml (no hardcoded Rust
@@ -59,19 +59,21 @@ jobs:
       - name: Install protoc
         run: |
           set -euo pipefail
+          sudo find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name 'azure*.list' -o -name 'microsoft*.list' -o -name '*microsoft*.list' \) -print -delete || true
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
           protoc --version
       - name: Build stripped release binaries and man pages
         # No --target: the runner arch matches the package arch, so this is a
-        # native build. basil-bin's DEFAULT features (spiffe + db-keystore +
-        # onepassword + unlock-age-yubikey + unlock-bip39 + pqc) are the
-        # supported release build. Optional HTTP, TPM, AWS KMS, and GCP KMS
-        # surfaces are deliberately outside the default release build. The
-        # profile strips symbols and uses fat LTO for shipped artifacts. `xtask`
-        # emits roff man pages for both shipped binaries.
+        # native build. basil-bin's DEFAULT features (db-keystore +
+        # onepassword + unlock-age-yubikey + unlock-bip39) are the supported
+        # release build; PQC and SPIFFE client dependencies are always compiled
+        # in. Optional HTTP server, TPM, AWS KMS, GCP KMS, OTLP, and secure
+        # allocator surfaces are deliberately outside the default release build.
+        # The profile strips symbols and uses fat LTO for shipped artifacts.
+        # `xtask` emits roff man pages for both shipped binaries.
         run: |
-          cargo build --profile dist -p basil-bin -p xtask
+          cargo build --profile dist -p basil-bin -p basil-nats-bridge -p xtask
           target/dist/xtask -o target/dist/man
       - name: Assemble .deb
         id: deb
@@ -111,7 +113,7 @@ jobs:
           dpkg-deb --root-owner-group --build "$root" "$deb"
           echo "path=$deb" >> "$GITHUB_OUTPUT"
       - name: Attest build provenance for the .deb
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: ${{ steps.deb.outputs.path }}
       - name: Attach the .deb to the GitHub Release
@@ -149,7 +151,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Derive pkgver from the tag
@@ -193,7 +195,7 @@ jobs:
           fi
           echo "path=$pkg" >> "$GITHUB_OUTPUT"
       - name: Attest build provenance for the Arch package
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: ${{ steps.pkg.outputs.path }}
       - name: Attach the Arch package to the GitHub Release

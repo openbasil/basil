@@ -18,6 +18,11 @@ rust-version = "1.88"
 publish = true
 autobins = false
 
+[package.metadata.dist]
+# Keep the bridge in GitHub release archives and shell installers, but do not
+# emit a second Homebrew formula from the same workspace release.
+installers = ["shell"]
+
 [[bin]]
 name = "basil-nats-bridge"
 path = "src/main.rs"

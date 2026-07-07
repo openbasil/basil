@@ -12,9 +12,9 @@
 # keeping the human-readable tag as a trailing comment so the pin stays legible
 # and tools like Dependabot/Renovate can still bump it.
 #
-# Idempotent: lines already pinned to a 40-hex SHA are left untouched (their
-# trailing `# tag` comment, if any, is preserved). Local (`./…`) and Docker
-# (`docker://…`) action refs are skipped.
+# Idempotent: unpinned refs are pinned, and lines already pinned to a 40-hex SHA
+# are refreshed when their trailing `# tag` comment identifies the intended
+# moving tag. Local (`./…`) and Docker (`docker://…`) action refs are skipped.
 #
 # Requires the GitHub CLI authenticated (or GH_TOKEN set) to resolve refs:
 #   gh auth login        # or: export GH_TOKEN=<token>
@@ -91,8 +91,19 @@ for file in "${files[@]}"; do
       if [[ "$action" == ./* || "$action" == docker://* ]]; then
         printf '%s\n' "$line" >>"$tmp"; continue
       fi
-      # Already a SHA: leave as-is (keep whatever comment is there).
       if is_sha "$ref"; then
+        # Already a SHA. If the line carries our conventional trailing
+        # `# tag`, refresh the SHA to the current target of that tag so stale
+        # pins can be advanced by rerunning this script.
+        if [[ "${BASH_REMATCH[5]:-}" =~ ^[[:space:]]*#[[:space:]]*([^[:space:]]+)[[:space:]]*$ ]]; then
+          tag="${BASH_REMATCH[1]}"
+          sha="$(resolve "$action" "$tag")"
+          printf '%s%s@%s # %s\n' "$prefix" "$action" "$sha" "$tag" >>"$tmp"
+          if [ "$sha" != "$ref" ]; then
+            changed=1
+          fi
+          continue
+        fi
         printf '%s\n' "$line" >>"$tmp"; continue
       fi
       sha="$(resolve "$action" "$ref")"

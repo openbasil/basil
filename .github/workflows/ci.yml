@@ -8,7 +8,7 @@ name: CI
 #
 # Triggers (mirrors build.yml): this workflow deliberately does NOT run on
 # branch pushes or pull requests. It runs only on:
-#   * push of a `basil-v*` tag whose commit is on `main` -- a guard rejects tags
+#   * push of a `v*` tag whose commit is on `main` -- a guard rejects tags
 #     that are not an ancestor of main; the full architecture matrix runs.
 #   * manual `workflow_dispatch` -> test one chosen architecture (or `all`).
 #
@@ -19,7 +19,7 @@ name: CI
 on:
   push:
     tags:
-      - 'basil-v*'
+      - 'v*'
   workflow_dispatch:
     inputs:
       architecture:
@@ -64,7 +64,7 @@ jobs:
       # tag push needs the checkout; a manual dispatch just reads the arch input.
       - name: Checkout
         if: ${{ github.event_name == 'push' }}
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -110,7 +110,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       # Provision the exact toolchain pinned by rust-toolchain.toml (channel +
       # rustfmt/clippy components + targets). `rustup show` installs the
@@ -120,10 +120,10 @@ jobs:
         run: rustup show
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Install just
-        uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
 
       # basil-proto's build.rs drives `tonic-prost-build`, which shells out to
       # `protoc`. The Nix build (build.yml) gets it from the flake; these native
@@ -132,6 +132,7 @@ jobs:
         if: ${{ runner.os == 'Linux' }}
         run: |
           set -euo pipefail
+          sudo find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name 'azure*.list' -o -name 'microsoft*.list' -o -name '*microsoft*.list' \) -print -delete || true
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
           protoc --version
@@ -205,7 +206,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout (with clients/go submodule)
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           submodules: recursive
 
@@ -215,21 +216,22 @@ jobs:
         run: rustup show
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Install Go (from clients/go/go.mod)
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: clients/go/go.mod
 
       - name: Install just
-        uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
 
       # `test-stream-interop` builds the Rust `stream_cli` example, whose
       # basil-proto dependency runs `protoc` in its build script.
       - name: Install protoc
         run: |
           set -euo pipefail
+          sudo find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name 'azure*.list' -o -name 'microsoft*.list' -o -name '*microsoft*.list' \) -print -delete || true
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
           protoc --version

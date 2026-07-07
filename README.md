@@ -94,6 +94,8 @@ vulnerabilities.
 
 ## Status
 
+[Feature matrix and Roadmap](https://docs.openbasil.org/reference/feature-matrix/)
+
 Basil is pre-1.0 (currently 0.6.x) and under active development. The wire
 protocol and config formats can still change between minor versions; breaking
 changes are called out in the [CHANGELOG](CHANGELOG.md). It runs on Linux;

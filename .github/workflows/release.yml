@@ -38,13 +38,13 @@ permissions:
 #
 # If there's a prerelease-style suffix to the version, then the release(s)
 # will be marked as a prerelease.
-# Runs ONLY on a pushed `basil-v*` release tag -- deliberately NOT on branch
+# Runs ONLY on a pushed `v*` release tag -- deliberately NOT on branch
 # pushes or pull requests. dist reads the version from the tag (github.ref_name),
 # so this pipeline has no manual `workflow_dispatch`: it always needs a real tag.
 on:
   push:
     tags:
-      - 'basil-v*'
+      - 'v*'
 
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
@@ -58,7 +58,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
           submodules: recursive
@@ -122,7 +122,7 @@ jobs:
       - name: enable windows longpaths
         run: |
           git config --global core.longpaths true
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
           submodules: recursive
@@ -142,6 +142,12 @@ jobs:
           pattern: artifacts-*
           path: target/distrib/
           merge-multiple: true
+      - name: Disable transient Microsoft apt sources
+        if: ${{ runner.os == 'Linux' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name 'azure*.list' -o -name 'microsoft*.list' -o -name '*microsoft*.list' \) -print -delete || true
       - name: Install dependencies
         run: |
           ${{ matrix.packages_install }}
@@ -154,7 +160,11 @@ jobs:
         run: |
           set -euo pipefail
           case "$RUNNER_OS" in
-            Linux) sudo apt-get update && sudo apt-get install -y protobuf-compiler ;;
+            Linux)
+              sudo find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name 'azure*.list' -o -name 'microsoft*.list' -o -name '*microsoft*.list' \) -print -delete || true
+              sudo apt-get update
+              sudo apt-get install -y protobuf-compiler
+              ;;
             macOS) brew install protobuf ;;
           esac
           protoc --version
@@ -198,7 +208,7 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
           submodules: recursive
@@ -248,7 +258,7 @@ jobs:
     outputs:
       val: ${{ steps.host.outputs.manifest }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
           submodules: recursive
@@ -313,7 +323,7 @@ jobs:
       GITHUB_EMAIL: "admin+bot@axo.dev"
     if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: true
           repository: "openbasil/homebrew-tap"
@@ -360,7 +370,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
           submodules: recursive
@@ -398,7 +408,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
       # Provision the toolchain pinned by rust-toolchain.toml (no hardcoded Rust
@@ -409,19 +419,21 @@ jobs:
       - name: Install protoc
         run: |
           set -euo pipefail
+          sudo find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name 'azure*.list' -o -name 'microsoft*.list' -o -name '*microsoft*.list' \) -print -delete || true
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
           protoc --version
       - name: Build stripped release binaries and man pages
         # No --target: the runner arch matches the package arch, so this is a
-        # native build. basil-bin's DEFAULT features (spiffe + db-keystore +
-        # onepassword + unlock-age-yubikey + unlock-bip39 + pqc) are the
-        # supported release build. Optional HTTP, TPM, AWS KMS, and GCP KMS
-        # surfaces are deliberately outside the default release build. The
-        # profile strips symbols and uses fat LTO for shipped artifacts. `xtask`
-        # emits roff man pages for both shipped binaries.
+        # native build. basil-bin's DEFAULT features (db-keystore +
+        # onepassword + unlock-age-yubikey + unlock-bip39) are the supported
+        # release build; PQC and SPIFFE client dependencies are always compiled
+        # in. Optional HTTP server, TPM, AWS KMS, GCP KMS, OTLP, and secure
+        # allocator surfaces are deliberately outside the default release build.
+        # The profile strips symbols and uses fat LTO for shipped artifacts.
+        # `xtask` emits roff man pages for both shipped binaries.
         run: |
-          cargo build --profile dist -p basil-bin -p xtask
+          cargo build --profile dist -p basil-bin -p basil-nats-bridge -p xtask
           target/dist/xtask -o target/dist/man
       - name: Assemble .deb
         id: deb
@@ -461,7 +473,7 @@ jobs:
           dpkg-deb --root-owner-group --build "$root" "$deb"
           echo "path=$deb" >> "$GITHUB_OUTPUT"
       - name: Attest build provenance for the .deb
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
         with:
           subject-path: ${{ steps.deb.outputs.path }}
       - name: Attach the .deb to the GitHub Release
@@ -499,7 +511,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
       - name: Derive pkgver from the tag
@@ -543,7 +555,7 @@ jobs:
           fi
           echo "path=$pkg" >> "$GITHUB_OUTPUT"
       - name: Attest build provenance for the Arch package
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
         with:
           subject-path: ${{ steps.pkg.outputs.path }}
       - name: Attach the Arch package to the GitHub Release

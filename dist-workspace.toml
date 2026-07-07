@@ -8,9 +8,8 @@
 # Reference: https://axodotdev.github.io/cargo-dist/book/reference/config.html
 #
 # What dist owns here:
-#   * signed, attested `.tar.xz` archives of the `basil-bin` package for the
-#     three first-class targets below, each containing `basil` and
-#     `basil-nats-bridge`;
+#   * signed, attested `.tar.xz` archives for the three first-class targets
+#     below, covering the `basil` and `basil-nats-bridge` binaries;
 #   * a Homebrew formula (serves macOS arm64 AND Linux) published to the
 #     `openbasil/homebrew-tap` tap;
 #   * GitHub Artifact Attestations (build provenance) for every artifact.
@@ -29,14 +28,14 @@ cargo-dist-version = "0.32.0"
 # CI backend + release hosting.
 ci = "github"
 hosting = "github"
-# The dist-able package is `crates/basil-bin`, which ships both the unified
-# `basil` binary and the companion `basil-nats-bridge` courier. The `basil`
-# binary is built with its DEFAULT features (onepassword + unlock-age-yubikey +
-# unlock-bip39); SPIFFE and PQC are always compiled in. Optional HTTP,
-# db-keystore, TPM, AWS KMS, and GCP KMS surfaces are deliberately outside the
-# default release build.
-packages = ["basil-bin"]
-installers = ["homebrew"]
+# The dist-able packages ship the unified `basil` binary and the companion
+# `basil-nats-bridge` courier. The `basil` binary is built with its DEFAULT
+# features (db-keystore + onepassword + unlock-age-yubikey + unlock-bip39). PQC
+# and SPIFFE client dependencies are always compiled in. Optional HTTP server,
+# TPM, AWS KMS, GCP KMS, OTLP, and secure allocator surfaces are deliberately
+# outside the default release build.
+packages = ["basil-bin", "basil-nats-bridge"]
+installers = ["shell", "homebrew"]
 # First-class release targets.
 targets = [
   "x86_64-unknown-linux-gnu",
@@ -48,12 +47,14 @@ unix-archive = ".tar.xz"
 # Homebrew tap the `publish-homebrew-formula` job pushes to. The tap repo must
 # exist and CI must hold a HOMEBREW_TAP_TOKEN secret (see docs/runbooks/release.md).
 tap = "openbasil/homebrew-tap"
+# Release tags must use `v{semver}`. cargo-dist 0.32.0 parses `basil-v0.7.0`
+# as a singular package tag for the `basil` Rust client crate, which has no
+# distributable binaries, so the release matrix comes out empty.
 publish-jobs = ["homebrew"]
-# Name the formula `basil` (not the crate name `basil-bin`) so the install is
-# `brew install openbasil/tap/basil`.
-formula = "basil"
 # Only run `dist plan` on PRs (no artifact uploads).
 pr-run-mode = "plan"
+# Publish RCs to the tap when the release tag itself is a prerelease.
+publish-prereleases = true
 # Emit GitHub Artifact Attestations (Sigstore build provenance) for all
 # artifacts. Verified with `gh attestation verify` (public repo required).
 github-attestations = true

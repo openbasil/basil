@@ -124,6 +124,7 @@ capability-policy = "strict"
 
 [unlock]
 unlock-passphrase-file = "$PASS_FILE"
+unlock-passphrase-no-wipe = true
 EOF
 
 # ---- step 6: boot the broker against the pre-filled store + bundle -----------
@@ -268,6 +269,7 @@ capability-policy = "strict"
 
 [unlock]
 unlock-passphrase-file = "$PASS_FILE"
+unlock-passphrase-no-wipe = true
 EOF
 if timeout 30 "$AGENT_BIN" agent \
      --config "$BAD_CONFIG" --vault-addr "$ADDR" --socket "$BAD_SOCKET" \
@@ -360,6 +362,7 @@ no-reconcile = true
 
 [unlock]
 unlock-passphrase-file = "$PASS_FILE"
+unlock-passphrase-no-wipe = true
 EOF
 "$AGENT_BIN" agent \
     --config "$GRACE0_CONFIG" \
@@ -424,6 +427,7 @@ no-reconcile = true
 
 [unlock]
 unlock-passphrase-file = "$PASS_FILE"
+unlock-passphrase-no-wipe = true
 EOF
 "$AGENT_BIN" agent \
     --config "$RET_CONFIG" \
