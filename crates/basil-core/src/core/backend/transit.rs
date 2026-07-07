@@ -616,30 +616,41 @@ impl TransitClient {
     /// extracted into a fresh [`Zeroizing`] `String` and the parsed `Value` is
     /// dropped immediately (its transient b64 residue is the irreducible serde
     /// cost: minimized, not retained); that `Zeroizing` `String` is base64-decoded
-    /// into the returned [`Zeroizing`] `Vec<u8>`. Used **only** by the sealing
-    /// materialize path (the value is an X25519 private key).
+    /// into the returned [`Zeroizing`] `Vec<u8>`. Serves the materialize paths
+    /// (the value is a private key) and the value-class `get` (the value is a
+    /// stored secret, security review finding 17).
     pub(crate) async fn kv_get_secret(
         &self,
         token: &str,
         key_id: &str,
         version: Option<u32>,
-    ) -> Result<Zeroizing<Vec<u8>>, BackendError> {
+    ) -> Result<super::KvSecret, BackendError> {
         let path = version.map_or_else(|| key_id.to_string(), |v| format!("{key_id}?version={v}"));
         // Read the body as zeroizing text (wipes the JSON, which holds the b64 key).
         let body = self.get_at_text(Mount::KvAbsolute, token, &path).await?;
         // Extract the base64 value into a zeroizing String, then drop the Value
         // immediately so the transient b64 residue inside serde's tree is wiped as
         // soon as possible (the body text is wiped when `body` drops at fn end).
-        let value_b64: Zeroizing<String> = {
+        let (value_b64, read_version): (Zeroizing<String>, u32) = {
             let parsed: Value = serde_json::from_str(&body)
                 .map_err(|e| BackendError::Protocol(format!("kv read not JSON: {e}")))?;
-            let b64 = parsed
+            let data = parsed
                 .get("data")
-                .and_then(|d| d.get("data"))
+                .ok_or_else(|| BackendError::Protocol("missing data in kv read".into()))?;
+            let b64 = data
+                .get("data")
                 .and_then(|d| d.get("value"))
                 .and_then(Value::as_str)
                 .ok_or_else(|| BackendError::Protocol("no value field in kv read".into()))?;
-            Zeroizing::new(b64.to_string())
+            let read_version = data
+                .get("metadata")
+                .and_then(|m| m.get("version"))
+                .and_then(Value::as_u64)
+                .map_or_else(
+                    || version.unwrap_or(1),
+                    |v| u32::try_from(v).unwrap_or(u32::MAX),
+                );
+            (Zeroizing::new(b64.to_string()), read_version)
             // `parsed` (and its inner b64 String) drops here.
         };
         let value = Zeroizing::new(
@@ -647,7 +658,10 @@ impl TransitClient {
                 // Do NOT echo decode detail (could leak material); fixed message.
                 .map_err(|_| BackendError::Protocol("kv value not base64".into()))?,
         );
-        Ok(value)
+        Ok(super::KvSecret {
+            value,
+            version: read_version,
+        })
     }
 
     /// Write `value` as a fresh KV-v2 version of `key_id`, returning the new

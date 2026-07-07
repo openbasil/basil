@@ -600,7 +600,7 @@ async fn issue_x509_response(
     _uid: u32,
     plan: &X509IssuePlan,
 ) -> Result<X509svidResponse, Status> {
-    let issued = state
+    let mut issued = state
         .manager()
         .issue_x509_svid(&plan.key_name, &plan.spiffe_id, plan.ttl_seconds)
         .await
@@ -609,7 +609,10 @@ async fn issue_x509_response(
         svids: vec![X509svid {
             spiffe_id: plan.spiffe_id.clone(),
             x509_svid: issued.cert_chain_der.concat(),
-            x509_svid_key: issued.leaf_private_key_der.to_vec(),
+            // Move (never copy) the leaf key out of its `Zeroizing` buffer:
+            // the proto field is then the only plain copy, and `X509svid`
+            // zeroizes it on drop after tonic encodes the response.
+            x509_svid_key: std::mem::take(&mut *issued.leaf_private_key_der),
             bundle: issued.bundle_der.concat(),
             hint: String::new(),
         }],

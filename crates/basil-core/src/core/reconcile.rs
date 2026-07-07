@@ -575,9 +575,12 @@ mod tests {
             &self,
             _key_id: &str,
             _version: Option<u32>,
-        ) -> Result<zeroize::Zeroizing<Vec<u8>>, BackendError> {
+        ) -> Result<crate::backend::KvSecret, BackendError> {
             match self.probe {
-                Probe::Present => Ok(zeroize::Zeroizing::new(b"present".to_vec())),
+                Probe::Present => Ok(crate::backend::KvSecret {
+                    value: zeroize::Zeroizing::new(b"present".to_vec()),
+                    version: 1,
+                }),
                 Probe::Absent => Err(BackendError::KeyNotFound("absent".into())),
                 Probe::Unreachable => Err(BackendError::Transport("connection refused".into())),
             }

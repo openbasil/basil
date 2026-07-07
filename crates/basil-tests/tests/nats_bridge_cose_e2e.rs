@@ -399,6 +399,7 @@ async fn nats_bridge_round_trips_sealed_cose() {
             request_subject: REQUEST_SUBJECT.to_string(),
             queue_group: None,
             max_message_bytes: 1024 * 1024,
+            concurrency_limit: 32,
         },
     };
     let bridge = tokio::spawn(async move { basil_nats_bridge::run(config).await });
@@ -522,6 +523,7 @@ async fn go_client_round_trips_sealed_cose_through_nats_bridge() {
             request_subject: REQUEST_SUBJECT.to_string(),
             queue_group: None,
             max_message_bytes: 1024 * 1024,
+            concurrency_limit: 32,
         },
     };
     let bridge = tokio::spawn(async move { basil_nats_bridge::run(config).await });

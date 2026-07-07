@@ -710,9 +710,10 @@ impl Client {
             }),
         )
         .await?;
-        let body = response.into_inner();
+        let mut body = response.into_inner();
         Ok(SecretValue {
-            value: body.value,
+            // The response zeroizes its `value` on drop; take the bytes out.
+            value: std::mem::take(&mut body.value),
             version: body.version,
         })
     }
@@ -1070,11 +1071,12 @@ impl Client {
             }),
         )
         .await?;
-        let body = response.into_inner();
+        let mut body = response.into_inner();
         Ok(IssuedCertificate {
-            cert_chain_der: body.cert_chain_der,
-            private_key_der: body.private_key_der,
-            ca_chain_der: body.ca_chain_der,
+            // The response zeroizes its private key on drop; take fields out.
+            cert_chain_der: std::mem::take(&mut body.cert_chain_der),
+            private_key_der: std::mem::take(&mut body.private_key_der),
+            ca_chain_der: std::mem::take(&mut body.ca_chain_der),
         })
     }
 

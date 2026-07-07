@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -484,28 +484,32 @@ fn deposit_aad(
 }
 
 fn credential_fingerprint(cred: &BackendCred) -> String {
+    /// The three non-secret identifying fields of a GCP service-account key
+    /// file. Deserializing through this typed view skips every other field
+    /// (notably `private_key`) as transient parser state instead of
+    /// materializing the whole secret JSON into a `serde_json::Value` tree.
+    #[derive(Deserialize)]
+    struct GcpSaIdentity {
+        project_id: Option<String>,
+        client_email: Option<String>,
+        private_key_id: Option<String>,
+    }
+
     if let BackendCred::GcpKms {
         service_account_json: Some(json),
         ..
     } = cred
-        && let Ok(value) = serde_json::from_str::<serde_json::Value>(json.expose_secret())
+        && let Ok(identity) = serde_json::from_str::<GcpSaIdentity>(json.expose_secret())
     {
-        let project = value
-            .get("project_id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("-");
-        let email = value
-            .get("client_email")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("-");
-        let key_id = value
-            .get("private_key_id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("-");
+        let project = identity.project_id.as_deref().unwrap_or("-");
+        let email = identity.client_email.as_deref().unwrap_or("-");
+        let key_id = identity.private_key_id.as_deref().unwrap_or("-");
         return format!("gcp-sa:{project}:{email}:{key_id}");
     }
 
-    let encoded = serde_json::to_vec(cred).unwrap_or_default();
-    let digest = Sha256::digest(encoded);
+    // The serialized credential carries the secret itself: keep the encoded
+    // bytes in `Zeroizing` (wiped on drop) so only the digest survives.
+    let encoded = Zeroizing::new(serde_json::to_vec(cred).unwrap_or_default());
+    let digest = Sha256::digest(encoded.as_slice());
     format!("sha256:{}", B64.encode(digest))
 }

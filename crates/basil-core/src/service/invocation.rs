@@ -924,12 +924,15 @@ mod tests {
             &self,
             key_id: &str,
             version: Option<u32>,
-        ) -> Result<Zeroizing<Vec<u8>>, BackendError> {
+        ) -> Result<crate::backend::KvSecret, BackendError> {
             let _ = version;
             self.kv
                 .get(key_id)
                 .cloned()
-                .map(Zeroizing::new)
+                .map(|value| crate::backend::KvSecret {
+                    value: Zeroizing::new(value),
+                    version: 1,
+                })
                 .ok_or_else(|| BackendError::KeyNotFound(key_id.to_string()))
         }
     }

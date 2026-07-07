@@ -21,6 +21,13 @@ SPDX-License-Identifier: Apache-2.0
   bounded concurrency limit, BYOK `KeyMaterial` redacts and zeroizes private
   bytes, the COSE-over-NATS demo uses subscription readiness instead of a sleep,
   and the streaming encryption format now has a normative spec.
+- Security review fixes: zeroization gaps closed on four secondary paths —
+  deposit credential fingerprinting no longer parses the full secret JSON and
+  hashes through a zeroizing buffer, value-class `get_secret` reads flow through
+  the same zeroizing chain as the seed path, X.509 leaf private keys are moved
+  (not copied) into wire messages that now zeroize on drop (also `get_secret`
+  and `issue_certificate` responses), and the Vault `AppRole` login response is
+  parsed through typed zeroizing storage instead of a JSON value tree.
 - Nix example hardening: the example package now defaults to the local flake
   instead of a remote repository.
 

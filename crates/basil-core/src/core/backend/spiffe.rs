@@ -22,13 +22,14 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tracing::{debug, info};
-use zeroize::Zeroizing;
 
 use basil_proto::{AeadAlgorithm, CiphertextEnvelope, KeyMaterial, KeyType};
 
 use super::svid::SvidMinter;
 use super::transit::{TransitClient, read_body, transit_aead_type};
-use super::{Backend, BackendError, KeyMetadata, KvValue, NewKey, PublicKey, SignOptions};
+use super::{
+    Backend, BackendError, KeyMetadata, KvSecret, KvValue, NewKey, PublicKey, SignOptions,
+};
 
 /// Re-login this long before the cached token actually expires.
 const TOKEN_REFRESH_SKEW: Duration = Duration::from_secs(10);
@@ -335,7 +336,7 @@ impl Backend for SpiffeVaultBackend {
         &self,
         key_id: &str,
         version: Option<u32>,
-    ) -> Result<Zeroizing<Vec<u8>>, BackendError> {
+    ) -> Result<KvSecret, BackendError> {
         let token = self.token().await?;
         self.transit.kv_get_secret(&token, key_id, version).await
     }

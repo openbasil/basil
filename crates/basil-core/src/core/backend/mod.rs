@@ -52,6 +52,21 @@ pub struct KvValue {
     pub version: u32,
 }
 
+/// A KV-v2 SECRET read: the stored bytes wrapped in [`Zeroizing`] plus the
+/// version they came from.
+///
+/// The secret-custody sibling of [`KvValue`], returned by
+/// [`Backend::kv_get_secret`] for reads whose bytes are secrets (a
+/// materialize-to-use private key, a value-class `get`). The buffer wipes on
+/// drop.
+#[derive(Debug)]
+pub struct KvSecret {
+    /// The raw stored value bytes; wiped on drop.
+    pub value: Zeroizing<Vec<u8>>,
+    /// The KV-v2 version these bytes were read from.
+    pub version: u32,
+}
+
 /// A post-quantum algorithm a [`Backend`] may natively custody and operate on
 /// **in place**: the private seed never leaves the backend.
 ///
@@ -513,16 +528,17 @@ pub trait Backend: Send + Sync {
     /// Read a **KV-v2 value as a SECRET**: the stored bytes wrapped in
     /// [`Zeroizing`] end-to-end, never landing in a non-zeroizing owner that drops
     /// un-wiped. Distinct from [`Backend::kv_get`], which returns a plain
-    /// [`KvValue`] for value/public reads, this path is used **only** by the
-    /// sealing materialize (`materialize_sealing_private`), where the bytes are an
-    /// X25519 private key. The returned buffer wipes on drop.
+    /// [`KvValue`] for public/probe reads, this path serves the materialize
+    /// reads (`materialize_sealing_private` / `materialize_signing_seed`, where
+    /// the bytes are a private key) and the value-class `get` (where the bytes
+    /// are a stored secret). The returned buffer wipes on drop.
     ///
     /// The default returns [`BackendError::Unsupported`]; [`transit`] overrides it.
     async fn kv_get_secret(
         &self,
         key_id: &str,
         version: Option<u32>,
-    ) -> Result<Zeroizing<Vec<u8>>, BackendError> {
+    ) -> Result<KvSecret, BackendError> {
         let _ = (key_id, version);
         Err(BackendError::Unsupported("kv_get_secret"))
     }

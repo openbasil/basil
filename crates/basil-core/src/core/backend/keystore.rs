@@ -16,7 +16,7 @@ use basil_keystore_backend::{
 use basil_proto::{AeadAlgorithm, CiphertextEnvelope, KeyMaterial, KeyType};
 use zeroize::Zeroizing;
 
-use super::{Backend, BackendError, KeyMetadata, KvValue, NewKey, PublicKey};
+use super::{Backend, BackendError, KeyMetadata, KvSecret, KvValue, NewKey, PublicKey};
 
 /// Backend over a local/external key-value secret store.
 pub struct KeystoreBackend {
@@ -181,13 +181,16 @@ impl Backend for KeystoreBackend {
         &self,
         key_id: &str,
         version: Option<u32>,
-    ) -> Result<Zeroizing<Vec<u8>>, BackendError> {
+    ) -> Result<KvSecret, BackendError> {
         if let Some(v) = version
             && v != keystore_version()
         {
             return Err(BackendError::KeyNotFound(key_id.to_owned()));
         }
-        self.get_secret(key_id)
+        Ok(KvSecret {
+            value: self.get_secret(key_id)?,
+            version: keystore_version(),
+        })
     }
 
     async fn kv_put(&self, key_id: &str, value: &[u8]) -> Result<u32, BackendError> {

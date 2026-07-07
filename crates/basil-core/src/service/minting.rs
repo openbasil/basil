@@ -69,16 +69,19 @@ impl MintingService for BrokerGrpc {
             ip_sans: body.ip_sans.clone(),
             ttl_seconds: ttl_secs,
         };
-        let issued = self
+        let mut issued = self
             .state
             .manager()
             .issue_x509_cert(&body.issuer_key_id, &cert_request)
             .await
             .map_err(|e| manager_status("issue_certificate", &e))?;
         Ok(Response::new(pb::IssueCertificateResponse {
-            cert_chain_der: issued.cert_chain_der,
-            private_key_der: issued.leaf_private_key_der.to_vec(),
-            ca_chain_der: issued.bundle_der,
+            cert_chain_der: std::mem::take(&mut issued.cert_chain_der),
+            // Move (never copy) the leaf key out of its `Zeroizing` buffer:
+            // the proto field is then the only plain copy, and the response
+            // zeroizes it on drop after tonic encodes it.
+            private_key_der: std::mem::take(&mut *issued.leaf_private_key_der),
+            ca_chain_der: std::mem::take(&mut issued.bundle_der),
         }))
     }
 }

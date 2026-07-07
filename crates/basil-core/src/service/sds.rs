@@ -285,7 +285,7 @@ async fn secret_resource(state: &BrokerState, plan: &SdsResourcePlan) -> Result<
             spiffe_id,
             ttl_seconds,
         } => {
-            let issued = state
+            let mut issued = state
                 .manager()
                 .issue_x509_svid(key_name, spiffe_id, *ttl_seconds)
                 .await
@@ -294,7 +294,15 @@ async fn secret_resource(state: &BrokerState, plan: &SdsResourcePlan) -> Result<
                 name: resource_name.clone(),
                 r#type: Some(Type::TlsCertificate(TlsCertificate {
                     certificate_chain: Some(inline_bytes(issued.cert_chain_der.concat())),
-                    private_key: Some(inline_bytes(issued.leaf_private_key_der.to_vec())),
+                    // Move (never copy) the leaf key out of its `Zeroizing`
+                    // buffer: the proto field is then the only plain copy, and
+                    // `TlsCertificate` zeroizes it on drop right after the
+                    // `encode_to_vec` below. The encoded `Any` payload also
+                    // carries the key but is owned by the discovery response /
+                    // tonic after send, out of wiping reach.
+                    private_key: Some(inline_bytes(std::mem::take(
+                        &mut *issued.leaf_private_key_der,
+                    ))),
                 })),
             }
         }
@@ -573,19 +581,25 @@ mod tests {
         let Some(Type::TlsCertificate(cert)) = cert.r#type else {
             panic!("expected tls certificate");
         };
+        // `TlsCertificate` zeroizes on drop, so fields cannot be moved out:
+        // assert on borrowed views.
         assert_eq!(
             cert.certificate_chain
+                .as_ref()
                 .expect("certificate chain")
                 .specifier
+                .as_ref()
                 .expect("inline chain"),
-            Specifier::InlineBytes(b"leafissuer".to_vec())
+            &Specifier::InlineBytes(b"leafissuer".to_vec())
         );
         assert_eq!(
             cert.private_key
+                .as_ref()
                 .expect("private key")
                 .specifier
+                .as_ref()
                 .expect("inline key"),
-            Specifier::InlineBytes(b"private-key".to_vec())
+            &Specifier::InlineBytes(b"private-key".to_vec())
         );
 
         let bundle = decode_secret(&response.resources[1]);

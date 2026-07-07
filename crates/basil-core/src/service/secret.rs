@@ -23,15 +23,18 @@ impl SecretService for BrokerGrpc {
     ) -> GrpcResult<pb::GetSecretResponse> {
         let body = request.get_ref();
         self.authorize(&request, Op::Get, &body.secret_id)?;
-        let value = self
+        let mut secret = self
             .state
             .manager()
             .get(&body.secret_id, body.version)
             .await
             .map_err(|e| manager_status("get_secret", &e))?;
         Ok(Response::new(pb::GetSecretResponse {
-            value: value.value,
-            version: value.version,
+            // Move (never copy) the bytes out of the `Zeroizing` chain: the
+            // proto field is then the only plain copy, and the response
+            // zeroizes it on drop after tonic encodes it (finding 17).
+            value: std::mem::take(&mut *secret.value),
+            version: secret.version,
         }))
     }
 

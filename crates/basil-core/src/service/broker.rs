@@ -486,10 +486,13 @@ mod tests {
             &self,
             key_id: &str,
             version: Option<u32>,
-        ) -> Result<Zeroizing<Vec<u8>>, BackendError> {
+        ) -> Result<crate::backend::KvSecret, BackendError> {
             let _ = version;
             match key_id {
-                "nats/curve-box" => Ok(Zeroizing::new(vec![0x55; 32])),
+                "nats/curve-box" => Ok(crate::backend::KvSecret {
+                    value: Zeroizing::new(vec![0x55; 32]),
+                    version: 1,
+                }),
                 _ => Err(BackendError::KeyNotFound(key_id.to_string())),
             }
         }

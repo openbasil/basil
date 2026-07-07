@@ -277,6 +277,20 @@ pub async fn approle_login(
     role_id: &str,
     secret_id: &str,
 ) -> Result<Zeroizing<String>> {
+    /// Typed view of the login response body: only the two fields the caller
+    /// needs are parsed; everything else is skipped as transient parser state
+    /// instead of landing in a `serde_json::Value` copy of the token.
+    #[derive(serde::Deserialize)]
+    struct LoginResponse {
+        auth: Option<LoginAuth>,
+    }
+    #[derive(serde::Deserialize)]
+    struct LoginAuth {
+        client_token: Option<String>,
+        #[serde(default)]
+        lease_duration: u64,
+    }
+
     let addr = addr.trim_end_matches('/');
     let url = format!("{addr}/v1/auth/approle/login");
     crate::ensure_crypto_provider();
@@ -293,28 +307,32 @@ pub async fn approle_login(
         .await
         .context("sending AppRole login request")?;
     let status = resp.status();
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .context("decoding AppRole login response")?;
     if !status.is_success() {
+        // Fail before reading the body; it is never echoed into the error.
         bail!("AppRole login failed (HTTP {status})");
     }
-    let token = body
-        .get("auth")
-        .and_then(|a| a.get("client_token"))
-        .and_then(serde_json::Value::as_str)
+    // The raw body text carries the token: hold it in `Zeroizing` (wiped on
+    // drop) and deserialize the typed view above, moving — never copying — the
+    // token `String` into the returned `Zeroizing` handle.
+    let body = Zeroizing::new(
+        resp.text()
+            .await
+            .context("reading AppRole login response")?,
+    );
+    let parsed: LoginResponse =
+        serde_json::from_str(&body).context("decoding AppRole login response")?;
+    let auth = parsed
+        .auth
         .context("AppRole login response has no auth.client_token")?;
-    let lease = body
-        .get("auth")
-        .and_then(|a| a.get("lease_duration"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
+    let token = auth
+        .client_token
+        .map(Zeroizing::new)
+        .context("AppRole login response has no auth.client_token")?;
     info!(
-        lease_seconds = lease,
+        lease_seconds = auth.lease_duration,
         "exchanged AppRole secret_id for vault token"
     );
-    Ok(Zeroizing::new(token.to_string()))
+    Ok(token)
 }
 
 #[cfg(test)]

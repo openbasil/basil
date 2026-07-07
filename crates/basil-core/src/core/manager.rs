@@ -39,7 +39,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::backend::{
-    Backend, BackendError, KvValue, NativeAlgorithm, NewKey, PublicKey, SignOptions,
+    Backend, BackendError, KvSecret, NativeAlgorithm, NewKey, PublicKey, SignOptions,
     X509CertRequest, X509Svid,
 };
 use crate::catalog::{BackendRef, Catalog, Class, Engine, GenerateSpec, KeyAlgorithm, KeyEntry};
@@ -1451,7 +1451,7 @@ impl BackendManager {
         // The stored value is raw X25519 private bytes; copy into a fixed,
         // zeroizing array (fails closed on a wrong length, never indexes). The
         // source `Zeroizing<Vec>` wipes when it drops at the end of this scope.
-        x25519_seal::private_from_slice(&secret)
+        x25519_seal::private_from_slice(&secret.value)
             .map_err(|e| ManagerError::Sealing(SealingFailure::from_seal(e)))
     }
 
@@ -1507,7 +1507,7 @@ impl BackendManager {
         // The stored value is the raw 32-byte Ed25519 seed; copy into a fixed,
         // zeroizing array (fails closed on a wrong length, never indexes). The
         // source `Zeroizing<Vec>` wipes when it drops at the end of this scope.
-        ed25519_sign::seed_from_slice(&secret)
+        ed25519_sign::seed_from_slice(&secret.value)
             .map_err(|e| ManagerError::Signing(SigningFailure::from_sign(e)))
     }
 
@@ -1520,11 +1520,18 @@ impl BackendManager {
     /// material through `get` (that op-class gate is the security invariant here).
     /// `version = None` reads the latest version.
     ///
+    /// A `value`-class read is a SECRET: it is routed through the [`Zeroizing`]
+    /// chain ([`Backend::kv_get_secret`], like the materialize paths) so no
+    /// plain copy of the cleartext is left in freed heap (the t9a leak, security
+    /// review finding 17). A `public`-class read carries no secret and uses the
+    /// plain [`Backend::kv_get`] path; its bytes are wrapped into the returned
+    /// [`KvSecret`] for a uniform signature.
+    ///
     /// # Errors
     ///
     /// [`ManagerError::UnknownKey`], [`ManagerError::OpNotValidForClass`], or
     /// [`ManagerError::Backend`].
-    pub async fn get(&self, key_id: &str, version: Option<u32>) -> Result<KvValue, ManagerError> {
+    pub async fn get(&self, key_id: &str, version: Option<u32>) -> Result<KvSecret, ManagerError> {
         let routed = self.resolve(key_id)?;
         require_class(
             "get",
@@ -1532,7 +1539,14 @@ impl BackendManager {
             routed.class(),
             &[Class::Value, Class::Public],
         )?;
-        Ok(routed.backend.kv_get(routed.path(), version).await?)
+        if routed.class() == Class::Value {
+            return Ok(routed.backend.kv_get_secret(routed.path(), version).await?);
+        }
+        let kv = routed.backend.kv_get(routed.path(), version).await?;
+        Ok(KvSecret {
+            value: Zeroizing::new(kv.value),
+            version: kv.version,
+        })
     }
 
     /// `set` writes `value` as a fresh KV-v2 version of `key_id`, returning the
@@ -2613,10 +2627,16 @@ mod tests {
         async fn kv_get_secret(
             &self,
             key_id: &str,
-            _version: Option<u32>,
-        ) -> Result<Zeroizing<Vec<u8>>, BackendError> {
+            version: Option<u32>,
+        ) -> Result<KvSecret, BackendError> {
             *self.0.last_path.lock().unwrap() = Some(key_id.to_string());
-            Ok(Zeroizing::new(self.0.kv_lookup(key_id)))
+            let version = version.unwrap_or_else(|| {
+                u32::try_from(self.0.latest_version.load(Ordering::SeqCst)).unwrap_or(u32::MAX)
+            });
+            Ok(KvSecret {
+                value: Zeroizing::new(self.0.kv_lookup(key_id)),
+                version,
+            })
         }
 
         async fn kv_put(&self, key_id: &str, value: &[u8]) -> Result<u32, BackendError> {
@@ -3279,8 +3299,9 @@ mod tests {
         );
 
         // get reads the value back + the version (latest when none requested).
+        // A value-class read comes back through the `Zeroizing` chain.
         let kv = mgr.get("web.value", None).await.expect("get");
-        assert_eq!(kv.value, b"super-secret");
+        assert_eq!(kv.value.as_slice(), b"super-secret");
         assert_eq!(kv.version, 6);
     }
 
@@ -3297,7 +3318,7 @@ mod tests {
         let (mgr, _p, secondary) = fixture();
         // get is value/public-class -> a public cert is readable via get.
         let kv = mgr.get("web.cert", None).await.expect("get on public key");
-        assert_eq!(kv.value, b"stored-value");
+        assert_eq!(kv.value.as_slice(), b"stored-value");
         assert_eq!(
             secondary.last_path().as_deref(),
             Some("secret/data/web/cert")
@@ -3741,18 +3762,19 @@ mod tests {
     async fn kv_get_secret_returns_zeroizing_bytes_and_round_trips() {
         // FIX 1: the SECRET read keeps bytes in `Zeroizing` end-to-end. Functional
         // check: it returns exactly what `kv_put` stored (the wipe itself can't be
-        // unit-tested, but the type is `Zeroizing<Vec<u8>>` and the bytes match).
+        // unit-tested, but `KvSecret.value` is `Zeroizing<Vec<u8>>` and the bytes
+        // match).
         let backend = MockHandle(MockBackend::new("primary"));
         let stored = vec![0x11u8; 32];
         backend
             .kv_put("secret/data/enroll/x25519", &stored)
             .await
             .expect("put");
-        let got: Zeroizing<Vec<u8>> = backend
+        let got = backend
             .kv_get_secret("secret/data/enroll/x25519", None)
             .await
             .expect("secret read");
-        assert_eq!(got.as_slice(), stored.as_slice());
+        assert_eq!(got.value.as_slice(), stored.as_slice());
     }
 
     #[tokio::test]

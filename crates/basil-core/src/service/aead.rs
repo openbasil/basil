@@ -477,7 +477,7 @@ mod tests {
             &self,
             key_id: &str,
             _version: Option<u32>,
-        ) -> Result<Zeroizing<Vec<u8>>, BackendError> {
+        ) -> Result<crate::backend::KvSecret, BackendError> {
             let value = self
                 .store
                 .lock()
@@ -485,7 +485,10 @@ mod tests {
                 .get(key_id)
                 .cloned();
             value
-                .map(Zeroizing::new)
+                .map(|value| crate::backend::KvSecret {
+                    value: Zeroizing::new(value),
+                    version: 1,
+                })
                 .ok_or(BackendError::Unsupported("kv_get_secret"))
         }
     }

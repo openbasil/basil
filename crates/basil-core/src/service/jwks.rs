@@ -866,7 +866,6 @@ mod tests {
         use axum::http::{Method, Request, StatusCode, header};
         use rsa::pkcs8::EncodePublicKey as _;
         use tower::ServiceExt as _;
-        use zeroize::Zeroizing;
 
         use super::super::{
             JWKS_PATH, JWKS_WELL_KNOWN_PATH, JwksHttpConfig, build_jwks, is_jwks_issuer,
@@ -964,7 +963,7 @@ mod tests {
                 &self,
                 _key_id: &str,
                 _version: Option<u32>,
-            ) -> Result<Zeroizing<Vec<u8>>, BackendError> {
+            ) -> Result<crate::backend::KvSecret, BackendError> {
                 self.0.forbidden();
                 Err(BackendError::Backend(
                     "kv_get_secret must not be called".into(),

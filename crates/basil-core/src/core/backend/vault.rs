@@ -10,15 +10,14 @@
 //! same engine, see [`super::spiffe::SpiffeVaultBackend`].
 
 use async_trait::async_trait;
-use zeroize::Zeroizing;
 
 use basil_proto::{AeadAlgorithm, CiphertextEnvelope, KeyMaterial, KeyType};
 
 use super::pki::PkiClient;
 use super::transit::{TransitClient, transit_aead_type};
 use super::{
-    Backend, BackendError, KeyMetadata, KvValue, NewKey, PublicKey, SignOptions, X509Bundle,
-    X509Svid,
+    Backend, BackendError, KeyMetadata, KvSecret, KvValue, NewKey, PublicKey, SignOptions,
+    X509Bundle, X509Svid,
 };
 
 pub struct VaultBackend {
@@ -183,7 +182,7 @@ impl Backend for VaultBackend {
         &self,
         key_id: &str,
         version: Option<u32>,
-    ) -> Result<Zeroizing<Vec<u8>>, BackendError> {
+    ) -> Result<KvSecret, BackendError> {
         self.transit
             .kv_get_secret(&self.token, key_id, version)
             .await

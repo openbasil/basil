@@ -88,3 +88,45 @@ pub mod xds {
         }
     }
 }
+
+// Zeroize-on-drop for the secret-bearing wire messages. The broker moves
+// secret/private-key bytes into these protos to send them, and the tonic codec
+// drops the message right after encoding it — these impls wipe that last owned
+// copy instead of leaving cleartext in freed heap (core security review
+// findings 17/19). The codec's transient encode buffer is tonic-owned and out
+// of reach. Note a `Drop` impl forbids moving fields out: consumers take owned
+// bytes with `std::mem::take` on the field.
+
+impl Drop for broker::v1::GetSecretResponse {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.value);
+    }
+}
+
+impl Drop for broker::v1::IssueCertificateResponse {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.private_key_der);
+    }
+}
+
+impl Drop for spiffe::X509svid {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.x509_svid_key);
+    }
+}
+
+impl Drop for envoy::extensions::transport_sockets::tls::v3::TlsCertificate {
+    fn drop(&mut self) {
+        use envoy::config::core::v3::data_source::Specifier;
+        if let Some(source) = self.private_key.as_mut()
+            && let Some(specifier) = source.specifier.as_mut()
+        {
+            match specifier {
+                Specifier::InlineBytes(bytes) => zeroize::Zeroize::zeroize(bytes),
+                Specifier::Filename(text)
+                | Specifier::InlineString(text)
+                | Specifier::EnvironmentVariable(text) => zeroize::Zeroize::zeroize(text),
+            }
+        }
+    }
+}
