@@ -45,6 +45,16 @@ SPDX-License-Identifier: Apache-2.0
   peer that resolves to a policy subject (it names the backend kind); and the
   ungated SDS `ValidationContext` trust bundle is documented as intentionally
   public (the same bytes the SPIFFE `FetchX509Bundles` serves ungated).
+- Security review fixes: the gRPC Unix socket is bound with the umask tightened
+  to `0177` so the socket node is owner-only from creation; generated
+  self-signed TLS keys are written by `step` only inside a freshly created
+  `0700` temp dir (existing keys via `0600` secret-file writes); the plaintext
+  `http://` Vault warning now parses the URL and is suppressed only for literal
+  loopback IPs; catalog `schemaVersion` is validated as strictly as the policy
+  schema; the seal epoch sidecar is checked before the bundle is opened and
+  documented as accidental-rollback protection only; and local-software custody
+  cross-checks the record-declared `wrapping_key` against the catalog-declared
+  storage key, rejecting mismatches.
 - Nix example hardening: the example package now defaults to the local flake
   instead of a remote repository.
 
