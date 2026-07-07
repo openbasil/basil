@@ -118,7 +118,8 @@ impl SpiffeWorkloadApi for SpiffeWorkloadGrpc {
                 loop {
                     match rx.recv().await {
                         Ok(event) if x509_bundle_refresh_event(&plan, &event.kind) => break,
-                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break,
+                        Ok(_) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
                     }
                 }
@@ -214,7 +215,8 @@ impl SpiffeWorkloadApi for SpiffeWorkloadGrpc {
                 loop {
                     match rx.recv().await {
                         Ok(event) if jwt_bundle_refresh_event(&plan, &event.kind) => break,
-                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break,
+                        Ok(_) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
                     }
                 }
@@ -1731,6 +1733,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_x509_bundles_refreshes_after_event_lag() {
+        use futures::StreamExt as _;
+
+        let (service, _backend) = service();
+        let events = service.state.events().clone();
+        let mut stream = service
+            .fetch_x509_bundles(x509_bundles_request())
+            .await
+            .expect("fetch x509 bundles")
+            .into_inner();
+        let _initial = stream.next().await.expect("initial response");
+        for version in 0..1025 {
+            events.key_rotated("unrelated.key", version);
+        }
+        let response = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("lag refresh response")
+            .expect("stream item")
+            .expect("lag refresh response ok");
+        assert!(response.bundles.contains_key("spiffe://example.org"));
+    }
+
+    #[tokio::test]
     async fn fetch_jwt_bundles_streams_initial_jwks_map() {
         use futures::StreamExt as _;
 
@@ -1776,6 +1801,29 @@ mod tests {
             .expect("refresh response")
             .expect("stream item")
             .expect("refresh response ok");
+        assert!(response.bundles.contains_key("spiffe://example.org"));
+    }
+
+    #[tokio::test]
+    async fn fetch_jwt_bundles_refreshes_after_event_lag() {
+        use futures::StreamExt as _;
+
+        let (service, _backend) = service();
+        let events = service.state.events().clone();
+        let mut stream = service
+            .fetch_jwt_bundles(jwt_bundles_request())
+            .await
+            .expect("fetch jwt bundles")
+            .into_inner();
+        let _initial = stream.next().await.expect("initial response");
+        for version in 0..1025 {
+            events.key_rotated("unrelated.key", version);
+        }
+        let response = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("lag refresh response")
+            .expect("stream item")
+            .expect("lag refresh response ok");
         assert!(response.bundles.contains_key("spiffe://example.org"));
     }
 

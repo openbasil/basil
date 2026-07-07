@@ -20,6 +20,7 @@ use basil::{
 };
 use basil_core::agent_cli::ExplainArgs;
 use clap::{Subcommand, ValueEnum};
+use zeroize::Zeroizing;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum AeadAlg {
@@ -967,10 +968,11 @@ fn read_exactly_one_secret_arg(
     inline: Option<String>,
     file: Option<&Path>,
     field: &'static str,
-) -> Result<String> {
+) -> Result<Zeroizing<String>> {
     match (inline, file) {
-        (Some(value), None) => Ok(value),
+        (Some(value), None) => Ok(Zeroizing::new(value)),
         (None, Some(path)) => std::fs::read_to_string(path)
+            .map(Zeroizing::new)
             .with_context(|| format!("reading {field} file {}", path.display())),
         (None, None) => bail!("supply --{field} or --{field}-file"),
         (Some(_), Some(_)) => bail!("supply only one of --{field} or --{field}-file"),
@@ -1916,6 +1918,34 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn nats_secret_arg_reader_returns_zeroizing_strings() {
+        fn assert_zeroizing_string(_: &zeroize::Zeroizing<String>) {}
+
+        let inline =
+            super::read_exactly_one_secret_arg(Some("inline-secret".to_string()), None, "jwt")
+                .expect("inline secret must parse");
+        assert_zeroizing_string(&inline);
+        assert_eq!(inline.as_str(), "inline-secret");
+
+        let path = std::env::temp_dir().join(format!(
+            "basil-nats-secret-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time is after unix epoch")
+                .as_nanos()
+        ));
+        std::fs::write(&path, "file-secret").expect("secret fixture must be written");
+
+        let from_file = super::read_exactly_one_secret_arg(None, Some(&path), "seed")
+            .expect("file secret must parse");
+        assert_zeroizing_string(&from_file);
+        assert_eq!(from_file.as_str(), "file-secret");
+
+        std::fs::remove_file(path).expect("secret fixture must be removed");
     }
 
     #[test]

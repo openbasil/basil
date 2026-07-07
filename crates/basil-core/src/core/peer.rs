@@ -10,11 +10,11 @@
 //! `/proc`: the executable path, the process lineage, and any wrapping SSH
 //! session.
 //!
-//! Detail note: Linux SO_PEERCRED is a snapshot of the peer's creds captured at time
+//! Detail note: Linux `SO_PEERCRED` is a snapshot of the peer's creds captured at time
 //! of `connect(2)`. For short-lived RPC connections, or when called from a systemd
 //! service, creds at connect time is almost always the same as current effective creds.
 //!
-//! On MacOS (not officially supported, but it works), getpeerid/LOCAL_PEERPID returns
+//! On `MacOS` (not officially supported, but it works), `getpeerid/LOCAL_PEERPID` returns
 //! the peer's current effective creds.
 //!
 

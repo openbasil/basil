@@ -21,7 +21,7 @@ use crate::catalog::{
 use crate::decision::DecisionRecord;
 use crate::reload::{ReloadError, check_reload, reload_generation};
 use crate::service::broker::{BoxStream, BrokerGrpc, GrpcResult};
-use crate::service::shared::{event_allowed, proto_event};
+use crate::service::shared::{event_allowed, payload_too_large, proto_event};
 use crate::state::{ReadinessOutcome, ReadinessState};
 use crate::transport::{broker_status, peer_from_request};
 use tracing::warn;
@@ -420,7 +420,12 @@ impl AdminService for BrokerGrpc {
         let trust_domain = body.trust_domain.trim();
         let jti = body.jti.trim();
         let expires_at_unix = body.expires_at_unix;
-        validate_revoke_request(trust_domain, jti, expires_at_unix)?;
+        validate_revoke_request(
+            trust_domain,
+            jti,
+            expires_at_unix,
+            self.state.limits().max_payload_size,
+        )?;
 
         let peer = peer_from_request(&request);
         let generation = self.state.load_generation();
@@ -632,6 +637,7 @@ fn validate_revoke_request(
     trust_domain: &str,
     jti: &str,
     expires_at_unix: u64,
+    max_payload_size: usize,
 ) -> Result<(), tonic::Status> {
     if trust_domain.is_empty() {
         return Err(broker_status(
@@ -641,12 +647,24 @@ fn validate_revoke_request(
             "trust_domain is required",
         ));
     }
+    if trust_domain.len() > max_payload_size {
+        return Err(payload_too_large(
+            REVOKE_OP_TOKEN,
+            "trust_domain exceeds configured cap",
+        ));
+    }
     if jti.is_empty() {
         return Err(broker_status(
             Code::InvalidArgument,
             "INVALID_ARGUMENT",
             REVOKE_OP_TOKEN,
             "jti is required",
+        ));
+    }
+    if jti.len() > max_payload_size {
+        return Err(payload_too_large(
+            REVOKE_OP_TOKEN,
+            "jti exceeds configured cap",
         ));
     }
     if expires_at_unix <= unix_now_secs() {
@@ -1564,10 +1582,27 @@ mod tests {
     #[test]
     fn validate_revoke_request_rejects_missing_and_expired_inputs() {
         let future = unix_now_secs().saturating_add(300);
-        assert!(validate_revoke_request("example.org", "jti-1", future).is_ok());
-        assert!(validate_revoke_request("", "jti-1", future).is_err());
-        assert!(validate_revoke_request("example.org", "", future).is_err());
-        assert!(validate_revoke_request("example.org", "jti-1", 1).is_err());
+        assert!(validate_revoke_request("example.org", "jti-1", future, 1024).is_ok());
+        assert!(validate_revoke_request("", "jti-1", future, 1024).is_err());
+        assert!(validate_revoke_request("example.org", "", future, 1024).is_err());
+        assert!(validate_revoke_request("example.org", "jti-1", 1, 1024).is_err());
+    }
+
+    #[test]
+    fn validate_revoke_request_rejects_oversized_identifiers() {
+        let future = unix_now_secs().saturating_add(300);
+        assert_eq!(
+            validate_revoke_request("example.org", "jti-1", future, 10)
+                .expect_err("oversized trust domain rejected")
+                .code(),
+            Code::ResourceExhausted
+        );
+        assert_eq!(
+            validate_revoke_request("td", "jti-1", future, 4)
+                .expect_err("oversized jti rejected")
+                .code(),
+            Code::ResourceExhausted
+        );
     }
 
     #[tokio::test]

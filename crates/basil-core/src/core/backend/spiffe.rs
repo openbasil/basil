@@ -19,14 +19,16 @@
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde::Deserialize;
+use serde_json::json;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
+use zeroize::Zeroizing;
 
 use basil_proto::{AeadAlgorithm, CiphertextEnvelope, KeyMaterial, KeyType};
 
 use super::svid::SvidMinter;
-use super::transit::{TransitClient, read_body, transit_aead_type};
+use super::transit::{TransitClient, transit_aead_type};
 use super::{
     Backend, BackendError, KeyMetadata, KvSecret, KvValue, NewKey, PublicKey, SignOptions,
 };
@@ -57,8 +59,20 @@ pub struct SpiffeConfig {
 }
 
 struct CachedToken {
-    token: String,
+    token: Zeroizing<String>,
     expires_at: Instant,
+}
+
+#[derive(Deserialize)]
+struct LoginResponse {
+    auth: Option<LoginAuth>,
+}
+
+#[derive(Deserialize)]
+struct LoginAuth {
+    client_token: Option<String>,
+    #[serde(default)]
+    lease_duration: u64,
 }
 
 pub struct SpiffeVaultBackend {
@@ -132,7 +146,7 @@ impl SpiffeVaultBackend {
 
     /// Return a valid Vault token, re-running the SVID login when the cached
     /// token is missing or within [`TOKEN_REFRESH_SKEW`] of expiry.
-    async fn token(&self) -> Result<String, BackendError> {
+    async fn token(&self) -> Result<Zeroizing<String>, BackendError> {
         let mut guard = self.cached.lock().await;
         /* ubs:ignore false positive: time _not_ used as source of randomness. */
         if let Some(c) = guard.as_ref()
@@ -161,23 +175,21 @@ impl SpiffeVaultBackend {
             .send()
             .await
             .map_err(|e| BackendError::Transport(e.to_string()))?;
-        let body = read_body(resp)
-            .await?
-            .ok_or_else(|| BackendError::Protocol("empty login response".into()))?;
-
-        let auth = body
-            .get("auth")
-            .ok_or_else(|| BackendError::Backend("login response has no auth block".into()))?;
-        let token = auth
-            .get("client_token")
-            .and_then(Value::as_str)
-            .ok_or_else(|| BackendError::Protocol("no client_token in login response".into()))?
-            .to_string();
-        let lease = auth
-            .get("lease_duration")
-            .and_then(Value::as_u64)
-            .filter(|&l| l > 0)
-            .unwrap_or(DEFAULT_LEASE_SECS);
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(BackendError::Backend(format!(
+                "login failed (HTTP {status})"
+            )));
+        }
+        let body = Zeroizing::new(
+            resp.text()
+                .await
+                .map_err(|e| BackendError::Transport(e.to_string()))?,
+        );
+        if body.trim().is_empty() {
+            return Err(BackendError::Protocol("empty login response".into()));
+        }
+        let (token, lease) = parse_login_response(&body)?;
 
         info!(lease_seconds = lease, "obtained vault token via JWT-SVID");
         /* ubs:ignore false positive: time is _not_ used as source of randomness. */
@@ -187,6 +199,24 @@ impl SpiffeVaultBackend {
             expires_at: Instant::now() + Duration::from_secs(lease),
         })
     }
+}
+
+fn parse_login_response(body: &str) -> Result<(Zeroizing<String>, u64), BackendError> {
+    let parsed: LoginResponse =
+        serde_json::from_str(body).map_err(|e| BackendError::Protocol(e.to_string()))?;
+    let auth = parsed
+        .auth
+        .ok_or_else(|| BackendError::Backend("login response has no auth block".into()))?;
+    let token = auth
+        .client_token
+        .map(Zeroizing::new)
+        .ok_or_else(|| BackendError::Protocol("no client_token in login response".into()))?;
+    let lease = if auth.lease_duration > 0 {
+        auth.lease_duration
+    } else {
+        DEFAULT_LEASE_SECS
+    };
+    Ok((token, lease))
 }
 
 #[async_trait]
@@ -407,5 +437,20 @@ mod tests {
             Err(other) => panic!("wrong error: {other}"),
             Ok(_) => panic!("invalid pem must be rejected"),
         }
+    }
+
+    #[test]
+    fn login_response_parser_extracts_zeroizing_token_and_lease() {
+        let body = r#"{"auth":{"client_token":"vault-token","lease_duration":42}}"#;
+        let (token, lease) = super::parse_login_response(body).expect("login response parses");
+        assert_eq!(token.as_str(), "vault-token");
+        assert_eq!(lease, 42);
+    }
+
+    #[test]
+    fn login_response_parser_defaults_non_expiring_lease() {
+        let body = r#"{"auth":{"client_token":"vault-token","lease_duration":0}}"#;
+        let (_token, lease) = super::parse_login_response(body).expect("login response parses");
+        assert_eq!(lease, super::DEFAULT_LEASE_SECS);
     }
 }

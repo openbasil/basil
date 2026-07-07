@@ -808,6 +808,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

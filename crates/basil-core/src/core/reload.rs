@@ -18,11 +18,11 @@
 //!
 //! The reloadable surface is the **content** the [`Pdp`](crate::catalog::Pdp) and
 //! the audit trail consume: the entire policy (rules / roles / name + membership
-//! tables) and the per-key *authorization* attributes: `writable`, `class`,
-//! `labels`, `description`, `missing`. The **routing shape** is restart-only:
+//! tables) and the per-key *authorization* attributes: `writable`, `labels`,
+//! `description`, `missing`. The **routing shape** is restart-only:
 //! the [`BackendManager`](crate::manager::BackendManager) and the live backend
 //! instances were built from the sealed bundle at startup, so adding/removing a
-//! backend, or changing any key's `backend`/`path`/`engine`/`key_type`/
+//! backend, or changing any key's `class`/`backend`/`path`/`engine`/`key_type`/
 //! `public_path`, needs a re-unlock and is rejected here (the Nix module routes
 //! such edits to `ExecStart`, i.e. a restart). [`routing_shape`] captures exactly
 //! the dimensions baked into the manager; a candidate whose shape differs from the
@@ -149,9 +149,8 @@ struct BackendShape {
 
 /// The restart-only routing shape of one key: the dimensions that select a
 /// backend instance, a backend-native locator, and the materialize footprint.
-/// `writable` / `class`-surface authorization is *not* here (those are
-/// reloadable), but `class` itself selects the op surface + engine inference and
-/// the materialize arm, so it is part of the shape.
+/// `writable` is not here (it is reloadable), but `class` selects the op surface,
+/// engine inference, and the materialize arm, so it is restart-only shape.
 #[derive(Debug, PartialEq, Eq)]
 struct KeyShape {
     class: Class,
@@ -209,8 +208,8 @@ fn routing_shape(
 ///
 /// Compares the candidate's routing shape against the **currently serving**
 /// generation's catalog. A backend added/removed/repathed, or any key's
-/// `backend`/`path`/`engine`/`key_type`/`public_path` changed (or a key added/removed,
-/// which changes the key set, hence the shape), is restart-only.
+/// `class`/`backend`/`path`/`engine`/`key_type`/`public_path` changed (or a key
+/// added/removed, which changes the key set, hence the shape), is restart-only.
 fn ensure_reloadable(current: &Catalog, candidate: &Catalog) -> Result<(), ReloadError> {
     let (cur_backends, cur_keys) = routing_shape(current);
     let (new_backends, new_keys) = routing_shape(candidate);
@@ -222,7 +221,7 @@ fn ensure_reloadable(current: &Catalog, candidate: &Catalog) -> Result<(), Reloa
     }
     if cur_keys != new_keys {
         return Err(ReloadError::RoutingShapeChanged(
-            "a key was added/removed or a key's backend/path/engine/key_type/public_path changed"
+            "a key was added/removed or a key's class/backend/path/engine/key_type/public_path changed"
                 .to_string(),
         ));
     }

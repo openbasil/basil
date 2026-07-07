@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Changelog
 
-## 0.6.2 2026-07-07
+## Unreleased
 
 - Release for testing CI updates
 
@@ -65,6 +65,12 @@ SPDX-License-Identifier: Apache-2.0
   per key version; and `aes-gcm`/`aes` build with their `zeroize` features so
   GHASH keys and AES round-key schedules are scrubbed on drop
   (`chacha20poly1305` already zeroizes unconditionally).
+- additional security-review cleanup: SPIFFE Vault login now scrubs the login
+  response body and caches tokens in zeroizing storage, SPIFFE bundle streams
+  refresh after broadcast lag instead of waiting indefinitely, NATS credential
+  input arguments move into zeroizing storage immediately, stale Go client docs
+  now reference `basil explain --json`, reload guidance correctly treats
+  `class` as restart-only, and revoke requests cap `trust_domain` and `jti`.
 
 ## 0.6.1 2026-07-07
 
