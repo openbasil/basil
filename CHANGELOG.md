@@ -6,29 +6,36 @@ SPDX-License-Identifier: Apache-2.0
 
 # Changelog
 
-## 0.6.1
+## 0.6.1 2026-07-07
 
-- renamed basil-client crate to basil
-- Security review fixes: 1Password updates now avoid secret argv exposure, redact
-  token-bearing debug output, and keep 1Password secret material in zeroizing
-  owners.
-- Security review fixes: reloads are serialized, catalog/policy parsing fails
+### Renamed basil-client to basil
+
+- crate name 'basil-client' renamed to 'basil'
+
+### Security review fixes (1 high-sev found)
+
+- 1Password updates now avoid secret argv exposure, redact token-bearing
+  debug output, and keep 1Password secret material in zeroizing owners.
+
+### Security review fixes (medium & low severity)
+
+- reloads are serialized, catalog/policy parsing fails
   closed on unknown fields, raw issuer-key signing is denied, audit text values
   are escaped, JWKS responses are cached with conditional `304` support, and
   JWT-SVID requests are limited to the caller identity by default.
-- Security review fixes: the NATS JWT validation API only exposes
+- the NATS JWT validation API only exposes
   `matched_signer` for valid tokens, the NATS bridge processes requests with a
   bounded concurrency limit, BYOK `KeyMaterial` redacts and zeroizes private
   bytes, the COSE-over-NATS demo uses subscription readiness instead of a sleep,
   and the streaming encryption format now has a normative spec.
-- Security review fixes: zeroization gaps closed on four secondary paths —
+- zeroization gaps closed on four secondary paths —
   deposit credential fingerprinting no longer parses the full secret JSON and
   hashes through a zeroizing buffer, value-class `get_secret` reads flow through
   the same zeroizing chain as the seed path, X.509 leaf private keys are moved
   (not copied) into wire messages that now zeroize on drop (also `get_secret`
   and `issue_certificate` responses), and the Vault `AppRole` login response is
   parsed through typed zeroizing storage instead of a JSON value tree.
-- Security review fixes: `sign`/`verify` messages and signatures are bounded by
+- `sign`/`verify` messages and signatures are bounded by
   `max_payload_size` and the NATS curve `encrypt`/`decrypt` payloads by
   `max_encrypt_size`; `validate_nats_jwt` now requires a peer that resolves to a
   policy subject and caps the presented token length; Argon2 slot parameters
@@ -36,7 +43,7 @@ SPDX-License-Identifier: Apache-2.0
   allocated; an oversized deposit log invalidates only its excess tail instead
   of every deposit; and a JWT-SVID without a `jti` fails validation so
   revocation always holds.
-- Security review fixes: readiness classifies absent keys against the currently
+- readiness classifies absent keys against the currently
   serving generation, so a hot reload flipping a key's `missing` policy takes
   effect without a restart; the admin `Watch` stream closes with `DATA_LOSS`
   when a slow watcher overflows the event buffer instead of silently skipping
@@ -45,7 +52,7 @@ SPDX-License-Identifier: Apache-2.0
   peer that resolves to a policy subject (it names the backend kind); and the
   ungated SDS `ValidationContext` trust bundle is documented as intentionally
   public (the same bytes the SPIFFE `FetchX509Bundles` serves ungated).
-- Security review fixes: the gRPC Unix socket is bound with the umask tightened
+- the gRPC Unix socket is bound with the umask tightened
   to `0177` so the socket node is owner-only from creation; generated
   self-signed TLS keys are written by `step` only inside a freshly created
   `0700` temp dir (existing keys via `0600` secret-file writes); the plaintext
