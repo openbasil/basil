@@ -28,6 +28,14 @@ SPDX-License-Identifier: Apache-2.0
   (not copied) into wire messages that now zeroize on drop (also `get_secret`
   and `issue_certificate` responses), and the Vault `AppRole` login response is
   parsed through typed zeroizing storage instead of a JSON value tree.
+- Security review fixes: `sign`/`verify` messages and signatures are bounded by
+  `max_payload_size` and the NATS curve `encrypt`/`decrypt` payloads by
+  `max_encrypt_size`; `validate_nats_jwt` now requires a peer that resolves to a
+  policy subject and caps the presented token length; Argon2 slot parameters
+  from the on-disk bundle are rejected outside a sane band before any memory is
+  allocated; an oversized deposit log invalidates only its excess tail instead
+  of every deposit; and a JWT-SVID without a `jti` fails validation so
+  revocation always holds.
 - Nix example hardening: the example package now defaults to the local flake
   instead of a remote repository.
 

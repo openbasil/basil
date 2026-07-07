@@ -26,6 +26,10 @@ use super::format::{
 use super::{MethodRegistry, SealError};
 
 const DEPOSIT_AAD_LABEL: &[u8] = b"basil-bundle-deposit-v1";
+/// Bounded per-bundle deposit work: records past this index are reported as
+/// [`DepositStatus::LogTooLarge`] and never verified or applied, while the
+/// records below the cap keep working, so an appender cannot deny every
+/// earlier deposit.
 const MAX_DEPOSITS: usize = 1024;
 
 /// Public review state for one deposit record.
@@ -70,7 +74,7 @@ pub enum DepositStatus {
     DecryptFailed,
     /// Opened credential did not decode as a `BackendCred`.
     DecodeFailed,
-    /// Deposit log exceeds the bounded record cap.
+    /// Record sits past the bounded log cap; only this excess tail is ignored.
     LogTooLarge,
 }
 
@@ -265,21 +269,6 @@ fn review_authorized(
     parsed: &ParsedBundle,
     baseline: &CredBundle,
 ) -> (Vec<DepositReview>, Vec<Candidate>) {
-    if parsed.body.deposits.len() > MAX_DEPOSITS {
-        return (
-            parsed
-                .body
-                .deposits
-                .iter()
-                .enumerate()
-                .map(|(index, record)| {
-                    review(record, index, DepositStatus::LogTooLarge, None, baseline)
-                })
-                .collect(),
-            Vec::new(),
-        );
-    }
-
     let Some(private) = baseline.deposit.ingest_private_key.as_ref() else {
         return (
             parsed
@@ -325,6 +314,21 @@ fn review_authorized(
     let mut reviews = Vec::with_capacity(parsed.body.deposits.len());
     let mut candidates = Vec::new();
     for (index, record) in parsed.body.deposits.iter().enumerate() {
+        // An oversized log invalidates only its *excess tail*: the first
+        // MAX_DEPOSITS records (the log is append-only, so the earliest) still
+        // verify and apply, so an actor able to append records cannot
+        // fail-closed-DoS every earlier deposit. Excess records are reported
+        // without doing any signature/decrypt work.
+        if index >= MAX_DEPOSITS {
+            reviews.push(review(
+                record,
+                index,
+                DepositStatus::LogTooLarge,
+                None,
+                baseline,
+            ));
+            continue;
+        }
         match review_one(parsed, baseline, &private, record, index) {
             Ok((candidate, deposit_review)) => {
                 candidates.push(candidate);

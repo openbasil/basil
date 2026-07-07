@@ -265,6 +265,12 @@ impl SigningService for BrokerGrpc {
         let actor = self.authorize(&request, Op::Sign, &body.key_id)?;
         let uid = Self::require_unix_uid(&actor, "sign")?;
         ensure_supported_signing_algorithm(body.algorithm, "sign")?;
+        if body.message.len() > self.state.limits().max_payload_size {
+            return Err(payload_too_large(
+                "sign",
+                "sign message exceeds configured cap",
+            ));
+        }
         // An ML-DSA key dispatches through the crypto provider (software custody);
         // every other key signs in place through the classical manager path.
         if let Some(algorithm) = self.state.manager().ml_dsa_algorithm_for(&body.key_id) {
@@ -295,6 +301,14 @@ impl SigningService for BrokerGrpc {
         let actor = self.authorize(&request, Op::Verify, &body.key_id)?;
         let uid = Self::require_unix_uid(&actor, "verify")?;
         ensure_supported_signing_algorithm(body.algorithm, "verify")?;
+        if body.message.len() > self.state.limits().max_payload_size
+            || body.signature.len() > self.state.limits().max_payload_size
+        {
+            return Err(payload_too_large(
+                "verify",
+                "verify payload exceeds configured cap",
+            ));
+        }
         if let Some(algorithm) = self.state.manager().ml_dsa_algorithm_for(&body.key_id) {
             let gate = self.provider_gate(&actor, &body.key_id);
             let (valid, dispatch) = self

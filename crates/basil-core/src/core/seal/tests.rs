@@ -503,6 +503,60 @@ fn authorized_deposit_overlays_baseline() {
 }
 
 #[test]
+fn oversized_deposit_log_drops_only_the_excess_tail() {
+    let (mut payload, signer) = deposit_payload(&["vault-transit"]);
+    let method = PassphraseMethod::with_params(Zeroizing::new(b"deposit-pass".to_vec()), FAST);
+    let file = seal(
+        &payload,
+        &[SlotSpec {
+            method: &method,
+            label: "passphrase".into(),
+        }],
+    )
+    .unwrap();
+    let mut parsed = format::decode(&file).unwrap();
+    let recipient = payload.deposit_recipient().unwrap();
+    let contributor = super::contributor_public_token(&signer);
+    let replacement = BackendCred::VaultToken {
+        token: SecretString::new("s.deposited".to_string()),
+        addr: Some("http://127.0.0.1:8200".to_string()),
+    };
+    let valid = create_signed_record(
+        &parsed.body.header,
+        "vault-transit".to_string(),
+        contributor,
+        1,
+        &recipient,
+        &signer,
+        &replacement,
+    )
+    .unwrap();
+    parsed.body.deposits.push(valid.clone());
+    // Flood the log one past the cap with junk records (the bumped seq breaks
+    // each signature): a mass append must not invalidate the earlier deposit.
+    for extra in 0..1024u64 {
+        let mut junk = valid.clone();
+        junk.seq = 2 + extra;
+        parsed.body.deposits.push(junk);
+    }
+
+    let reviews = apply_authorized_deposits(&parsed, &mut payload);
+
+    assert_eq!(reviews.len(), 1025);
+    // The earliest record still verifies and applies...
+    assert_eq!(reviews[0].status, DepositStatus::Effective);
+    assert_token(&payload, "vault-transit", "s.deposited");
+    // ...junk below the cap is rejected individually...
+    assert!(
+        reviews[1..1024]
+            .iter()
+            .all(|r| r.status == DepositStatus::BadSignature)
+    );
+    // ...and only the excess tail is dropped as log-too-large.
+    assert_eq!(reviews[1024].status, DepositStatus::LogTooLarge);
+}
+
+#[test]
 fn unauthorized_deposit_is_ignored() {
     let (mut payload, signer) = deposit_payload(&["other-backend"]);
     let method = PassphraseMethod::with_params(Zeroizing::new(b"deposit-pass".to_vec()), FAST);

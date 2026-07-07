@@ -1175,6 +1175,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grpc_validate_nats_jwt_requires_a_resolved_subject() {
+        let service = BrokerGrpc::new(mint_state());
+        // uid 7 resolves to no policy subject: the RPC must fail closed at
+        // entry, before the caller-supplied-nkey arm can run (finding 16).
+        let mut request = Request::new(pb::ValidateNatsJwtRequest {
+            jwt: "not-a-jwt".to_string(),
+            allowed_signers: vec![pb::AllowedNatsSigner {
+                signer: Some(pb::allowed_nats_signer::Signer::NatsPublicKey(
+                    KeyPair::new_account().public_key(),
+                )),
+            }],
+            expected_type: pb::NatsJwtType::Unspecified.into(),
+        });
+        request.extensions_mut().insert(PeerInfo {
+            uid: Some(7),
+            ..PeerInfo::default()
+        });
+        let status = service
+            .validate_nats_jwt(request)
+            .await
+            .expect_err("unresolved peer rejected");
+        assert_eq!(status.code(), Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn grpc_validate_nats_jwt_caps_jwt_length() {
+        let service = BrokerGrpc::new(mint_state());
+        let oversized = "a".repeat(service.state.limits().max_payload_size + 1);
+        let status = service
+            .validate_nats_jwt(authed_request(pb::ValidateNatsJwtRequest {
+                jwt: oversized,
+                allowed_signers: Vec::new(),
+                expected_type: pb::NatsJwtType::Unspecified.into(),
+            }))
+            .await
+            .expect_err("oversized jwt rejected");
+        assert_eq!(status.code(), Code::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn grpc_sign_verify_and_nats_curve_enforce_payload_caps() {
+        let service = BrokerGrpc::new(mint_state());
+        let over_payload = vec![0u8; service.state.limits().max_payload_size + 1];
+        let over_encrypt = vec![0u8; service.state.limits().max_encrypt_size + 1];
+
+        // `issuer.server` (nats_type=N): not a credential issuer, so raw
+        // sign/verify pass the PDP hard cap and reach the payload cap.
+        let status = service
+            .sign(authed_request(pb::SignRequest {
+                key_id: "issuer.server".to_string(),
+                message: over_payload.clone(),
+                algorithm: pb::SigningAlgorithm::Ed25519Nkey.into(),
+            }))
+            .await
+            .expect_err("oversized sign message rejected");
+        assert_eq!(status.code(), Code::ResourceExhausted);
+
+        let status = service
+            .verify(authed_request(pb::VerifyRequest {
+                key_id: "issuer.server".to_string(),
+                message: Vec::new(),
+                signature: over_payload,
+                algorithm: pb::SigningAlgorithm::Ed25519Nkey.into(),
+            }))
+            .await
+            .expect_err("oversized verify signature rejected");
+        assert_eq!(status.code(), Code::ResourceExhausted);
+
+        let status = service
+            .encrypt_nats_curve(authed_request(pb::EncryptNatsCurveRequest {
+                key_id: "nats.curve_box".to_string(),
+                recipient_public_xkey: String::new(),
+                plaintext: over_encrypt.clone(),
+            }))
+            .await
+            .expect_err("oversized curve plaintext rejected");
+        assert_eq!(status.code(), Code::ResourceExhausted);
+
+        let status = service
+            .decrypt_nats_curve(authed_request(pb::DecryptNatsCurveRequest {
+                key_id: "nats.curve_box".to_string(),
+                sender_public_xkey: String::new(),
+                ciphertext: over_encrypt,
+            }))
+            .await
+            .expect_err("oversized curve ciphertext rejected");
+        assert_eq!(status.code(), Code::ResourceExhausted);
+    }
+
+    #[tokio::test]
     async fn grpc_nats_unsupported_issuer_role_is_invalid_argument() {
         let service = BrokerGrpc::new(mint_state());
         let status = service

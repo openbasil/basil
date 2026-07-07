@@ -8,15 +8,17 @@ use basil_proto::broker::v1 as pb;
 use basil_proto::broker::v1::minting_service_server::MintingService;
 use basil_proto::broker::v1::nats_service_server::NatsService;
 use serde_json::Value as JsonValue;
-use tonic::{Request, Response, Status};
+use tonic::{Code, Request, Response, Status};
 
 use crate::backend::BackendError;
 use crate::catalog::policy::Op;
 use crate::minter::{NatsJtiMode, NatsJwtKind, SignNatsJwtSpec};
 use crate::service::broker::{BrokerGrpc, GrpcResult};
 use crate::service::shared::{
-    backend_status, claims_json, credential_response, invalid_request, manager_status, ttl_seconds,
+    backend_status, claims_json, credential_response, invalid_request, manager_status,
+    payload_too_large, ttl_seconds,
 };
+use crate::transport::{broker_status, peer_from_request};
 
 #[tonic::async_trait]
 impl MintingService for BrokerGrpc {
@@ -261,6 +263,12 @@ impl NatsService for BrokerGrpc {
     ) -> GrpcResult<pb::EncryptNatsCurveResponse> {
         let body = request.get_ref();
         self.authorize(&request, Op::EncryptNatsCurve, &body.key_id)?;
+        if body.plaintext.len() > self.state.limits().max_encrypt_size {
+            return Err(payload_too_large(
+                "encrypt_nats_curve",
+                "encrypt payload exceeds configured cap",
+            ));
+        }
         let ciphertext = self
             .state
             .manager()
@@ -276,6 +284,12 @@ impl NatsService for BrokerGrpc {
     ) -> GrpcResult<pb::DecryptNatsCurveResponse> {
         let body = request.get_ref();
         self.authorize(&request, Op::DecryptNatsCurve, &body.key_id)?;
+        if body.ciphertext.len() > self.state.limits().max_encrypt_size {
+            return Err(payload_too_large(
+                "decrypt_nats_curve",
+                "decrypt payload exceeds configured cap",
+            ));
+        }
         let plaintext = self
             .state
             .manager()
@@ -346,11 +360,38 @@ impl NatsService for BrokerGrpc {
         Ok(Response::new(credential_response_at(token, expires_at)?))
     }
 
+    #[allow(clippy::too_many_lines)] // linear entry-gate + signer-match flow; splitting
+    // it would only scatter the validation order this handler exists to pin down.
     async fn validate_nats_jwt(
         &self,
         request: Request<pb::ValidateNatsJwtRequest>,
     ) -> GrpcResult<pb::ValidateNatsJwtResponse> {
         let body = request.get_ref();
+        // RPC-entry authentication: the whole handler — including the
+        // `NatsPublicKey` arm, which verifies against a caller-supplied nkey and
+        // never reaches the per-key `authorize` below — only runs for a peer that
+        // resolves to a policy subject.
+        let peer = peer_from_request(&request);
+        if self
+            .state
+            .load_generation()
+            .pdp()
+            .resolve_local_actor(&peer)
+            .is_err()
+        {
+            return Err(broker_status(
+                Code::Unauthenticated,
+                "UNAUTHENTICATED",
+                "validate_nats_jwt",
+                "missing or unresolved peer credentials",
+            ));
+        }
+        if body.jwt.len() > self.state.limits().max_payload_size {
+            return Err(payload_too_large(
+                "validate_nats_jwt",
+                "jwt exceeds configured cap",
+            ));
+        }
         let Ok(decoded) = basil_nats::decode_nats_jwt(&body.jwt) else {
             return Ok(Response::new(validate_nats_response(
                 false,

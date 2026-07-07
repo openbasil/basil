@@ -775,9 +775,13 @@ fn reject_revoked_jwtsvid(
     trust_domain: &str,
     claims: &serde_json::Value,
 ) -> Result<(), Status> {
-    let Some(jti) = claims.get("jti").and_then(serde_json::Value::as_str) else {
-        return Ok(());
-    };
+    // Revocation is `jti`-scoped and the broker minter stamps `jti`
+    // unconditionally (`mint_svid`): a token without one can never be revoked,
+    // so accepting it would make revocation unenforceable. Fail closed.
+    let jti = claims
+        .get("jti")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(validation_failed)?;
     if store.is_revoked(trust_domain, jti) {
         return Err(validation_failed());
     }
@@ -1844,6 +1848,38 @@ mod tests {
             .expect("expired deny-list entry does not reject")
             .into_inner();
         assert_eq!(response.spiffe_id, "spiffe://example.org/svc-api");
+    }
+
+    #[tokio::test]
+    async fn validate_jwtsvid_rejects_token_without_jti() {
+        use rsa::pkcs1::EncodeRsaPrivateKey;
+        let (service, _backend) = service();
+        // A well-signed, in-audience token minus `jti`: revocation is
+        // jti-scoped, so a jti-less token could never be revoked and must be
+        // rejected outright (finding 20).
+        let expires_at = jsonwebtoken::get_current_timestamp().saturating_add(300);
+        let claims = serde_json::json!({
+            "iss": "spiffe://example.org/basil",
+            "sub": "spiffe://example.org/svc-api",
+            "aud": "vault",
+            "iat": expires_at.saturating_sub(60),
+            "exp": expires_at,
+        });
+        let private_pem = test_issuer_key()
+            .to_pkcs1_pem(rsa::pkcs8::LineEnding::LF)
+            .expect("pkcs1 pem");
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_rsa_pem(private_pem.as_bytes()).expect("private key"),
+        )
+        .expect("token signs");
+        let status = service
+            .validate_jwtsvid(validate_request(9100, "vault", token))
+            .await
+            .expect_err("jti-less token rejected");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(status.message(), "JWT-SVID validation failed");
     }
 
     #[tokio::test]
