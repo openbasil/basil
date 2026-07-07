@@ -248,9 +248,11 @@ pub enum ReadinessState {
 /// The non-secret outcome of one readiness probe.
 ///
 /// Carries the coarse [`ReadinessState`] plus the key counts the admin summary
-/// reports. It is generation-independent (the serving generation id is stamped on
-/// the wire response by the caller), so a cached outcome is reused only while it
-/// still matches the generation that produced it (see [`CachedReadiness`]).
+/// reports. Absent keys are classified against the serving generation's catalog
+/// at probe time (`missing` is a reloadable dimension), so a cached outcome is
+/// reused only while it still matches the generation that produced it (see
+/// [`CachedReadiness`]); the serving generation id itself is stamped on the wire
+/// response by the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadinessOutcome {
     /// The coarse readiness category.

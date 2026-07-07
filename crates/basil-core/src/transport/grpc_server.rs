@@ -254,12 +254,24 @@ mod tests {
           "backends": { "bao": { "kind": "vault", "addr": "https://127.0.0.1:8200" } },
           "keys": {}
         }"#;
-        let policy = r#"{
-          "roles": {},
-          "rules": [],
-          "config": { "names": { "users": {}, "groups": {} }, "memberships": {} }
-        }"#;
-        let (catalog, policy, config, warnings) = load(catalog, policy).expect("fixture loads");
+        // These tests exercise transport wiring over a real UDS, so the peer uid
+        // the kernel reports is this test process's own; register it as a policy
+        // subject so the `status` canary RPC (which requires a resolved subject)
+        // answers.
+        let uid = rustix::process::getuid().as_raw();
+        let policy = format!(
+            r#"{{
+              "schemaVersion": 2,
+              "subjects": {{ "test.peer": {{ "allOf": [ {{ "kind": "unix", "uid": {uid} }} ] }} }},
+              "roles": {{}},
+              "rules": [],
+              "config": {{
+                "names": {{ "users": {{ "{uid}": "test-peer" }}, "groups": {{}} }},
+                "memberships": {{ "{uid}": [{uid}] }}
+              }}
+            }}"#
+        );
+        let (catalog, policy, config, warnings) = load(catalog, &policy).expect("fixture loads");
         assert!(warnings.is_empty());
         let mut backends: BTreeMap<String, Box<dyn Backend>> = BTreeMap::new();
         backends.insert("bao".to_string(), Box::new(DummyBackend));

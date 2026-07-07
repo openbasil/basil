@@ -78,6 +78,16 @@ pub enum Op {
     /// state. It is deliberately absent from [`ALL_OPS`], so no data-plane grant
     /// or wildcard action implies it; grant it explicitly over `broker.revoke`.
     Revoke,
+    /// Subscribe to the broker event stream (admin `Watch`: key rotations,
+    /// bundle changes, revocations).
+    ///
+    /// This is a broker-wide admin op because a subscription observes
+    /// broker-wide change traffic (every `Revoked` id and `BundleChanged`
+    /// domain), not a single key. It is deliberately absent from [`ALL_OPS`],
+    /// so no data-plane grant or wildcard action implies it; grant it
+    /// explicitly over `broker.watch`. `KeyRotated` events additionally stay
+    /// filtered per key by the watcher's data-plane grants.
+    Watch,
     /// Permit a caller to use the **local-software** crypto provider for a key
     /// (the software-custodied PQC arm: ML-DSA signing, ML-KEM unwrap).
     ///
@@ -154,6 +164,7 @@ impl Op {
             Self::Reload => "reload",
             Self::Explain => "explain",
             Self::Revoke => "revoke",
+            Self::Watch => "watch",
             Self::UseSoftwareCustody => "use_software_custody",
         }
     }
@@ -181,6 +192,7 @@ impl Op {
             "reload" => Self::Reload,
             "explain" => Self::Explain,
             "revoke" => Self::Revoke,
+            "watch" => Self::Watch,
             "use_software_custody" => Self::UseSoftwareCustody,
             other => return Err(ActionTermError::UnknownOp(other.to_string())),
         };
@@ -504,9 +516,11 @@ mod tests {
         assert_eq!(Op::parse("reload").unwrap(), Op::Reload);
         assert_eq!(Op::parse("explain").unwrap(), Op::Explain);
         assert_eq!(Op::parse("revoke").unwrap(), Op::Revoke);
+        assert_eq!(Op::parse("watch").unwrap(), Op::Watch);
         assert_eq!(Op::Reload.token(), "reload");
         assert_eq!(Op::Explain.token(), "explain");
         assert_eq!(Op::Revoke.token(), "revoke");
+        assert_eq!(Op::Watch.token(), "watch");
         assert!(matches!(
             Op::parse("nope"),
             Err(ActionTermError::UnknownOp(_))
@@ -515,7 +529,7 @@ mod tests {
 
     #[test]
     fn admin_ops_are_not_write_and_excluded_from_any_op_expansion() {
-        for op in [Op::Reload, Op::Explain, Op::Revoke] {
+        for op in [Op::Reload, Op::Explain, Op::Revoke, Op::Watch] {
             assert!(!op.is_write());
             assert!(
                 !ALL_OPS.contains(&op),

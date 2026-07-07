@@ -592,7 +592,8 @@ mod tests {
           },
           "rules": [
             { "id": "mint", "subjects": ["svc.mint"], "action": ["role:minter", "role:reader", "role:signer"], "target": ["issuer.*"] },
-            { "id": "nats-box", "subjects": ["svc.mint"], "action": ["role:nats_box"], "target": ["nats.curve_box"] }
+            { "id": "nats-box", "subjects": ["svc.mint"], "action": ["role:nats_box"], "target": ["nats.curve_box"] },
+            { "id": "watch", "subjects": ["svc.mint"], "action": ["op:watch"], "target": ["broker.watch"] }
           ],
           "config": {
             "names": { "users": { "42": "svc-mint" }, "groups": {} },

@@ -36,6 +36,15 @@ SPDX-License-Identifier: Apache-2.0
   allocated; an oversized deposit log invalidates only its excess tail instead
   of every deposit; and a JWT-SVID without a `jti` fails validation so
   revocation always holds.
+- Security review fixes: readiness classifies absent keys against the currently
+  serving generation, so a hot reload flipping a key's `missing` policy takes
+  effect without a restart; the admin `Watch` stream closes with `DATA_LOSS`
+  when a slow watcher overflows the event buffer instead of silently skipping
+  events; `Watch` subscriptions are gated by a new dedicated `op:watch` admin
+  grant over `broker.watch` and audited per subscription; `status` requires a
+  peer that resolves to a policy subject (it names the backend kind); and the
+  ungated SDS `ValidationContext` trust bundle is documented as intentionally
+  public (the same bytes the SPIFFE `FetchX509Bundles` serves ungated).
 - Nix example hardening: the example package now defaults to the local flake
   instead of a remote repository.
 

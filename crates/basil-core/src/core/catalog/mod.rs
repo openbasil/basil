@@ -28,8 +28,8 @@ pub mod schema;
 pub use glob::{GlobError, GlobSeg, KeyGlob};
 pub use loader::{LoadError, LoadWarning, RawPolicy, RawRule, RawSubjectDefinition, load};
 pub use pdp::{
-    ADMIN_EXPLAIN_TARGET, ADMIN_RELOAD_TARGET, ADMIN_REVOKE_TARGET, AllowVia, Decision, DenyReason,
-    EffectiveGrant, Explanation, MatchedRule, Pdp,
+    ADMIN_EXPLAIN_TARGET, ADMIN_RELOAD_TARGET, ADMIN_REVOKE_TARGET, ADMIN_WATCH_TARGET, AllowVia,
+    Decision, DenyReason, EffectiveGrant, Explanation, MatchedRule, Pdp,
 };
 pub use policy::{
     ActionTerm, ActionTermError, Config, Grant, NameTable, Op, PrincipalSpec, ResolvedPolicy,

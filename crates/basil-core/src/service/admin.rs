@@ -15,8 +15,8 @@ use crate::actor::SubjectResolutionError;
 use crate::audit::ReloadActor;
 use crate::catalog::policy::Op;
 use crate::catalog::{
-    ADMIN_EXPLAIN_TARGET, ADMIN_RELOAD_TARGET, ADMIN_REVOKE_TARGET, AllowVia, Decision, DenyReason,
-    Explanation, MatchedRule,
+    ADMIN_EXPLAIN_TARGET, ADMIN_RELOAD_TARGET, ADMIN_REVOKE_TARGET, ADMIN_WATCH_TARGET, AllowVia,
+    Decision, DenyReason, Explanation, MatchedRule, MissingPolicy,
 };
 use crate::decision::DecisionRecord;
 use crate::reload::{ReloadError, check_reload, reload_generation};
@@ -31,6 +31,8 @@ use tracing::warn;
 const RELOAD_OP_TOKEN: &str = "reload";
 const EXPLAIN_OP_TOKEN: &str = "explain";
 const REVOKE_OP_TOKEN: &str = "revoke";
+const WATCH_OP_TOKEN: &str = "watch";
+const STATUS_OP_TOKEN: &str = "status";
 
 fn admin_resolution_status(op: &'static str, err: &SubjectResolutionError) -> tonic::Status {
     match err {
@@ -52,7 +54,26 @@ fn admin_resolution_status(op: &'static str, err: &SubjectResolutionError) -> to
 impl AdminService for BrokerGrpc {
     type WatchStream = BoxStream<pb::Event>;
 
-    async fn status(&self, _request: Request<pb::StatusRequest>) -> GrpcResult<pb::StatusResponse> {
+    /// Broker identity summary: backend kind, agent version, wire protocol.
+    ///
+    /// Unlike its deliberately ungated siblings [`health`](Self::health) and
+    /// [`readiness`](Self::readiness) (which return nothing a connected peer
+    /// cannot already infer), `status` names the configured backend kind
+    /// (`vault`, `aws-kms`, ...): deployment-infrastructure detail with recon
+    /// value. The caller must therefore **resolve to a policy subject** (the
+    /// same fail-closed peer-credential resolution every data-plane op runs)
+    /// before the broker answers. No per-key or admin grant is required beyond
+    /// that: for a configured subject the backend kind is non-secret deployment
+    /// metadata, and the only other fields (`version`, `protocol`) are already
+    /// served ungated by `health`.
+    async fn status(&self, request: Request<pb::StatusRequest>) -> GrpcResult<pb::StatusResponse> {
+        let peer = peer_from_request(&request);
+        let generation = self.state.load_generation();
+        generation
+            .pdp()
+            .resolve_local_actor(&peer)
+            .map_err(|err| admin_resolution_status(STATUS_OP_TOKEN, &err))?;
+        drop(generation);
         Ok(Response::new(pb::StatusResponse {
             backend: self.state.backend_label().to_string(),
             version: self.state.agent_version().to_string(),
@@ -83,9 +104,11 @@ impl AdminService for BrokerGrpc {
     /// - a backend was **unreachable** (or rejecting), so `check` returns a fatal
     ///   [`ReconcileError::Probe`], surfaced as
     ///   [`ReadinessReason::BackendUnreachable`]; or
-    /// - a `missing=error` key's material is **absent**
-    ///   ([`CheckReport::should_fail_required`]), so its ops would fail closed,
-    ///   surfaced as [`ReadinessReason::RequiredKeyMissing`].
+    /// - a `missing=error` key's material is **absent**, so its ops would fail
+    ///   closed, surfaced as [`ReadinessReason::RequiredKeyMissing`]. Absent keys
+    ///   are classified against the **currently serving** generation's catalog
+    ///   (`missing` is a reloadable dimension), so a hot reload flipping a key
+    ///   `warn -> error` changes the verdict without a restart.
     ///
     /// The response is a non-secret **summary**: counts plus a coarse reason and
     /// the active generation id. It never returns key names, key material, or the
@@ -107,39 +130,93 @@ impl AdminService for BrokerGrpc {
                 .cache_readiness(self.state.active_generation_id(), fresh);
             fresh
         };
-        // Stamp the *current* generation id on the wire response; the cached outcome
-        // is generation-independent and is only reused while the generation matches.
+        // Stamp the *current* generation id on the wire response; the cached
+        // outcome was classified against the generation it was probed under and
+        // is only reused while the serving generation still matches.
         Ok(Response::new(readiness_response(
             outcome,
             self.state.active_generation_id(),
         )))
     }
 
+    /// Subscribe to the broker event stream (`KeyRotated`, `BundleChanged`,
+    /// `Revoked`).
+    ///
+    /// Gated by the dedicated broker-admin `watch` op ([`Op::Watch`]) over
+    /// [`ADMIN_WATCH_TARGET`]: like every admin op it is granted only by an
+    /// explicit `op:watch` action (never implied by `*`, not even root's), and
+    /// the subscription decision is audited on both the allow and the deny
+    /// path. `KeyRotated` events are additionally filtered per key against the
+    /// watcher's data-plane grants ([`event_allowed`]).
+    ///
+    /// Delivery is at-most-once over a bounded buffer: when a slow watcher
+    /// falls far enough behind that the broker drops events for it, the stream
+    /// is **closed with `DATA_LOSS`** instead of silently skipping the gap (a
+    /// missed `Revoked` must never be invisible). On `DATA_LOSS` the watcher
+    /// reconnects and re-fetches whatever state it mirrors (bundles,
+    /// revocation lists) from scratch.
     async fn watch(&self, request: Request<pb::WatchRequest>) -> GrpcResult<Self::WatchStream> {
         let peer = peer_from_request(&request);
         let generation = self.state.load_generation();
-        let Ok(actor) = generation.pdp().resolve_local_actor(&peer) else {
-            return Err(broker_status(
-                Code::Unauthenticated,
-                "UNAUTHENTICATED",
-                "watch",
-                "missing or unresolved peer credentials",
+        let actor = generation
+            .pdp()
+            .resolve_local_actor(&peer)
+            .map_err(|err| admin_resolution_status(WATCH_OP_TOKEN, &err))?;
+
+        let decision = generation.pdp().decide_admin(&actor, Op::Watch);
+        self.state
+            .record_decision(&DecisionRecord::from_actor_decision(
+                generation.id(),
+                &actor,
+                Op::Watch,
+                ADMIN_WATCH_TARGET,
+                &decision,
             ));
-        };
+        drop(generation);
+
+        if matches!(decision, Decision::Deny { .. }) {
+            return Err(broker_status(
+                Code::PermissionDenied,
+                "UNAUTHORIZED",
+                WATCH_OP_TOKEN,
+                "not authorized to watch broker events",
+            ));
+        }
+
         let kinds = request.get_ref().kinds.clone();
         let state = Arc::clone(&self.state);
         let rx = state.events().subscribe();
         let stream = futures::stream::unfold(
-            (state, rx, kinds, actor),
-            |(state, mut rx, kinds, actor)| async move {
+            (state, rx, kinds, actor, false),
+            |(state, mut rx, kinds, actor, lost)| async move {
+                if lost {
+                    return None;
+                }
                 loop {
                     match rx.recv().await {
                         Ok(event) => {
                             if event_allowed(&state, &actor, &kinds, &event) {
-                                return Some((Ok(proto_event(event)), (state, rx, kinds, actor)));
+                                return Some((
+                                    Ok(proto_event(event)),
+                                    (state, rx, kinds, actor, false),
+                                ));
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            // The buffer overflowed and this watcher missed
+                            // events (possibly a `Revoked`). Fail loud: close
+                            // the stream with DATA_LOSS so the watcher knows to
+                            // resync, rather than resuming with a silent gap.
+                            return Some((
+                                Err(broker_status(
+                                    Code::DataLoss,
+                                    "DATA_LOSS",
+                                    WATCH_OP_TOKEN,
+                                    "watcher lagged and events were dropped; reconnect and resync",
+                                )),
+                                (state, rx, kinds, actor, true),
+                            ));
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
                     }
                 }
@@ -420,16 +497,34 @@ impl BrokerGrpc {
     async fn probe_readiness(&self) -> ReadinessOutcome {
         match self.state.manager().check().await {
             Ok(report) => {
+                // Classify absent keys against the **currently serving**
+                // generation's catalog, not the startup manager catalog: the
+                // `missing` policy is a reloadable dimension, so a hot reload
+                // flipping a key `warn -> error` must flip the readiness
+                // verdict without a restart. The probe's existence results stay
+                // valid across generations (the reload routing-shape guard pins
+                // the key set and paths); only the classification can change. A
+                // probed key absent from the serving catalog is unreachable by
+                // that same guard; fall back to its startup policy.
+                let generation = self.state.load_generation();
                 let keys_total = u32::try_from(report.keys.len()).unwrap_or(u32::MAX);
                 let keys_present = u32::try_from(report.present_count()).unwrap_or(u32::MAX);
-                let required_missing = report.required_missing().len();
-                let keys_required_missing = u32::try_from(required_missing).unwrap_or(u32::MAX);
-                // Absent keys total minus the required (`error`) ones = the
-                // warn/generate-absent keys that do not block readiness.
-                let optional_missing = report.missing().count().saturating_sub(required_missing);
-                let keys_optional_missing = u32::try_from(optional_missing).unwrap_or(u32::MAX);
+                let mut keys_required_missing: u32 = 0;
+                let mut keys_optional_missing: u32 = 0;
+                for (name, probed_policy) in report.missing() {
+                    let policy = generation
+                        .catalog()
+                        .keys
+                        .get(name)
+                        .map_or(probed_policy, |entry| entry.missing);
+                    if policy == MissingPolicy::Error {
+                        keys_required_missing = keys_required_missing.saturating_add(1);
+                    } else {
+                        keys_optional_missing = keys_optional_missing.saturating_add(1);
+                    }
+                }
 
-                let state = if required_missing == 0 {
+                let state = if keys_required_missing == 0 {
                     ReadinessState::Ready
                 } else {
                     ReadinessState::RequiredKeyMissing
@@ -461,9 +556,10 @@ impl BrokerGrpc {
 }
 
 /// Build the wire [`pb::ReadinessResponse`] from a non-secret [`ReadinessOutcome`]
-/// and the **current** serving generation id (`basil-8nwy`). The outcome is
-/// generation-independent (cached across calls within the TTL); the generation id
-/// is always stamped fresh so a hot reload's id is reflected immediately.
+/// and the **current** serving generation id (`basil-8nwy`). The outcome is cached
+/// across calls within the TTL and reused only while the serving generation still
+/// matches; the generation id is always stamped fresh so a hot reload's id is
+/// reflected immediately.
 fn readiness_response(outcome: ReadinessOutcome, generation: u64) -> pb::ReadinessResponse {
     let reason = match outcome.state {
         ReadinessState::Ready => pb::ReadinessReason::Ready,
@@ -978,6 +1074,74 @@ mod tests {
         assert_eq!(probes.load(Ordering::Relaxed), 6);
     }
 
+    /// Absent keys are classified against the **serving** generation's catalog,
+    /// not the startup manager catalog (basil-5bw): a hot reload flipping a
+    /// key's `missing` policy `warn -> error` flips the verdict on the next
+    /// probe, without a restart.
+    #[tokio::test]
+    async fn readiness_reclassifies_missing_against_the_serving_generation() {
+        const WARN_ONLY: &str = r#"{
+          "schemaVersion": 1,
+          "backends": { "b": { "kind": "vault", "addr": "http://127.0.0.1:8200" } },
+          "keys": {
+            "warn.value": {
+              "class": "value", "backend": "b", "engine": "kv2",
+              "path": "secret/data/warn/value", "writable": true, "missing": "warn",
+              "description": "a warn-on-missing value"
+            }
+          }
+        }"#;
+        let (catalog, policy, config, _w) = load(WARN_ONLY, EMPTY_POLICY).expect("fixture");
+        let mut backends: BTreeMap<String, Box<dyn Backend>> = BTreeMap::new();
+        backends.insert(
+            "b".into(),
+            Box::new(ProbeBackend {
+                probe: Probe::Absent,
+                probes: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let manager = BackendManager::new(catalog.clone(), backends).expect("manager builds");
+        let grpc = BrokerGrpc::new(Arc::new(BrokerState::new(
+            catalog, policy, config, manager, "vault",
+        )));
+
+        // Under the startup catalog the absent key is optional: ready.
+        let first = grpc
+            .readiness(Request::new(pb::ReadinessRequest {}))
+            .await
+            .expect("readiness never errs")
+            .into_inner();
+        assert!(first.ready);
+        assert_eq!(first.keys_required_missing, 0);
+        assert_eq!(first.keys_optional_missing, 1);
+
+        // Hot-flip the key to `missing=error` in a new serving generation (a
+        // reloadable dimension); the manager's startup catalog still says warn.
+        let flipped = WARN_ONLY.replace(r#""missing": "warn""#, r#""missing": "error""#);
+        let (catalog2, policy2, config2, _w) =
+            load(&flipped, EMPTY_POLICY).expect("flipped fixture");
+        grpc.state
+            .swap_generation(Arc::new(crate::state::Generation::new(
+                2,
+                Arc::new(catalog2),
+                policy2,
+                config2,
+            )));
+
+        // The generation change invalidates the readiness cache; the re-probe
+        // must classify the same absent key as REQUIRED now: not ready.
+        let second = grpc
+            .readiness(Request::new(pb::ReadinessRequest {}))
+            .await
+            .expect("readiness never errs")
+            .into_inner();
+        assert!(!second.ready);
+        assert_eq!(second.reason(), pb::ReadinessReason::RequiredKeyMissing);
+        assert_eq!(second.generation, 2);
+        assert_eq!(second.keys_required_missing, 1);
+        assert_eq!(second.keys_optional_missing, 0);
+    }
+
     // ---- Admin reload RPC (basil-atq) ---------------------------------------
 
     use crate::peer::PeerInfo;
@@ -1123,7 +1287,8 @@ mod tests {
           },
           "roles": {},
           "rules": [
-            { "id": "admin-revoke", "subjects": ["svc.revoke"], "action": ["op:revoke"], "target": ["broker.revoke"] }
+            { "id": "admin-revoke", "subjects": ["svc.revoke"], "action": ["op:revoke"], "target": ["broker.revoke"] },
+            { "id": "admin-watch",  "subjects": ["svc.revoke"], "action": ["op:watch"],  "target": ["broker.watch"] }
           ],
           "config": {
             "names": { "users": { "4244": "svc-revoke" }, "groups": {} },
@@ -1433,6 +1598,102 @@ mod tests {
             .expect_err("reload admin must not imply revoke");
         assert_eq!(status.code(), Code::PermissionDenied);
         assert_status_omits_admin_canaries(&status);
+    }
+
+    /// `status` requires the peer to resolve to a policy subject (basil-4g5):
+    /// an unattested or unconfigured peer must not learn the backend kind. A
+    /// resolved subject needs no further grant.
+    #[tokio::test]
+    async fn status_requires_a_resolved_subject() {
+        let (grpc, _inputs) = reload_grpc();
+
+        // No peer credentials at all: fail closed before policy.
+        let status = grpc
+            .status(Request::new(pb::StatusRequest {}))
+            .await
+            .expect_err("no peer credentials");
+        assert_eq!(status.code(), Code::Unauthenticated);
+
+        // A uid that resolves to no policy subject is denied.
+        let mut req = Request::new(pb::StatusRequest {});
+        req.extensions_mut().insert(PeerInfo {
+            uid: Some(9999),
+            ..PeerInfo::default()
+        });
+        let status = grpc.status(req).await.expect_err("unresolved subject");
+        assert_eq!(status.code(), Code::PermissionDenied);
+        assert_status_omits_admin_canaries(&status);
+
+        // Any resolved subject (a plain data-plane one, uid 7) may read it.
+        let mut req = Request::new(pb::StatusRequest {});
+        req.extensions_mut().insert(PeerInfo {
+            uid: Some(7),
+            ..PeerInfo::default()
+        });
+        let resp = grpc
+            .status(req)
+            .await
+            .expect("resolved subject reads status")
+            .into_inner();
+        assert_eq!(resp.backend, "vault");
+        assert_eq!(resp.protocol, 1);
+    }
+
+    /// No data-plane grant and no *other* admin grant implies watch: the
+    /// subscription needs an explicit `op:watch` over `broker.watch`
+    /// (basil-8li). An unattested peer fails closed before policy.
+    #[tokio::test]
+    async fn unauthorized_watch_is_denied() {
+        let (grpc, _inputs) = reload_grpc();
+        // uid 7: data-plane signer; 4242/4243/4244: other admin grants;
+        // uid 9999: resolves to no subject at all.
+        for uid in [7, 4242, 4243, 4244] {
+            let result = grpc
+                .watch(reload_request(uid, false).map(|_| pb::WatchRequest { kinds: vec![] }))
+                .await;
+            let Err(status) = result else {
+                panic!("uid {uid} must be denied watch");
+            };
+            assert_eq!(status.code(), Code::PermissionDenied, "uid {uid}");
+            assert_status_omits_admin_canaries(&status);
+        }
+
+        let result = grpc
+            .watch(Request::new(pb::WatchRequest { kinds: vec![] }))
+            .await;
+        let Err(status) = result else {
+            panic!("a peer with no credentials must be denied watch");
+        };
+        assert_eq!(status.code(), Code::Unauthenticated);
+    }
+
+    /// A watcher that falls behind the bounded event buffer is closed with
+    /// `DATA_LOSS` instead of silently resuming past the gap (basil-l3m): a
+    /// missed `Revoked` must never be invisible.
+    #[tokio::test]
+    async fn lagged_watcher_stream_closes_with_data_loss() {
+        use futures::StreamExt as _;
+
+        let grpc = revoke_grpc().await;
+        let mut watch = grpc
+            .watch(revoke_request(4244, "", "", 1).map(|_| pb::WatchRequest { kinds: vec![] }))
+            .await
+            .expect("watch opens")
+            .into_inner();
+
+        // Overflow the bounded (1024) broadcast buffer before the stream is
+        // ever polled: the watcher has now provably missed events.
+        for i in 0..1100_u32 {
+            grpc.state
+                .events()
+                .revoked("example.org", format!("jti-{i}"));
+        }
+
+        let item = watch.next().await.expect("stream yields the gap marker");
+        let status = item.expect_err("the gap surfaces as an error, not an event");
+        assert_eq!(status.code(), Code::DataLoss);
+        // The stream is CLOSED after the gap marker: no silent resumption.
+        assert!(watch.next().await.is_none());
     }
 
     #[tokio::test]

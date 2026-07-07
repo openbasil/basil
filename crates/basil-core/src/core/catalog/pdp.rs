@@ -493,11 +493,18 @@ pub const ADMIN_EXPLAIN_TARGET: &str = "broker.explain";
 /// `{ "action": ["op:revoke"], "target": ["broker.revoke"] }`.
 pub const ADMIN_REVOKE_TARGET: &str = "broker.revoke";
 
+/// The reserved policy target for the broker event-stream watch admin op.
+///
+/// This is **not** a catalog key. Grant it explicitly with
+/// `{ "action": ["op:watch"], "target": ["broker.watch"] }`.
+pub const ADMIN_WATCH_TARGET: &str = "broker.watch";
+
 const fn admin_target(op: Op) -> Option<&'static str> {
     match op {
         Op::Reload => Some(ADMIN_RELOAD_TARGET),
         Op::Explain => Some(ADMIN_EXPLAIN_TARGET),
         Op::Revoke => Some(ADMIN_REVOKE_TARGET),
+        Op::Watch => Some(ADMIN_WATCH_TARGET),
         Op::Get
         | Op::List
         | Op::GetPublicKey
@@ -599,6 +606,7 @@ mod tests {
     //  gid 10 (wheel)    : operator over web.tls.ca_cert      (hard-cap target)
     //  uid 5000          : member of gid 10 by supplementary membership only
     //  uid 9007          : revoke over broker.revoke          (admin op)
+    //  uid 9008          : watch over broker.watch            (admin op)
     //  uid 0 (root)      : * over * (root any-target)
     const SUBJECTS: &str = r#"
       "svc.grafana":     { "allOf": [ { "kind": "unix", "uid": 9002 } ] },
@@ -607,6 +615,7 @@ mod tests {
       "svc.enroll":      { "allOf": [ { "kind": "unix", "uid": 9005 } ] },
       "svc.reload":      { "allOf": [ { "kind": "unix", "uid": 9006 } ] },
       "svc.revoke":      { "allOf": [ { "kind": "unix", "uid": 9007 } ] },
+      "svc.watch":       { "allOf": [ { "kind": "unix", "uid": 9008 } ] },
       "ops.wheel":       { "allOf": [ { "kind": "unix", "gid": 10 } ] },
       "breakglass.root": { "breakGlass": true, "allOf": [ { "kind": "unix", "uid": 0 } ] }
     "#;
@@ -620,6 +629,7 @@ mod tests {
       { "id": "reload-admin",     "subjects": ["svc.reload"],      "action": ["op:reload"],     "target": ["broker.reload"] },
       { "id": "reload-wheel",     "subjects": ["ops.wheel"],       "action": ["op:reload"],     "target": ["broker.reload"] },
       { "id": "revoke-admin",     "subjects": ["svc.revoke"],      "action": ["op:revoke"],     "target": ["broker.revoke"] },
+      { "id": "watch-admin",      "subjects": ["svc.watch"],       "action": ["op:watch"],      "target": ["broker.watch"] },
       { "id": "root-all",         "subjects": ["breakglass.root"], "action": ["*"],             "target": ["*"] }
     "#;
 
@@ -628,10 +638,10 @@ mod tests {
     // full declared group set, not the primary gid.
     const CONFIG: &str = r#"
       "names": {
-        "users":  { "0": "root", "9002": "svc-grafana", "9003": "svc-nats", "9004": "svc-minter", "9005": "svc-enroll", "9006": "svc-admin", "9007": "svc-revoke", "5000": "alice" },
+        "users":  { "0": "root", "9002": "svc-grafana", "9003": "svc-nats", "9004": "svc-minter", "9005": "svc-enroll", "9006": "svc-admin", "9007": "svc-revoke", "9008": "svc-watch", "5000": "alice" },
         "groups": { "10": "wheel" }
       },
-      "memberships": { "5000": [5000, 10], "9002": [9002], "9003": [9003], "9004": [9004], "9005": [9005], "9006": [9006], "9007": [9007] }
+      "memberships": { "5000": [5000, 10], "9002": [9002], "9003": [9003], "9004": [9004], "9005": [9005], "9006": [9006], "9007": [9007], "9008": [9008] }
     "#;
 
     fn policy_json() -> String {
@@ -1101,6 +1111,27 @@ mod tests {
     }
 
     #[test]
+    fn decide_admin_allows_explicit_watch_grant() {
+        let (c, r, cfg) = fixture();
+        let pdp = Pdp::new(&c, &r, &cfg);
+        assert_eq!(
+            decide_admin(&pdp, 9008, Op::Watch),
+            Decision::Allow {
+                via: via("svc.watch")
+            }
+        );
+        // The watch grant implies NO other admin op.
+        for op in [Op::Reload, Op::Explain, Op::Revoke] {
+            assert_eq!(
+                decide_admin(&pdp, 9008, op),
+                Decision::Deny {
+                    reason: DenyReason::NotPermitted
+                }
+            );
+        }
+    }
+
+    #[test]
     fn decide_admin_default_denies_without_an_explicit_reload_grant() {
         let (c, r, cfg) = fixture();
         let pdp = Pdp::new(&c, &r, &cfg);
@@ -1128,7 +1159,7 @@ mod tests {
             9005, // enroll sealer
             0,    // root: `*` action over `*` target
         ] {
-            for op in [Op::Reload, Op::Explain, Op::Revoke] {
+            for op in [Op::Reload, Op::Explain, Op::Revoke, Op::Watch] {
                 assert_eq!(
                     decide_admin(&pdp, uid, op),
                     Decision::Deny {
@@ -1156,7 +1187,7 @@ mod tests {
                 via: via("breakglass.root")
             }
         );
-        for op in [Op::Reload, Op::Explain, Op::Revoke] {
+        for op in [Op::Reload, Op::Explain, Op::Revoke, Op::Watch] {
             assert_eq!(
                 pdp.decide_admin(&actor, op),
                 Decision::Deny {

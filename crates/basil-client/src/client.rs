@@ -1081,6 +1081,9 @@ impl Client {
     }
 
     /// The broker's backend identifier, build version, and wire protocol version.
+    ///
+    /// The broker answers only callers that resolve to a policy subject (no
+    /// further grant is needed); an unattested or unconfigured peer is denied.
     pub async fn status(&mut self) -> Result<AgentStatus> {
         let response = Self::bounded(
             self.default_timeout,
