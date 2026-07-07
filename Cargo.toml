@@ -18,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.0-rc.1"
+version = "0.7.0-rc.2"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["info@openbasil.org"]
@@ -27,14 +27,14 @@ homepage = "https://github.com/openbasil/basil"
 documentation = "https://docs.openbasil.org"
 
 [workspace.dependencies]
-basil = { version = "0.7.0-rc.1", path = "crates/basil-client" }
-basil-cose = { version = "0.7.0-rc.1", path = "crates/basil-cose" }
-basil-proto = { version = "0.7.0-rc.1", path = "crates/basil-proto" }
-basil-nats = { version = "0.7.0-rc.1", path = "crates/basil-nats" }
-basil-nats-bridge = { version = "0.7.0-rc.1", path = "crates/basil-nats-bridge" }
-basil-keystore-backend = { version = "0.7.0-rc.1", path = "crates/basil-keystore-backend" }
-basil-core = { version = "0.7.0-rc.1", path = "crates/basil-core", default-features = false }
-basil-bin = { version = "0.7.0-rc.1", path = "crates/basil-bin" }
+basil = { version = "0.7.0-rc.2", path = "crates/basil-client" }
+basil-cose = { version = "0.7.0-rc.2", path = "crates/basil-cose" }
+basil-proto = { version = "0.7.0-rc.2", path = "crates/basil-proto" }
+basil-nats = { version = "0.7.0-rc.2", path = "crates/basil-nats" }
+basil-nats-bridge = { version = "0.7.0-rc.2", path = "crates/basil-nats-bridge" }
+basil-keystore-backend = { version = "0.7.0-rc.2", path = "crates/basil-keystore-backend" }
+basil-core = { version = "0.7.0-rc.2", path = "crates/basil-core", default-features = false }
+basil-bin = { version = "0.7.0-rc.2", path = "crates/basil-bin" }
 
 # `aes` is depended on directly (alongside aes-gcm's own `zeroize` feature, which
 # only scrubs the GHASH key) so its `zeroize` feature zeroizes AES round-key
