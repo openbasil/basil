@@ -66,7 +66,7 @@ async fn serve_with_shutdown(
         warn!(%path, "removed stale socket");
     }
 
-    let listener = UnixListener::bind(&path)?;
+    let listener = bind_restricted(&path)?;
     apply_socket_permissions(&path, config.socket_mode, config.socket_group.as_deref())?;
 
     info!(
@@ -103,6 +103,18 @@ async fn serve_with_shutdown(
     }
 
     result.map_err(std::io::Error::other)
+}
+
+/// Bind the listening Unix socket with the process umask tightened to `0o177`,
+/// so the socket node is created owner-only no matter how loose the inherited
+/// umask is. The listen backlog is live from `bind`, so the mode must be
+/// restrictive *at creation*; the later [`apply_socket_permissions`] can only
+/// widen it to the configured mode/group (never leaves a permissive window).
+fn bind_restricted(path: &str) -> io::Result<UnixListener> {
+    let inherited = rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o177));
+    let listener = UnixListener::bind(path);
+    rustix::process::umask(inherited);
+    listener
 }
 
 fn apply_socket_permissions(path: &str, mode: u32, group: Option<&str>) -> io::Result<()> {
@@ -310,6 +322,26 @@ mod tests {
 
     fn socket_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("basil-{name}-{}.sock", uuid::Uuid::new_v4()))
+    }
+
+    #[tokio::test]
+    async fn socket_is_owner_only_at_bind_even_under_a_loose_umask() {
+        // Loosen the process umask: without the tightened bind the socket node
+        // would be group/world-accessible for the instant before the explicit
+        // chmod, with the listen backlog already live.
+        let inherited = rustix::process::umask(rustix::fs::Mode::empty());
+        let socket = socket_path("umask");
+        let listener = bind_restricted(&socket.to_string_lossy()).expect("binds");
+        rustix::process::umask(inherited);
+
+        let mode = std::fs::metadata(&socket)
+            .expect("socket metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "socket must be owner-only at bind");
+        drop(listener);
+        let _ = std::fs::remove_file(&socket);
     }
 
     #[test]

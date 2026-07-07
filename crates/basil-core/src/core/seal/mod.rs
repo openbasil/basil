@@ -373,9 +373,17 @@ pub fn remove_slot(parsed: &ParsedBundle, slot_id: u32) -> Result<Vec<u8>, SealE
 ///
 /// Missing sidecars are initialized to the bundle's current epoch. A sidecar with
 /// a higher epoch than the bundle means an older bundle was swapped in and is
-/// refused. A sidecar with a lower epoch is advanced. The sidecar itself is only
-/// best-effort logical anti-rollback; TPM NV binding remains the deferred
-/// stronger protection.
+/// refused. A sidecar with a lower epoch is advanced.
+///
+/// **Not a security boundary against a local writer.** Anyone who can replace
+/// the broker-owned bundle can typically also delete the sidecar, and a missing
+/// sidecar is (re)initialized rather than refused: the check only catches
+/// *accidental* rollback (a restored backup, a mis-synced deploy). Deliberate
+/// rollback resistance requires the deferred TPM NV binding. Callers must run
+/// this check on the parsed header **before** opening the bundle, so a stale
+/// bundle is refused without decrypting its payload or applying its deposit log.
+/// Only the plaintext header epoch is consumed here; the header is authenticated
+/// later, as the payload/slot AAD, when the bundle opens.
 ///
 /// # Errors
 /// [`SealError::Format`] on stale bundles or sidecar IO/parse errors.

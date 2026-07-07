@@ -18,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["info@openbasil.org"]
@@ -27,14 +27,14 @@ homepage = "https://github.com/openbasil/basil"
 documentation = "https://docs.rs/basil"
 
 [workspace.dependencies]
-basil = { version = "0.6.0", path = "crates/basil-client" }
-basil-cose = { version = "0.6.0", path = "crates/basil-cose" }
-basil-proto = { version = "0.6.0", path = "crates/basil-proto" }
-basil-nats = { version = "0.6.0", path = "crates/basil-nats" }
-basil-nats-bridge = { version = "0.6.0", path = "crates/basil-nats-bridge" }
-basil-keystore-backend = { version = "0.6.0", path = "crates/basil-keystore-backend" }
-basil-core = { version = "0.6.0", path = "crates/basil-core", default-features = false }
-basil-bin = { version = "0.6.0", path = "crates/basil-bin" }
+basil = { version = "0.6.1", path = "crates/basil-client" }
+basil-cose = { version = "0.6.1", path = "crates/basil-cose" }
+basil-proto = { version = "0.6.1", path = "crates/basil-proto" }
+basil-nats = { version = "0.6.1", path = "crates/basil-nats" }
+basil-nats-bridge = { version = "0.6.1", path = "crates/basil-nats-bridge" }
+basil-keystore-backend = { version = "0.6.1", path = "crates/basil-keystore-backend" }
+basil-core = { version = "0.6.1", path = "crates/basil-core", default-features = false }
+basil-bin = { version = "0.6.1", path = "crates/basil-bin" }
 
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 aes-kw = "0.3"
@@ -106,7 +106,7 @@ rand_core = "0.10.1"
 # (openssl) default path.
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }
 rsa = { version = "0.9", features = ["pem"] }
-rustix = { version = "1", features = ["process"] }
+rustix = { version = "1", features = ["fs", "process"] }
 rustls = { version = "0.23.41", default-features = false, features = ["ring", "std"] }
 salsa20 = { version = "0.10", features = ["zeroize"] }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }

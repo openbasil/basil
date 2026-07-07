@@ -675,7 +675,12 @@ impl BackendManager {
             && let Some(kem) = routed.key_type().and_then(ml_kem_provider_algorithm)
         {
             let public_key = LocalSoftwareProvider::new(routed.backend)
-                .public_key(key_id, routed.path(), kem.token())
+                .public_key(
+                    key_id,
+                    routed.path(),
+                    routed.entry.labels.get("pqc_storage_key"),
+                    kem.token(),
+                )
                 .await?;
             return Ok(PublicKey {
                 public_key,
@@ -701,7 +706,12 @@ impl BackendManager {
             && let Some(algorithm) = routed.key_type().and_then(ml_dsa_signature_algorithm)
         {
             let public_key = LocalSoftwareProvider::new(routed.backend)
-                .public_key(key_id, routed.path(), algorithm.token())
+                .public_key(
+                    key_id,
+                    routed.path(),
+                    routed.entry.labels.get("pqc_storage_key"),
+                    algorithm.token(),
+                )
                 .await?;
             return Ok(PublicKey {
                 public_key,
@@ -819,6 +829,7 @@ impl BackendManager {
             backend_path: routed.path(),
             algorithm,
             message,
+            storage_key: routed.entry.labels.get("pqc_storage_key"),
         };
         let signature = match provider {
             CryptoProviderId::VaultTransit => {
@@ -864,6 +875,7 @@ impl BackendManager {
             algorithm,
             message,
             signature,
+            storage_key: routed.entry.labels.get("pqc_storage_key"),
         };
         let valid = match provider {
             CryptoProviderId::VaultTransit => {
@@ -1329,6 +1341,7 @@ impl BackendManager {
             envelope_algorithm,
             plaintext,
             aad: Some(aad),
+            storage_key: routed.entry.labels.get("pqc_storage_key"),
         };
         let envelope = match provider {
             CryptoProviderId::VaultTransit => {
@@ -1388,6 +1401,7 @@ impl BackendManager {
             nonce: parts.nonce,
             ciphertext: parts.ciphertext,
             aad: Some(aad),
+            storage_key: routed.entry.labels.get("pqc_storage_key"),
         };
         let plaintext = match provider {
             CryptoProviderId::VaultTransit => {
@@ -2071,7 +2085,17 @@ fn generate_self_signed_tls(
     existing_key_pem: Option<&[u8]>,
 ) -> Result<TlsMaterial, ManagerError> {
     let dir = std::env::temp_dir().join(format!("basil-self-signed-tls-{}", Uuid::new_v4()));
-    std::fs::create_dir(&dir).map_err(|e| {
+    // Owner-only from the instant it exists: `step` writes the private key into
+    // this directory with umask-default file modes, so the directory itself must
+    // deny traversal to everyone else (mode is applied atomically at mkdir; a
+    // umask can only tighten it further).
+    let mut dir_builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        dir_builder.mode(0o700);
+    }
+    dir_builder.create(&dir).map_err(|e| {
         ManagerError::Backend(BackendError::Backend(format!(
             "self-signed-tls tempdir create: {e}"
         )))
@@ -2130,6 +2154,21 @@ fn generate_self_signed_tls_in_dir(
             "self-signed-tls step failed: {}",
             detail.trim()
         ))));
+    }
+
+    // Defense in depth on top of the 0700 parent dir: `step`-generated key files
+    // get owner-only mode too (the existing-key path already wrote it 0600 via
+    // `write_secret_file`).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).map_err(
+            |e| {
+                ManagerError::Backend(BackendError::Backend(format!(
+                    "self-signed-tls key perms: {e}"
+                )))
+            },
+        )?;
     }
 
     let cert_pem = std::fs::read(&cert_path).map_err(|e| {

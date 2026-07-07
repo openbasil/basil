@@ -423,11 +423,13 @@ pub(crate) struct LocalSoftwareMaterial {
 }
 impl SoftwareCustodyKeyRecord {
     /// Parse and validate a software-custody record for the local-software
-    /// provider, cross-checking it against the requested key id, algorithm, and
-    /// the provider's own version (the catalog cross-check that the wired
-    /// manager performs is layered on top in `service::*`). The record's own
-    /// declared wrapping key is the backend AEAD key, so the AAD binds exactly
-    /// what was sealed.
+    /// provider, cross-checking it against the requested key id, algorithm, the
+    /// provider's own version, and the **catalog-declared** storage AEAD key
+    /// (`storage_key`, the `pqc_storage_key` label): a record whose
+    /// self-declared `wrapping_key` disagrees is rejected, so a swapped or
+    /// re-wrapped record cannot redirect the seed unwrap to an AEAD key the
+    /// catalog never authorized. The returned material carries the catalog key,
+    /// and the AAD binds it.
     ///
     /// # Errors
     ///
@@ -439,6 +441,7 @@ impl SoftwareCustodyKeyRecord {
         algorithm: &str,
         provider_version: &str,
         kv_version: u32,
+        storage_key: &str,
     ) -> Result<LocalSoftwareMaterial, SoftwareCustodyRecordError> {
         let record: Self =
             serde_json::from_slice(bytes).map_err(|_| SoftwareCustodyRecordError::Malformed)?;
@@ -448,7 +451,7 @@ impl SoftwareCustodyKeyRecord {
             provider: CryptoProviderId::LocalSoftware.token(),
             provider_version,
             custody: CustodyMode::SoftwareEncrypted.token(),
-            storage_key: &record.encrypted_private_key.wrapping_key,
+            storage_key,
         };
         record.validate_metadata(&catalog, kv_version)?;
         let ciphertext = record.encrypted_private_key()?;
@@ -457,7 +460,7 @@ impl SoftwareCustodyKeyRecord {
         Ok(LocalSoftwareMaterial {
             ciphertext,
             aad,
-            storage_key: record.encrypted_private_key.wrapping_key.clone(),
+            storage_key: storage_key.to_string(),
             public_key,
             key_version: kv_version,
         })
@@ -627,6 +630,10 @@ pub struct SignRequest<'a> {
     pub algorithm: SignatureAlgorithm,
     /// The raw message to sign (signed as-is, not a precomputed digest).
     pub message: &'a [u8],
+    /// Catalog-declared AEAD key that wraps a software-custodied private seed;
+    /// the custody record must agree. Required by the local-software provider;
+    /// ignored by backend-native providers.
+    pub storage_key: Option<&'a str>,
 }
 
 /// Verify request.
@@ -641,6 +648,10 @@ pub struct VerifyRequest<'a> {
     pub message: &'a [u8],
     /// Signature bytes.
     pub signature: &'a [u8],
+    /// Catalog-declared AEAD key that wraps a software-custodied private seed;
+    /// the custody record must agree. Required by the local-software provider;
+    /// ignored by backend-native providers.
+    pub storage_key: Option<&'a str>,
 }
 
 /// Encapsulate request.
@@ -651,6 +662,10 @@ pub struct EncapsulateRequest<'a> {
     pub backend_path: &'a str,
     /// KEM algorithm.
     pub algorithm: KemAlgorithm,
+    /// Catalog-declared AEAD key that wraps a software-custodied private seed;
+    /// the custody record must agree. Required by the local-software provider;
+    /// ignored by backend-native providers.
+    pub storage_key: Option<&'a str>,
 }
 
 /// Decapsulate request.
@@ -663,6 +678,10 @@ pub struct DecapsulateRequest<'a> {
     pub algorithm: KemAlgorithm,
     /// Encapsulated shared-secret material.
     pub encapsulated_key: &'a [u8],
+    /// Catalog-declared AEAD key that wraps a software-custodied private seed;
+    /// the custody record must agree. Required by the local-software provider;
+    /// ignored by backend-native providers.
+    pub storage_key: Option<&'a str>,
 }
 
 /// KEM ciphertext and shared-secret output.
@@ -687,6 +706,10 @@ pub struct WrapEnvelopeRequest<'a> {
     pub plaintext: &'a [u8],
     /// Optional associated data.
     pub aad: Option<&'a [u8]>,
+    /// Catalog-declared AEAD key that wraps a software-custodied private seed;
+    /// the custody record must agree. Required by the local-software provider;
+    /// ignored by backend-native providers.
+    pub storage_key: Option<&'a str>,
 }
 
 /// KEM/envelope unwrap request.
@@ -707,6 +730,10 @@ pub struct UnwrapEnvelopeRequest<'a> {
     pub ciphertext: &'a [u8],
     /// Optional associated data.
     pub aad: Option<&'a [u8]>,
+    /// Catalog-declared AEAD key that wraps a software-custodied private seed;
+    /// the custody record must agree. Required by the local-software provider;
+    /// ignored by backend-native providers.
+    pub storage_key: Option<&'a str>,
 }
 
 /// KEM/envelope output.
@@ -978,13 +1005,27 @@ impl<'a> LocalSoftwareProvider<'a> {
     }
 
     /// Read + validate the custody record for one operation.
+    ///
+    /// `storage_key` is the catalog-declared AEAD key (the `pqc_storage_key`
+    /// label): it is the trust anchor the record's self-declared `wrapping_key`
+    /// is checked against, so it is required on every use path exactly as on
+    /// the generate path.
     async fn material(
         &self,
         key_id: &str,
         backend_path: &str,
+        storage_key: Option<&str>,
         op: &'static str,
         algorithm: &'static str,
     ) -> Result<LocalSoftwareMaterial, ProviderError> {
+        let storage_key = storage_key.ok_or_else(|| {
+            crypto_failed(
+                CryptoProviderId::LocalSoftware,
+                op,
+                algorithm,
+                "software-custody key is missing its storage AEAD key",
+            )
+        })?;
         let kv = self.backend.kv_get(backend_path, None).await?;
         SoftwareCustodyKeyRecord::parse_for_local_software(
             &kv.value,
@@ -992,6 +1033,7 @@ impl<'a> LocalSoftwareProvider<'a> {
             algorithm,
             self.provider_version,
             kv.version,
+            storage_key,
         )
         .map_err(|_| {
             crypto_failed(
@@ -1029,10 +1071,11 @@ impl<'a> LocalSoftwareProvider<'a> {
         &self,
         key_id: &str,
         backend_path: &str,
+        storage_key: Option<&str>,
         algorithm: &'static str,
     ) -> Result<Vec<u8>, ProviderError> {
         let material = self
-            .material(key_id, backend_path, "get_public_key", algorithm)
+            .material(key_id, backend_path, storage_key, "get_public_key", algorithm)
             .await?;
         Ok(material.public_key)
     }
@@ -1239,6 +1282,7 @@ impl CryptoProvider for LocalSoftwareProvider<'_> {
             .material(
                 request.key_id,
                 request.backend_path,
+                request.storage_key,
                 "sign",
                 algorithm.token(),
             )
@@ -1267,6 +1311,7 @@ impl CryptoProvider for LocalSoftwareProvider<'_> {
             .material(
                 request.key_id,
                 request.backend_path,
+                request.storage_key,
                 "verify",
                 algorithm.token(),
             )
@@ -1295,6 +1340,7 @@ impl CryptoProvider for LocalSoftwareProvider<'_> {
             .material(
                 request.key_id,
                 request.backend_path,
+                request.storage_key,
                 "encapsulate",
                 kem_algorithm_name(request.algorithm),
             )
@@ -1323,6 +1369,7 @@ impl CryptoProvider for LocalSoftwareProvider<'_> {
             .material(
                 request.key_id,
                 request.backend_path,
+                request.storage_key,
                 "decapsulate",
                 kem_algorithm_name(request.algorithm),
             )
@@ -1351,6 +1398,7 @@ impl CryptoProvider for LocalSoftwareProvider<'_> {
             .material(
                 request.key_id,
                 request.backend_path,
+                request.storage_key,
                 "wrap_envelope",
                 kem_algorithm_name(request.kem_algorithm),
             )
@@ -1389,6 +1437,7 @@ impl CryptoProvider for LocalSoftwareProvider<'_> {
             .material(
                 request.key_id,
                 request.backend_path,
+                request.storage_key,
                 "unwrap_envelope",
                 kem_algorithm_name(request.kem_algorithm),
             )
@@ -1950,6 +1999,7 @@ mod tests {
                 backend_path: "issuer",
                 algorithm: SignatureAlgorithm::Rs256,
                 message: b"digest",
+                storage_key: None,
             })
             .await
             .expect("signs");
@@ -1971,6 +2021,7 @@ mod tests {
                 backend_path: "issuer",
                 algorithm: SignatureAlgorithm::MlDsa65,
                 message: b"digest",
+                storage_key: None,
             })
             .await
             .expect_err("ML-DSA unsupported");
@@ -2145,6 +2196,7 @@ mod pqc_provider_tests {
                     backend_path: PATH,
                     algorithm: sig_algorithm,
                     message: b"basil pqc payload",
+                    storage_key: Some(STORAGE_KEY),
                 })
                 .await
                 .expect("sign");
@@ -2156,6 +2208,7 @@ mod pqc_provider_tests {
                         algorithm: sig_algorithm,
                         message: b"basil pqc payload",
                         signature: &signature,
+                        storage_key: Some(STORAGE_KEY),
                     })
                     .await
                     .expect("verify"),
@@ -2170,6 +2223,7 @@ mod pqc_provider_tests {
                         algorithm: sig_algorithm,
                         message: b"tampered payload",
                         signature: &signature,
+                        storage_key: Some(STORAGE_KEY),
                     })
                     .await
                     .expect("verify"),
@@ -2196,6 +2250,7 @@ mod pqc_provider_tests {
                     key_id: KEY_ID,
                     backend_path: PATH,
                     algorithm: kem,
+                    storage_key: Some(STORAGE_KEY),
                 })
                 .await
                 .expect("encapsulate");
@@ -2205,6 +2260,7 @@ mod pqc_provider_tests {
                     backend_path: PATH,
                     algorithm: kem,
                     encapsulated_key: &encapsulation.encapsulated_key,
+                    storage_key: Some(STORAGE_KEY),
                 })
                 .await
                 .expect("decapsulate");
@@ -2241,6 +2297,7 @@ mod pqc_provider_tests {
                         envelope_algorithm,
                         plaintext: b"top secret",
                         aad: Some(b"context"),
+                        storage_key: Some(STORAGE_KEY),
                     })
                     .await
                     .expect("wrap");
@@ -2255,6 +2312,7 @@ mod pqc_provider_tests {
                         nonce: &envelope.nonce,
                         ciphertext: &envelope.ciphertext,
                         aad: Some(b"context"),
+                        storage_key: Some(STORAGE_KEY),
                     })
                     .await
                     .expect("unwrap");
@@ -2270,6 +2328,7 @@ mod pqc_provider_tests {
                         nonce: &envelope.nonce,
                         ciphertext: &envelope.ciphertext,
                         aad: Some(b"wrong"),
+                        storage_key: Some(STORAGE_KEY),
                     })
                     .await
                     .expect_err("wrong aad fails");
@@ -2294,6 +2353,7 @@ mod pqc_provider_tests {
                 backend_path: PATH,
                 algorithm: SignatureAlgorithm::Ed25519,
                 message: b"m",
+                storage_key: Some(STORAGE_KEY),
             })
             .await
             .expect_err("non-pqc rejected");
@@ -2317,6 +2377,7 @@ mod pqc_provider_tests {
                 backend_path: PATH,
                 algorithm: SignatureAlgorithm::MlDsa44,
                 message: b"m",
+                storage_key: Some(STORAGE_KEY),
             })
             .await
             .expect_err("malformed record");
@@ -2347,10 +2408,73 @@ mod pqc_provider_tests {
                 backend_path: PATH,
                 algorithm: SignatureAlgorithm::MlDsa65,
                 message: b"m",
+                storage_key: Some(STORAGE_KEY),
             })
             .await
             .expect_err("version mismatch");
         assert!(matches!(err, ProviderError::CryptoFailed { .. }));
+    }
+
+    #[tokio::test]
+    async fn record_wrapping_key_must_match_the_catalog_storage_key() {
+        let seed = [0x11u8; ml_dsa_sign::SEED_LEN];
+        let public =
+            ml_dsa_sign::public_from_seed(ml_dsa_sign::MlDsaAlgorithm::MlDsa65, &seed).expect("pk");
+        let record = custody_record("ml-dsa-65", &public, LocalSoftwareProvider::PROVIDER_VERSION);
+        let backend = CustodyBackend::single(record, &seed);
+        let provider = LocalSoftwareProvider::new(&backend);
+        // The record self-declares STORAGE_KEY; the catalog declares another
+        // AEAD key. The cross-check must reject the record before any unwrap,
+        // so a swapped/re-wrapped record cannot pick its own wrapping key.
+        let err = provider
+            .sign(SignRequest {
+                key_id: KEY_ID,
+                backend_path: PATH,
+                algorithm: SignatureAlgorithm::MlDsa65,
+                message: b"m",
+                storage_key: Some("other-storage-aead"),
+            })
+            .await
+            .expect_err("wrapping-key mismatch");
+        assert!(matches!(
+            err,
+            ProviderError::CryptoFailed {
+                op: "sign",
+                reason: "malformed software-custody record",
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn use_path_without_a_catalog_storage_key_fails_closed() {
+        let seed = [0x11u8; ml_dsa_sign::SEED_LEN];
+        let public =
+            ml_dsa_sign::public_from_seed(ml_dsa_sign::MlDsaAlgorithm::MlDsa65, &seed).expect("pk");
+        let record = custody_record("ml-dsa-65", &public, LocalSoftwareProvider::PROVIDER_VERSION);
+        let backend = CustodyBackend::single(record, &seed);
+        let provider = LocalSoftwareProvider::new(&backend);
+        // Without the catalog-declared storage key there is no trust anchor to
+        // validate the record's wrapping key against: refuse, exactly like the
+        // generate path.
+        let err = provider
+            .sign(SignRequest {
+                key_id: KEY_ID,
+                backend_path: PATH,
+                algorithm: SignatureAlgorithm::MlDsa65,
+                message: b"m",
+                storage_key: None,
+            })
+            .await
+            .expect_err("missing storage key");
+        assert!(matches!(
+            err,
+            ProviderError::CryptoFailed {
+                op: "sign",
+                reason: "software-custody key is missing its storage AEAD key",
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -2511,6 +2635,7 @@ mod pqc_provider_tests {
                     backend_path: PATH,
                     algorithm: sig_algorithm,
                     message: b"provisioned payload",
+                    storage_key: Some(STORAGE_KEY),
                 })
                 .await
                 .expect("sign");
@@ -2522,6 +2647,7 @@ mod pqc_provider_tests {
                         algorithm: sig_algorithm,
                         message: b"provisioned payload",
                         signature: &signature,
+                        storage_key: Some(STORAGE_KEY),
                     })
                     .await
                     .expect("verify"),

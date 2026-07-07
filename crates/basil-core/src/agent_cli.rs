@@ -1243,6 +1243,25 @@ fn is_metadata_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
+/// True when `addr` is a plaintext `http://` URL whose host is not a literal
+/// loopback IP. The URL is parsed rather than substring-matched, so a host like
+/// `127.0.0.1.evil.example` cannot suppress the plaintext warning; hostnames
+/// (`localhost` included) count as non-loopback because name resolution is not
+/// under our control. An unparseable `http://`-prefixed address still warns.
+fn is_plaintext_non_loopback_http(addr: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(addr) else {
+        return addr.starts_with("http://");
+    };
+    if parsed.scheme() != "http" {
+        return false;
+    }
+    match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => !ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => !ip.is_loopback(),
+        Some(url::Host::Domain(_)) | None => true,
+    }
+}
+
 /// Resolve the setup `doctor --keys` unlocks with. The authenticated key probe is
 /// a preflight read; it must not consume a passphrase file that the subsequent
 /// agent start needs, so it sets `passphrase_no_wipe`.
@@ -1573,7 +1592,7 @@ struct Prepared {
 /// panic) at every step. The plaintext [`CredBundle`] is zeroized before return;
 /// each backend holds only its own cred.
 async fn prepare_manager(setup: &SetupArgs) -> Result<Prepared> {
-    if setup.vault_addr.starts_with("http://") && !setup.vault_addr.contains("127.0.0.1") {
+    if is_plaintext_non_loopback_http(&setup.vault_addr) {
         warn!(addr = %setup.vault_addr, "talking to vault over plaintext HTTP");
     }
 
@@ -2299,6 +2318,31 @@ mod tests {
         ));
         std::fs::write(&path, contents).expect("write temp config");
         path
+    }
+
+    #[test]
+    fn plaintext_http_warning_requires_a_literal_loopback_ip() {
+        // Warns: plaintext to a non-loopback destination, including hosts that
+        // merely *contain* a loopback address as a substring, and hostnames.
+        for addr in [
+            "http://vault.internal:8200",
+            "http://127.0.0.1.evil.example:8200",
+            "http://10.0.0.1:8200",
+            "http://localhost:8200",
+            "http://not a url",
+        ] {
+            assert!(is_plaintext_non_loopback_http(addr), "{addr} must warn");
+        }
+        // Silent: literal loopback IPs and any https destination.
+        for addr in [
+            "http://127.0.0.1:8200",
+            "http://127.8.8.8:8200",
+            "http://[::1]:8200",
+            "https://vault.internal:8200",
+            "https://127.0.0.1:8200",
+        ] {
+            assert!(!is_plaintext_non_loopback_http(addr), "{addr} must not warn");
+        }
     }
 
     fn overrides_for(config: PathBuf) -> ConfigOverrides {

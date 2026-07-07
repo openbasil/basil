@@ -80,6 +80,13 @@ pub enum LoadError {
         version: u32,
     },
 
+    /// The catalog schema version is not supported by this loader.
+    #[error("catalog schemaVersion `{version}` is unsupported (expected 1)")]
+    UnsupportedCatalogSchema {
+        /// The unsupported version.
+        version: u32,
+    },
+
     /// A subject name is empty after trimming.
     #[error("subject name must not be empty")]
     EmptySubjectName,
@@ -483,6 +490,7 @@ pub fn load(
             source,
         })?;
 
+    validate_catalog_schema(catalog.schema_version)?;
     let warnings = validate_catalog(&catalog)?;
     validate_policy_schema(raw_policy.schema_version)?;
     let subjects = parse_subjects(
@@ -503,6 +511,16 @@ pub fn load(
 }
 
 // ---- Catalog validation (§2, §5) --------------------------------------------
+
+/// Hard-require the one catalog schema version this loader understands,
+/// mirroring [`validate_policy_schema`]: a future incompatible catalog must
+/// fail closed at load instead of parsing silently.
+const fn validate_catalog_schema(version: u32) -> Result<(), LoadError> {
+    if version == 1 {
+        return Ok(());
+    }
+    Err(LoadError::UnsupportedCatalogSchema { version })
+}
 
 fn validate_catalog(catalog: &Catalog) -> Result<Vec<LoadWarning>, LoadError> {
     // Duplicate key names cannot occur (BTreeMap dedups on deserialize), so the
@@ -1292,6 +1310,22 @@ mod tests {
     }
 
     // ---- Catalog hard errors ------------------------------------------------
+
+    #[test]
+    fn unsupported_catalog_schema_version_is_a_hard_error() {
+        // Mirror of the strict policy schemaVersion check: a future incompatible
+        // catalog must fail closed at load instead of parsing silently.
+        let cat = catalog_json(ASYM_KEY).replacen("\"schemaVersion\": 1", "\"schemaVersion\": 7", 1);
+        let pol = policy_json(
+            READER_ROLE,
+            r#"{ "id": "r1", "subjects": ["svc.nats"], "action": ["role:reader"], "target": ["nats.account"] }"#,
+        );
+        let err = load(&cat, &pol).expect_err("catalog schemaVersion 7 refused");
+        assert!(matches!(
+            err,
+            LoadError::UnsupportedCatalogSchema { version: 7 }
+        ));
+    }
 
     #[test]
     fn key_name_charset_is_enforced_at_load() {

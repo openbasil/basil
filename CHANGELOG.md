@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Changelog
 
-## Unreleased
+## 0.6.1
 
 - renamed basil-client crate to basil
 - Security review fixes: 1Password updates now avoid secret argv exposure, redact

@@ -67,6 +67,13 @@ pub fn open_bundle_at_startup(bundle_path: &Path, args: &UnlockArgs) -> Result<C
         .with_context(|| format!("reading sealed bundle from {}", bundle_path.display()))?;
     let parsed = format::decode(&bytes).context("parsing sealed bundle")?;
 
+    // Best-effort logical anti-rollback, checked BEFORE any unlock slot is
+    // tried: a stale bundle is refused without decrypting its payload or
+    // applying its deposit log. This is not a boundary against a local writer
+    // (see `seal::verify_epoch_sidecar`).
+    crate::seal::verify_epoch_sidecar(&parsed, &epoch_sidecar_path(bundle_path))
+        .context("checking sealed-bundle epoch sidecar")?;
+
     // Build the registry from the enabled+configured methods. We keep the
     // method values alive for the duration of the open call.
     #[cfg(feature = "unlock-age-yubikey")]
@@ -119,8 +126,6 @@ pub fn open_bundle_at_startup(bundle_path: &Path, args: &UnlockArgs) -> Result<C
             );
         }
     }
-    crate::seal::verify_epoch_sidecar(&parsed, &epoch_sidecar_path(bundle_path))
-        .context("checking sealed-bundle epoch sidecar")?;
     Ok(creds)
 }
 
