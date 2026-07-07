@@ -10,7 +10,7 @@
 }:
 
 let
-  cfg = config.service.basil;
+  cfg = config.services.basil;
   settings = cfg.settings;
 
   cleanJson =
@@ -249,11 +249,11 @@ in
     assertions = [
       {
         assertion = settings.package != null;
-        message = "service.basil.settings.package must provide a package containing bin/basil.";
+        message = "services.basil.settings.package must provide a package containing bin/basil.";
       }
       {
         assertion = cfg.bundle != null;
-        message = "service.basil.bundle must be set to the sealed credential bundle path.";
+        message = "services.basil.bundle must be set to the sealed credential bundle path.";
       }
       {
         assertion = lib.all (
@@ -269,35 +269,35 @@ in
             )
           )
         ) (builtins.attrValues cfg.policy.unixSubjects);
-        message = "service.basil.policy.unixSubjects entries must reference users/groups with numeric uid/gid.";
+        message = "services.basil.policy.unixSubjects entries must reference users/groups with numeric uid/gid.";
       }
       {
         assertion = lib.all (spec: (spec.user != null) != (spec.group != null)) (
           builtins.attrValues cfg.policy.unixSubjects
         );
-        message = "each service.basil.policy.unixSubjects entry must set exactly one of user or group.";
+        message = "each services.basil.policy.unixSubjects entry must set exactly one of user or group.";
       }
       {
         assertion =
           lib.intersectLists (builtins.attrNames cfg.policy.subjects) (builtins.attrNames generatedSubjects)
           == [ ];
-        message = "service.basil.policy.subjects and generated policy.unixSubjects must not define the same subject.";
+        message = "services.basil.policy.subjects and generated policy.unixSubjects must not define the same subject.";
       }
       {
         assertion = !settings.invocation.enable || settings.brokerIdentity.id != null;
-        message = "service.basil.settings.brokerIdentity.id is required when invocation.enable is true.";
+        message = "services.basil.settings.brokerIdentity.id is required when invocation.enable is true.";
       }
       {
         assertion = !settings.invocation.enable || settings.brokerIdentity.responseSigningKeyId != null;
-        message = "service.basil.settings.brokerIdentity.responseSigningKeyId is required when invocation.enable is true.";
+        message = "services.basil.settings.brokerIdentity.responseSigningKeyId is required when invocation.enable is true.";
       }
       {
         assertion = !settings.invocation.enable || settings.invocation.requestEncryptionKeyId != null;
-        message = "service.basil.settings.invocation.requestEncryptionKeyId is required when invocation.enable is true.";
+        message = "services.basil.settings.invocation.requestEncryptionKeyId is required when invocation.enable is true.";
       }
       {
         assertion = !settings.invocation.enable || settings.invocation.audience != [ ];
-        message = "service.basil.settings.invocation.audience must not be empty when invocation.enable is true.";
+        message = "services.basil.settings.invocation.audience must not be empty when invocation.enable is true.";
       }
     ];
 

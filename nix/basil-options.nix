@@ -679,7 +679,7 @@ let
   };
 in
 {
-  options.service.basil = {
+  options.services.basil = {
     enable = mkOption {
       type = types.bool;
       default = false;

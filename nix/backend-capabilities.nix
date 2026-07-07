@@ -4,13 +4,13 @@
 
 # Backend capability presets: what a given Vault / OpenBao *release provides*.
 #
-# A preset is the `implementation` of a `service.basil.catalog.backends.<name>`
+# A preset is the `implementation` of a `services.basil.catalog.backends.<name>`
 # entry: the backend `kind`, the secrets `engines`, fine-grained `capabilities`,
 # and native transit key types that version supports. Reference one from your
 # catalog:
 #
 #   let caps = import ./nix/backend-capabilities.nix; in
-#   service.basil.catalog.backends.bao = {
+#   services.basil.catalog.backends.bao = {
 #     implementation = caps.OPENBAO_2_5;     # what the server PROVIDES
 #     addr           = "https://127.0.0.1:8200";
 #     # requires = [ "byok-import" ];        # optional extra app REQUIREMENT
