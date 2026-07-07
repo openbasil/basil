@@ -3,9 +3,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Command es256produce signs a bare COSE_Sign1 under ES256 with go-cose,
-// using the P-256 key material from the checked-in Basil ES256 fixture, and
-// prints the tagged bytes as hex. Basil's P256Verifier must accept the result,
-// proving Basil verifies standard (reference-produced) ES256 signatures.
+// using the P-256 key material from the checked-in Basil ES256 fixture,
+// normalizes the ECDSA signature to low-S form, and prints the tagged bytes as
+// hex. Basil's P256Verifier must accept the result, proving Basil verifies
+// standard (reference-produced) ES256 signatures that satisfy Basil's
+// non-malleability policy.
 package main
 
 import (
@@ -37,6 +39,20 @@ func mustUnhex(value string) []byte {
 		panic(err)
 	}
 	return out
+}
+
+func normalizeLowS(msg *cose.Sign1Message) {
+	if len(msg.Signature) != 64 {
+		panic(fmt.Sprintf("expected 64-byte ES256 signature, got %d bytes", len(msg.Signature)))
+	}
+	n := elliptic.P256().Params().N
+	halfN := new(big.Int).Rsh(new(big.Int).Set(n), 1)
+	s := new(big.Int).SetBytes(msg.Signature[32:64])
+	if s.Cmp(halfN) <= 0 {
+		return
+	}
+	s.Sub(n, s)
+	s.FillBytes(msg.Signature[32:64])
 }
 
 func main() {
@@ -77,5 +93,14 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println(hex.EncodeToString(msg))
+	var sign1 cose.Sign1Message
+	if err := sign1.UnmarshalCBOR(msg); err != nil {
+		panic(err)
+	}
+	normalizeLowS(&sign1)
+	normalized, err := sign1.MarshalCBOR()
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(hex.EncodeToString(normalized))
 }
