@@ -9,7 +9,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+homepage.workspace = true
 repository.workspace = true
+documentation = "https://docs.rs/basil-cose"
 keywords = ["cose", "cbor", "cryptography", "security"]
 categories = ["cryptography", "no-std"]
 publish = true
@@ -25,6 +27,8 @@ fixtures = []
 # that the rest of the workspace relies on. Cargo feature unification still
 # collapses these to single copies in a workspace build.
 [dependencies]
+# Direct dep only to enable `aes/zeroize` (round-key scrubbing) for aes-gcm.
+aes = { workspace = true }
 aes-gcm = { workspace = true }
 chacha20poly1305 = { workspace = true, features = ["alloc"] }
 ed25519-dalek = { workspace = true }

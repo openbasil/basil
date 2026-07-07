@@ -20,6 +20,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
+        // broker.proto uses proto3 `optional` fields. protoc stabilized these in
+        // 3.15, but older toolchains (e.g. Ubuntu 22.04's apt protoc 3.12.4)
+        // reject them unless this flag is set. Newer protoc accept it as a no-op,
+        // so passing it unconditionally keeps the build working across every
+        // runner and the Nix flake without depending on the installed protoc.
+        .protoc_arg("--experimental_allow_proto3_optional")
         .compile_protos(&protos, &["proto"])?;
 
     println!("cargo:rerun-if-changed=proto/basil/broker/v1/broker.proto");

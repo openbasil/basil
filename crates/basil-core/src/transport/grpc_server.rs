@@ -321,7 +321,11 @@ mod tests {
     }
 
     fn socket_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("basil-{name}-{}.sock", uuid::Uuid::new_v4()))
+        // Unix-domain socket paths must fit in sun_path: 104 bytes on macOS, 108
+        // on Linux. macOS's std::env::temp_dir() (/var/folders/...) is long enough
+        // that "basil-{name}-{uuid}.sock" overflowed the macOS limit; anchor at the
+        // short, always-writable /tmp so the full path stays well under it.
+        PathBuf::from("/tmp").join(format!("basil-{name}-{}.sock", uuid::Uuid::new_v4()))
     }
 
     #[tokio::test]

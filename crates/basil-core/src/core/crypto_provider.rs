@@ -1075,7 +1075,13 @@ impl<'a> LocalSoftwareProvider<'a> {
         algorithm: &'static str,
     ) -> Result<Vec<u8>, ProviderError> {
         let material = self
-            .material(key_id, backend_path, storage_key, "get_public_key", algorithm)
+            .material(
+                key_id,
+                backend_path,
+                storage_key,
+                "get_public_key",
+                algorithm,
+            )
             .await?;
         Ok(material.public_key)
     }
@@ -2420,7 +2426,11 @@ mod pqc_provider_tests {
         let seed = [0x11u8; ml_dsa_sign::SEED_LEN];
         let public =
             ml_dsa_sign::public_from_seed(ml_dsa_sign::MlDsaAlgorithm::MlDsa65, &seed).expect("pk");
-        let record = custody_record("ml-dsa-65", &public, LocalSoftwareProvider::PROVIDER_VERSION);
+        let record = custody_record(
+            "ml-dsa-65",
+            &public,
+            LocalSoftwareProvider::PROVIDER_VERSION,
+        );
         let backend = CustodyBackend::single(record, &seed);
         let provider = LocalSoftwareProvider::new(&backend);
         // The record self-declares STORAGE_KEY; the catalog declares another
@@ -2451,7 +2461,11 @@ mod pqc_provider_tests {
         let seed = [0x11u8; ml_dsa_sign::SEED_LEN];
         let public =
             ml_dsa_sign::public_from_seed(ml_dsa_sign::MlDsaAlgorithm::MlDsa65, &seed).expect("pk");
-        let record = custody_record("ml-dsa-65", &public, LocalSoftwareProvider::PROVIDER_VERSION);
+        let record = custody_record(
+            "ml-dsa-65",
+            &public,
+            LocalSoftwareProvider::PROVIDER_VERSION,
+        );
         let backend = CustodyBackend::single(record, &seed);
         let provider = LocalSoftwareProvider::new(&backend);
         // Without the catalog-declared storage key there is no trust anchor to

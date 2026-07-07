@@ -12,7 +12,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use basil_cose::{
@@ -24,9 +23,8 @@ use basil_cose::{
 };
 use basil_proto::broker::v1 as pb;
 use basil_proto::invocation::{
-    CONTENT_TYPE_MINT_JWT_REQUEST, CONTENT_TYPE_MINT_NATS_USER_REQUEST, CONTENT_TYPE_SIGN_REQUEST,
-    CONTENT_TYPE_SIGN_RESPONSE, InvocationStatusCode, MintJwtInvocationRequest,
-    MintNatsUserInvocationRequest, SignInvocationRequest, SignInvocationResponse,
+    CONTENT_TYPE_SIGN_REQUEST, CONTENT_TYPE_SIGN_RESPONSE, InvocationStatusCode,
+    SignInvocationRequest, SignInvocationResponse,
 };
 use tokio::sync::Mutex;
 
@@ -44,37 +42,6 @@ pub type LocalSealedInvocationSigner = basil_cose::Ed25519Signer;
 /// This is useful when the caller owns the response key locally and wants the
 /// client helper to decrypt the broker's sealed response in process.
 pub type LocalSealedInvocationRecipient = basil_cose::X25519Recipient;
-
-/// Plaintext CBOR body for a sealed invocation request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SealedInvocationBody {
-    /// A broker `Sign` request.
-    Sign(SignInvocationRequest),
-    /// A broker `MintJwt` request.
-    MintJwt(MintJwtInvocationRequest),
-    /// A broker `MintNatsUser` request.
-    MintNatsUser(MintNatsUserInvocationRequest),
-}
-
-impl SealedInvocationBody {
-    /// Encode this body as deterministic CBOR.
-    #[must_use]
-    pub fn to_cbor_bytes(&self) -> Vec<u8> {
-        match self {
-            Self::Sign(body) => body.to_cbor_bytes(),
-            Self::MintJwt(body) => body.to_cbor_bytes(),
-            Self::MintNatsUser(body) => body.to_cbor_bytes(),
-        }
-    }
-
-    const fn content_type(&self) -> &'static str {
-        match self {
-            Self::Sign(_) => CONTENT_TYPE_SIGN_REQUEST,
-            Self::MintJwt(_) => CONTENT_TYPE_MINT_JWT_REQUEST,
-            Self::MintNatsUser(_) => CONTENT_TYPE_MINT_NATS_USER_REQUEST,
-        }
-    }
-}
 
 /// Request metadata for building a COSE sealed invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -326,7 +293,11 @@ pub enum SealedInvocationResponseError {
     SignResponseBody(#[from] basil_proto::invocation::InvocationError),
 }
 
-/// Prepare a sealed invocation request.
+/// Prepare a sealed `Sign` invocation request.
+///
+/// `Sign` is the only invocation the broker executes; the minting body
+/// schemas registered in `basil_proto::invocation` have no response decoder
+/// and are rejected by the broker, so they cannot be prepared here.
 ///
 /// The client chooses no nonce or ephemeral key material itself:
 /// [`build_sealed`] generates the COSE content nonce and ephemeral X25519 key
@@ -344,7 +315,7 @@ pub enum SealedInvocationResponseError {
 pub async fn prepare_sealed_invocation<S: Signer>(
     options: SealedInvocationOptions,
     recipient_public_key: &[u8],
-    body: &SealedInvocationBody,
+    body: &SignInvocationRequest,
     signer: &S,
 ) -> Result<PreparedSealedInvocation, SealedInvocationError> {
     let sender_key_id = KeyId::from_text(&options.sender_sign_id)?;
@@ -372,7 +343,7 @@ pub async fn prepare_sealed_invocation<S: Signer>(
 
     let cose = build_sealed(
         &SealParams {
-            content_type: ContentType::new(body.content_type().to_string())?,
+            content_type: ContentType::new(CONTENT_TYPE_SIGN_REQUEST.to_string())?,
             plaintext: &body.to_cbor_bytes(),
             claims,
             role: MessageRole::Request,
@@ -605,7 +576,6 @@ pub struct CarrierSigner<C, S, R, V> {
     recipient: R,
     broker_verifier: V,
     config: CarrierSignerConfig,
-    sequence: AtomicU64,
 }
 
 /// A [`CarrierSigner`] for the common pure-carrier deployment.
@@ -641,7 +611,6 @@ impl<C, S, R, V> CarrierSigner<C, S, R, V> {
             recipient,
             broker_verifier,
             config,
-            sequence: AtomicU64::new(0),
         })
     }
 }
@@ -668,15 +637,18 @@ where
     async fn sign(&self, sig_structure: &[u8]) -> Result<Signature, SignError> {
         let now = current_unix_secs()?;
         let ttl = u32::try_from(self.config.request_ttl.as_secs()).unwrap_or(u32::MAX);
-        let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
+        // A fresh 64-bit random nonce keeps the id collision-free across
+        // process restarts; a per-process counter would restart at its seed
+        // and could reuse an id within the same second.
+        let nonce = rand::random::<u64>();
 
-        let body = SealedInvocationBody::Sign(SignInvocationRequest {
+        let body = SignInvocationRequest {
             key_id: self.target_key_name.clone(),
             message: sig_structure.to_vec(),
             algorithm: pb::SigningAlgorithm::Unspecified.into(),
-        });
+        };
         let options = SealedInvocationOptions {
-            message_id: format!("{}-{now}-{seq}", self.config.request_sign_id),
+            message_id: format!("{}-{now}-{nonce:016x}", self.config.request_sign_id),
             issued_at_unix: now,
             expires_at_unix: Some(now.saturating_add(ttl)),
             sender_sign_id: self.config.request_sign_id.clone(),
@@ -805,12 +777,12 @@ mod tests {
         }
     }
 
-    fn sign_body() -> SealedInvocationBody {
-        SealedInvocationBody::Sign(SignInvocationRequest {
+    fn sign_body() -> SignInvocationRequest {
+        SignInvocationRequest {
             key_id: "target-sign".to_string(),
             message: b"payload".to_vec(),
             algorithm: pb::SigningAlgorithm::Unspecified.into(),
-        })
+        }
     }
 
     async fn prepared_request() -> (PreparedSealedInvocation, Ed25519Signer, X25519Recipient) {

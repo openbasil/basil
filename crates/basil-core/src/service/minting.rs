@@ -367,9 +367,9 @@ impl NatsService for BrokerGrpc {
         request: Request<pb::ValidateNatsJwtRequest>,
     ) -> GrpcResult<pb::ValidateNatsJwtResponse> {
         let body = request.get_ref();
-        // RPC-entry authentication: the whole handler — including the
+        // RPC-entry authentication: the whole handler, including the
         // `NatsPublicKey` arm, which verifies against a caller-supplied nkey and
-        // never reaches the per-key `authorize` below — only runs for a peer that
+        // never reaches the per-key `authorize` below, only runs for a peer that
         // resolves to a policy subject.
         let peer = peer_from_request(&request);
         if self

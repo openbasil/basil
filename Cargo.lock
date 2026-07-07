@@ -37,6 +37,7 @@ dependencies = [
  "cfg-if",
  "cipher 0.4.4",
  "cpufeatures 0.2.17",
+ "zeroize",
 ]
 
 [[package]]
@@ -62,6 +63,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -766,6 +768,7 @@ dependencies = [
 name = "basil"
 version = "0.6.1"
 dependencies = [
+ "aes 0.8.4",
  "aes-gcm",
  "basil-cose",
  "basil-proto",
@@ -811,6 +814,7 @@ dependencies = [
 name = "basil-core"
 version = "0.6.1"
 dependencies = [
+ "aes 0.8.4",
  "aes-gcm",
  "aes-kw",
  "age",
@@ -884,6 +888,7 @@ dependencies = [
 name = "basil-cose"
 version = "0.6.1"
 dependencies = [
+ "aes 0.8.4",
  "aes-gcm",
  "chacha20poly1305",
  "ed25519-dalek",
@@ -901,6 +906,7 @@ dependencies = [
 name = "basil-keystore-backend"
 version = "0.6.1"
 dependencies = [
+ "aes 0.8.4",
  "aes-gcm",
  "basil",
  "chacha20poly1305",

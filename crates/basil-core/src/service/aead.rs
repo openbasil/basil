@@ -726,6 +726,35 @@ mod tests {
         assert_eq!(plaintext, b"enrollment payload");
     }
 
+    // An envelope naming no AEAD suite is an implicit attacker-suppliable
+    // algorithm choice; decrypt must reject it, not fall back to a default.
+    #[tokio::test]
+    async fn decrypt_rejects_an_unspecified_aead_algorithm() {
+        let svc = service(cose_backend());
+        let status = svc
+            .decrypt(request(
+                42,
+                pb::DecryptRequest {
+                    key_id: COSE_KEY_ID.to_string(),
+                    envelope: Some(pb::CiphertextEnvelope {
+                        alg: pb::AeadAlgorithm::Unspecified.into(),
+                        key_version: 1,
+                        nonce: vec![0u8; 12],
+                        ciphertext: vec![0u8; 32],
+                    }),
+                    aad: None,
+                },
+            ))
+            .await
+            .expect_err("unspecified AEAD algorithm is rejected on decrypt");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(
+            status.message().contains("missing AEAD algorithm"),
+            "unexpected message: {}",
+            status.message()
+        );
+    }
+
     #[tokio::test]
     async fn unseal_cose_through_grpc_with_x25519_key() {
         let svc = service(cose_backend());

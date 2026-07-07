@@ -9,6 +9,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/basil-proto"
+keywords = ["basil", "grpc", "protobuf", "spiffe", "tonic"]
+categories = ["network-programming", "api-bindings"]
 rust-version = "1.85"
 publish = true
 

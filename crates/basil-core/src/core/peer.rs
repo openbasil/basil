@@ -10,10 +10,13 @@
 //! `/proc`: the executable path, the process lineage, and any wrapping SSH
 //! session.
 //!
-//! This broker only runs on NixOS, which has no `dpkg` package database, so the
-//! attestation is purely credential- and `/proc`-derived (no Debian package
-//! verification). It is informational for v1 (logged per connection); a future
-//! policy layer can gate `SIGN` on it.
+//! Detail note: Linux SO_PEERCRED is a snapshot of the peer's creds captured at time
+//! of `connect(2)`. For short-lived RPC connections, or when called from a systemd
+//! service, creds at connect time is almost always the same as current effective creds.
+//!
+//! On MacOS (not officially supported, but it works), getpeerid/LOCAL_PEERPID returns
+//! the peer's current effective creds.
+//!
 
 use std::collections::HashMap;
 use std::fs;

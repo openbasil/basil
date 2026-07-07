@@ -317,7 +317,7 @@ pub async fn approle_login(
         bail!("AppRole login failed (HTTP {status})");
     }
     // The raw body text carries the token: hold it in `Zeroizing` (wiped on
-    // drop) and deserialize the typed view above, moving — never copying — the
+    // drop) and deserialize the typed view above, moving (never copying) the
     // token `String` into the returned `Zeroizing` handle.
     let body = Zeroizing::new(
         resp.text()

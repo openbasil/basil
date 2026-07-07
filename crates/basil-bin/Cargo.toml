@@ -11,6 +11,9 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
+documentation = "https://docs.openbasil.org"
+keywords = ["basil", "vault", "secrets", "cryptography", "cli"]
+categories = ["cryptography", "command-line-utilities"]
 rust-version = "1.88"
 publish = true
 

@@ -1247,7 +1247,7 @@ fn is_metadata_ip(ip: std::net::IpAddr) -> bool {
 /// loopback IP. The URL is parsed rather than substring-matched, so a host like
 /// `127.0.0.1.evil.example` cannot suppress the plaintext warning; hostnames
 /// (`localhost` included) count as non-loopback because name resolution is not
-/// under our control. An unparseable `http://`-prefixed address still warns.
+/// under our control. An unparsable `http://`-prefixed address still warns.
 fn is_plaintext_non_loopback_http(addr: &str) -> bool {
     let Ok(parsed) = url::Url::parse(addr) else {
         return addr.starts_with("http://");
@@ -2341,7 +2341,10 @@ mod tests {
             "https://vault.internal:8200",
             "https://127.0.0.1:8200",
         ] {
-            assert!(!is_plaintext_non_loopback_http(addr), "{addr} must not warn");
+            assert!(
+                !is_plaintext_non_loopback_http(addr),
+                "{addr} must not warn"
+            );
         }
     }
 

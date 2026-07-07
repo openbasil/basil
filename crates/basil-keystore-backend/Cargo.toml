@@ -9,6 +9,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/basil-keystore-backend"
+keywords = ["basil", "keystore", "keyring", "onepassword", "secrets"]
+categories = ["cryptography", "authentication"]
 rust-version = "1.85"
 publish = true
 
@@ -20,6 +25,8 @@ onepassword = ["dep:serde", "dep:serde_json", "dep:url", "dep:percent-encoding"]
 [dependencies]
 basil = { workspace = true }
 
+# Direct dep only to enable `aes/zeroize` (round-key scrubbing) for aes-gcm.
+aes = { workspace = true }
 aes-gcm = { workspace = true }
 chacha20poly1305 = { workspace = true }
 db-keystore = { workspace = true, optional = true }

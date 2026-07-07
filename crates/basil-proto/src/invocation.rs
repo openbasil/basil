@@ -26,16 +26,27 @@ pub const CONTENT_TYPE_SIGN_REQUEST: &str = "application/basil.sign-request";
 /// COSE content type for [`SignInvocationResponse`] plaintext bodies.
 pub const CONTENT_TYPE_SIGN_RESPONSE: &str = "application/basil.sign-response";
 /// COSE content type for [`MintJwtInvocationRequest`] plaintext bodies.
+///
+/// Reserved registry entry: the broker executes only sealed `Sign`
+/// invocations and rejects this content type with `UNSUPPORTED_CONTENT_TYPE`.
 pub const CONTENT_TYPE_MINT_JWT_REQUEST: &str = "application/basil.mint-jwt-request";
 /// COSE content type for [`MintJwtInvocationResponse`] plaintext bodies.
+///
+/// Reserved registry entry: see [`CONTENT_TYPE_MINT_JWT_REQUEST`].
 pub const CONTENT_TYPE_MINT_JWT_RESPONSE: &str = "application/basil.mint-jwt-response";
 /// COSE content type for [`MintNatsUserInvocationRequest`] plaintext bodies.
+///
+/// Reserved registry entry: the broker executes only sealed `Sign`
+/// invocations and rejects this content type with `UNSUPPORTED_CONTENT_TYPE`.
 pub const CONTENT_TYPE_MINT_NATS_USER_REQUEST: &str = "application/basil.mint-nats-user-request";
 /// COSE content type for [`MintNatsUserInvocationResponse`] plaintext bodies.
+///
+/// Reserved registry entry: see [`CONTENT_TYPE_MINT_NATS_USER_REQUEST`].
 pub const CONTENT_TYPE_MINT_NATS_USER_RESPONSE: &str = "application/basil.mint-nats-user-response";
 
 /// Every registered basil invocation content type, request/response pairs in
-/// registry order.
+/// registry order. Only the sign pair is executable today; the mint pairs are
+/// reserved wire-format contracts pinned by fixtures.
 pub const INVOCATION_CONTENT_TYPES: [&str; 6] = [
     CONTENT_TYPE_SIGN_REQUEST,
     CONTENT_TYPE_SIGN_RESPONSE,
@@ -274,6 +285,10 @@ impl SignInvocationResponse {
 }
 
 /// CBOR body selected by [`CONTENT_TYPE_MINT_JWT_RESPONSE`].
+///
+/// Reserved format contract: encode-only (no decoder), pinned by fixtures.
+/// The broker does not mint JWTs over sealed invocations; it rejects
+/// [`CONTENT_TYPE_MINT_JWT_REQUEST`] with `UNSUPPORTED_CONTENT_TYPE`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MintJwtInvocationResponse {
     /// Trusted operation status.
@@ -305,6 +320,10 @@ impl MintJwtInvocationResponse {
 }
 
 /// CBOR body selected by [`CONTENT_TYPE_MINT_NATS_USER_RESPONSE`].
+///
+/// Reserved format contract: encode-only (no decoder), pinned by fixtures.
+/// The broker does not mint NATS users over sealed invocations; it rejects
+/// [`CONTENT_TYPE_MINT_NATS_USER_REQUEST`] with `UNSUPPORTED_CONTENT_TYPE`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MintNatsUserInvocationResponse {
     /// Trusted operation status.
@@ -336,6 +355,10 @@ impl MintNatsUserInvocationResponse {
 }
 
 /// CBOR body selected by [`CONTENT_TYPE_MINT_JWT_REQUEST`].
+///
+/// Reserved format contract: the broker rejects this content type with
+/// `UNSUPPORTED_CONTENT_TYPE`, so sending it always fails. It is pinned by
+/// fixtures for the day mint support lands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MintJwtInvocationRequest {
     /// Catalog signing key id.
@@ -367,6 +390,10 @@ impl MintJwtInvocationRequest {
 }
 
 /// CBOR body selected by [`CONTENT_TYPE_MINT_NATS_USER_REQUEST`].
+///
+/// Reserved format contract: the broker rejects this content type with
+/// `UNSUPPORTED_CONTENT_TYPE`, so sending it always fails. It is pinned by
+/// fixtures for the day mint support lands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MintNatsUserInvocationRequest {
     /// Account signing key id.
@@ -646,23 +673,40 @@ impl<'a> CborDecoder<'a> {
         self.len_value(initial & 0x1f, field)
     }
 
+    /// Decode an integer or length argument, rejecting non-minimal forms:
+    /// deterministic CBOR (RFC 8949 §4.2.1) requires the shortest encoding.
     fn len_value(&mut self, additional: u8, field: &'static str) -> Result<u64, InvocationError> {
-        match additional {
-            value @ 0..=23 => Ok(u64::from(value)),
-            24 => self.take(field).map(u64::from),
-            25 => self
-                .take_array::<2>(field)
-                .map(u16::from_be_bytes)
-                .map(u64::from),
-            26 => self
-                .take_array::<4>(field)
-                .map(u32::from_be_bytes)
-                .map(u64::from),
-            27 => self.take_array::<8>(field).map(u64::from_be_bytes),
-            _ => Err(InvocationError::InvalidBody(
-                "unsupported CBOR additional info",
-            )),
+        let (value, minimum) = match additional {
+            value @ 0..=23 => return Ok(u64::from(value)),
+            24 => (self.take(field).map(u64::from)?, 24),
+            25 => (
+                self.take_array::<2>(field)
+                    .map(u16::from_be_bytes)
+                    .map(u64::from)?,
+                u64::from(u8::MAX) + 1,
+            ),
+            26 => (
+                self.take_array::<4>(field)
+                    .map(u32::from_be_bytes)
+                    .map(u64::from)?,
+                u64::from(u16::MAX) + 1,
+            ),
+            27 => (
+                self.take_array::<8>(field).map(u64::from_be_bytes)?,
+                u64::from(u32::MAX) + 1,
+            ),
+            _ => {
+                return Err(InvocationError::InvalidBody(
+                    "unsupported CBOR additional info",
+                ));
+            }
+        };
+        if value < minimum {
+            return Err(InvocationError::InvalidBody(
+                "non-minimal CBOR integer or length encoding",
+            ));
         }
+        Ok(value)
     }
 
     fn peek(&self) -> Option<u8> {
@@ -790,6 +834,51 @@ mod tests {
             SignInvocationResponse::from_cbor_bytes(&denied.to_cbor_bytes()).unwrap(),
             denied
         );
+    }
+
+    #[test]
+    fn non_minimal_cbor_integer_and_length_forms_are_rejected() {
+        // SignInvocationRequest { key_id: "k", message: [0x01], algorithm: 1 }
+        // in the minimal deterministic encoding.
+        let minimal = [0xa3, 0x01, 0x61, 0x6b, 0x02, 0x41, 0x01, 0x03, 0x01];
+        let decoded = SignInvocationRequest::from_cbor_bytes(&minimal).unwrap();
+        assert_eq!(decoded.to_cbor_bytes(), minimal);
+
+        let non_minimal: [&[u8]; 8] = [
+            // map length 3 in one-byte form
+            &[0xb8, 0x03, 0x01, 0x61, 0x6b, 0x02, 0x41, 0x01, 0x03, 0x01],
+            // map key 1 in one-byte form
+            &[0xa3, 0x18, 0x01, 0x61, 0x6b, 0x02, 0x41, 0x01, 0x03, 0x01],
+            // text length 1 in one-byte form
+            &[0xa3, 0x01, 0x78, 0x01, 0x6b, 0x02, 0x41, 0x01, 0x03, 0x01],
+            // byte-string length 1 in one-byte form
+            &[0xa3, 0x01, 0x61, 0x6b, 0x02, 0x58, 0x01, 0x01, 0x03, 0x01],
+            // algorithm 1 in one-byte form
+            &[0xa3, 0x01, 0x61, 0x6b, 0x02, 0x41, 0x01, 0x03, 0x18, 0x01],
+            // algorithm 1 in two-byte form
+            &[
+                0xa3, 0x01, 0x61, 0x6b, 0x02, 0x41, 0x01, 0x03, 0x19, 0x00, 0x01,
+            ],
+            // algorithm 1 in four-byte form
+            &[
+                0xa3, 0x01, 0x61, 0x6b, 0x02, 0x41, 0x01, 0x03, 0x1a, 0x00, 0x00, 0x00, 0x01,
+            ],
+            // algorithm 1 in eight-byte form
+            &[
+                0xa3, 0x01, 0x61, 0x6b, 0x02, 0x41, 0x01, 0x03, 0x1b, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x01,
+            ],
+        ];
+        for bytes in non_minimal {
+            assert_eq!(
+                SignInvocationRequest::from_cbor_bytes(bytes),
+                Err(InvocationError::InvalidBody(
+                    "non-minimal CBOR integer or length encoding"
+                )),
+                "{}",
+                hex(bytes)
+            );
+        }
     }
 
     #[test]

@@ -40,7 +40,7 @@ pub use proto::{
 pub use sealed_invocation::{
     BrokerRecipient, BrokerSigner, CarrierSigner, CarrierSignerConfig, LocalCarrierSigner,
     LocalSealedInvocationRecipient, LocalSealedInvocationSigner, PreparedSealedInvocation,
-    SealedInvocationBody, SealedInvocationCarrier, SealedInvocationError, SealedInvocationOptions,
+    SealedInvocationCarrier, SealedInvocationError, SealedInvocationOptions,
     SealedInvocationResponseError, prepare_sealed_invocation, verify_and_decrypt_sign_response,
     verify_and_open_sign_response,
 };

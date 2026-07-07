@@ -8,6 +8,10 @@
 name = "basil-artifact-signing"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
+authors = ["info@openbasil.org"]
+repository = "https://github.com/openbasil/basil"
+homepage = "https://github.com/openbasil/basil"
 publish = false
 
 [[bin]]

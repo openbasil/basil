@@ -1315,7 +1315,8 @@ mod tests {
     fn unsupported_catalog_schema_version_is_a_hard_error() {
         // Mirror of the strict policy schemaVersion check: a future incompatible
         // catalog must fail closed at load instead of parsing silently.
-        let cat = catalog_json(ASYM_KEY).replacen("\"schemaVersion\": 1", "\"schemaVersion\": 7", 1);
+        let cat =
+            catalog_json(ASYM_KEY).replacen("\"schemaVersion\": 1", "\"schemaVersion\": 7", 1);
         let pol = policy_json(
             READER_ROLE,
             r#"{ "id": "r1", "subjects": ["svc.nats"], "action": ["role:reader"], "target": ["nats.account"] }"#,

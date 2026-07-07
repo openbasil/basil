@@ -91,7 +91,7 @@ pub mod xds {
 
 // Zeroize-on-drop for the secret-bearing wire messages. The broker moves
 // secret/private-key bytes into these protos to send them, and the tonic codec
-// drops the message right after encoding it — these impls wipe that last owned
+// drops the message right after encoding it. These impls wipe that last owned
 // copy instead of leaving cleartext in freed heap (core security review
 // findings 17/19). The codec's transient encode buffer is tonic-owned and out
 // of reach. Note a `Drop` impl forbids moving fields out: consumers take owned

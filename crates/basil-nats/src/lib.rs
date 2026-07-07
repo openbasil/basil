@@ -400,7 +400,8 @@ pub fn open_nats_curve(
     let Some(rest) = ciphertext.strip_prefix(XKEY_VERSION_V1) else {
         return Err(Error::BadXKeyVersion);
     };
-    if rest.len() <= XKEY_NONCE_LEN + XKEY_TAG_LEN {
+    // An authentic box of the empty plaintext is exactly nonce + tag bytes.
+    if rest.len() < XKEY_NONCE_LEN + XKEY_TAG_LEN {
         return Err(Error::BadXKeyCiphertextLen(ciphertext.len()));
     }
     let Some((nonce, body)) = rest.split_at_checked(XKEY_NONCE_LEN) else {
@@ -466,7 +467,7 @@ fn box_crypt(
 #[allow(deprecated)]
 fn nats_box_key(shared: &Zeroizing<[u8; 32]>) -> Zeroizing<SecretboxKey> {
     let input = crypto_secretbox::aead::generic_array::GenericArray::<u8, U16>::default();
-    let key = SecretboxKey::clone_from_slice(shared.as_slice());
+    let key = Zeroizing::new(SecretboxKey::clone_from_slice(shared.as_slice()));
     Zeroizing::new(hsalsa::<U10>(&key, &input))
 }
 
@@ -1698,19 +1699,20 @@ pub fn assemble(signing_input: &str, signature: &[u8]) -> String {
 /// Render a `nsc`-style `NATS` user `.creds` document from a compact user JWT
 /// and user `NKey` seed.
 ///
-/// The result embeds the seed and must be handled as a secret by callers. Inputs
-/// are trimmed and must each fit on one line.
+/// The result embeds the seed, so it is returned in a [`Zeroizing`] owner and
+/// must be handled as a secret by callers. Inputs are trimmed and must each fit
+/// on one line.
 ///
 /// # Errors
 ///
 /// Returns [`Error::InvalidClaims`] when `jwt` or `seed` is empty or contains an
 /// embedded line break.
-pub fn format_user_creds(jwt: &str, seed: &str) -> Result<String, Error> {
+pub fn format_user_creds(jwt: &str, seed: &str) -> Result<Zeroizing<String>, Error> {
     let jwt = single_line_creds_field("NATS user JWT", jwt)?;
     let seed = single_line_creds_field("NATS user NKey seed", seed)?;
-    Ok(format!(
+    Ok(Zeroizing::new(format!(
         "-----BEGIN NATS USER JWT-----\n{jwt}\n------END NATS USER JWT------\n\n************************* IMPORTANT *************************\nNKEY Seed printed below can be used to sign and prove identity.\nNKEYs are sensitive and should be treated as secrets.\n\n-----BEGIN USER NKEY SEED-----\n{seed}\n------END USER NKEY SEED------\n\n*************************************************************\n"
-    ))
+    )))
 }
 
 fn single_line_creds_field<'a>(name: &str, value: &'a str) -> Result<&'a str, Error> {
@@ -1771,7 +1773,7 @@ mod tests {
         let creds = format_user_creds(" jwt.token.sig ", " SUUSERSEED ")
             .expect("credentials document must render");
         assert_eq!(
-            creds,
+            creds.as_str(),
             "-----BEGIN NATS USER JWT-----\njwt.token.sig\n------END NATS USER JWT------\n\n************************* IMPORTANT *************************\nNKEY Seed printed below can be used to sign and prove identity.\nNKEYs are sensitive and should be treated as secrets.\n\n-----BEGIN USER NKEY SEED-----\nSUUSERSEED\n------END USER NKEY SEED------\n\n*************************************************************\n"
         );
     }
@@ -1976,6 +1978,53 @@ mod tests {
             open_nats_curve(&receiver_private, &sender_public, &tampered),
             Err(Error::XKeyOpenFailed)
         ));
+    }
+
+    #[test]
+    fn nats_curve_box_empty_payload_round_trips() {
+        let sender_private = Zeroizing::new([0x55; 32]);
+        let receiver_private = Zeroizing::new([0x66; 32]);
+        let sender_public =
+            encode_public(NkeyType::Curve, &xkey_public_from_private(&sender_private))
+                .expect("sender xkey encodes");
+        let receiver_public = encode_public(
+            NkeyType::Curve,
+            &xkey_public_from_private(&receiver_private),
+        )
+        .expect("receiver xkey encodes");
+
+        let mut rng = TestRng::default();
+        let boxed = seal_nats_curve(&sender_private, &receiver_public, b"", &mut rng)
+            .expect("seal of empty payload succeeds");
+        assert_eq!(
+            boxed.len(),
+            XKEY_VERSION_V1.len() + XKEY_NONCE_LEN + XKEY_TAG_LEN
+        );
+
+        let opened = open_nats_curve(&receiver_private, &sender_public, &boxed)
+            .expect("open of authentic empty box succeeds");
+        assert!(opened.is_empty());
+
+        // One byte short of nonce + tag is still malformed.
+        let (_, truncated) = boxed.split_last().expect("box is non-empty");
+        assert!(matches!(
+            open_nats_curve(&receiver_private, &sender_public, truncated),
+            Err(Error::BadXKeyCiphertextLen(_))
+        ));
+
+        // Interop: nkeys opens basil's empty box, and basil opens nkeys' one.
+        let sender = XKey::new_from_raw(*sender_private);
+        let receiver = XKey::new_from_raw(*receiver_private);
+        let nkeys_opened = receiver
+            .open(&boxed, &sender)
+            .expect("nkeys opens basil empty box");
+        assert!(nkeys_opened.is_empty());
+        let nkeys_box = sender
+            .seal(b"", &receiver)
+            .expect("nkeys seals empty payload");
+        let basil_opened = open_nats_curve(&receiver_private, &sender.public_key(), &nkeys_box)
+            .expect("basil opens nkeys empty box");
+        assert!(basil_opened.is_empty());
     }
 
     #[test]

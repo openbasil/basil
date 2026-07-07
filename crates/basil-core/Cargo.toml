@@ -9,6 +9,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/basil-core"
+keywords = ["basil", "vault", "broker", "cryptography", "kms"]
+categories = ["cryptography", "network-programming", "authentication"]
 rust-version = "1.88"
 publish = true
 
@@ -41,6 +46,8 @@ basil-cose = { workspace = true }
 basil-nats = { workspace = true }
 basil-keystore-backend = { workspace = true, optional = true }
 
+# Direct dep only to enable `aes/zeroize` (round-key scrubbing) for aes-gcm.
+aes = { workspace = true }
 aes-gcm = { workspace = true }
 aes-kw = { workspace = true }
 age = { workspace = true }

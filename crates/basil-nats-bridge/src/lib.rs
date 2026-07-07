@@ -27,7 +27,7 @@ use tokio::time::timeout;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tonic::{Code, Status};
 use tower::service_fn;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// NATS header carrying the stable bridge error token.
 pub const ERROR_HEADER: &str = "Basil-Bridge-Error";
@@ -594,9 +594,13 @@ async fn uds_channel(path: &Path, connect_timeout: Duration) -> Result<Channel, 
 
 /// Run the bridge until the NATS subscription ends or a runtime error occurs.
 ///
+/// Reply-publish failures are logged and do not stop the bridge.
+///
 /// # Errors
 ///
-/// Returns an error when NATS/Basil setup fails or a reply publish fails.
+/// Returns an error when NATS/Basil setup fails, a request worker panics, or
+/// the subscription stream ends ([`RuntimeError::SubscriptionEnded`]), so an
+/// on-failure supervisor restarts the bridge instead of seeing a clean exit.
 #[allow(clippy::significant_drop_tightening)]
 pub async fn run(config: Config) -> Result<(), RuntimeError> {
     let nats = connect_nats(&config).await?;
@@ -626,18 +630,18 @@ pub async fn run(config: Config) -> Result<(), RuntimeError> {
         let max_message_bytes = config.bridge.max_message_bytes;
         tasks.spawn(async move {
             let action = handle_request(request, max_message_bytes, &mut basil).await;
-            publish_action(&nats, action).await
+            publish_action(&nats, action).await;
         });
     }
     while !tasks.is_empty() {
         drain_one_task(&mut tasks).await?;
     }
-    Ok(())
+    Err(RuntimeError::SubscriptionEnded)
 }
 
-async fn drain_one_task(tasks: &mut JoinSet<Result<(), RuntimeError>>) -> Result<(), RuntimeError> {
+async fn drain_one_task(tasks: &mut JoinSet<()>) -> Result<(), RuntimeError> {
     if let Some(result) = tasks.join_next().await {
-        result.map_err(RuntimeError::WorkerJoin)??;
+        result.map_err(RuntimeError::WorkerJoin)?;
     }
     Ok(())
 }
@@ -673,16 +677,17 @@ async fn subscribe(
     }
 }
 
-async fn publish_action(
-    nats: &async_nats::Client,
-    action: BridgeAction,
-) -> Result<(), RuntimeError> {
-    match action {
+/// Publish a bridge action, logging (not propagating) publish failures so one
+/// failed reply cannot take down the whole bridge.
+async fn publish_action(nats: &async_nats::Client, action: BridgeAction) {
+    let (subject, result) = match action {
         BridgeAction::Reply(reply) if reply.headers.is_empty() => {
             debug!(reply_subject = %reply.subject, "forwarding sealed Basil response");
-            nats.publish(reply.subject, Bytes::from(reply.payload))
-                .await
-                .map_err(RuntimeError::NatsPublish)
+            let subject = reply.subject.clone();
+            let result = nats
+                .publish(reply.subject, Bytes::from(reply.payload))
+                .await;
+            (subject, result)
         }
         BridgeAction::Reply(reply) => {
             warn!(
@@ -690,9 +695,11 @@ async fn publish_action(
                 error = reply.headers.get(ERROR_HEADER).unwrap_or("UNKNOWN"),
                 "replying with bridge-level error",
             );
-            nats.publish_with_headers(reply.subject, to_nats_headers(&reply.headers), Bytes::new())
-                .await
-                .map_err(RuntimeError::NatsPublish)
+            let subject = reply.subject.clone();
+            let result = nats
+                .publish_with_headers(reply.subject, to_nats_headers(&reply.headers), Bytes::new())
+                .await;
+            (subject, result)
         }
         BridgeAction::NoReply(error) => {
             warn!(
@@ -700,8 +707,15 @@ async fn publish_action(
                 message = %error.message,
                 "dropping request because no NATS reply subject was present",
             );
-            Ok(())
+            return;
         }
+    };
+    if let Err(publish_error) = result {
+        error!(
+            reply_subject = %subject,
+            error = %publish_error,
+            "reply publish failed; dropping the reply and keeping the bridge alive",
+        );
     }
 }
 
@@ -731,9 +745,10 @@ pub enum RuntimeError {
     /// NATS subscription failed.
     #[error("NATS subscription failed: {0}")]
     NatsSubscribe(async_nats::SubscribeError),
-    /// NATS reply publish failed.
-    #[error("NATS publish failed: {0}")]
-    NatsPublish(async_nats::PublishError),
+    /// The NATS subscription stream ended; the bridge can no longer serve
+    /// requests and a supervisor should restart it.
+    #[error("NATS subscription stream ended")]
+    SubscriptionEnded,
     /// Request worker failed.
     #[error("bridge request worker failed: {0}")]
     WorkerJoin(tokio::task::JoinError),

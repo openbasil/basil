@@ -6,6 +6,66 @@ SPDX-License-Identifier: Apache-2.0
 
 # Changelog
 
+## 0.6.2 2026-07-07
+
+- Release for testing CI updates
+
+### CI and release-workflow fixes
+
+- Added `--experimental_allow_proto3_optional` to `protoc`, so `broker.proto`'s proto3
+  `optional` fields compile against the older `protoc` (3.12.4) shipped by the
+  `ubuntu-22.04-arm` CI runner as well as newer toolchains and the Nix flake
+  (the flag is a no-op on `protoc` >= 3.15, where proto3 optional is stable).
+- The gRPC-server unit tests bind their Unix sockets under `/tmp` instead of
+  `std::env::temp_dir()`, keeping the full path within the macOS `sun_path`
+  limit (104 bytes; macOS's `/var/folders/...` temp dir overflowed it) so the
+  darwin `cargo test` and Nix-build jobs no longer fail with `path must be
+  shorter than SUN_LEN`.
+- All crates now declares `repository`,`homepage`,`documentation`,`keywords`,`categories`.
+  cargo-dist requires `repository` to plan the GitHub Release and Homebrew formula.
+
+### Security review fixes (medium & low severity)
+
+- Go client hardening: the sealed-invocation decoder now enforces COSE `crit`
+  (present, integer labels, exactly the understood profile set) instead of
+  ignoring it; user gRPC/workload-API dial options are applied before the fixed
+  ones so the transport credentials, pinned `:authority`, Unix dialer, and
+  Workload API address can no longer be overridden (making the documented
+  contract true); `MintJwt` rejects integer claims above 2^53 that
+  `google.protobuf.Struct`'s float64 numbers would silently corrupt; and
+  `Encrypt`/`WrapEnvelope` error on a success response that omits its envelope
+  instead of returning `(nil, nil)`.
+- sealed-invocation and AEAD wire-contract tightening: `CarrierSigner` message
+  ids carry a fresh 64-bit random nonce instead of a per-process counter, so a
+  restart inside the same second can no longer reuse a `cti`; the unusable
+  `SealedInvocationBody` mint variants are removed from the Rust client
+  (`prepare_sealed_invocation` now takes the `SignInvocationRequest` the broker
+  actually executes, and the mint body schemas are documented as reserved
+  fixture-pinned contracts); the invocation body CBOR decoders reject
+  non-minimal integer and length encodings per the deterministic-CBOR contract;
+  and `AEAD_ALGORITHM_UNSPECIFIED` is rejected on decrypt as well as encrypt
+  (proto and Go client docs now match the broker's fail-closed behavior).
+- vendoring and example hygiene: the vendored SPIFFE Workload API proto is
+  restored to verbatim upstream bytes with its licensing declared in
+  `REUSE.toml` (upstream copyright, no more OpenBasil misattribution), the Go
+  client's vendored `broker.proto` is re-synced from the Rust copy (SPDX header
+  and comment drift) with stubs regenerated; the COSE-over-NATS demo drops the
+  dead can-never-succeed NATS binary probe in favor of the log wait and its
+  generated agent config and sealed bundle now carry explicit `vault-addr` /
+  `addr=` so they no longer depend on `VAULT_ADDR` leaking into the agent
+  environment; and the 1Password backend fails on malformed `op item list`
+  output instead of treating it as an empty vault (which created duplicates on
+  `set` and misreported `get` as not-found).
+- authentic empty-payload NATS xkey boxes now open (off-by-one bound fixed,
+  with nkeys interop tests); the NATS box shared-secret key copy is zeroized
+  and `format_user_creds` returns its seed-bearing document as
+  `Zeroizing<String>`; the NATS bridge logs and survives reply-publish
+  failures and treats subscription-stream end as an error so supervisors
+  restart it; the keystore AEAD documents the ~2^32-message random-nonce bound
+  per key version; and `aes-gcm`/`aes` build with their `zeroize` features so
+  GHASH keys and AES round-key schedules are scrubbed on drop
+  (`chacha20poly1305` already zeroizes unconditionally).
+
 ## 0.6.1 2026-07-07
 
 ### Renamed basil-client to basil
@@ -28,7 +88,7 @@ SPDX-License-Identifier: Apache-2.0
   bounded concurrency limit, BYOK `KeyMaterial` redacts and zeroizes private
   bytes, the COSE-over-NATS demo uses subscription readiness instead of a sleep,
   and the streaming encryption format now has a normative spec.
-- zeroization gaps closed on four secondary paths —
+- zeroization gaps closed on four secondary paths,
   deposit credential fingerprinting no longer parses the full secret JSON and
   hashes through a zeroizing buffer, value-class `get_secret` reads flow through
   the same zeroizing chain as the seed path, X.509 leaf private keys are moved

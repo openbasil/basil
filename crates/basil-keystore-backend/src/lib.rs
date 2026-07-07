@@ -2,7 +2,11 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Optional materialize-to-use key-store support for Basil.
+//! Optional materialize-to-use key-store support for [Basil](https://github.com/openbasil/basil).
+//!
+//! To use within basil, the basil-bin crate needs to be compiled
+//! with either `db-keystore` or `onepassword` features.
+//! see [Backends & custody](https://docs.openbasil.org/introduction/backends-and-custody/)
 //!
 //! This crate holds the storage adapters and local crypto needed when Basil is
 //! backed by a key/value store rather than an in-place transit engine. Secret
@@ -128,6 +132,16 @@ pub fn verify_ed25519(
 }
 
 /// Encrypt with a materialized 32-byte AEAD key. Basil owns the nonce.
+///
+/// # Nonce bounds
+///
+/// Each call draws a fresh random 96-bit nonce; nothing tracks how many
+/// messages a key has protected. With random 96-bit nonces the collision
+/// probability stays below the customary 2^-32 target only while a single key
+/// version protects fewer than about 2^32 messages (NIST SP 800-38D section
+/// 8.3). This module does not enforce that bound: operators of high-volume
+/// keys must rotate the backing secret (bumping the envelope `key_version`)
+/// well before a key version approaches 2^32 encryptions.
 ///
 /// # Errors
 ///

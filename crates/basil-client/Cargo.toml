@@ -9,6 +9,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/basil"
+keywords = ["basil", "grpc", "cryptography", "secrets", "client"]
+categories = ["cryptography", "api-bindings", "authentication"]
 rust-version = "1.85"
 publish = true
 
@@ -30,6 +35,8 @@ tracing = { workspace = true }
 # the same RustCrypto family already used by basil-core; none of them pull in
 # OpenBao, a tonic server, age, or argon2, so the published `basil` client crate
 # stays free of broker/server dependencies.
+# Direct dep only to enable `aes/zeroize` (round-key scrubbing) for aes-gcm.
+aes = { workspace = true }
 aes-gcm = { workspace = true }
 chacha20poly1305 = { workspace = true }
 ml-kem = { workspace = true }

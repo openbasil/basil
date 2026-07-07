@@ -257,7 +257,7 @@ impl EnvoySdsGrpc {
         // The validation context is deliberately NOT PDP-gated, asymmetric with
         // the `Op::Mint` gate above **by design**: the certificate resource
         // releases a freshly minted *private* key, while the validation context
-        // carries only the trust domain's *public* CA bundle — the same bytes
+        // carries only the trust domain's *public* CA bundle, the same bytes
         // the SPIFFE Workload API serves ungated to any socket peer via
         // `FetchX509Bundles` (bundles are public by SPIFFE convention), so a
         // read grant here would add policy friction without hiding anything.

@@ -70,20 +70,14 @@ wait_for_file_socket() {
 }
 
 wait_for_nats() {
-  for _ in $(seq 1 100); do
-    if "$DEMO_BIN" run \
-      --socket "$SOCKET.missing" \
-      --nats-url "$NATS_URL" \
-      --bridge-subject "$BRIDGE_SUBJECT" >/dev/null 2>&1; then
+  for _ in $(seq 1 120); do
+    if grep -q "Server is ready" "$NATS_LOG" 2>/dev/null; then
       return
     fi
     if ! kill -0 "$NATS_PID" >/dev/null 2>&1; then
       echo "nats-server exited during startup; log:" >&2
       cat "$NATS_LOG" >&2
       exit 1
-    fi
-    if grep -q "Server is ready" "$NATS_LOG"; then
-      return
     fi
     sleep 0.1
   done
@@ -227,6 +221,7 @@ catalog = "$CATALOG"
 policy = "$POLICY"
 bundle = "$BUNDLE"
 socket = "$SOCKET"
+vault-addr = "$VAULT_ADDR"
 
 [unlock]
 unlock-passphrase-file = "$PASS_FILE"
@@ -314,7 +309,7 @@ HCL
   write_policy
   "$ROOT/target/debug/basil" bundle create "$BUNDLE" \
     --slot passphrase:file="$PASS_FILE" \
-    --backend "id=bao,type=openbao,role-id=$role_id,secret-id-file=$APPROLE_SECRET_FILE" >/dev/null
+    --backend "id=bao,type=openbao,addr=$VAULT_ADDR,role-id=$role_id,secret-id-file=$APPROLE_SECRET_FILE" >/dev/null
   write_agent_config
 
   echo "nats"

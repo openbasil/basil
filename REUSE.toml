@@ -16,6 +16,15 @@ precedence = "override"
 SPDX-FileCopyrightText = "NONE"
 SPDX-License-Identifier = "CC0-1.0"
 
+# Vendored SPIFFE Workload API proto: verbatim upstream file (see
+# crates/basil-proto/proto/spiffe/UPSTREAM.md for the pinned commit).
+# Declaring licensing here because upstream file has no header.
+[[annotations]]
+path = "crates/basil-proto/proto/spiffe/workloadapi.proto"
+precedence = "override"
+SPDX-FileCopyrightText = "The SPIFFE Project & Scytale, Inc"
+SPDX-License-Identifier = "Apache-2.0"
+
 # Code and other first-party project files.
 [[annotations]]
 path = [
@@ -54,4 +63,3 @@ path = [
 precedence = "closest"
 SPDX-FileCopyrightText = "NONE"
 SPDX-License-Identifier = "CC0-1.0"
-

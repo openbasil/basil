@@ -324,7 +324,8 @@ impl OnePasswordProvider {
             &["item", "list", "--vault", vault, "--format", "json"],
             None,
         )?;
-        let items: Vec<OnePasswordListItem> = serde_json::from_str(&out).unwrap_or_default();
+        let items: Vec<OnePasswordListItem> = serde_json::from_str(&out)
+            .map_err(|_| StoreError::Backend("onepassword-parse-item-list".to_owned()))?;
         Ok(items
             .into_iter()
             .find(|item| item.title == item_name)

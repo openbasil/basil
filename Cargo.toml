@@ -24,7 +24,7 @@ license = "Apache-2.0"
 authors = ["info@openbasil.org"]
 repository = "https://github.com/openbasil/basil"
 homepage = "https://github.com/openbasil/basil"
-documentation = "https://docs.rs/basil"
+documentation = "https://docs.openbasil.org"
 
 [workspace.dependencies]
 basil = { version = "0.6.1", path = "crates/basil-client" }
@@ -36,7 +36,11 @@ basil-keystore-backend = { version = "0.6.1", path = "crates/basil-keystore-back
 basil-core = { version = "0.6.1", path = "crates/basil-core", default-features = false }
 basil-bin = { version = "0.6.1", path = "crates/basil-bin" }
 
-aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+# `aes` is depended on directly (alongside aes-gcm's own `zeroize` feature, which
+# only scrubs the GHASH key) so its `zeroize` feature zeroizes AES round-key
+# schedules on drop; aes-gcm 0.10 does not forward it.
+aes = { version = "0.8", default-features = false, features = ["zeroize"] }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc", "zeroize"] }
 aes-kw = "0.3"
 age = { version = "0.11", features = ["plugin"] }
 anyhow = "1"
@@ -54,6 +58,8 @@ axum = { version = "0.8.9", default-features = false, features = ["http1", "toki
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 bip39 = "2"
 bytes = "1"
+# chacha20poly1305 0.10 zeroizes its cipher key material unconditionally (its
+# `zeroize` dependency is non-optional), so no feature flag is needed.
 chacha20poly1305 = { version = "0.10", default-features = false }
 clap = { version = "4", features = ["derive", "env"] }
 crypto_secretbox = { version = "0.1.1", default-features = false, features = ["alloc", "salsa20"] }
