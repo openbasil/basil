@@ -16,6 +16,7 @@
 //! (a UTF-8 string round trip through `op`), never a `SecretString`, and
 //! every error is reduced to a stable, leak-safe summary before it leaves this module.
 
+use std::fmt;
 use std::process::Command;
 
 use percent_encoding::percent_decode_str;
@@ -40,7 +41,7 @@ struct OnePasswordField {
     /// Human-readable label used to locate the `"value"` field.
     label: Option<String>,
     /// The stored value, absent for some field types.
-    value: Option<String>,
+    value: Option<SecretString>,
 }
 
 /// A `1Password` item with its fields, as `op item get --format json` reports it.
@@ -60,7 +61,7 @@ struct OnePasswordListItem {
 }
 
 /// One field of a new-item creation template (`op item create`).
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct OnePasswordFieldTemplate {
     /// Field label (`"project"`, `"key"`, `"value"`).
     label: String,
@@ -68,11 +69,11 @@ struct OnePasswordFieldTemplate {
     #[serde(rename = "type")]
     field_type: String,
     /// The value to store.
-    value: String,
+    value: SecretString,
 }
 
 /// A new-item creation template serialized to JSON on `op item create` stdin.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct OnePasswordItemTemplate {
     /// Item title (the formatted item name).
     title: String,
@@ -85,16 +86,30 @@ struct OnePasswordItemTemplate {
 }
 
 /// Resolved `1Password` addressing/auth configuration, parsed from a provider URI.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct OnePasswordConfig {
     /// Optional account shorthand (`--account`), for multi-account setups.
     pub account: Option<String>,
     /// Default vault; `"Private"` when unset.
     pub default_vault: Option<String>,
     /// Service-account token (`OP_SERVICE_ACCOUNT_TOKEN`) for non-interactive auth.
-    pub service_account_token: Option<String>,
+    pub service_account_token: Option<Zeroizing<String>>,
     /// Item-title template override; [`DEFAULT_FOLDER_PREFIX`] when unset.
     pub folder_prefix: Option<String>,
+}
+
+impl fmt::Debug for OnePasswordConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OnePasswordConfig")
+            .field("account", &self.account)
+            .field("default_vault", &self.default_vault)
+            .field(
+                "service_account_token",
+                &self.service_account_token.as_ref().map(|_| "REDACTED"),
+            )
+            .field("folder_prefix", &self.folder_prefix)
+            .finish()
+    }
 }
 
 impl OnePasswordConfig {
@@ -126,7 +141,8 @@ impl OnePasswordConfig {
             let username = decode(url.username());
             if !username.is_empty() {
                 if scheme == "onepassword+token" {
-                    config.service_account_token = Some(url.password().map_or(username, decode));
+                    config.service_account_token =
+                        Some(Zeroizing::new(url.password().map_or(username, decode)));
                 } else {
                     config.account = Some(username);
                 }
@@ -236,14 +252,14 @@ impl OnePasswordProvider {
     ///
     /// Errors are classified into [`OpErr`] without ever echoing `op` stderr
     /// (which can contain a secret value).
-    fn run(&self, args: &[&str], stdin_data: Option<&str>) -> Result<String, OpErr> {
+    fn run(&self, args: &[&str], stdin_data: Option<&str>) -> Result<Zeroizing<String>, OpErr> {
         use std::io::Write as _;
         use std::process::Stdio;
 
         let mut cmd = Command::new(&self.op_command);
         strip_op_session_env(&mut cmd);
         if let Some(token) = &self.config.service_account_token {
-            cmd.env("OP_SERVICE_ACCOUNT_TOKEN", token);
+            cmd.env("OP_SERVICE_ACCOUNT_TOKEN", token.as_str());
         }
         if let Some(account) = &self.config.account {
             cmd.arg("--account").arg(account);
@@ -268,16 +284,20 @@ impl OnePasswordProvider {
             cmd.output().map_err(|e| spawn_err(&e))?
         };
 
+        let stdout = Zeroizing::new(output.stdout);
         if output.status.success() {
-            return String::from_utf8(output.stdout).map_err(|_| {
-                OpErr::Store(StoreError::Backend(
-                    "onepassword-non-utf8-output".to_owned(),
-                ))
-            });
+            return String::from_utf8(stdout.to_vec())
+                .map(Zeroizing::new)
+                .map_err(|_| {
+                    OpErr::Store(StoreError::Backend(
+                        "onepassword-non-utf8-output".to_owned(),
+                    ))
+                });
         }
 
         // Classify by known stderr markers, but never propagate the raw text.
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr_bytes = Zeroizing::new(output.stderr);
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
         if stderr.contains("isn't an item") {
             Err(OpErr::NotFound)
         } else if stderr.contains("More than one item") {
@@ -319,12 +339,12 @@ impl OnePasswordProvider {
         // Prefer the labelled `value` field, then any concealed/password field.
         for field in &item.fields {
             if field.label.as_deref() == Some("value") {
-                return Ok(field.value.as_deref().map(as_secret_bytes));
+                return Ok(field.value.as_ref().map(SecretString::to_secret_bytes));
             }
         }
         for field in &item.fields {
             if field.field_type == "CONCEALED" || field.id == "password" {
-                return Ok(field.value.as_deref().map(as_secret_bytes));
+                return Ok(field.value.as_ref().map(SecretString::to_secret_bytes));
             }
         }
         Ok(None)
@@ -365,7 +385,11 @@ impl OnePasswordProvider {
         }
     }
 
-    /// Store `value` at `key`, creating or updating the item.
+    /// Store `value` at `key`, creating or replacing the item.
+    ///
+    /// An existing item is deleted and recreated (its `1Password` item id and
+    /// edit history do not survive an update); this keeps the secret value off
+    /// the `op` command line on every path.
     ///
     /// # Errors
     ///
@@ -382,48 +406,86 @@ impl OnePasswordProvider {
         let vault = self.vault();
         let item_name = self.item_name(project, key, profile);
 
+        // Updates are delete-and-recreate so the new value travels the same
+        // stdin template path as creation: `op item edit` only takes field
+        // assignments as argv, and argv is world-readable via
+        // `/proc/<pid>/cmdline` for the lifetime of the `op` process.
         if let Some(id) = self.find_item_id(&item_name, &vault)? {
-            // Update the existing item's `value` field by id.
-            let assignment = format!("value={text}");
-            let args = ["item", "edit", &id, "--vault", &vault, &assignment];
+            let args = ["item", "delete", &id, "--vault", &vault];
             self.run(&args, None)?;
-        } else {
-            // Create a fresh Secure Note; the template (incl. the value) is piped
-            // on stdin, never placed on the command line.
-            let template = OnePasswordItemTemplate {
-                title: item_name,
-                category: "SECURE_NOTE".to_owned(),
-                fields: vec![
-                    OnePasswordFieldTemplate {
-                        label: "project".to_owned(),
-                        field_type: "STRING".to_owned(),
-                        value: project.to_owned(),
-                    },
-                    OnePasswordFieldTemplate {
-                        label: "key".to_owned(),
-                        field_type: "STRING".to_owned(),
-                        value: key.to_owned(),
-                    },
-                    OnePasswordFieldTemplate {
-                        label: "value".to_owned(),
-                        field_type: "STRING".to_owned(),
-                        value: text.to_owned(),
-                    },
-                ],
-                tags: vec!["automated".to_owned(), project.to_owned()],
-            };
-            let json = serde_json::to_string(&template)
-                .map_err(|_| StoreError::Backend("onepassword-template-encode".to_owned()))?;
-            let args = ["item", "create", "--vault", &vault, "-"];
-            self.run(&args, Some(&json))?;
         }
+
+        // Create a fresh Secure Note; the template (incl. the value) is piped
+        // on stdin, never placed on the command line.
+        let template = OnePasswordItemTemplate {
+            title: item_name,
+            category: "SECURE_NOTE".to_owned(),
+            fields: vec![
+                OnePasswordFieldTemplate {
+                    label: "project".to_owned(),
+                    field_type: "STRING".to_owned(),
+                    value: SecretString::new(project.to_owned()),
+                },
+                OnePasswordFieldTemplate {
+                    label: "key".to_owned(),
+                    field_type: "STRING".to_owned(),
+                    value: SecretString::new(key.to_owned()),
+                },
+                OnePasswordFieldTemplate {
+                    label: "value".to_owned(),
+                    field_type: "STRING".to_owned(),
+                    value: SecretString::new(text.to_owned()),
+                },
+            ],
+            tags: vec!["automated".to_owned(), project.to_owned()],
+        };
+        let json = Zeroizing::new(
+            serde_json::to_string(&template)
+                .map_err(|_| StoreError::Backend("onepassword-template-encode".to_owned()))?,
+        );
+        let args = ["item", "create", "--vault", &vault, "-"];
+        self.run(&args, Some(&json))?;
         Ok(())
     }
 }
 
 /// Wrap a string value's bytes in a zeroizing owner.
-fn as_secret_bytes(value: &str) -> Zeroizing<Vec<u8>> {
-    Zeroizing::new(value.to_owned().into_bytes())
+struct SecretString(Zeroizing<String>);
+
+impl SecretString {
+    fn new(value: String) -> Self {
+        Self(Zeroizing::new(value))
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretString {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(|s| Self(Zeroizing::new(s)))
+    }
+}
+
+impl Serialize for SecretString {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("REDACTED")
+    }
+}
+
+impl SecretString {
+    fn to_secret_bytes(&self) -> Zeroizing<Vec<u8>> {
+        Zeroizing::new(self.0.as_bytes().to_vec())
+    }
 }
 
 /// Map a spawn failure to a leak-safe store error, distinguishing a missing CLI.
@@ -471,7 +533,10 @@ mod tests {
     #[test]
     fn uri_token_scheme_captures_token_from_username() {
         let c = OnePasswordConfig::from_uri("onepassword+token://ops_tok@Private").unwrap();
-        assert_eq!(c.service_account_token.as_deref(), Some("ops_tok"));
+        assert_eq!(
+            c.service_account_token.as_ref().map(|s| s.as_str()),
+            Some("ops_tok")
+        );
         assert_eq!(c.default_vault.as_deref(), Some("Private"));
         assert!(c.account.is_none());
     }
@@ -479,7 +544,18 @@ mod tests {
     #[test]
     fn uri_token_scheme_captures_token_from_password() {
         let c = OnePasswordConfig::from_uri("onepassword+token://acct:ops_tok@Private").unwrap();
-        assert_eq!(c.service_account_token.as_deref(), Some("ops_tok"));
+        assert_eq!(
+            c.service_account_token.as_ref().map(|s| s.as_str()),
+            Some("ops_tok")
+        );
+    }
+
+    #[test]
+    fn config_debug_redacts_service_account_token() {
+        let c = OnePasswordConfig::from_uri("onepassword+token://acct:ops_tok@Private").unwrap();
+        let rendered = format!("{c:?}");
+        assert!(rendered.contains("REDACTED"));
+        assert!(!rendered.contains("ops_tok"));
     }
 
     #[test]

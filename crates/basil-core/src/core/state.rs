@@ -227,6 +227,10 @@ impl BrokerLimits {
 /// (hot reload) invalidates the cache immediately regardless of the TTL.
 pub const READINESS_CACHE_TTL: Duration = Duration::from_secs(2);
 
+/// How long a computed JWKS document is reused before re-reading issuer public
+/// keys from the backend. A generation change invalidates the cache immediately.
+pub const JWKS_CACHE_TTL: Duration = Duration::from_secs(2);
+
 /// The coarse readiness category a probe resolved to: the proto-free core of the
 /// admin `Readiness` summary (the service layer maps it onto the wire enum).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,6 +282,17 @@ struct CachedReadiness {
     expires_at: Instant,
 }
 
+/// A cached JWKS document, keyed by the serving generation.
+#[derive(Debug, Clone)]
+pub struct CachedJwks {
+    /// Serialized JWKS body.
+    pub body: Vec<u8>,
+    /// Strong `ETag` for `body`.
+    pub etag: String,
+    generation: u64,
+    expires_at: Instant,
+}
+
 /// The shared broker state: the loaded policy surface plus the backend manager.
 ///
 /// Construct once with [`BrokerState::new`] and wrap in an `Arc`; the accept loop
@@ -292,6 +307,13 @@ pub struct BrokerState {
     /// not expose its backend kinds, so the binary supplies one at construction
     /// (e.g. `"vault"`); `vault-i9j`'s `list`/metadata work can refine this.
     backend_label: String,
+    /// The broker software version reported by `status`/`health`. The binary
+    /// (`basil-bin`) supplies its own `CARGO_PKG_VERSION` at construction via
+    /// [`BrokerState::with_version`], so the served version tracks the shipped
+    /// `basil` binary even if this library crate (`basil-core`) is versioned
+    /// separately. Defaults to this crate's version (the workspace version, the
+    /// two coincide today) when the binary does not set it.
+    agent_version: String,
     /// Broker-wide payload caps + rotation grace/retention policy.
     limits: BrokerLimits,
     /// Optional JSONL audit sink (`vault-vq5`): when `Some`, every recorded
@@ -312,6 +334,14 @@ pub struct BrokerState {
     /// backend probe is never run while the lock is held, and the cache is bypassed
     /// when the serving generation has changed since the cached probe.
     readiness_cache: Mutex<Option<CachedReadiness>>,
+    /// Short TTL cache for the unauthenticated network-facing JWKS endpoint.
+    jwks_cache: Mutex<Option<CachedJwks>>,
+    /// Serializes the reload engine's validate→swap sequence. SIGHUP and the
+    /// admin-reload RPC can fire concurrently; without this lock both could pin
+    /// generation N, both stamp N+1, and the staler candidate could overwrite
+    /// the newer one (a silent lost update). Holds no data: it only orders the
+    /// two triggers. Reloads are rare, so contention is irrelevant.
+    reload_lock: Mutex<()>,
 }
 
 impl BrokerState {
@@ -357,12 +387,18 @@ impl BrokerState {
             generation: ArcSwap::from_pointee(generation),
             manager,
             backend_label: backend_label.into(),
+            // Default to this crate's version; the binary overrides with its own
+            // via `with_version` so `status`/`health` report the `basil` binary's
+            // version, not `basil-core`'s.
+            agent_version: env!("CARGO_PKG_VERSION").to_string(),
             limits,
             audit: None,
             events: EventSource::new(),
             jwt_revocations: JwtRevocationStore::default(),
             reload_inputs: None,
             readiness_cache: Mutex::new(None),
+            jwks_cache: Mutex::new(None),
+            reload_lock: Mutex::new(()),
         }
     }
 
@@ -385,6 +421,17 @@ impl BrokerState {
         self
     }
 
+    /// Set the broker software version reported by `status`/`health`.
+    ///
+    /// The binary (`basil-bin`) passes its own `env!("CARGO_PKG_VERSION")` so the
+    /// served version follows the shipped `basil` binary rather than this
+    /// library crate. Without this, the version defaults to `basil-core`'s.
+    #[must_use]
+    pub fn with_version(mut self, version: impl Into<String>) -> Self {
+        self.agent_version = version.into();
+        self
+    }
+
     /// Record the configured on-disk catalog/policy paths so the SIGHUP reload
     /// engine (`basil-y3e.2`) can re-read from the **same** paths startup used.
     ///
@@ -401,6 +448,14 @@ impl BrokerState {
     #[must_use]
     pub const fn reload_inputs(&self) -> Option<&ReloadInputs> {
         self.reload_inputs.as_ref()
+    }
+
+    /// The lock the reload engine holds across its whole validate→swap sequence,
+    /// so concurrent triggers (SIGHUP + admin RPC) apply strictly one at a time
+    /// and generation ids stay monotonic with no lost update.
+    #[must_use]
+    pub const fn reload_lock(&self) -> &Mutex<()> {
+        &self.reload_lock
     }
 
     /// The id of the **currently serving** generation (observable for the status
@@ -451,6 +506,30 @@ impl BrokerState {
                 outcome,
                 generation,
                 expires_at: Instant::now() + READINESS_CACHE_TTL,
+            });
+        }
+    }
+
+    /// Return the cached JWKS document for the currently-serving generation.
+    #[must_use]
+    pub fn cached_jwks(&self) -> Option<CachedJwks> {
+        let generation = self.active_generation_id();
+        let now = Instant::now();
+        let cached = {
+            let guard = self.jwks_cache.lock().ok()?;
+            (*guard).clone()?
+        };
+        (cached.generation == generation && now < cached.expires_at).then_some(cached)
+    }
+
+    /// Store a freshly-built JWKS document for `generation`.
+    pub fn cache_jwks(&self, generation: u64, body: Vec<u8>, etag: String) {
+        if let Ok(mut guard) = self.jwks_cache.lock() {
+            *guard = Some(CachedJwks {
+                body,
+                etag,
+                generation,
+                expires_at: Instant::now() + JWKS_CACHE_TTL,
             });
         }
     }
@@ -593,6 +672,12 @@ impl BrokerState {
     #[must_use]
     pub fn backend_label(&self) -> &str {
         &self.backend_label
+    }
+
+    /// The broker software version advertised in `status`/`health` responses.
+    #[must_use]
+    pub fn agent_version(&self) -> &str {
+        &self.agent_version
     }
 
     /// The broker-wide payload caps + rotation grace/retention policy.

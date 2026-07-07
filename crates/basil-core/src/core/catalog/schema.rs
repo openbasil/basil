@@ -15,8 +15,13 @@ use basil_proto::KeyType;
 use serde::{Deserialize, Serialize};
 
 /// The catalog: one document, per-generation immutable.
+///
+/// Unknown fields are a hard load error (`deny_unknown_fields`, here and on the
+/// nested structs): several optional fields default to their *most permissive*
+/// state (`sealingPin` absent = unrestricted decrypt oracle), so a typo'd field
+/// name must fail closed at load rather than be silently dropped.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Catalog {
     /// Schema version of this document.
     pub schema_version: u32,
@@ -28,6 +33,7 @@ pub struct Catalog {
 
 /// A backend instance the catalog routes keys to.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackendRef {
     /// Which kind of backend this is.
     pub kind: BackendKind,
@@ -365,8 +371,12 @@ impl PinnedParties {
 }
 
 /// One catalog key (§2.4).
+///
+/// Unknown fields fail the load closed: `sealingPin` (and other optional
+/// fields) default to their most permissive state, so a misspelled field must
+/// be an error, never a silent drop.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct KeyEntry {
     /// Key class (§2.4.1).
     pub class: Class,
@@ -421,6 +431,25 @@ impl KeyEntry {
             // materialized in-process: it is a KV-backed key, not transit.
             Class::Value | Class::Public | Class::Sealing => Engine::Kv2,
         })
+    }
+
+    /// Whether this key is a credential **issuer**: a NATS operator/account
+    /// nkey (`nats_type=O`/`A`, the roles that sign account/user JWTs) or a
+    /// SPIFFE JWT/X.509 issuer (`svid_kind=jwt`/`x509`).
+    ///
+    /// Raw `sign` is hard-denied on these keys by the PDP: a caller holding a
+    /// plain `op:sign` grant could otherwise assemble the signing input
+    /// off-broker and mint fully valid credentials, bypassing every check the
+    /// dedicated `sign_nats_jwt`/`mint` ops enforce (kind, jti mode,
+    /// ttl/expiry). Issue through those ops instead.
+    #[must_use]
+    pub fn is_credential_issuer(&self) -> bool {
+        let nats_issuer = matches!(
+            self.labels.nats_type(),
+            Some(basil_nats::NkeyType::Operator | basil_nats::NkeyType::Account)
+        );
+        let svid_issuer = matches!(self.labels.get("svid_kind"), Some("jwt" | "x509"));
+        nats_issuer || svid_issuer
     }
 
     /// Whether this key is a **materialize-to-use** key (design §17.7): its
@@ -557,7 +586,7 @@ impl KeyAlgorithm {
 /// A generation recipe for `value` / `public` material (§2.5). Crypto keys
 /// generate from `key_type` and carry no recipe.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(tag = "format", rename_all = "kebab-case")]
+#[serde(tag = "format", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum GenerateSpec {
     /// Random printable password of `bytes` length.
     AsciiPrintable {

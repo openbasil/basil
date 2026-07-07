@@ -16,6 +16,14 @@ pub mod client_cli;
 use basil_core::{agent_cli, bundle_cli, init};
 use clap::{CommandFactory, Parser, Subcommand};
 
+/// The shipped `basil` binary version.
+///
+/// Captured in this crate so it is `basil-bin`'s `CARGO_PKG_VERSION` (the same
+/// value `--version` prints via clap), which the agent threads into
+/// `status`/`health`keeping the reported version in lockstep with the binary
+/// even if `basil-core` is versioned separately.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Top-level `basil` command-line interface.
 #[derive(Debug, Parser)]
 #[command(name = "basil", version, about = "Basil broker and operator tool")]
@@ -39,7 +47,7 @@ pub enum Command {
     #[command(subcommand)]
     Bundle(Box<bundle_cli::BundleCommand>),
     /// Explain a policy decision: why a subject would be allowed or denied an op
-    /// on a key. By DEFAULT this is an offline dry-run — it builds the PDP from
+    /// on a key. By DEFAULT this is an offline dry-run: it builds the PDP from
     /// the catalog + policy FILES on disk and evaluates the tuple through the same
     /// matcher enforcement uses (no socket, no backend, no secrets). With `--live`
     /// it instead queries the RUNNING broker's serving generation over the global

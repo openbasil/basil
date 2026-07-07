@@ -1312,10 +1312,15 @@ fn basil_aead_algorithm(value: i32) -> AeadAlgorithm {
     }
 }
 
-fn proto_key_material(value: KeyMaterial) -> pb::KeyMaterial {
-    let material = match value {
-        KeyMaterial::Ed25519Seed(seed) => pb::key_material::Material::Ed25519Seed(seed),
-        KeyMaterial::Pkcs8Der(der) => pb::key_material::Material::Pkcs8Der(der),
+fn proto_key_material(mut value: KeyMaterial) -> pb::KeyMaterial {
+    // KeyMaterial zeroizes on drop, so its fields cannot be moved out by
+    // pattern match; take the buffer instead (no copy, drop zeroizes the
+    // leftover empty vec).
+    let material = match &mut value {
+        KeyMaterial::Ed25519Seed(seed) => {
+            pb::key_material::Material::Ed25519Seed(std::mem::take(seed))
+        }
+        KeyMaterial::Pkcs8Der(der) => pb::key_material::Material::Pkcs8Der(std::mem::take(der)),
     };
     pb::KeyMaterial {
         material: Some(material),

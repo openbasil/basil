@@ -152,7 +152,7 @@ impl SecretFileModeArg {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Create a new asymmetric key.
+    /// Create a new asymmetric or KEM key.
     NewKey {
         /// Dotted catalog name for the new key.
         #[arg(long, default_value = "example.signing_key")]
@@ -1671,7 +1671,15 @@ mod tests {
     #[test]
     fn explain_live_flag_selects_the_broker_path() {
         let cli = Cli::parse_from([
-            "basil", "explain", "--subject", "s", "--op", "get", "--key", "k", "--live",
+            "basil",
+            "explain",
+            "--subject",
+            "s",
+            "--op",
+            "get",
+            "--key",
+            "k",
+            "--live",
         ]);
         match cli.command {
             crate::Command::Explain(args) => {
@@ -1696,8 +1704,15 @@ mod tests {
 
     #[test]
     fn explain_live_conflicts_with_effective() {
-        let err = Cli::try_parse_from(["basil", "explain", "--subject", "s", "--live", "--effective"])
-            .expect_err("--live has no effective mode; clap must reject the combination");
+        let err = Cli::try_parse_from([
+            "basil",
+            "explain",
+            "--subject",
+            "s",
+            "--live",
+            "--effective",
+        ])
+        .expect_err("--live has no effective mode; clap must reject the combination");
         assert!(
             err.to_string().contains("cannot be used with"),
             "expected a clap conflict error, got: {err}"

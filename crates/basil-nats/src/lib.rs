@@ -635,7 +635,7 @@ impl DecodedNatsJwt {
         if !self.verify_signature(&matched_signer.public_key) {
             return NatsJwtValidation {
                 reason: NatsJwtValidationReason::BadSignature,
-                matched_signer: Some(matched_signer),
+                matched_signer: None,
             };
         }
         if let Some(exp) = self.claims.expires_at
@@ -643,7 +643,7 @@ impl DecodedNatsJwt {
         {
             return NatsJwtValidation {
                 reason: NatsJwtValidationReason::Expired,
-                matched_signer: Some(matched_signer),
+                matched_signer: None,
             };
         }
         if let Some(nbf) = self.claims.not_before
@@ -651,7 +651,7 @@ impl DecodedNatsJwt {
         {
             return NatsJwtValidation {
                 reason: NatsJwtValidationReason::NotYetValid,
-                matched_signer: Some(matched_signer),
+                matched_signer: None,
             };
         }
         NatsJwtValidation {
@@ -685,8 +685,16 @@ pub struct MatchedNatsSigner {
 pub struct NatsJwtValidation {
     /// Machine-readable validation result.
     pub reason: NatsJwtValidationReason,
-    /// The matched signer, when the candidate set contained the embedded issuer.
+    /// The verified signer. `Some` only when [`Self::is_valid`] is true.
     pub matched_signer: Option<MatchedNatsSigner>,
+}
+
+impl NatsJwtValidation {
+    /// Whether the token signature and time claims are valid.
+    #[must_use]
+    pub const fn is_valid(self) -> bool {
+        matches!(self.reason, NatsJwtValidationReason::Valid)
+    }
 }
 
 /// Authoritative validation result for a decoded NATS JWT.
@@ -1746,7 +1754,7 @@ mod tests {
 
         fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
             for byte in dst {
-                *byte = (self.0 as u8).wrapping_mul(37).wrapping_add(0x5a);
+                *byte = self.0.to_le_bytes()[0].wrapping_mul(37).wrapping_add(0x5a);
                 self.0 = self.0.wrapping_add(1);
             }
             Ok(())
@@ -1790,6 +1798,8 @@ mod tests {
             )
             .expect("validate");
         assert_eq!(validation.reason, NatsJwtValidationReason::Valid);
+        assert!(validation.is_valid());
+        assert!(validation.matched_signer.is_some());
 
         let raw_validation = decoded
             .verify_with_candidates(
@@ -1798,6 +1808,8 @@ mod tests {
             )
             .expect("validate raw");
         assert_eq!(raw_validation.reason, NatsJwtValidationReason::Valid);
+        assert!(raw_validation.is_valid());
+        assert!(raw_validation.matched_signer.is_some());
     }
 
     #[test]
@@ -2440,6 +2452,8 @@ mod tests {
             .verify_with_candidates([CandidateSigner::Nkey(&account_public)], 200)
             .expect("validate expired");
         assert_eq!(expired_validation.reason, NatsJwtValidationReason::Expired);
+        assert!(!expired_validation.is_valid());
+        assert!(expired_validation.matched_signer.is_none());
 
         let claims = json!({
             "jti": "manual",
@@ -2460,6 +2474,8 @@ mod tests {
             future_validation.reason,
             NatsJwtValidationReason::NotYetValid
         );
+        assert!(!future_validation.is_valid());
+        assert!(future_validation.matched_signer.is_none());
     }
 
     #[test]
@@ -2487,6 +2503,8 @@ mod tests {
             .verify_with_candidates([CandidateSigner::Nkey(&account_public)], 1_782_000_000)
             .expect("validate tampered");
         assert_eq!(bad_signature.reason, NatsJwtValidationReason::BadSignature);
+        assert!(!bad_signature.is_valid());
+        assert!(bad_signature.matched_signer.is_none());
 
         let valid = signed_token(&input, &account);
         let decoded_valid = decode_nats_jwt(&valid).expect("decode valid");
@@ -2495,6 +2513,7 @@ mod tests {
             .verify_with_candidates([CandidateSigner::Nkey(&other_public)], 1_782_000_000)
             .expect("validate unknown");
         assert_eq!(unknown.reason, NatsJwtValidationReason::UnknownSigner);
+        assert!(!unknown.is_valid());
         assert!(unknown.matched_signer.is_none());
     }
 

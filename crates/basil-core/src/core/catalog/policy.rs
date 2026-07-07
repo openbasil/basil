@@ -200,7 +200,7 @@ pub enum SignatureKeyAlgorithm {
 
 /// A typed principal selector inside a subject definition.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum PrincipalSpec {
     /// Unix peer-credential selector. At least one of `uid` or `gid` must be set.
     Unix {
@@ -347,6 +347,7 @@ pub struct Rule {
 
 /// The export-resolved name table (§4): numeric id → symbolic name, for logging.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct NameTable {
     /// uid → user name.
     #[serde(default)]
@@ -358,6 +359,7 @@ pub struct NameTable {
 
 /// Export-resolved config tables (§4).
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// uid/gid → name, for `name(num)` logging.
     #[serde(default)]

@@ -4,7 +4,6 @@ _default:
    
 rust-docs:
     cargo doc -p basil  -p basil-nats -p basil-proto -p basil-cose --all-features --no-deps
-    dufs -p 21000 target/doc
 
 # Generate roff man pages for the `basil` and `basil-nats-bridge` binaries into
 # `target/man` (override with `just man-pages <dir>`). Pages are named
@@ -158,9 +157,4 @@ test-e2e engine="both":
     echo "===== e2e summary ====="
     for e in "${engines[@]}"; do printf '  %-8s %s\n' "$e" "${result[$e]}"; done
     exit "$rc"
-
-ubs:
-    ~/.local/bin/ubs-rust.sh -v --ci  --exclude-tests  --exclude=.work \
-        --strict-gitignore \
-        --emit-findings-json=/tmp/ubs-basil.json  . >/tmp/ubs-basil.out
 

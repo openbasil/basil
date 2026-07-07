@@ -844,8 +844,8 @@ fn vault_cred(backend: &BackendArg, fields: &mut BTreeMap<String, String>) -> Re
 
 /// Reject a backend `addr` that isn't a usable base address before it is sealed
 /// into a bundle. Without this, a schemeless value like `127.0.0.1:8200` is
-/// accepted here and only surfaces much later — as an opaque reqwest "builder
-/// error" — when the agent first probes the backend.
+/// accepted here and only surfaces much later as an opaque reqwest "builder
+/// error" when the agent first probes the backend.
 fn validate_backend_addr(addr: &str) -> Result<()> {
     let url = Url::parse(addr).with_context(|| {
         format!(
@@ -1286,7 +1286,10 @@ mod tests {
         let err = validate_backend_addr("ftp://vault.example.com:8200")
             .expect_err("ftp scheme rejected")
             .to_string();
-        assert!(err.contains("unsupported scheme"), "unexpected error: {err}");
+        assert!(
+            err.contains("unsupported scheme"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

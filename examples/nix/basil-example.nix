@@ -20,10 +20,8 @@
   pkgs ? import (builtins.getFlake "github:NixOS/nixpkgs/nixpkgs-unstable") {
     system = builtins.currentSystem;
   },
-  #basilPackage ? (builtins.getFlake (toString ../../.)).packages.${builtins.currentSystem}.basil,
   basilPackage ?
-    (builtins.getFlake "github:openbasil/basil").packages.${builtins.currentSystem}.basil,
-  # ?ref=refs/tags/basil-v0.4.0";
+    (builtins.getFlake (toString ../../.)).packages.${builtins.currentSystem}.basil,
 }:
 
 let
@@ -260,7 +258,7 @@ let
         ../../nix/basil-agent.nix
       ];
 
-      service.basil = {
+      services.basil = {
         enable = true;
         inherit catalog policy;
 

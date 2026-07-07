@@ -5,6 +5,7 @@
 //! Shared Basil domain types used by the client and agent internals.
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 /// Asymmetric key type used by key creation, import, signing, and minting.
 ///
@@ -106,13 +107,30 @@ pub enum CatalogKind {
 }
 
 /// BYOK key material for import. Write-only; never returned to clients.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KeyMaterial {
     /// 32-byte raw Ed25519 seed.
     Ed25519Seed(#[serde(with = "serde_bytes")] Vec<u8>),
     /// Generic PKCS#8 DER.
     Pkcs8Der(#[serde(with = "serde_bytes")] Vec<u8>),
+}
+
+impl std::fmt::Debug for KeyMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ed25519Seed(_) => f.write_str("Ed25519Seed(REDACTED)"),
+            Self::Pkcs8Der(_) => f.write_str("Pkcs8Der(REDACTED)"),
+        }
+    }
+}
+
+impl Drop for KeyMaterial {
+    fn drop(&mut self) {
+        match self {
+            Self::Ed25519Seed(bytes) | Self::Pkcs8Der(bytes) => bytes.zeroize(),
+        }
+    }
 }
 
 /// Self-describing AEAD ciphertext produced by `encrypt` and consumed by
@@ -208,5 +226,12 @@ mod tests {
         assert_eq!(v, json!({"ed25519_seed":[1,2,3]}));
         let back: KeyMaterial = serde_json::from_value(v).unwrap();
         assert_eq!(back, KeyMaterial::Ed25519Seed(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn key_material_debug_redacts_private_bytes() {
+        let rendered = format!("{:?}", KeyMaterial::Ed25519Seed(vec![171; 32]));
+        assert_eq!(rendered, "Ed25519Seed(REDACTED)");
+        assert!(!rendered.contains("171"));
     }
 }

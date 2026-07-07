@@ -297,8 +297,7 @@ fn build_catalog(args: &InitArgs, layout: &Layout) -> Catalog {
             generate: None,
             sealing_pin: None,
             labels: Labels::default(),
-            description: "Example Ed25519 signing key scaffolded by `basil init`."
-                .to_string(),
+            description: "Example Ed25519 signing key scaffolded by `basil init`.".to_string(),
         },
     );
 

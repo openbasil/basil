@@ -349,8 +349,29 @@ pub enum LoadError {
         source: ActionTermError,
     },
 
-    /// A rule has a `*` target but at least one referenced subject is not break-glass.
-    #[error("rule `{rule}`: `*` target requires every referenced subject to set breakGlass=true")]
+    /// A catalog key name is not dotted-lowercase (§2.4): `[a-z0-9][a-z0-9_]*`
+    /// segments separated by single dots. Enforced at load so a key name can
+    /// never carry control characters into the text tracing sinks (the audit
+    /// record logs the key on every decision).
+    #[error("key name `{key}` is not dotted-lowercase ([a-z0-9_] segments separated by `.`)")]
+    BadKeyName {
+        /// The offending key name, control characters escaped for display.
+        key: String,
+    },
+
+    /// A subject name contains a control character. Subject names reach the
+    /// text tracing sinks on every decision record, so they must be printable.
+    #[error("subject name `{subject}` contains a control character")]
+    BadSubjectName {
+        /// The offending subject name, control characters escaped for display.
+        subject: String,
+    },
+
+    /// A rule has a match-everything target (`*` or a bare `**`) but at least
+    /// one referenced subject is not break-glass.
+    #[error(
+        "rule `{rule}`: a match-everything target (`*` or `**`) requires every referenced subject to set breakGlass=true"
+    )]
     NonBreakGlassAnyTarget {
         /// The offending rule id.
         rule: String,
@@ -366,6 +387,7 @@ pub enum LoadError {
 /// policy document by serializing the **real** wire type: it cannot drift from
 /// what [`load`] parses, and round-trips back through this same struct.
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RawPolicy {
     /// Policy schema version. The subject registry schema is version 2.
     #[serde(rename = "schemaVersion", default = "default_policy_schema_version")]
@@ -396,7 +418,12 @@ const fn default_policy_schema_version() -> u32 {
 }
 
 /// One raw subject definition. Exactly one of `allOf` or `anyOf` must be set.
+///
+/// Unknown fields fail closed: a typo'd `breakGlass` silently defaulting to
+/// `false` would be caught by the any-target gate, but the same class of typo
+/// on future fields must never load as a permissive default.
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RawSubjectDefinition {
     /// Whether this subject is eligible for rules targeting global `*`.
     #[serde(rename = "breakGlass", default, skip_serializing_if = "is_false")]
@@ -416,6 +443,7 @@ const fn is_false(value: &bool) -> bool {
 
 /// One raw policy rule with `subjects` plus prefix-form `action`/`target` terms.
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RawRule {
     /// Stable rule id (for logging and audit).
     pub id: String,
@@ -492,6 +520,7 @@ fn validate_key(
     key: &KeyEntry,
     warnings: &mut Vec<LoadWarning>,
 ) -> Result<(), LoadError> {
+    validate_key_name(name)?;
     validate_backend_ref(catalog, name, key)?;
     validate_description(name, key)?;
     validate_key_type(name, key)?;
@@ -503,6 +532,27 @@ fn validate_key(
     validate_reserved_labels(name, key)?;
     warn_missing_nats_type(name, key, warnings);
     Ok(())
+}
+
+/// Enforce the documented dotted-lowercase key-name shape (§2.4): one or more
+/// `[a-z0-9][a-z0-9_]*` segments separated by single dots. Key names are logged
+/// on every decision record, so the charset is pinned here, at load,
+/// fail-closed. (A *client-supplied* name on a denied request is separately
+/// escaped when the `DecisionRecord` is built.)
+fn validate_key_name(name: &str) -> Result<(), LoadError> {
+    let seg_ok = |seg: &str| {
+        let mut chars = seg.chars();
+        chars
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+            && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    };
+    if !name.is_empty() && name.split('.').all(seg_ok) {
+        return Ok(());
+    }
+    Err(LoadError::BadKeyName {
+        key: name.chars().flat_map(char::escape_default).collect(),
+    })
 }
 
 /// Fail-closed guardrail (basil-6o4): a `svid_kind=jwt` issuer must resolve to a
@@ -880,6 +930,13 @@ fn parse_subject(
     if normalized.is_empty() {
         return Err(LoadError::EmptySubjectName);
     }
+    // Subject names are logged on every decision record; a control character
+    // (newline, ESC) could forge lines in the text tracing sinks.
+    if normalized.chars().any(char::is_control) {
+        return Err(LoadError::BadSubjectName {
+            subject: normalized.chars().flat_map(char::escape_default).collect(),
+        });
+    }
     let match_ = match (raw.all_of, raw.any_of) {
         (Some(specs), None) => {
             validate_principal_specs(normalized, &specs, "allOf", unauthenticated_subject)?;
@@ -1054,7 +1111,7 @@ fn parse_rule(
             source,
         })?;
 
-    if target.iter().any(KeyGlob::is_any_key)
+    if target.iter().any(KeyGlob::matches_all)
         && raw.subjects.iter().any(|name| {
             !subjects
                 .get(name)
@@ -1235,6 +1292,100 @@ mod tests {
     }
 
     // ---- Catalog hard errors ------------------------------------------------
+
+    #[test]
+    fn key_name_charset_is_enforced_at_load() {
+        // Key names land in the text log sinks on every decision record, so a
+        // name outside the documented dotted-lowercase shape (control chars
+        // especially) is a fatal load error.
+        for bad in [
+            "nats.\naccount", // newline: the log-injection vector
+            "Nats.account",   // uppercase
+            "nats.acc ount",  // space
+            "nats.-account",  // segment must start [a-z0-9]
+            ".nats",          // empty segment
+        ] {
+            let key = format!(
+                r#""{}": {{
+                  "class": "asymmetric", "keyType": "ed25519-nkey", "backend": "bao",
+                  "path": "nats", "writable": true, "description": "bad name"
+                }}"#,
+                bad.replace('\n', "\\n")
+            );
+            let cat = catalog_json(&key);
+            let pol = policy_json(READER_ROLE, "");
+            assert!(
+                matches!(load(&cat, &pol), Err(LoadError::BadKeyName { .. })),
+                "key name {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn subject_name_with_control_char_is_fatal() {
+        let cat = catalog_json(ASYM_KEY);
+        let pol = r#"{
+          "schemaVersion": 2,
+          "subjects": { "svc.\nnats": { "allOf": [ { "kind": "unix", "uid": 9002 } ] } },
+          "roles": {},
+          "rules": [],
+          "config": {}
+        }"#;
+        assert!(matches!(
+            load(&cat, pol),
+            Err(LoadError::BadSubjectName { .. })
+        ));
+    }
+
+    #[test]
+    fn unknown_catalog_key_field_is_fatal() {
+        // A typo'd optional field (`sealingPim` for `sealingPin`) must be a hard
+        // load error: silently dropping it would load the key in its most
+        // permissive state (no pin = unrestricted unseal oracle).
+        let typo_key = r#"
+          "seal.recipient": {
+            "class": "sealing", "keyType": "ml-kem-768", "backend": "bao",
+            "path": "seal", "publicPath": "seal-pub", "writable": false,
+            "sealingPim": { "externalAad": ["ctx"] },
+            "description": "sealing key with a typo'd pin"
+          }"#;
+        let cat = catalog_json(typo_key);
+        let pol = policy_json(READER_ROLE, "");
+        let err = load(&cat, &pol).expect_err("unknown field rejected");
+        assert!(matches!(
+            err,
+            LoadError::Json {
+                what: "catalog",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unknown_policy_rule_field_is_fatal() {
+        let cat = catalog_json(ASYM_KEY);
+        let pol = policy_json(
+            READER_ROLE,
+            r#"{ "id": "r1", "subjects": ["svc.nats"], "action": ["role:reader"], "target": ["nats.account"], "targe": ["*"] }"#,
+        );
+        let err = load(&cat, &pol).expect_err("unknown rule field rejected");
+        assert!(matches!(err, LoadError::Json { what: "policy", .. }));
+    }
+
+    #[test]
+    fn unknown_subject_field_is_fatal() {
+        let cat = catalog_json(ASYM_KEY);
+        // `breakGlas` (typo) silently defaulting breakGlass=false must not load.
+        let pol = r#"{
+          "schemaVersion": 2,
+          "subjects": { "svc.nats": { "breakGlas": true, "allOf": [ { "kind": "unix", "uid": 9002 } ] } },
+          "roles": {},
+          "rules": [],
+          "config": {}
+        }"#;
+        let err = load(&cat, pol).expect_err("unknown subject field rejected");
+        assert!(matches!(err, LoadError::Json { what: "policy", .. }));
+    }
 
     #[test]
     fn unknown_backend_is_fatal() {
@@ -1739,6 +1890,31 @@ mod tests {
             load(&cat, &pol),
             Err(LoadError::NonBreakGlassAnyTarget { .. })
         ));
+    }
+
+    #[test]
+    fn non_root_bare_doublestar_target_is_fatal() {
+        let cat = catalog_json(ASYM_KEY);
+        // A bare `**` matches every catalog key, exactly like `*`; it must be
+        // subject to the same break-glass gate (it previously slipped past).
+        let pol = policy_json(
+            READER_ROLE,
+            r#"{ "id": "r1", "subjects": ["svc.nats"], "action": ["role:reader"], "target": ["**"] }"#,
+        );
+        assert!(matches!(
+            load(&cat, &pol),
+            Err(LoadError::NonBreakGlassAnyTarget { .. })
+        ));
+    }
+
+    #[test]
+    fn break_glass_bare_doublestar_target_is_allowed() {
+        let cat = catalog_json(ASYM_KEY);
+        let pol = policy_json(
+            READER_ROLE,
+            r#"{ "id": "r1", "subjects": ["breakglass.root"], "action": ["role:reader"], "target": ["**"] }"#,
+        );
+        load(&cat, &pol).expect("break-glass subject may hold a bare `**` target");
     }
 
     #[test]

@@ -858,15 +858,6 @@ fn requested_or_templated_spiffe_id(
     requested: &str,
     entry: &KeyEntry,
 ) -> Result<String, Status> {
-    if !requested.is_empty() {
-        if !is_spiffe_id(requested) || !spiffe_id_matches_trust_domain(requested, entry) {
-            return Err(invalid_argument(
-                "requested SPIFFE ID is malformed or out of trust domain",
-            ));
-        }
-        return Ok(requested.to_string());
-    }
-
     let trust_domain = entry
         .labels
         .get("trust_domain")
@@ -878,12 +869,23 @@ fn requested_or_templated_spiffe_id(
         .get(&uid)
         .map_or_else(|| uid.to_string(), std::string::ToString::to_string);
     let id = format!("spiffe://{trust_domain}/{segment}");
-    if is_spiffe_id(&id) {
-        Ok(id)
-    } else {
-        Err(Status::new(
+    if !is_spiffe_id(&id) {
+        return Err(Status::new(
             Code::Internal,
             "templated SPIFFE ID is malformed",
+        ));
+    }
+
+    if requested.is_empty() || requested == id {
+        Ok(id)
+    } else if is_spiffe_id(requested) && spiffe_id_matches_trust_domain(requested, entry) {
+        Err(Status::new(
+            Code::PermissionDenied,
+            "requested SPIFFE ID is outside the caller identity",
+        ))
+    } else {
+        Err(invalid_argument(
+            "requested SPIFFE ID is malformed or out of trust domain",
         ))
     }
 }
@@ -1987,12 +1989,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_jwtsvid_accepts_explicit_same_domain_id() {
+    async fn fetch_jwtsvid_accepts_explicit_caller_identity() {
         let (service, _backend) = service();
         let response = service
             .fetch_jwtsvid(jwt_request(
                 9100,
-                "spiffe://example.org/custom",
+                "spiffe://example.org/svc-api",
                 vec!["vault", "nats"],
             ))
             .await
@@ -2005,8 +2007,22 @@ mod tests {
                 .iter()
                 /* ubs constant time equality check is not needed here */
                 /* ubs:ignore */
-                .all(|svid| svid.spiffe_id == "spiffe://example.org/custom")
+                .all(|svid| svid.spiffe_id == "spiffe://example.org/svc-api")
         );
+    }
+
+    #[tokio::test]
+    async fn fetch_jwtsvid_rejects_explicit_same_domain_impersonation() {
+        let (service, _backend) = service();
+        let status = service
+            .fetch_jwtsvid(jwt_request(
+                9100,
+                "spiffe://example.org/custom",
+                vec!["vault", "nats"],
+            ))
+            .await
+            .expect_err("impersonation denied");
+        assert_eq!(status.code(), Code::PermissionDenied);
     }
 
     #[tokio::test]

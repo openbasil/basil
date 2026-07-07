@@ -20,6 +20,7 @@ path = "src/main.rs"
 
 [features]
 default = [
+  "db-keystore",
   "onepassword",
   "unlock-age-yubikey",
   "unlock-bip39",

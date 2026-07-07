@@ -22,6 +22,7 @@ use hyper_util::rt::TokioIo;
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::net::UnixStream;
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tonic::{Code, Status};
@@ -37,6 +38,7 @@ pub const RETRYABLE_HEADER: &str = "Basil-Bridge-Retryable";
 
 const DEFAULT_BASIL_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_CONCURRENCY_LIMIT: usize = 32;
 const MAX_ALLOWED_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Command-line arguments for the `basil-nats-bridge` binary.
@@ -91,6 +93,8 @@ pub struct BridgeConfig {
     pub queue_group: Option<String>,
     /// Maximum accepted NATS payload size in bytes.
     pub max_message_bytes: usize,
+    /// Maximum broker calls in flight at once.
+    pub concurrency_limit: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,6 +124,7 @@ struct RawBridgeConfig {
     request_subject: String,
     queue_group: Option<String>,
     max_message_bytes: usize,
+    concurrency_limit: Option<usize>,
 }
 
 impl Config {
@@ -163,6 +168,11 @@ impl TryFrom<RawConfig> for Config {
             .map(|value| non_empty(&value, "bridge.queue-group"))
             .transpose()?;
         validate_max_message_bytes(raw.bridge.max_message_bytes)?;
+        let concurrency_limit = raw
+            .bridge
+            .concurrency_limit
+            .unwrap_or(DEFAULT_CONCURRENCY_LIMIT);
+        validate_concurrency_limit(concurrency_limit)?;
 
         Ok(Self {
             nats: NatsConfig {
@@ -174,6 +184,7 @@ impl TryFrom<RawConfig> for Config {
                 request_subject,
                 queue_group,
                 max_message_bytes: raw.bridge.max_message_bytes,
+                concurrency_limit,
             },
         })
     }
@@ -210,6 +221,13 @@ const fn validate_max_message_bytes(value: usize) -> Result<(), ConfigError> {
     Ok(())
 }
 
+const fn validate_concurrency_limit(value: usize) -> Result<(), ConfigError> {
+    if value == 0 {
+        return Err(ConfigError::InvalidConcurrencyLimit { value });
+    }
+    Ok(())
+}
+
 /// Configuration parse and validation error.
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -229,6 +247,12 @@ pub enum ConfigError {
         value: usize,
         /// Maximum supported value.
         max: usize,
+    },
+    /// Concurrency bound is unsupported.
+    #[error("`bridge.concurrency-limit` must be >= 1, got {value}")]
+    InvalidConcurrencyLimit {
+        /// Configured value.
+        value: usize,
     },
 }
 
@@ -576,23 +600,44 @@ async fn uds_channel(path: &Path, connect_timeout: Duration) -> Result<Channel, 
 #[allow(clippy::significant_drop_tightening)]
 pub async fn run(config: Config) -> Result<(), RuntimeError> {
     let nats = connect_nats(&config).await?;
-    let mut basil = BasilGrpcInvoker::connect(&config.basil.socket).await?;
+    let basil = BasilGrpcInvoker::connect(&config.basil.socket).await?;
     let mut subscriber = subscribe(&nats, &config).await?;
+    let concurrency_limit = config.bridge.concurrency_limit;
 
     info!(
         request_subject = %config.bridge.request_subject,
         queue_group = ?config.bridge.queue_group,
+        concurrency_limit,
         "Basil NATS bridge listening",
     );
 
+    let mut tasks = JoinSet::new();
     while let Some(message) = subscriber.next().await {
+        while tasks.len() >= concurrency_limit {
+            drain_one_task(&mut tasks).await?;
+        }
         let request = BridgeRequest {
             subject: message.subject.to_string(),
             reply: message.reply.map(|subject| subject.to_string()),
             payload: message.payload.to_vec(),
         };
-        let action = handle_request(request, config.bridge.max_message_bytes, &mut basil).await;
-        publish_action(&nats, action).await?;
+        let nats = nats.clone();
+        let mut basil = basil.clone();
+        let max_message_bytes = config.bridge.max_message_bytes;
+        tasks.spawn(async move {
+            let action = handle_request(request, max_message_bytes, &mut basil).await;
+            publish_action(&nats, action).await
+        });
+    }
+    while !tasks.is_empty() {
+        drain_one_task(&mut tasks).await?;
+    }
+    Ok(())
+}
+
+async fn drain_one_task(tasks: &mut JoinSet<Result<(), RuntimeError>>) -> Result<(), RuntimeError> {
+    if let Some(result) = tasks.join_next().await {
+        result.map_err(RuntimeError::WorkerJoin)??;
     }
     Ok(())
 }
@@ -689,6 +734,9 @@ pub enum RuntimeError {
     /// NATS reply publish failed.
     #[error("NATS publish failed: {0}")]
     NatsPublish(async_nats::PublishError),
+    /// Request worker failed.
+    #[error("bridge request worker failed: {0}")]
+    WorkerJoin(tokio::task::JoinError),
 }
 
 #[cfg(test)]
@@ -711,6 +759,7 @@ socket = "/run/basil/basil.sock"
 request-subject = "basil.invocation"
 queue-group = "basil-bridge"
 max-message-bytes = 1048576
+concurrency-limit = 8
 "#;
 
     #[derive(Debug)]
@@ -759,6 +808,7 @@ max-message-bytes = 1048576
         assert_eq!(config.bridge.request_subject, "basil.invocation");
         assert_eq!(config.bridge.queue_group.as_deref(), Some("basil-bridge"));
         assert_eq!(config.bridge.max_message_bytes, 1_048_576);
+        assert_eq!(config.bridge.concurrency_limit, 8);
     }
 
     #[test]
@@ -780,6 +830,31 @@ max-message-bytes = 4096
 
         assert_eq!(config.nats.creds, None);
         assert_eq!(config.bridge.queue_group, None);
+        assert_eq!(config.bridge.concurrency_limit, DEFAULT_CONCURRENCY_LIMIT);
+    }
+
+    #[test]
+    fn rejects_zero_concurrency_limit() {
+        let error = Config::from_toml_str(
+            r#"
+[nats]
+url = "nats://127.0.0.1:4222"
+
+[basil]
+socket = "/run/basil/basil.sock"
+
+[bridge]
+request-subject = "basil.invocation"
+max-message-bytes = 1024
+concurrency-limit = 0
+"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ConfigError::InvalidConcurrencyLimit { value: 0 }
+        ));
     }
 
     #[test]

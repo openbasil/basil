@@ -9,6 +9,20 @@ SPDX-License-Identifier: Apache-2.0
 ## Unreleased
 
 - renamed basil-client crate to basil
+- Security review fixes: 1Password updates now avoid secret argv exposure, redact
+  token-bearing debug output, and keep 1Password secret material in zeroizing
+  owners.
+- Security review fixes: reloads are serialized, catalog/policy parsing fails
+  closed on unknown fields, raw issuer-key signing is denied, audit text values
+  are escaped, JWKS responses are cached with conditional `304` support, and
+  JWT-SVID requests are limited to the caller identity by default.
+- Security review fixes: the NATS JWT validation API only exposes
+  `matched_signer` for valid tokens, the NATS bridge processes requests with a
+  bounded concurrency limit, BYOK `KeyMaterial` redacts and zeroizes private
+  bytes, the COSE-over-NATS demo uses subscription readiness instead of a sleep,
+  and the streaming encryption format now has a normative spec.
+- Nix example hardening: the example package now defaults to the local flake
+  instead of a remote repository.
 
 ## 0.6.0 2026-07-06
 
@@ -47,7 +61,7 @@ SPDX-License-Identifier: Apache-2.0
 
 - CI: Go unit tests and the Rust<->Go stream interop suite over the clients/go submodule (basil-ubd)
 - Nix: per-architecture build targets `basil-x86_64-linux`, `basil-aarch64-linux`, `basil-aarch64-darwin`
-- workflow `build.yml`: reproducible per-arch Nix builds — manual dispatch (choose architecture + branch) and automatic on `basil-v*` tags (all three platforms, tags must be on main)
+- workflow `build.yml`: reproducible per-arch Nix builds, manual dispatch (choose architecture + branch) and automatic on `basil-v*` tags (all three platforms, tags must be on main)
 - Arch Linux aarch64 package alongside x86_64 (basil-60f)
 - `scripts/pin-github-actions.sh` and `just pin-actions`: pin GitHub Actions to commit SHAs, run automatically from `gen-release-workflow` (basil-yko)
 
@@ -60,8 +74,8 @@ SPDX-License-Identifier: Apache-2.0
 
 ### Cli simplifications
 
-- breaking: CLI flattening — the `basil config` namespace is removed; its subcommands are promoted to top-level verbs (`basil doctor`, `basil init`, `basil explain`). There is no `basil config` command any more
-- breaking: `basil config check` → `basil doctor`. Its offline capability enforcement and invocation broker-identity/key-binding validation become offline `doctor` checks; per-key present/missing detail moves under `basil doctor --keys` (per-key `key_material:<key>` rows); flag `--check-keys` → `--keys` and the `--require` gate → `--strict`. `doctor` adopts a fatal-vs-warning exit model: non-zero exit only for FATAL conditions (those that would stop the broker from starting — catalog won't load, backend unreachable, bundle won't unlock/is stale, a `missing=error` key reconcile cannot satisfy); everything else (a `missing=generate` key, an optional key absent, `bao` not on PATH, loose bundle perms) is a report-only WARNING, and `--strict` additionally fails on warnings. `DOCTOR_SCHEMA_VERSION` bumps to 2 (`status` token `fail` → `fatal`; summary gains a `fatal` count)
+- breaking: CLI flattening: the `basil config` namespace is removed; its subcommands are promoted to top-level verbs (`basil doctor`, `basil init`, `basil explain`). There is no `basil config` command any more
+- breaking: `basil config check` → `basil doctor`. Its offline capability enforcement and invocation broker-identity/key-binding validation become offline `doctor` checks; per-key present/missing detail moves under `basil doctor --keys` (per-key `key_material:<key>` rows); flag `--check-keys` → `--keys` and the `--require` gate → `--strict`. `doctor` adopts a fatal-vs-warning exit model: non-zero exit only for FATAL conditions (those that would stop the broker from starting: catalog won't load, backend unreachable, bundle won't unlock/is stale, a `missing=error` key reconcile cannot satisfy); everything else (a `missing=generate` key, an optional key absent, `bao` not on PATH, loose bundle perms) is a report-only WARNING, and `--strict` additionally fails on warnings. `DOCTOR_SCHEMA_VERSION` bumps to 2 (`status` token `fail` → `fatal`; summary gains a `fatal` count)
 - breaking: `basil config init` → `basil init` (idiomatic, like `git init` / `cargo init`). `basil init` now honors the socket path (basil-u00): the generated `basil-agent.toml` `socket = ...` line follows precedence explicit `--socket <path>` > `BASIL_SOCKET` env var > `<dir>/basil.sock`, instead of always writing `<dir>/basil.sock`
 - breaking: `basil config explain` → `basil explain`. `basil explain` now runs an offline policy dry-run against catalog+policy files by DEFAULT and `--live` queries the running broker; the separate over-socket `explain` verb is folded into this and removed
 

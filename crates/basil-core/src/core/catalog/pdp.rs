@@ -26,13 +26,18 @@
 //!    which other check would have failed).
 //! 2. **`writable` hard cap (§2.4.2):** if `op.is_write()` and the key's
 //!    `writable == false` → [`DenyReason::NotWritable`], regardless of policy.
-//! 3. Allow if a `(op, glob)` grant for the actor's [`SubjectName`] matches
+//! 3. **Credential-issuer hard cap:** if `op` is `sign` and the key is a
+//!    credential issuer (`nats_type=O`/`A`, or `svid_kind=jwt`/`x509`) →
+//!    [`DenyReason::IssuerRawSign`], regardless of policy. Raw `sign` on an
+//!    issuer key is unrestricted minting: the caller assembles the signing
+//!    input off-broker and none of the `sign_nats_jwt`/`mint` validation runs.
+//! 4. Allow if a `(op, glob)` grant for the actor's [`SubjectName`] matches
 //!    `key`.
-//! 4. Allow if `op` is [`Op::Get`] or [`Op::GetPublicKey`], the key's
+//! 5. Allow if `op` is [`Op::Get`] or [`Op::GetPublicKey`], the key's
 //!    `class == Public`, and the actor has a resolved subject. This preserves the
 //!    public-read rule without making missing local identity authorization
 //!    implicit.
-//! 5. Else [`DenyReason::NotPermitted`].
+//! 6. Else [`DenyReason::NotPermitted`].
 //!
 //! The decision carries enough for the audit log (`vault-vq5`): which subject
 //! matched on allow, or which check failed on deny. This module does **not** write
@@ -141,6 +146,11 @@ pub enum DenyReason {
     /// A write op against a key whose `writable == false` (the §2.4.2 hard cap),
     /// denied regardless of policy.
     NotWritable,
+    /// A raw `sign` against a credential-issuer key (NATS operator/account
+    /// nkey, or a SPIFFE `jwt`/`x509` issuer), denied regardless of policy:
+    /// off-broker assembly of the signing input would bypass the dedicated
+    /// minting ops' validation. Use `sign_nats_jwt`/`mint` instead.
+    IssuerRawSign,
     /// No grant matched and the key is not a public read (default-deny, step 5).
     NotPermitted,
 }
@@ -371,6 +381,15 @@ impl<'a> Pdp<'a> {
             return Explanation::deny(DenyReason::NotWritable);
         }
 
+        // Step 3: the credential-issuer hard cap: raw `sign` against an issuer
+        // key (NATS operator/account nkey, SPIFFE jwt/x509 issuer) is denied
+        // regardless of grant. A caller could assemble the signing input
+        // off-broker and mint valid credentials, bypassing every validation the
+        // dedicated `sign_nats_jwt`/`mint` ops enforce; issue through those.
+        if op == Op::Sign && entry.is_credential_issuer() {
+            return Explanation::deny(DenyReason::IssuerRawSign);
+        }
+
         // Step 4: iterate rules in declaration order; first matching predicate + grant wins.
         for rule in &self.policy.rules {
             if let Some(subject) = matching_rule_subject(&rule.subjects, actor.subject.as_str())
@@ -404,6 +423,9 @@ impl<'a> Pdp<'a> {
         };
         if op.is_write() && !entry.writable {
             return Explanation::deny(DenyReason::NotWritable);
+        }
+        if op == Op::Sign && entry.is_credential_issuer() {
+            return Explanation::deny(DenyReason::IssuerRawSign);
         }
         Explanation::deny(DenyReason::NotPermitted)
     }
@@ -788,9 +810,11 @@ mod tests {
     fn root_any_target_allowed() {
         let (c, r, cfg) = fixture();
         let pdp = Pdp::new(&c, &r, &cfg);
-        // root (user:0) has `*` action over `*` target -> any op on any catalog key.
+        // root (user:0) has `*` action over `*` target -> any op on any catalog
+        // key, except the hard caps: raw sign on the issuer-labeled nats.account
+        // is denied even for root (see issuer_raw_sign_hard_cap tests).
         assert_eq!(
-            decide(&pdp, 0, Op::Sign, "nats.account"),
+            decide(&pdp, 0, Op::Verify, "nats.account"),
             Decision::Allow {
                 via: via("breakglass.root")
             }
@@ -898,23 +922,18 @@ mod tests {
     fn mint_allowed_via_minter_but_denied_for_signer_only() {
         let (c, r, cfg) = fixture();
         let pdp = Pdp::new(&c, &r, &cfg);
-        // uid 9004 has role:minter -> mint allowed; mint != sign so sign denied.
+        // uid 9004 has role:minter -> mint allowed.
         assert_eq!(
             decide(&pdp, 9004, Op::Mint, "nats.account"),
             Decision::Allow {
                 via: via("svc.minter")
             }
         );
-        assert_eq!(
-            decide(&pdp, 9004, Op::Sign, "nats.account"),
-            Decision::Deny {
-                reason: DenyReason::NotPermitted
-            }
-        );
 
-        // uid 9003 has role:signer -> sign allowed; signer does NOT grant mint.
+        // uid 9003 has role:signer -> verify allowed via the grant, but signer
+        // does NOT grant mint (default-deny).
         assert_eq!(
-            decide(&pdp, 9003, Op::Sign, "nats.account"),
+            decide(&pdp, 9003, Op::Verify, "nats.account"),
             Decision::Allow {
                 via: via("svc.nats")
             }
@@ -923,6 +942,40 @@ mod tests {
             decide(&pdp, 9003, Op::Mint, "nats.account"),
             Decision::Deny {
                 reason: DenyReason::NotPermitted
+            }
+        );
+    }
+
+    #[test]
+    fn issuer_raw_sign_hard_cap_denies_regardless_of_grant() {
+        // nats.account carries nats_type=A (a NATS account key: a credential
+        // issuer). Raw `sign` on it would let the caller assemble the JWT
+        // signing input off-broker and bypass every sign_nats_jwt/mint
+        // validation, so the PDP hard-caps it for EVERY subject: the granted
+        // signer, an ungranted minter, and even root's `* / *`.
+        let (c, r, cfg) = fixture();
+        let pdp = Pdp::new(&c, &r, &cfg);
+        for uid in [9003, 9004, 0] {
+            assert_eq!(
+                decide(&pdp, uid, Op::Sign, "nats.account"),
+                Decision::Deny {
+                    reason: DenyReason::IssuerRawSign
+                },
+                "raw sign on an issuer key must be hard-capped for uid {uid}"
+            );
+        }
+        // The cap is sign-specific: the signer's other granted ops still work,
+        // and the dedicated minting op stays available to the minter.
+        assert_eq!(
+            decide(&pdp, 9003, Op::Verify, "nats.account"),
+            Decision::Allow {
+                via: via("svc.nats")
+            }
+        );
+        assert_eq!(
+            decide(&pdp, 9004, Op::Mint, "nats.account"),
+            Decision::Allow {
+                via: via("svc.minter")
             }
         );
     }
@@ -1138,7 +1191,7 @@ mod tests {
             }
         );
         assert_eq!(
-            pdp.decide(&actor, Op::Sign, "nats.account"),
+            pdp.decide(&actor, Op::Mint, "nats.account"),
             Decision::Deny {
                 reason: DenyReason::NotPermitted
             }
@@ -1194,10 +1247,11 @@ mod tests {
     fn explain_reports_specific_role_rule_not_a_sibling() {
         // uid 9003 (signer) and 9004 (minter) share the nats.account target but via
         // DIFFERENT rules; explain must name the rule that actually matched.
+        // (`verify`, not `sign`: raw sign on an issuer key is hard-capped.)
         let (c, r, cfg) = fixture();
         let pdp = Pdp::new(&c, &r, &cfg);
 
-        let signer = explain(&pdp, 9003, Op::Sign, "nats.account");
+        let signer = explain(&pdp, 9003, Op::Verify, "nats.account");
         assert_eq!(
             signer.matched.as_ref().map(|m| m.rule_id.as_str()),
             Some("nats-signer")

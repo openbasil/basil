@@ -12,6 +12,11 @@ use basil_bin::{Cli, Command, client_cli};
 use basil_core::agent_cli;
 use clap::Parser;
 
+// With `db-keystore` enabled, turso (its SQLite engine) already installs a
+// mimalloc `#[global_allocator]`, and a crate graph can only declare one; the
+// process still runs on mimalloc either way, and `secure-alloc`
+// (`mimalloc/secure`) applies to turso's instance too via feature unification.
+#[cfg(not(feature = "db-keystore"))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -20,7 +25,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Init(args) => agent_cli::run_init(cli.socket.as_deref(), &args),
-        Command::Agent(args) => agent_cli::run_agent(args).await,
+        Command::Agent(args) => agent_cli::run_agent(args, basil_bin::VERSION).await,
         Command::Bundle(command) => agent_cli::run_bundle(*command),
         // Unified `explain`: offline file dry-run by default; `--live` queries the
         // running broker over the global `--socket` (needs the `explain` perm).

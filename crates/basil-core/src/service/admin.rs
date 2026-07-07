@@ -55,7 +55,7 @@ impl AdminService for BrokerGrpc {
     async fn status(&self, _request: Request<pb::StatusRequest>) -> GrpcResult<pb::StatusResponse> {
         Ok(Response::new(pb::StatusResponse {
             backend: self.state.backend_label().to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: self.state.agent_version().to_string(),
             protocol: 1,
         }))
     }
@@ -69,7 +69,7 @@ impl AdminService for BrokerGrpc {
     async fn health(&self, _request: Request<pb::HealthRequest>) -> GrpcResult<pb::HealthResponse> {
         Ok(Response::new(pb::HealthResponse {
             alive: true,
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: self.state.agent_version().to_string(),
         }))
     }
 
@@ -591,6 +591,7 @@ fn deny_reason_token(reason: DenyReason) -> String {
     match reason {
         DenyReason::UnknownKey => "unknown_key",
         DenyReason::NotWritable => "not_writable",
+        DenyReason::IssuerRawSign => "issuer_raw_sign",
         DenyReason::NotPermitted => "not_permitted",
     }
     .to_string()

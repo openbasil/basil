@@ -4,6 +4,7 @@
 
 //! Unified key/value secret store for Basil's key-store backend.
 
+use std::fmt;
 #[cfg(feature = "db-keystore")]
 use std::path::PathBuf;
 #[cfg(feature = "db-keystore")]
@@ -26,7 +27,7 @@ use crate::onepassword::{OnePasswordConfig, OnePasswordProvider};
 const SERVICE: &str = "basil";
 
 /// Store open configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum StoreConfig {
     /// Placeholder used only when the crate is built without concrete backend
     /// features. `basil-agent` rejects that feature combination before use.
@@ -53,6 +54,33 @@ pub enum StoreConfig {
         /// Item-title profile.
         profile: String,
     },
+}
+
+impl fmt::Debug for StoreConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            #[cfg(not(any(feature = "db-keystore", feature = "onepassword")))]
+            Self::Unavailable => f.write_str("Unavailable"),
+            #[cfg(feature = "db-keystore")]
+            Self::DbKeystore { path, cipher, dek } => f
+                .debug_struct("DbKeystore")
+                .field("path", path)
+                .field("cipher", cipher)
+                .field("dek", dek)
+                .finish(),
+            #[cfg(feature = "onepassword")]
+            Self::OnePassword {
+                provider_uri: _,
+                project,
+                profile,
+            } => f
+                .debug_struct("OnePassword")
+                .field("provider_uri", &"REDACTED")
+                .field("project", project)
+                .field("profile", profile)
+                .finish(),
+        }
+    }
 }
 
 /// Secret-store failure. Variants carry only stable discriminators, paths, or
@@ -415,5 +443,18 @@ mod tests {
             Err(other) => panic!("expected a Backend error, got {other:?}"),
             Ok(_) => panic!("a non-onepassword scheme must fail closed"),
         }
+    }
+
+    #[cfg(feature = "onepassword")]
+    #[test]
+    fn onepassword_store_config_debug_redacts_provider_uri() {
+        let cfg = super::StoreConfig::OnePassword {
+            provider_uri: "onepassword+token://acct:ops_tok@Private".to_string(),
+            project: "p".to_string(),
+            profile: "default".to_string(),
+        };
+        let rendered = format!("{cfg:?}");
+        assert!(rendered.contains("REDACTED"));
+        assert!(!rendered.contains("ops_tok"));
     }
 }

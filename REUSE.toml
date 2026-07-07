@@ -24,8 +24,6 @@ path = [
   "**/*.nix",
   "**/justfile",
   "clippy.toml",
-  "AGENTS.md",
-  "CLAUDE.md",
   "packaging/**",
   ".github/workflows/ci.yml",
   ".github/workflows/build.yml",
@@ -42,7 +40,7 @@ precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 OpenBasil Contributors"
 SPDX-License-Identifier = "Apache-2.0"
 
-# Generated, lock, and data files: no original authorship — copyright disclaimed.
+# Generated, lock, and data files: no original authorship; copyright disclaimed.
 # `closest` so any of these that later grows its own header keeps it.
 [[annotations]]
 path = [

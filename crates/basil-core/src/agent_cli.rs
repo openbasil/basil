@@ -1645,7 +1645,7 @@ fn enforce_startup_capabilities(catalog: &crate::Catalog, policy: CapabilityPoli
 
 /// Run the broker daemon: load catalog/policy + the sealed bundle, unlock,
 /// construct backends from the decrypted creds, then serve.
-async fn run_daemon(args: RunArgs) -> Result<()> {
+async fn run_daemon(args: RunArgs, version: &'static str) -> Result<()> {
     let run_config = load_run_config(&args.overrides)?;
     // Shared setup: load catalog/policy, unlock the bundle, build the manager
     // (the CredBundle is zeroized inside `prepare_manager`).
@@ -1697,6 +1697,9 @@ async fn run_daemon(args: RunArgs) -> Result<()> {
         .context("loading JWT-SVID revocation deny-list")?;
     let mut state =
         BrokerState::with_limits(catalog, policy, config, manager, backend_label, limits)
+            // Report the shipped binary's version in `status`/`health`, not this
+            // library crate's (they coincide today via the workspace version).
+            .with_version(version)
             .with_jwt_revocations(jwt_revocations)
             // The SIGHUP reload engine (basil-y3e.2) re-reads from the SAME
             // configured catalog/policy paths startup used, never the wire.
@@ -2193,6 +2196,7 @@ const fn deny_reason_json(reason: crate::catalog::DenyReason) -> &'static str {
     match reason {
         DenyReason::UnknownKey => "unknown_key",
         DenyReason::NotWritable => "not_writable",
+        DenyReason::IssuerRawSign => "issuer_raw_sign",
         DenyReason::NotPermitted => "not_permitted",
     }
 }
@@ -2205,16 +2209,28 @@ const fn deny_explanation(reason: crate::catalog::DenyReason) -> &'static str {
         DenyReason::NotWritable => {
             "the key is not writable (write hard-cap), denied regardless of policy"
         }
+        DenyReason::IssuerRawSign => {
+            "raw sign on a credential-issuer key (issuer hard-cap), denied regardless of policy; \
+             use sign_nats_jwt/mint"
+        }
         DenyReason::NotPermitted => "no policy grant matches this (subject, op, key): default-deny",
     }
 }
 
 /// Run the broker daemon behind `basil agent`.
-pub async fn run_agent(args: RunArgs) -> Result<()> {
+///
+/// `version` is the shipped binary's version (`basil-bin`'s
+/// `CARGO_PKG_VERSION`), threaded through so `status`/`health` report the
+/// `basil` binary's version rather than this library crate's.
+pub async fn run_agent(args: RunArgs, version: &'static str) -> Result<()> {
     let overrides = args.overrides.clone();
     // `Box::pin`: with the cloud-KMS features the daemon future is large; this is
     // a once-per-process cold path, so the heap indirection is free.
-    Box::pin(run_with_config_logging(&overrides, run_daemon(args))).await
+    Box::pin(run_with_config_logging(
+        &overrides,
+        run_daemon(args, version),
+    ))
+    .await
 }
 
 /// Run the preflight doctor behind `basil doctor`.
@@ -2345,6 +2361,7 @@ mod tests {
 
     #[cfg(feature = "keystore-backend")]
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn run_config_file_supplies_all_startup_settings() {
         let config = temp_config(
             r#"
@@ -2584,10 +2601,10 @@ dir = "/var/log/basil"
         assert!(stdout_on.logging.stdout_enabled());
 
         let stdout_off: AgentConfigFile = toml::from_str(
-            r#"
+            r"
 [logging.stdout]
 enable = false
-"#,
+",
         )
         .expect("parse stdout-off config");
         assert_eq!(stdout_off.logging.stdout.enable, Some(false));
@@ -2613,10 +2630,10 @@ path = "/var/log/basil"
     #[test]
     fn file_logging_requires_dir_when_enabled() {
         let config: AgentConfigFile = toml::from_str(
-            r#"
+            r"
 [logging.file]
 enable = true
-"#,
+",
         )
         .expect("parse file config");
         let err = build_file_writer(&config.logging.file).expect_err("missing dir rejects");

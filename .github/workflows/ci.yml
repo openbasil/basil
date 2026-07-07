@@ -168,7 +168,7 @@ jobs:
           sudo chmod +x /usr/local/bin/vault
           vault version
 
-      # ---- Mandatory cargo gates (AGENTS.md) ----
+      # ---- Mandatory cargo gates ----
       - name: Build
         run: cargo build --workspace --all-features
 

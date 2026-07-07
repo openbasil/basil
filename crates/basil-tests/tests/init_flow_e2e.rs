@@ -120,11 +120,7 @@ fn scaffold_and_seal(engine: Engine, backend: &DevBackend, tag: &str) -> PathBuf
         ],
         backend.addr(),
     );
-    assert!(
-        ok,
-        "[{}] basil init failed:\n{out}",
-        engine.prefill_name()
-    );
+    assert!(ok, "[{}] basil init failed:\n{out}", engine.prefill_name());
 
     let config = dir.join("basil-agent.toml");
     let bundle = dir.join("bundle.sealed");

@@ -93,9 +93,9 @@ impl DecisionRecord {
         Self {
             generation,
             op,
-            key: key.to_string(),
+            key: sanitize_log_value(key),
             actor_kind: "subject".to_string(),
-            actor_id: actor.subject.clone(),
+            actor_id: sanitize_log_value(&actor.subject),
             authenticated_by: authenticated_by(actor),
             presenter_kind: presenter_kind(actor),
             presenter_id: presenter_id(actor),
@@ -118,7 +118,7 @@ impl DecisionRecord {
         Self {
             generation,
             op,
-            key: key.to_string(),
+            key: sanitize_log_value(key),
             actor_kind: "subject".to_string(),
             actor_id: "unresolved".to_string(),
             authenticated_by: Vec::new(),
@@ -176,6 +176,32 @@ impl DecisionRecord {
                 "authz decision: denied",
             ),
         }
+    }
+}
+
+/// Escape control characters in a client-influenced value (the requested key
+/// name, the subject) before it enters the record. The catalog/policy loader
+/// rejects control characters in real key/subject names, but a *denied* request
+/// is recorded with the raw client-supplied key (`UnknownKey` included), and
+/// the text `tracing` sinks (stdout `fmt`, rolling file) do not escape `%`
+/// Display fields: a newline in the key would forge a log line in the security
+/// record. The JSONL audit sink escapes independently via serde; sanitized
+/// values contain only printables, so it is unaffected.
+fn sanitize_log_value(value: &str) -> String {
+    if value.chars().any(char::is_control) {
+        value
+            .chars()
+            .flat_map(|c| {
+                let escaped: Box<dyn Iterator<Item = char>> = if c.is_control() {
+                    Box::new(c.escape_default())
+                } else {
+                    Box::new(std::iter::once(c))
+                };
+                escaped
+            })
+            .collect()
+    } else {
+        value.to_string()
     }
 }
 
@@ -241,6 +267,7 @@ const fn deny_reason_str(reason: DenyReason) -> &'static str {
     match reason {
         DenyReason::UnknownKey => "unknown_key",
         DenyReason::NotWritable => "not_writable",
+        DenyReason::IssuerRawSign => "issuer_raw_sign",
         DenyReason::NotPermitted => "not_permitted",
     }
 }
@@ -303,10 +330,34 @@ mod tests {
     }
 
     #[test]
+    fn hostile_key_and_subject_names_are_escaped_before_logging() {
+        // A client-supplied key is recorded even on a denied UnknownKey request;
+        // a newline/control char in it must not be able to forge a line in the
+        // text tracing sinks.
+        let decision = Decision::Deny {
+            reason: DenyReason::UnknownKey,
+        };
+        let hostile = "x\n{\"event_kind\":\"basil.audit.authz\",\"outcome\":\"allow\"}\u{1b}[0m";
+        let rec = DecisionRecord::from_actor_decision(1, &actor(), Op::Get, hostile, &decision);
+        assert!(
+            !rec.key.contains('\n') && !rec.key.contains('\u{1b}'),
+            "control chars must be escaped, got {:?}",
+            rec.key
+        );
+        assert!(rec.key.contains("\\n"), "newline is visibly escaped");
+        // A benign dotted-lowercase key is unchanged.
+        let rec =
+            DecisionRecord::from_actor_decision(1, &actor(), Op::Get, "web.tls.key", &decision);
+        assert_eq!(rec.key, "web.tls.key");
+        rec.record();
+    }
+
+    #[test]
     fn deny_reasons_have_stable_tokens() {
         for (reason, token) in [
             (DenyReason::UnknownKey, "unknown_key"),
             (DenyReason::NotWritable, "not_writable"),
+            (DenyReason::IssuerRawSign, "issuer_raw_sign"),
             (DenyReason::NotPermitted, "not_permitted"),
         ] {
             let rec = DecisionRecord::from_actor_decision(

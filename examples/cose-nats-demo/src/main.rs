@@ -22,7 +22,7 @@ use basil_cose::{
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use futures_util::StreamExt;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 use uuid::Uuid;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
@@ -148,6 +148,7 @@ async fn run_demo(socket: &str, nats_url: &str, bridge_subject: &str) -> anyhow:
 
     let bob_client = Arc::clone(&client);
     let bob_nats = nats.clone();
+    let (bob_ready_tx, bob_ready_rx) = oneshot::channel();
     let bob = tokio::spawn(async move {
         bob_loop(
             bob_client,
@@ -157,11 +158,12 @@ async fn run_demo(socket: &str, nats_url: &str, bridge_subject: &str) -> anyhow:
                 key_id: KeyId::from_text("alice.seal")?,
                 public: alice_seal_public,
             },
+            bob_ready_tx,
         )
         .await
     });
 
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    bob_ready_rx.await.context("wait for Bob subscription")?;
 
     let alice_bridge_signer = CarrierSigner::new(
         "alice.sign",
@@ -236,8 +238,11 @@ async fn bob_loop(
     nats: async_nats::Client,
     verifier: Ed25519Verifier,
     alice_recipient: X25519RecipientPublic,
+    ready: oneshot::Sender<()>,
 ) -> anyhow::Result<()> {
     let mut sub = nats.subscribe("demo.bob".to_string()).await?;
+    nats.flush().await?;
+    let _ = ready.send(());
     let message = sub
         .next()
         .await

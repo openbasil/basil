@@ -193,6 +193,21 @@ impl KeyGlob {
     pub const fn is_any_key(&self) -> bool {
         matches!(self, Self::AnyKey)
     }
+
+    /// Whether this glob matches **every** catalog key.
+    ///
+    /// True for the whole-term `*` ([`KeyGlob::AnyKey`]) and for a bare `**`
+    /// (`Pattern([DoubleStar])`, which matches any non-empty key). The
+    /// break-glass any-target gate keys on this, not on [`KeyGlob::is_any_key`],
+    /// so `**` cannot be used to sidestep the `*` guardrail while granting the
+    /// same reach.
+    #[must_use]
+    pub fn matches_all(&self) -> bool {
+        match self {
+            Self::AnyKey => true,
+            Self::Pattern(segs) => matches!(segs.as_slice(), [GlobSeg::DoubleStar]),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -328,5 +343,19 @@ mod tests {
         assert!(g.matches("a"));
         assert!(g.matches("a.b"));
         // a single-segment key still has at least one segment, so it matches.
+    }
+
+    #[test]
+    fn matches_all_covers_star_and_bare_doublestar() {
+        // Both spellings grant the entire catalog and must trip the break-glass
+        // any-target gate; anything narrower must not.
+        assert!(KeyGlob::parse("*").unwrap().matches_all());
+        assert!(KeyGlob::parse("**").unwrap().matches_all());
+        for narrower in ["web.**", "web.*", "web.tls.signing_key"] {
+            assert!(
+                !KeyGlob::parse(narrower).unwrap().matches_all(),
+                "`{narrower}` must not count as match-everything"
+            );
+        }
     }
 }

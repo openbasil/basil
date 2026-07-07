@@ -970,7 +970,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grpc_sign_completes_externally_assembled_rich_nats_jwt() {
+    async fn grpc_sign_on_issuer_key_is_hard_capped_but_rich_jwt_mints_via_sign_nats_jwt() {
+        // Raw `sign` on a NATS operator/account key would let a caller assemble
+        // the JWT signing input off-broker and bypass every validation the
+        // dedicated `sign_nats_jwt` op enforces (kind, jti mode, ttl/expiry),
+        // so the PDP hard-caps it even though the policy grants role:signer
+        // over `issuer.*`. The same rich claims still mint through the
+        // validated op: rejecting the bypass loses no legitimate capability.
         let operator = KeyPair::new_operator();
         let operator_public = operator.public_key();
         let account = KeyPair::new_account();
@@ -995,17 +1001,34 @@ mod tests {
         let jwt = rich_account_jwt(issuer_nkey, &account, &signing, &exporting, &user);
         let signing_input = jwt.signing_input().expect("rich signing input builds");
 
-        let signature = service
+        let denied = service
             .sign(authed_request(pb::SignRequest {
                 key_id: "issuer.operator".to_string(),
                 message: signing_input.as_bytes().to_vec(),
                 algorithm: pb::SigningAlgorithm::Ed25519Nkey.into(),
             }))
             .await
-            .expect("broker signs NATS JWT input")
+            .expect_err("raw sign on an issuer key is hard-capped");
+        assert_eq!(denied.code(), Code::PermissionDenied);
+
+        // Route the identical rich claims through the validated minting op.
+        let claims_json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(signing_input.split('.').nth(1).expect("claims part"))
+            .expect("claims decode");
+        let token = service
+            .sign_nats_jwt(authed_request(pb::SignNatsJwtRequest {
+                key_id: "issuer.operator".to_string(),
+                claims_json,
+                expected_type: pb::NatsJwtType::Account.into(),
+                ttl: Some(ttl()),
+                expires_at: None,
+                issued_at: None,
+                jti_mode: pb::NatsJtiMode::Rewrite.into(),
+            }))
+            .await
+            .expect("rich account JWT mints through the validated op")
             .into_inner()
-            .signature;
-        let token = basil_nats::assemble(&signing_input, &signature);
+            .token;
 
         let parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3);
@@ -1027,8 +1050,11 @@ mod tests {
 
         let issuer = KeyPair::from_public_key(claims["iss"].as_str().expect("issuer claim"))
             .expect("issuer public key parses");
+        let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(parts[2])
+            .expect("signature decodes");
         issuer
-            .verify(signing_input.as_bytes(), &signature)
+            .verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &signature)
             .expect("Basil signature verifies under issuer nkey");
     }
 

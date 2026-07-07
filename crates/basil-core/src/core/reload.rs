@@ -374,6 +374,15 @@ pub fn check_reload(state: &BrokerState) -> Result<ReloadOutcome, ReloadError> {
 /// ([`ReloadError::Validate`]), or the candidate changes a restart-only routing
 /// dimension ([`ReloadError::RoutingShapeChanged`]).
 pub fn reload_generation(state: &BrokerState) -> Result<ReloadOutcome, ReloadError> {
+    // Serialize the whole validate→swap sequence: SIGHUP and the admin RPC can
+    // trigger concurrently, and without this two reloads could both pin
+    // generation N, both stamp N+1, and let the staler candidate silently
+    // overwrite the newer one. A poisoned lock is recovered: it holds no data,
+    // it only orders the triggers.
+    let _reload_guard = state
+        .reload_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let candidate = validate_candidate(state)?;
     let ValidatedCandidate {
         catalog,
@@ -652,6 +661,42 @@ mod tests {
         let real = reload_generation(&state).expect_err("real reload rejects repath");
         assert!(matches!(real, ReloadError::RoutingShapeChanged(_)));
         assert_eq!(state.active_generation_id(), INITIAL_GENERATION_ID);
+    }
+
+    /// Concurrent reload triggers (SIGHUP + admin RPC in production; two threads
+    /// here) are serialized by the reload lock: both apply, generation ids stay
+    /// monotonic with no duplicate stamp, and no candidate is lost.
+    #[test]
+    fn concurrent_reloads_are_serialized_with_monotonic_generations() {
+        let (state, inputs) = state_with_files(&catalog_json(false), &policy_json(false));
+        write_files(&inputs, &catalog_json(true), &policy_json(true));
+
+        let outcomes = std::thread::scope(|scope| {
+            // Spawn both BEFORE joining either, so the two reloads genuinely
+            // overlap (a lazy spawn-then-join iterator would serialize them).
+            let first = scope.spawn(|| reload_generation(&state));
+            let second = scope.spawn(|| reload_generation(&state));
+            [first, second].map(|h| h.join().expect("reload thread panicked"))
+        });
+
+        let mut transitions: Vec<(u64, u64)> = outcomes
+            .into_iter()
+            .map(|o| {
+                let o = o.expect("both concurrent reloads apply");
+                (o.previous_generation, o.new_generation)
+            })
+            .collect();
+        transitions.sort_unstable();
+        // Strictly ordered handoff: N→N+1 then N+1→N+2, never two identical
+        // N→N+1 stamps (the lost-update signature).
+        assert_eq!(
+            transitions,
+            vec![
+                (INITIAL_GENERATION_ID, INITIAL_GENERATION_ID + 1),
+                (INITIAL_GENERATION_ID + 1, INITIAL_GENERATION_ID + 2),
+            ]
+        );
+        assert_eq!(state.active_generation_id(), INITIAL_GENERATION_ID + 2);
     }
 
     /// A broker with no configured paths fails the reload closed (no-op), never

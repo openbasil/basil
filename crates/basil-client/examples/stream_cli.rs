@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 
-use basil_client::stream::{
+use basil::stream::{
     AeadSuite, CekSource, LocalSeedCekRecovery, MlKemSuite, decrypt_aead, decrypt_ml_kem,
     encrypt_aead, encrypt_ml_kem,
 };

@@ -20,11 +20,11 @@
 //! modulus/exponent. The endpoint is unauthenticated, which is correct for a JWKS:
 //! a JWKS is meant to be world-readable, and it serves public keys only.
 //!
-//! The JWK set is rebuilt **fresh per request** off the live backend manager and
-//! reflects the **rotation grace window**: one JWK per issuer key version still
-//! inside `[grace_floor ..= latest]`, so a verifier can validate a token signed
-//! by a recently rotated-away version, and a version is dropped once it falls
-//! below the floor (`basil-uce.2`).
+//! The JWK set is cached briefly per generation after it is built from the live
+//! backend manager and reflects the **rotation grace window**: one JWK per issuer
+//! key version still inside `[grace_floor ..= latest]`, so a verifier can
+//! validate a token signed by a recently rotated-away version, and a version is
+//! dropped once it falls below the floor (`basil-uce.2`).
 //!
 //! When an `issuer` (public base URL) is configured, the OIDC discovery document
 //! is served at [`OIDC_DISCOVERY_PATH`] with a `jwks_uri` consistent with
@@ -41,7 +41,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::State;
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use sha2::{Digest as _, Sha256};
@@ -317,9 +317,31 @@ fn tls_acceptor_from_files(tls: &JwksTlsConfig) -> io::Result<tokio_rustls::TlsA
 /// their **public** halves fresh, so the response tracks issuer rotation. On any
 /// backend error it returns `503 Service Unavailable` with a non-secret body,
 /// never a panic, never any key material in the error.
-async fn jwks_handler(State(state): State<HttpState>) -> Response {
-    match build_jwks(&state.broker).await {
-        Ok(body) => jwks_response(body),
+async fn jwks_handler(headers: HeaderMap, State(state): State<HttpState>) -> Response {
+    match cached_or_build_jwks(&state.broker).await {
+        Ok(cached) => {
+            if headers
+                .get(header::IF_NONE_MATCH)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|tag| {
+                    tag.split(',')
+                        .any(|candidate| candidate.trim() == cached.etag)
+                })
+            {
+                return (
+                    StatusCode::NOT_MODIFIED,
+                    [
+                        (
+                            header::CACHE_CONTROL,
+                            format!("public, max-age={JWKS_MAX_AGE_SECS}"),
+                        ),
+                        (header::ETAG, cached.etag),
+                    ],
+                )
+                    .into_response();
+            }
+            jwks_response(cached.body, cached.etag)
+        }
         Err(reason) => {
             warn!(%reason, "JWKS request failed");
             (
@@ -397,8 +419,7 @@ fn discovery_response(doc: &serde_json::Value) -> Response {
 
 /// Construct the cacheable JWKS response: body + `Content-Type` + `Cache-Control`
 /// + a content-addressed `ETag` (SHA-256 of the body, base16). A `200`.
-fn jwks_response(body: Vec<u8>) -> Response {
-    let etag = etag_for(&body);
+fn jwks_response(body: Vec<u8>, etag: String) -> Response {
     (
         StatusCode::OK,
         [
@@ -412,6 +433,19 @@ fn jwks_response(body: Vec<u8>) -> Response {
         body,
     )
         .into_response()
+}
+
+async fn cached_or_build_jwks(state: &BrokerState) -> Result<crate::state::CachedJwks, String> {
+    if let Some(cached) = state.cached_jwks() {
+        return Ok(cached);
+    }
+    let generation = state.active_generation_id();
+    let body = build_jwks(state).await?;
+    let etag = etag_for(&body);
+    state.cache_jwks(generation, body, etag);
+    state
+        .cached_jwks()
+        .ok_or_else(|| "jwks cache unavailable".to_string())
 }
 
 /// A strong `ETag` derived from the response body (`"<hex sha256>"`).
@@ -583,7 +617,8 @@ mod tests {
     #[test]
     fn jwks_response_carries_cache_headers_and_content_type() {
         let body = assemble_jwks(&[]).expect("assemble");
-        let resp = jwks_response(body);
+        let etag = etag_for(&body);
+        let resp = jwks_response(body, etag);
         assert_eq!(resp.status(), StatusCode::OK);
         let headers = resp.headers();
         assert_eq!(
@@ -1486,7 +1521,6 @@ mod tests {
                 .expect("router does not panic");
             assert_eq!(first.status(), StatusCode::OK);
             let first_etag = first.headers().get(header::ETAG).cloned().expect("etag");
-            let first_body = response_body(first).await;
 
             let second = app
                 .oneshot(
@@ -1503,12 +1537,11 @@ mod tests {
                 )
                 .await
                 .expect("router does not panic");
-            assert_eq!(second.status(), StatusCode::OK);
+            assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
             assert_eq!(second.headers().get(header::ETAG), Some(&first_etag));
-            assert_eq!(
-                response_body(second).await,
-                first_body,
-                "untrusted cache/query/header data does not alter the JWKS body"
+            assert!(
+                response_body(second).await.is_empty(),
+                "conditional JWKS hit returns 304 without a body"
             );
         }
 

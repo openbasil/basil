@@ -97,7 +97,7 @@
                 PROTOC_INCLUDE = "${buildProtobuf}/include";
                 # `reqwest`'s `rustls-no-provider` feature pulls in
                 # `rustls-platform-verifier`, which loads the OS CA trust
-                # store as soon as a `Client` is built — even for tests that
+                # store as soon as a `Client` is built, even for tests that
                 # never touch the network (transit/spiffe/pki backend
                 # tests). The nix build sandbox has no `/etc/ssl/certs`, so
                 # point at nixpkgs' bundle explicitly for the check phase.
@@ -105,7 +105,7 @@
                 meta = with packageSet.lib; {
                   description = "Basil: Broker for Attestation, Secrets, Identity & Leases";
                   homepage = "https://github.com/openbasil/basil";
-                  license = licenses.apsl20;
+                  license = licenses.asl20;
                   mainProgram = "basil";
                 };
               };
