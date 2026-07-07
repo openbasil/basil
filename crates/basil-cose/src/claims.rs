@@ -72,13 +72,13 @@ pub enum MessageRole {
     /// Requires `in_reply_to` + `request_hash`; forbids
     /// `response_key_id`/`response_subject`.
     Response,
-    /// Peer message (demo, edgebox): requires `sender_key_id`; forbids the
+    /// Peer message: requires `sender_key_id`; forbids the
     /// request/response correlation labels.
     Peer,
 }
 
 /// Parameterized validation bounds. The broker feeds its `[invocation]`
-/// config; edgebox feeds its own. `now` is injected, never sampled
+/// config. `now` is injected, never sampled
 /// internally: a broker-free crate does not own time policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidationParams {

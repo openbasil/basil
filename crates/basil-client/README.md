@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # basil (client)
 
-The Rust client library for the Basil broker. Your program connects to Basil's local Unix socket
+The Rust client library for the [Basil broker](https://github.com/openbasil/basil). Your program connects to Basil's local Unix socket
 over gRPC and asks the broker to sign, verify, encrypt, decrypt, mint, or fetch on its behalf. The
 private key never enters your process: Basil attests you from the kernel (`SO_PEERCRED` uid/gid),
 checks its default-deny policy, and performs the operation in place against the backend.

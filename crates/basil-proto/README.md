@@ -14,22 +14,21 @@ looking for what actually crosses Basil's Unix socket, it is defined here and no
 `build.rs` compiles the vendored `.proto` sources under `proto/` with `tonic-prost-build` at
 build time (server and client stubs both):
 
-| Module | Source | Purpose |
-| --- | --- | --- |
-| `broker` | `proto/basil/broker/v1/broker.proto` | Basil's own broker API: signing, AEAD, secrets, minting, admin, and the sealed-invocation carrier (`SealedRequest` / `SealedResponse`). |
-| `spiffe` | `proto/spiffe/workloadapi.proto` | The upstream SPIFFE Workload API, vendored unmodified so SVID clients interoperate. |
-| Envoy SDS | `proto/envoy/**`, `proto/xds/**` | The Envoy secret discovery service surface Basil serves for TLS material delivery. |
-| `google.rpc` | `proto/google/rpc/status.proto` | Structured error details. |
+| Module       | Source                               | Purpose                                                                                                                                 |
+| ------------ | ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `broker`     | `proto/basil/broker/v1/broker.proto` | Basil's own broker API: signing, AEAD, secrets, minting, admin, and the sealed-invocation carrier (`SealedRequest` / `SealedResponse`). |
+| `spiffe`     | `proto/spiffe/workloadapi.proto`     | The upstream SPIFFE Workload API, vendored unmodified so SVID clients interoperate.                                                     |
+| Envoy SDS    | `proto/envoy/**`, `proto/xds/**`     | The Envoy secret discovery service surface Basil serves for TLS material delivery.                                                      |
+| `google.rpc` | `proto/google/rpc/status.proto`      | Structured error details.                                                                                                               |
 
 Vendoring the protos keeps builds hermetic: no network fetch, no drift against an upstream tag you
 did not choose.
 
 ## What is hand-written
 
-Two modules are deliberately code, not codegen:
+Two modules are code, not codegen:
 
-- `types`: shared Basil domain types used by the client and agent internals, so both sides agree
-  on one Rust representation instead of re-deriving it from raw messages.
+- `types`: common Basil domain types shared by the client and agent internals
 - `invocation`: the sealed-invocation plaintext body schemas and Basil's registered COSE content
   types (the RFC 9052 protected header 3 values that select a body schema), their deterministic
   CBOR codecs, and `InvocationStatus`. Envelope canonicalization itself lives in

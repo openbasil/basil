@@ -8,7 +8,7 @@ SPDX-License-Identifier: Apache-2.0
 
 `basil-nats-bridge` is a NATS request/reply courier for Basil sealed invocation
 messages. It subscribes to one NATS subject, accepts raw tagged COSE bytes,
-wraps those bytes in Basil's thin `SealedRequest` gRPC carrier over the
+wraps those bytes in Basil's thin [`SealedRequest` gRPC](https://docs.openbasil.org/clients/sealed-invocations/) carrier over the
 configured Unix socket, and publishes raw tagged COSE response bytes.
 
 The bridge does not decrypt request or response bodies. Actor authorization
@@ -49,25 +49,25 @@ that delivered it:
 
 ```json
 {
-  "subjects": {
-    "content.publisher": {
-      "allOf": [
-        {
-          "kind": "signature-key",
-          "algorithm": "nats-nkey",
-          "public": "UANATS_PUBLIC_NKEY"
-        }
-      ]
-    }
-  },
-  "rules": [
-    {
-      "id": "publisher-can-use-invocation-signing",
-      "subjects": ["content.publisher"],
-      "action": ["op:decrypt", "op:sign"],
-      "target": ["broker.request_encryption.2026q3", "publisher.signing.2026q3"]
-    }
-  ]
+	"subjects": {
+		"content.publisher": {
+			"allOf": [
+				{
+					"kind": "signature-key",
+					"algorithm": "nats-nkey",
+					"public": "UANATS_PUBLIC_NKEY"
+				}
+			]
+		}
+	},
+	"rules": [
+		{
+			"id": "publisher-can-use-invocation-signing",
+			"subjects": ["content.publisher"],
+			"action": ["op:decrypt", "op:sign"],
+			"target": ["broker.request_encryption.2026q3", "publisher.signing.2026q3"]
+		}
+	]
 }
 ```
 
@@ -113,10 +113,10 @@ bridge error headers. Bridge-level failures that have no sealed Basil response
 return an empty payload with these NATS headers when the request has a reply
 subject:
 
-| Header | Meaning |
-| --- | --- |
-| `Basil-Bridge-Error` | Stable bridge-level token. |
-| `Basil-Bridge-Message` | Operator-facing detail. |
+| Header                   | Meaning                                            |
+| ------------------------ | -------------------------------------------------- |
+| `Basil-Bridge-Error`     | Stable bridge-level token.                         |
+| `Basil-Bridge-Message`   | Operator-facing detail.                            |
 | `Basil-Bridge-Retryable` | `true` when retrying the same request may succeed. |
 
 Stable error tokens are `MALFORMED_REQUEST`, `MESSAGE_TOO_LARGE`,

@@ -6,20 +6,14 @@ SPDX-License-Identifier: Apache-2.0
 
 # basil-tests
 
-Live and interop integration tests for Basil. This crate is not published (`publish = false`) and
-ships no API: it exists so the whole system, the real `basil` binary against a real backend, is
-exercised the way an operator would run it, not just as unit tests inside each crate.
+Test harness, and Live and interop integration tests for Basil.
+This crate is not published (`publish = false`) and has no public API.
 
 ## The harness
 
-`src/lib.rs` is a shared live harness. It shells out to `scripts/prefill-test-store.sh`, which
-boots a dev `bao` (OpenBao), writes catalog / policy / sealed-bundle fixtures, and builds the
-binaries; then it runs `target/debug/basil run` on a temporary Unix socket. The default build
-includes `spiffe`, so the Workload API is served on the same socket as the broker.
-
-Tests that need an engine binary check `on_path(...)` and print an **explicit skip line** when it
-is absent. A silent `#[ignore]` skip is forbidden here: a test that never ran must be visible in
-the output.
+`src/lib.rs` is a shared live harness. It uses `scripts/prefill-test-store.sh` to
+boot a dev `bao` (OpenBao), write catalog / policy / sealed-bundle fixtures, and build the
+binaries; then it runs `target/debug/basil run` on a temporary Unix socket.
 
 ## What is covered
 
@@ -36,11 +30,11 @@ the output.
 
 ## Features
 
-| Feature | Enables |
-| --- | --- |
-| `live-e2e` | The tests that boot live OpenBao/Vault dev servers. |
-| `http` | Live tests needing the broker's JWKS/OIDC HTTP surface (builds `basil-bin` with `http`). |
-| `unlock-bip39` | The BIP39 break-glass harness helpers and `bip39_unlock_e2e`. |
+| Feature        | Enables                                                                                  |
+| -------------- | ---------------------------------------------------------------------------------------- |
+| `live-e2e`     | The tests that boot live OpenBao/Vault dev servers.                                      |
+| `http`         | Live tests needing the broker's JWKS/OIDC HTTP surface (builds `basil-bin` with `http`). |
+| `unlock-bip39` | The BIP39 break-glass harness helpers and `bip39_unlock_e2e`.                            |
 
 All are additive and on under `--all-features`. Run from the workspace root so the harness can
 find `scripts/` and the built binaries.

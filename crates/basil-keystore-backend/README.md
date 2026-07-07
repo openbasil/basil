@@ -6,14 +6,14 @@ SPDX-License-Identifier: Apache-2.0
 
 # basil-keystore-backend
 
-Optional **materialize-to-use** key-store support for Basil. Basil prefers in-place backends
+Optional **materialize-to-use** key-store support for [Basil](https://github.com/openbasil/basil). Basil prefers in-place backends
 (transit engines, cloud KMS) where a private key is never released. When you do not have one, this
 crate lets Basil be backed by a key/value store instead: secret bytes come out of storage into a
 [`Zeroizing`] owner, local crypto in `basil-core` uses the key for exactly one operation, and the
 material is wiped.
 
-That is a weaker custody story than in-place, and it is deliberately isolated here as an optional
-dependency: builds that do not need it carry none of this code.
+That is a weaker custody story than in-place, and it is deliberately isolated as an optional
+dependency so it can be compiled out if not needed.
 
 ## Stores
 

@@ -32,8 +32,7 @@ impl PartyIdentity {
         Self(None)
     }
 
-    /// A concrete party identity (for example edgebox's `d2h`/`h2d`
-    /// direction strings).
+    /// A concrete party identity
     ///
     /// # Errors
     /// [`ProfileError::EmptyPartyIdentity`] if the bytes are empty; an empty

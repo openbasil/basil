@@ -8,15 +8,15 @@ SPDX-License-Identifier: Apache-2.0
 
 A strict, deterministic COSE (RFC 9052/9053) profile for basil's sealed
 invocations. Broker-free and publishable, it is shared by the basil broker, the
-basil client crate, and edgebox.
+basil client crate, and basil users.
 
 ## Constructions
 
-| Construction | Shape | Build | Verify / open |
-| --- | --- | --- | --- |
-| Signed | bare `COSE_Sign1` (tag 18) | `build_signed` | `verify_signed` |
-| Sealed | `COSE_Sign1` over an embedded tagged `COSE_Encrypt` | `build_sealed` | `verify_sealed`, then `VerifiedSealed::open` |
-| Seal-only | bare `COSE_Encrypt` (tag 96) | `build_encrypted` | `decode_encrypted`, then `EncryptedMessage::open` |
+| Construction | Shape                                               | Build             | Verify / open                                     |
+| ------------ | --------------------------------------------------- | ----------------- | ------------------------------------------------- |
+| Signed       | bare `COSE_Sign1` (tag 18)                          | `build_signed`    | `verify_signed`                                   |
+| Sealed       | `COSE_Sign1` over an embedded tagged `COSE_Encrypt` | `build_sealed`    | `verify_sealed`, then `VerifiedSealed::open`      |
+| Seal-only    | bare `COSE_Encrypt` (tag 96)                        | `build_encrypted` | `decode_encrypted`, then `EncryptedMessage::open` |
 
 Algorithms: EdDSA (−8, Ed25519) or ES256 (−7, ECDSA P-256 + SHA-256)
 signatures; ECDH-ES + HKDF-256 (−25) with X25519 key agreement; A256GCM (3) or
@@ -79,9 +79,7 @@ The crate is `#![no_std]` + `alloc` and obtains production randomness through
   `build_encrypted_with_parts`) that accept caller-supplied ephemeral/nonce
   parts, for test vectors only. Never enable on production paths.
 
-## Design
+## Wire API
 
-The authoritative API/wire design is
-[`designs/basil-cose-api.md`](../../designs/basil-cose-api.md) (see §7.1 for
-C1 implementation notes, including the 2026-07-02 reviewer amendment that
-made `minicbor` the CBOR backend, aligning with edgebox-rs).
+The COSE api is described in [Sealed invocations](https://docs.openbasil.org/clients/sealed-invocations/)
+and is accessible from both Rust and Go clients.
