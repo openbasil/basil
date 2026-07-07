@@ -15,8 +15,8 @@ use crate::catalog::policy::Op;
 use crate::minter::{NatsJtiMode, NatsJwtKind, SignNatsJwtSpec};
 use crate::service::broker::{BrokerGrpc, GrpcResult};
 use crate::service::shared::{
-    backend_status, claims_json, credential_response, invalid_request, manager_status,
-    payload_too_large, ttl_seconds,
+    backend_status, credential_response, invalid_request, manager_status, payload_too_large,
+    ttl_seconds,
 };
 use crate::transport::{broker_status, peer_from_request};
 
@@ -29,7 +29,7 @@ impl MintingService for BrokerGrpc {
         let body = request.get_ref();
         self.authorize(&request, Op::Mint, &body.key_id)?;
         let ttl_secs = ttl_seconds(body.ttl.as_ref(), "mint")?;
-        let claims = claims_json(body.claims.as_ref(), "mint")?;
+        let claims = claims_json_bytes(&body.extra_claims_json, "mint", "extra_claims_json", true)?;
         let routed = self
             .state
             .manager()
@@ -307,7 +307,7 @@ impl NatsService for BrokerGrpc {
     ) -> GrpcResult<pb::CredentialResponse> {
         let body = request.get_ref();
         self.authorize(&request, Op::SignNatsJwt, &body.key_id)?;
-        let claims = claims_json_bytes(&body.claims_json, "sign_nats_jwt")?;
+        let claims = claims_json_bytes(&body.claims_json, "sign_nats_jwt", "claims_json", false)?;
         let ttl_secs = ttl_seconds(body.ttl.as_ref(), "sign_nats_jwt")?;
         let requested_issued_at = body
             .issued_at
@@ -595,14 +595,25 @@ fn timestamp_seconds(
         .map_err(|_| invalid_request(op, format!("{field} must be a non-negative unix timestamp")))
 }
 
-fn claims_json_bytes(claims_json: &[u8], op: &'static str) -> Result<JsonValue, Status> {
+fn claims_json_bytes(
+    claims_json: &[u8],
+    op: &'static str,
+    field: &'static str,
+    allow_empty: bool,
+) -> Result<JsonValue, Status> {
     if claims_json.is_empty() {
-        return Err(invalid_request(op, "claims_json is required"));
+        if allow_empty {
+            return Ok(JsonValue::Object(serde_json::Map::new()));
+        }
+        return Err(invalid_request(op, format!("{field} is required")));
     }
     let claims = serde_json::from_slice::<JsonValue>(claims_json)
-        .map_err(|e| invalid_request(op, format!("claims_json must be valid JSON: {e}")))?;
+        .map_err(|e| invalid_request(op, format!("{field} must be valid JSON: {e}")))?;
     if !claims.is_object() {
-        return Err(invalid_request(op, "claims_json must be a JSON object"));
+        return Err(invalid_request(
+            op,
+            format!("{field} must be a JSON object"),
+        ));
     }
     Ok(claims)
 }

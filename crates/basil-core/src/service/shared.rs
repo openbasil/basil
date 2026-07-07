@@ -7,8 +7,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use basil_proto::broker::v1 as pb;
-use prost_types::{Duration, Struct, Timestamp, Value as ProstValue, value::Kind as ProstKind};
-use serde_json::Value as JsonValue;
+use prost_types::{Duration, Timestamp};
 use tonic::{Code, Status};
 
 use crate::actor::AuthenticatedActor;
@@ -466,55 +465,6 @@ pub(super) fn ttl_seconds(ttl: Option<&Duration>, op: &'static str) -> Result<Op
         .checked_add(u64::from(ttl.nanos > 0))
         .ok_or_else(|| invalid_request(op, "ttl too large"))?;
     Ok(Some(rounded))
-}
-
-pub(super) fn claims_json(claims: Option<&Struct>, op: &'static str) -> Result<JsonValue, Status> {
-    let Some(claims) = claims else {
-        return Ok(JsonValue::Object(serde_json::Map::new()));
-    };
-    let fields = claims
-        .fields
-        .iter()
-        .map(|(key, value)| prost_value_to_json(value, op).map(|value| (key.clone(), value)))
-        .collect::<Result<serde_json::Map<_, _>, _>>()?;
-    Ok(JsonValue::Object(fields))
-}
-
-fn prost_value_to_json(value: &ProstValue, op: &'static str) -> Result<JsonValue, Status> {
-    let Some(kind) = &value.kind else {
-        return Ok(JsonValue::Null);
-    };
-    match kind {
-        ProstKind::NullValue(_) => Ok(JsonValue::Null),
-        ProstKind::NumberValue(number) => prost_number_to_json(*number, op),
-        ProstKind::StringValue(value) => Ok(JsonValue::String(value.clone())),
-        ProstKind::BoolValue(value) => Ok(JsonValue::Bool(*value)),
-        ProstKind::StructValue(value) => claims_json(Some(value), op),
-        ProstKind::ListValue(value) => value
-            .values
-            .iter()
-            .map(|value| prost_value_to_json(value, op))
-            .collect::<Result<Vec<_>, _>>()
-            .map(JsonValue::Array),
-    }
-}
-
-fn prost_number_to_json(number: f64, op: &'static str) -> Result<JsonValue, Status> {
-    if !number.is_finite() {
-        return Err(invalid_request(op, "claims contain a non-finite number"));
-    }
-    if number.fract() == 0.0 {
-        let decimal = format!("{number:.0}");
-        if let Ok(value) = decimal.parse::<i64>() {
-            return Ok(JsonValue::Number(value.into()));
-        }
-        if let Ok(value) = decimal.parse::<u64>() {
-            return Ok(JsonValue::Number(value.into()));
-        }
-    }
-    serde_json::Number::from_f64(number)
-        .map(JsonValue::Number)
-        .ok_or_else(|| invalid_request(op, "claims contain a non-finite number"))
 }
 
 pub(super) fn credential_response(

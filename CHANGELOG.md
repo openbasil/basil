@@ -8,9 +8,33 @@ SPDX-License-Identifier: Apache-2.0
 
 ## Unreleased
 
-- Release for testing CI updates
+### Breaking api changes
+
+- **Breaking: basil-proto, basil (rust client), basil-go (go client)**
+  generic `MintJwt` extra claims now use raw UTF-8 JSON bytes
+  (`extra_claims_json`) instead of `google.protobuf.Struct`, matching the
+  NATS `claims_json` pattern and preserving large integer claim values.
+
+- **Breaking: basil (rust client)** sealed-invocation mint request variants are
+  removed; `prepare_sealed_invocation` now takes the broker-executable
+  `SignInvocationRequest` body.
+
+- **Breaking: basil-proto and broker wire behavior**
+  `AEAD_ALGORITHM_UNSPECIFIED` is rejected on decrypt as well as encrypt.
+
+- **Breaking: wire-format validation** deterministic-CBOR decoders now reject
+  non-minimal integer and length encodings.
+
+- **Breaking: signature validation** ES256 verification now rejects high-S
+  signatures.
+
+- **Breaking: basil-go client behavior** `Encrypt` and `WrapEnvelope` now return
+  an error when a successful response omits its envelope instead of returning
+  `(nil, nil)`.
 
 ### CI and release-workflow fixes
+
+- Added homebrew-tap release workflow
 
 - Added `--experimental_allow_proto3_optional` to `protoc`, so `broker.proto`'s proto3
   `optional` fields compile against the older `protoc` (3.12.4) shipped by the
@@ -31,10 +55,7 @@ SPDX-License-Identifier: Apache-2.0
   ignoring it; user gRPC/workload-API dial options are applied before the fixed
   ones so the transport credentials, pinned `:authority`, Unix dialer, and
   Workload API address can no longer be overridden (making the documented
-  contract true); `MintJwt` rejects integer claims above 2^53 that
-  `google.protobuf.Struct`'s float64 numbers would silently corrupt; and
-  `Encrypt`/`WrapEnvelope` error on a success response that omits its envelope
-  instead of returning `(nil, nil)`.
+  contract true);
 - sealed-invocation and AEAD wire-contract tightening: `CarrierSigner` message
   ids carry a fresh 64-bit random nonce instead of a per-process counter, so a
   restart inside the same second can no longer reuse a `cti`; the unusable

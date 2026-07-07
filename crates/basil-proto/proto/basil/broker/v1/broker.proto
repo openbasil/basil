@@ -18,7 +18,6 @@ package basil.broker.v1;
 
 import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
-import "google/protobuf/struct.proto";
 
 // Asymmetric key type for key creation, import, signing, and minting.
 enum KeyType {
@@ -585,8 +584,9 @@ message MintJwtRequest {
   optional string subject = 2;
   // Time-to-live; sets `exp` relative to issue time. Absent = non-expiring.
   google.protobuf.Duration ttl = 3;
-  // Additional, non-reserved claims to embed.
-  google.protobuf.Struct claims = 4;
+  // Additional, non-reserved claims as UTF-8 JSON object bytes. Empty = no
+  // extra claims.
+  bytes extra_claims_json = 4;
 }
 
 // Request to mint a NATS user JWT (issued by an account key).

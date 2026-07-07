@@ -15,7 +15,7 @@ use basil_proto::broker::v1::secret_service_client::SecretServiceClient;
 use basil_proto::broker::v1::signing_service_client::SigningServiceClient;
 use hyper_util::rt::TokioIo;
 use prost::Message;
-use prost_types::{Duration as ProtoDuration, Struct, Timestamp, Value as ProtoValue};
+use prost_types::{Duration as ProtoDuration, Timestamp};
 use tokio::net::UnixStream;
 use tokio::time::timeout;
 use tonic::transport::{Channel, Endpoint};
@@ -815,7 +815,20 @@ impl Client {
         key_id: &str,
         sub: &str,
         ttl_secs: Option<u64>,
-        claims: serde_json::Value,
+        claims: impl serde::Serialize,
+    ) -> Result<MintedJwt> {
+        let extra_claims_json = serde_json::to_vec(&claims)?;
+        self.mint_jwt_json(key_id, sub, ttl_secs, extra_claims_json)
+            .await
+    }
+
+    /// Mint a generic JWT credential from pre-encoded additional claim JSON.
+    pub async fn mint_jwt_json(
+        &mut self,
+        key_id: &str,
+        sub: &str,
+        ttl_secs: Option<u64>,
+        extra_claims_json: impl Into<Vec<u8>>,
     ) -> Result<MintedJwt> {
         let response = Self::bounded(
             self.default_timeout,
@@ -823,7 +836,7 @@ impl Client {
                 key_id: key_id.to_string(),
                 subject: Some(sub.to_string()),
                 ttl: ttl_secs.map(proto_duration),
-                claims: Some(json_struct(claims)),
+                extra_claims_json: extra_claims_json.into(),
             }),
         )
         .await?;
@@ -1426,36 +1439,6 @@ fn non_zero(value: u64) -> Option<u64> {
     (value != 0).then_some(value)
 }
 
-fn json_struct(value: serde_json::Value) -> Struct {
-    let serde_json::Value::Object(fields) = value else {
-        return Struct::default();
-    };
-    Struct {
-        fields: fields
-            .into_iter()
-            .map(|(key, value)| (key, json_value(value)))
-            .collect(),
-    }
-}
-
-fn json_value(value: serde_json::Value) -> ProtoValue {
-    let kind = match value {
-        serde_json::Value::Null => prost_types::value::Kind::NullValue(0),
-        serde_json::Value::Bool(value) => prost_types::value::Kind::BoolValue(value),
-        serde_json::Value::Number(value) => {
-            prost_types::value::Kind::NumberValue(value.as_f64().unwrap_or(0.0))
-        }
-        serde_json::Value::String(value) => prost_types::value::Kind::StringValue(value),
-        serde_json::Value::Array(values) => {
-            prost_types::value::Kind::ListValue(prost_types::ListValue {
-                values: values.into_iter().map(json_value).collect(),
-            })
-        }
-        serde_json::Value::Object(_) => prost_types::value::Kind::StructValue(json_struct(value)),
-    };
-    ProtoValue { kind: Some(kind) }
-}
-
 #[cfg(test)]
 mod nats_client_tests {
     use std::sync::{Arc, Mutex};
@@ -1753,7 +1736,7 @@ mod nats_client_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{broker_error_info, json_struct, status_error};
+    use super::{broker_error_info, status_error};
     use basil_proto::broker::v1::BrokerErrorInfo;
     use prost::Message;
     use tonic::Code;
@@ -1800,15 +1783,6 @@ mod tests {
                 }
             )),
         }
-    }
-
-    #[test]
-    fn json_struct_ignores_non_object_root() {
-        assert!(
-            json_struct(serde_json::json!("not-an-object"))
-                .fields
-                .is_empty()
-        );
     }
 
     #[test]

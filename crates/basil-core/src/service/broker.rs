@@ -187,7 +187,7 @@ mod tests {
     use basil_proto::google::rpc::Status as RpcStatus;
     use nkeys::{KeyPair, XKey};
     use prost::Message;
-    use prost_types::{Duration, Struct, Value as ProstValue, value::Kind as ProstKind};
+    use prost_types::Duration;
     use serde_json::Value as JsonValue;
     use tonic::{Code, Request, Status};
 
@@ -378,53 +378,6 @@ mod tests {
             "mint",
         )
         .expect_err("negative ttl rejected");
-        assert_eq!(status.code(), Code::InvalidArgument);
-        assert_eq!(error_info(&status).reason, "INVALID_REQUEST");
-    }
-
-    #[test]
-    fn struct_claims_convert_to_json_and_reject_non_finite_numbers() {
-        let claims = Struct {
-            fields: [
-                (
-                    "scope".to_string(),
-                    ProstValue {
-                        kind: Some(ProstKind::StringValue("read".to_string())),
-                    },
-                ),
-                (
-                    "version".to_string(),
-                    ProstValue {
-                        kind: Some(ProstKind::NumberValue(2.0)),
-                    },
-                ),
-                (
-                    "ratio".to_string(),
-                    ProstValue {
-                        kind: Some(ProstKind::NumberValue(2.5)),
-                    },
-                ),
-            ]
-            .into(),
-        };
-        let json = claims_json(Some(&claims), "mint").expect("claims convert");
-        assert_eq!(json["scope"], JsonValue::String("read".to_string()));
-        assert_eq!(json["version"], JsonValue::Number(2.into()));
-        assert_eq!(
-            json["ratio"],
-            JsonValue::Number(serde_json::Number::from_f64(2.5).expect("finite"))
-        );
-
-        let claims = Struct {
-            fields: [(
-                "bad".to_string(),
-                ProstValue {
-                    kind: Some(ProstKind::NumberValue(f64::NAN)),
-                },
-            )]
-            .into(),
-        };
-        let status = claims_json(Some(&claims), "mint").expect_err("nan rejected");
         assert_eq!(status.code(), Code::InvalidArgument);
         assert_eq!(error_info(&status).reason, "INVALID_REQUEST");
     }
@@ -771,13 +724,26 @@ mod tests {
                 key_id: "issuer.account".to_string(),
                 subject: Some("subject".to_string()),
                 ttl: Some(ttl()),
-                claims: None,
+                extra_claims_json: serde_json::to_vec(&serde_json::json!({
+                    "large": 9_007_199_254_740_993_u64,
+                    "scope": "read"
+                }))
+                .expect("claims json"),
             }))
             .await
             .expect("generic mint succeeds")
             .into_inner();
         assert!(!generic.token.is_empty());
         assert!(generic.expires_at.is_some());
+        let parts: Vec<&str> = generic.token.split('.').collect();
+        let claims: JsonValue = serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(parts[1])
+                .expect("claims decode"),
+        )
+        .expect("claims json");
+        assert_eq!(claims["large"], 9_007_199_254_740_993_u64);
+        assert_eq!(claims["scope"], "read");
 
         let user_nkey = basil_nats::encode_public(basil_nats::NkeyType::User, &[2; 32])
             .expect("test user public key encodes");

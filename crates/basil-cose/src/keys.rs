@@ -199,6 +199,7 @@ impl Signer for Es256Signer {
                 .map_err(|_| SignError::Provider {
                     message: alloc::string::String::from("ecdsa signing failed"),
                 })?;
+        let sig = sig.normalize_s().unwrap_or(sig);
         Signature::from_bytes(sig.to_bytes().to_vec()).map_err(|_| SignError::Provider {
             message: alloc::string::String::from("empty signature"),
         })

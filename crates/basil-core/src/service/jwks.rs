@@ -20,11 +20,11 @@
 //! modulus/exponent. The endpoint is unauthenticated, which is correct for a JWKS:
 //! a JWKS is meant to be world-readable, and it serves public keys only.
 //!
-//! The JWK set is cached briefly per generation after it is built from the live
-//! backend manager and reflects the **rotation grace window**: one JWK per issuer
-//! key version still inside `[grace_floor ..= latest]`, so a verifier can
-//! validate a token signed by a recently rotated-away version, and a version is
-//! dropped once it falls below the floor (`basil-uce.2`).
+//! The JWK set is built from the live backend manager on each request and
+//! reflects the **rotation grace window**: one JWK per issuer key version still
+//! inside `[grace_floor ..= latest]`, so a verifier can validate a token signed
+//! by a recently rotated-away version, and a version is dropped once it falls
+//! below the floor (`basil-uce.2`).
 //!
 //! When an `issuer` (public base URL) is configured, the OIDC discovery document
 //! is served at [`OIDC_DISCOVERY_PATH`] with a `jwks_uri` consistent with
@@ -318,14 +318,14 @@ fn tls_acceptor_from_files(tls: &JwksTlsConfig) -> io::Result<tokio_rustls::TlsA
 /// backend error it returns `503 Service Unavailable` with a non-secret body,
 /// never a panic, never any key material in the error.
 async fn jwks_handler(headers: HeaderMap, State(state): State<HttpState>) -> Response {
-    match cached_or_build_jwks(&state.broker).await {
-        Ok(cached) => {
+    match build_jwks_document(&state.broker).await {
+        Ok(document) => {
             if headers
                 .get(header::IF_NONE_MATCH)
                 .and_then(|value| value.to_str().ok())
                 .is_some_and(|tag| {
                     tag.split(',')
-                        .any(|candidate| candidate.trim() == cached.etag)
+                        .any(|candidate| candidate.trim() == document.etag)
                 })
             {
                 return (
@@ -335,12 +335,12 @@ async fn jwks_handler(headers: HeaderMap, State(state): State<HttpState>) -> Res
                             header::CACHE_CONTROL,
                             format!("public, max-age={JWKS_MAX_AGE_SECS}"),
                         ),
-                        (header::ETAG, cached.etag),
+                        (header::ETAG, document.etag),
                     ],
                 )
                     .into_response();
             }
-            jwks_response(cached.body, cached.etag)
+            jwks_response(document.body, document.etag)
         }
         Err(reason) => {
             warn!(%reason, "JWKS request failed");
@@ -435,17 +435,15 @@ fn jwks_response(body: Vec<u8>, etag: String) -> Response {
         .into_response()
 }
 
-async fn cached_or_build_jwks(state: &BrokerState) -> Result<crate::state::CachedJwks, String> {
-    if let Some(cached) = state.cached_jwks() {
-        return Ok(cached);
-    }
-    let generation = state.active_generation_id();
+struct JwksDocument {
+    body: Vec<u8>,
+    etag: String,
+}
+
+async fn build_jwks_document(state: &BrokerState) -> Result<JwksDocument, String> {
     let body = build_jwks(state).await?;
     let etag = etag_for(&body);
-    state.cache_jwks(generation, body, etag);
-    state
-        .cached_jwks()
-        .ok_or_else(|| "jwks cache unavailable".to_string())
+    Ok(JwksDocument { body, etag })
 }
 
 /// A strong `ETag` derived from the response body (`"<hex sha256>"`).
@@ -859,6 +857,7 @@ mod tests {
     mod live_path {
         use std::collections::BTreeMap;
         use std::sync::Arc;
+        use std::sync::Mutex;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
         use async_trait::async_trait;
@@ -888,7 +887,7 @@ mod tests {
         /// so a test can assert the live path NEVER touched a private/secret seam.
         struct PubKeysBackend {
             /// version → SPKI-DER public-key bytes (RSA), served by `public_keys`.
-            versions: BTreeMap<u32, Vec<u8>>,
+            versions: Mutex<BTreeMap<u32, Vec<u8>>>,
             /// Count of `public_keys` calls (asserts the live path read the
             /// public map and how many issuers it fanned out to).
             public_keys_calls: AtomicUsize,
@@ -901,7 +900,7 @@ mod tests {
         impl PubKeysBackend {
             fn new(versions: BTreeMap<u32, Vec<u8>>) -> Arc<Self> {
                 Arc::new(Self {
-                    versions,
+                    versions: Mutex::new(versions),
                     public_keys_calls: AtomicUsize::new(0),
                     forbidden_called: AtomicBool::new(false),
                     fail: false,
@@ -910,11 +909,15 @@ mod tests {
 
             fn failing() -> Arc<Self> {
                 Arc::new(Self {
-                    versions: BTreeMap::new(),
+                    versions: Mutex::new(BTreeMap::new()),
                     public_keys_calls: AtomicUsize::new(0),
                     forbidden_called: AtomicBool::new(false),
                     fail: true,
                 })
+            }
+
+            fn set_versions(&self, versions: BTreeMap<u32, Vec<u8>>) {
+                *self.versions.lock().expect("versions lock") = versions;
             }
 
             fn forbidden(&self) {
@@ -942,7 +945,7 @@ mod tests {
                 if self.0.fail {
                     return Err(BackendError::Backend(SECRET_BACKEND_ERROR.into()));
                 }
-                Ok(self.0.versions.clone())
+                Ok(self.0.versions.lock().expect("versions lock").clone())
             }
             // ---- forbidden on the JWKS path: any call is a leak of intent. ----
             async fn public_key(&self, _key_id: &str) -> Result<Vec<u8>, BackendError> {
@@ -1541,6 +1544,78 @@ mod tests {
             assert!(
                 response_body(second).await.is_empty(),
                 "conditional JWKS hit returns 304 without a body"
+            );
+        }
+
+        /// Out-of-band backend rotation must be visible on the very next JWKS
+        /// fetch. The catalog generation does not change in this scenario, so a
+        /// generation-keyed in-process cache would stale-serve v1 here.
+        #[tokio::test]
+        async fn jwks_handler_rebuilds_after_backend_rotation_without_waiting() {
+            let kid_of = |der: &[u8]| -> String {
+                let body = crate::minter::jwt_svid_jwks_from_public_key(der, SvidAlg::Rs256)
+                    .expect("single-key jwks");
+                kids(&body).first().cloned().expect("one kid")
+            };
+
+            let der_v1 = rsa_public_der();
+            let der_v2 = rsa_public_der();
+            let kid_v1 = kid_of(&der_v1);
+            let kid_v2 = kid_of(&der_v2);
+            assert_ne!(kid_v1, kid_v2, "distinct public keys yield distinct kids");
+
+            let rsa = PubKeysBackend::new(BTreeMap::from([(1, der_v1.clone())]));
+            let other = PubKeysBackend::failing();
+            let state = state_with_grace(
+                catalog_from_json(SELECTION_CATALOG),
+                vec![("rsa", Arc::clone(&rsa)), ("other", Arc::clone(&other))],
+                1,
+            );
+            let app = router(Arc::new(state), JwksHttpConfig::default());
+
+            let first = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(JWKS_PATH)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("router does not panic");
+            assert_eq!(first.status(), StatusCode::OK);
+            let first_etag = first.headers().get(header::ETAG).cloned().expect("etag");
+            assert_eq!(
+                kids(response_body(first).await.as_bytes()),
+                vec![kid_v1.clone()]
+            );
+
+            rsa.set_versions(BTreeMap::from([(1, der_v1), (2, der_v2)]));
+
+            let second = app
+                .oneshot(
+                    Request::builder()
+                        .uri(JWKS_PATH)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("router does not panic");
+            assert_eq!(second.status(), StatusCode::OK);
+            assert_ne!(
+                second.headers().get(header::ETAG),
+                Some(&first_etag),
+                "rotated JWKS gets a new content-derived ETag"
+            );
+            let mut got = kids(response_body(second).await.as_bytes());
+            got.sort();
+            let mut want = vec![kid_v1, kid_v2];
+            want.sort();
+            assert_eq!(got, want, "v1 and v2 publish immediately after rotation");
+            assert_eq!(
+                rsa.public_keys_calls.load(Ordering::SeqCst),
+                2,
+                "each JWKS request reads the live public key map"
             );
         }
 

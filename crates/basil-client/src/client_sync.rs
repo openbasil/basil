@@ -161,10 +161,24 @@ impl BlockingClient {
         key_id: &str,
         sub: &str,
         ttl_secs: Option<u64>,
-        claims: serde_json::Value,
+        claims: impl serde::Serialize,
     ) -> Result<MintedJwt> {
         self.runtime
             .block_on(self.inner.mint_jwt(key_id, sub, ttl_secs, claims))
+    }
+
+    /// Mint a generic JWT credential from pre-encoded additional claim JSON.
+    pub fn mint_jwt_json(
+        &mut self,
+        key_id: &str,
+        sub: &str,
+        ttl_secs: Option<u64>,
+        extra_claims_json: impl Into<Vec<u8>>,
+    ) -> Result<MintedJwt> {
+        self.runtime.block_on(
+            self.inner
+                .mint_jwt_json(key_id, sub, ttl_secs, extra_claims_json),
+        )
     }
 
     /// Mint a NATS user JWT signed by an account key held by Basil.
