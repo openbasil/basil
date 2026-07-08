@@ -6,7 +6,14 @@ SPDX-License-Identifier: Apache-2.0
 
 # Changelog
 
-## 0.7.0 2026-07-07
+## Unreleased
+
+### Packaging fixes
+
+- packaging/arch: include both binaries
+- packaging/nix: add man pages
+
+## 0.7.0
 
 ### Breaking api changes
 
