@@ -72,6 +72,9 @@ st:
     jj status
     git -C clients/go status -s
 
+clean:
+    rm -rf target examples/*/target
+    
 # Run the full default Rust test suite.
 test-rust:
     cargo test --workspace
