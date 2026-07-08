@@ -21,6 +21,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures 0.2.17",
+ "zeroize",
 ]
 
 [[package]]
@@ -35,6 +36,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -220,8 +222,9 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "basil"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
+ "aes",
  "aes-gcm",
  "basil-cose",
  "basil-proto",
@@ -245,8 +248,9 @@ dependencies = [
 
 [[package]]
 name = "basil-cose"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
+ "aes",
  "aes-gcm",
  "chacha20poly1305",
  "ed25519-dalek",
@@ -277,7 +281,7 @@ dependencies = [
 
 [[package]]
 name = "basil-nats"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "base64",
  "crypto_secretbox",
@@ -294,7 +298,7 @@ dependencies = [
 
 [[package]]
 name = "basil-proto"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "prost",
  "prost-types",
@@ -303,6 +307,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "zeroize",
 ]
 
 [[package]]

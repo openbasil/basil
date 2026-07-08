@@ -54,7 +54,7 @@ cleanup() {
     fi
   done
 }
-trap cleanup EXIT
+trap 'st=$?; cleanup; [[ $st -ne 0 ]] && echo "FAIL (exit $st)" >&2; exit $st' EXIT
 
 wait_for_file_socket() {
   local path="$1" log="$2" pid="$3"
@@ -199,7 +199,8 @@ TOML
 }
 
 main() {
-  need bao
+  BAO="$(command -v bao || command -v vault || true)"
+  [[ -n "$BAO" ]] || { echo "missing required command: bao (or vault)" >&2; exit 1; }
   need nats-server
 
   rm -rf "$WORKDIR"
@@ -209,6 +210,8 @@ main() {
   echo "== build =="
   if [[ -n "${BASIL_BIN:-}" ]]; then
     BASIL="$BASIL_BIN"
+  elif command -v basil >/dev/null 2>&1; then
+    BASIL="$(command -v basil)"
   else
     cargo build --manifest-path "$ROOT/Cargo.toml" -p basil-bin --bin basil >/dev/null
     BASIL="$ROOT/target/debug/basil"
@@ -218,27 +221,27 @@ main() {
 
   echo "== openbao =="
   LISTEN="${VAULT_ADDR#http://}"
-  bao server -dev -dev-root-token-id="$VAULT_TOKEN" -dev-listen-address="$LISTEN" \
+  "$BAO" server -dev -dev-root-token-id="$VAULT_TOKEN" -dev-listen-address="$LISTEN" \
     >"$BAO_LOG" 2>&1 &
   BAO_PID="$!"
   for _ in $(seq 1 80); do
-    VAULT_ADDR="$VAULT_ADDR" VAULT_TOKEN="$VAULT_TOKEN" bao status >/dev/null 2>&1 && break
+    VAULT_ADDR="$VAULT_ADDR" VAULT_TOKEN="$VAULT_TOKEN" "$BAO" status >/dev/null 2>&1 && break
     sleep 0.1
   done
-  VAULT_ADDR="$VAULT_ADDR" VAULT_TOKEN="$VAULT_TOKEN" bao status >/dev/null
+  VAULT_ADDR="$VAULT_ADDR" VAULT_TOKEN="$VAULT_TOKEN" "$BAO" status >/dev/null
   export VAULT_ADDR VAULT_TOKEN
 
-  bao secrets enable transit >/dev/null 2>&1 || true
+  "$BAO" secrets enable transit >/dev/null 2>&1 || true
 
-  bao policy write basil-cose-nats-telemetry - >/dev/null <<'HCL'
+  "$BAO" policy write basil-cose-nats-telemetry - >/dev/null <<'HCL'
 path "transit/*" { capabilities = ["create", "read", "update", "delete", "list"] }
 HCL
-  bao auth enable approle >/dev/null 2>&1 || true
-  bao write auth/approle/role/basil-cose-nats-telemetry \
+  "$BAO" auth enable approle >/dev/null 2>&1 || true
+  "$BAO" write auth/approle/role/basil-cose-nats-telemetry \
     token_policies=basil-cose-nats-telemetry \
     token_ttl=1h token_max_ttl=4h >/dev/null
-  role_id="$(bao read -field=role_id auth/approle/role/basil-cose-nats-telemetry/role-id)"
-  bao write -f -field=secret_id auth/approle/role/basil-cose-nats-telemetry/secret-id \
+  role_id="$("$BAO" read -field=role_id auth/approle/role/basil-cose-nats-telemetry/role-id)"
+  "$BAO" write -f -field=secret_id auth/approle/role/basil-cose-nats-telemetry/secret-id \
     >"$APPROLE_SECRET_FILE"
   chmod 600 "$APPROLE_SECRET_FILE"
 

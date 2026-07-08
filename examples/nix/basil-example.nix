@@ -91,9 +91,10 @@ let
     };
   };
 
+  # No `schemaVersion` here: the `services.basil.policy` option set does not
+  # declare one (nix/basil-agent.nix stamps `schemaVersion = 2` when it projects
+  # the policy to JSON), so the direct `run` path below stamps it the same way.
   policy = {
-    schemaVersion = 2;
-
     # Named subjects: each maps a stable name to a typed principal selector, here
     # a Unix uid proven by `SO_PEERCRED`. Rules below grant to these names.
     subjects = {
@@ -219,7 +220,9 @@ let
     backends = builtins.mapAttrs (_: projectBackend) catalog.backends;
   };
   catalogJson = pkgs.writeText "basil-example-catalog.json" (builtins.toJSON projectedCatalog);
-  policyJson = pkgs.writeText "basil-example-policy.json" (builtins.toJSON policy);
+  policyJson = pkgs.writeText "basil-example-policy.json" (
+    builtins.toJSON (policy // { schemaVersion = 2; })
+  );
 
   # `--transit-mount` and `--strict-bundle-perms` are no longer `basil agent` CLI
   # flags; they are TOML startup-config settings. This minimal config carries

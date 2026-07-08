@@ -48,7 +48,7 @@ need() {
 }
 
 bao_cmd() {
-  VAULT_ADDR="$VAULT_ADDR" VAULT_TOKEN="$VAULT_TOKEN" bao "$@"
+  VAULT_ADDR="$VAULT_ADDR" VAULT_TOKEN="$VAULT_TOKEN" "$BAO" "$@"
 }
 
 cleanup() {
@@ -58,7 +58,7 @@ cleanup() {
     fi
   done
 }
-trap cleanup EXIT
+trap 'st=$?; cleanup; [[ $st -ne 0 ]] && echo "FAIL (exit $st)" >&2; exit $st' EXIT
 
 wait_for_file_socket() {
   local path="$1" log="$2" pid="$3"
@@ -262,7 +262,8 @@ TOML
 }
 
 main() {
-  need bao
+  BAO="$(command -v bao || command -v vault || true)"
+  [[ -n "$BAO" ]] || { echo "missing required command: bao (or vault)" >&2; exit 1; }
   need nats-server
   need cargo
 
@@ -273,12 +274,16 @@ main() {
   echo "== build =="
   if [[ -n "${BASIL_BIN:-}" ]]; then
     BASIL="$BASIL_BIN"
+  elif command -v basil >/dev/null 2>&1; then
+    BASIL="$(command -v basil)"
   else
     cargo build --manifest-path "$ROOT/Cargo.toml" -p basil-bin --bin basil >/dev/null
     BASIL="$ROOT/target/debug/basil"
   fi
   if [[ -n "${BASIL_NATS_BRIDGE_BIN:-}" ]]; then
     BRIDGE="$BASIL_NATS_BRIDGE_BIN"
+  elif command -v basil-nats-bridge >/dev/null 2>&1; then
+    BRIDGE="$(command -v basil-nats-bridge)"
   else
     cargo build --manifest-path "$ROOT/Cargo.toml" -p basil-nats-bridge --bin basil-nats-bridge >/dev/null
     BRIDGE="$ROOT/target/debug/basil-nats-bridge"
@@ -289,7 +294,7 @@ main() {
 
   echo "== openbao =="
   LISTEN="${VAULT_ADDR#http://}"
-  env -u VAULT_TOKEN bao server -dev -dev-root-token-id="$VAULT_TOKEN" -dev-listen-address="$LISTEN" >"$BAO_LOG" 2>&1 &
+  env -u VAULT_TOKEN "$BAO" server -dev -dev-root-token-id="$VAULT_TOKEN" -dev-listen-address="$LISTEN" >"$BAO_LOG" 2>&1 &
   BAO_PID="$!"
   for _ in $(seq 1 80); do
     bao_cmd status >/dev/null 2>&1 && break

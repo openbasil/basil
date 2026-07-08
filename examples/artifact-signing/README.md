@@ -51,7 +51,7 @@ even though the key exists and the process is otherwise authenticated.
 
 ## Prerequisites
 
-- [`bao`](https://openbao.org) (OpenBao) on `PATH`
+- [`bao`](https://openbao.org) (OpenBao) or [`vault`](https://developer.hashicorp.com/vault) on `PATH`
 - `cargo` (the script builds the `basil` agent and this example)
 
 ## How to run

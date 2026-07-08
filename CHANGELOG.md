@@ -8,6 +8,23 @@ SPDX-License-Identifier: Apache-2.0
 
 ## Unreleased
 
+### Example fixes
+
+- Go examples now all run without being nested as a submodule under the basil repo.
+
+- examples/*/run.sh and clients/go/examples/*/run.sh: consistent binary resolution:
+  check BASIL_BIN/BASIL_NATS_BRIDGE_BIN, then check path. Example scripts
+  now all use consistent failure handling: print FAIL to stderr and exit non-zero.
+
+- example run.sh scripts work with either `bao` or `vault`: they use `bao`
+  from `PATH` when present, else `vault`.
+
+- examples/nix: `basil-example.nix` no longer sets `policy.schemaVersion` on the
+  attrset it feeds into `services.basil.policy` (the option set declares no such
+  option, so importing the example `module` failed NixOS evaluation);
+  `schemaVersion = 2` is now stamped only in the direct-run JSON projection,
+  matching what `nix/basil-agent.nix` does.
+
 ### Packaging fixes
 
 - packaging/arch: include both binaries

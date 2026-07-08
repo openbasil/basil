@@ -67,7 +67,7 @@ side by side.
 
 ## Prerequisites
 
-- [`bao`](https://openbao.org) (OpenBao) and
+- [`bao`](https://openbao.org) (OpenBao) or [`vault`](https://developer.hashicorp.com/vault), and
   [`nats-server`](https://nats.io) on `PATH`
 - `cargo` (the script builds the `basil` agent and this example)
 

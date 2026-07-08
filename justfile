@@ -67,6 +67,19 @@ check:
     fd -e rs -x rustfmt --edition 2024
     typos
 
+# Run all examples
+# before running, either
+#    set BASIL_BIN and BASIL_NATS_BRIDGE_BIN
+#    or ensure `basil` and `basil-nats-bridge` are in your PATH
+run-examples:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    for script in examples/*/run.sh; do
+      echo "== running ${script}"
+      (cd "$(dirname "${script}")" && ./run.sh)
+    done
+
 # check status here and submodule
 st:
     jj status

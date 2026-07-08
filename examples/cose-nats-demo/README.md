@@ -45,7 +45,7 @@ any of these optional settings:
 - `BASIL_NATS_BRIDGE_BIN` (path to a prebuilt `basil-nats-bridge`; otherwise
   built from the repo root)
 
-Required commands on `PATH`: `bao`, `nats-server`, and `cargo`.
+Required commands on `PATH`: `bao` (or `vault`), `nats-server`, and `cargo`.
 
 ## Expected output
 

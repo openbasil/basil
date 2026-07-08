@@ -6,6 +6,8 @@
 
 set -euo pipefail
 
+trap 'st=$?; [[ $st -ne 0 ]] && echo "FAIL (exit $st)" >&2; exit $st' EXIT
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
@@ -52,9 +54,15 @@ make_secret_files() {
 
 build_binary() {
   # Prefer a prebuilt binary when BASIL_BIN is exported (e.g. an all-features
-  # broker); otherwise build basil-bin with the db-keystore backend feature.
+  # broker), then any basil on PATH (release/default builds carry the
+  # db-keystore feature); otherwise build basil-bin with the db-keystore
+  # backend feature.
   if [[ -n "${BASIL_BIN:-}" ]]; then
     BASIL="$BASIL_BIN"
+    return
+  fi
+  if command -v basil >/dev/null 2>&1; then
+    BASIL="$(command -v basil)"
     return
   fi
   cargo build \
@@ -93,7 +101,8 @@ start_agent() {
     --config "$BASIL_EXAMPLE_CONFIG" \
     >"$BASIL_EXAMPLE_AGENT_LOG" 2>&1 &
   AGENT_PID="$!"
-  trap 'kill "$AGENT_PID" >/dev/null 2>&1 || true' EXIT
+  # Replaces the top-of-script EXIT trap, so it must keep the FAIL convention.
+  trap 'st=$?; kill "$AGENT_PID" >/dev/null 2>&1 || true; [[ $st -ne 0 ]] && echo "FAIL (exit $st)" >&2; exit $st' EXIT
 
   for _ in $(seq 1 100); do
     if [[ -S "$BASIL_EXAMPLE_SOCKET" ]]; then
