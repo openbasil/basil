@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Changelog
 
-## Unreleased
+## 0.7.0 2026-07-07
 
 ### Breaking api changes
 

@@ -6,6 +6,8 @@ SPDX-License-Identifier: Apache-2.0
 
 # 🌿 Basil
 
+[![GitHub release](https://img.shields.io/github/v/release/openbasil/basil)](https://github.com/openbasil/basil/releases/latest)
+
 **Broker for Attestation, Secrets, Identity & Leases**
 
 Basil is a small agent that gives the workloads on a host identity, secrets,
