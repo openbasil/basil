@@ -480,9 +480,10 @@ jobs:
         run: gh release upload "${{ needs.plan.outputs.tag }}" "${{ steps.deb.outputs.path }}" --clobber
 
   # Arch Linux .pkg.tar.zst for x86_64 and aarch64, each built from the PUBLISHED
-  # release archive of that arch inside an Arch container (dist has no native Arch
-  # support). x86_64 uses the official `archlinux` image; aarch64 builds natively
-  # on an arm64 runner in an Arch Linux ARM image. The PKGBUILD lives at
+  # basil-bin and basil-nats-bridge release archives of that arch inside an Arch
+  # container (dist has no native Arch support). x86_64 uses the official
+  # `archlinux` image; aarch64 builds natively on an arm64 runner in an Arch
+  # Linux ARM image. The PKGBUILD lives at
   # packaging/arch/PKGBUILD; CI patches pkgver from the tag and runs `updpkgsums`
   # so the per-arch sha256 matches the real release tarball (correct sha256
   # handling -- no blind 'SKIP'). AUR publication is a separate MANUAL step that
@@ -524,8 +525,8 @@ jobs:
         env:
           PKGVER: ${{ steps.ver.outputs.version }}
         # makepkg refuses to run as root, so we create an unprivileged `builder`
-        # user. `updpkgsums` downloads the release tarball and rewrites the
-        # sha256sums in PKGBUILD before makepkg re-downloads and verifies it.
+        # user. `updpkgsums` downloads the release tarballs and rewrites the
+        # sha256sums in PKGBUILD before makepkg re-downloads and verifies them.
         # makepkg picks source_<CARCH> for the container's native arch (x86_64 on
         # the official image, aarch64 on the Arch Linux ARM image), so no CARCH
         # override is needed. `sudo` is installed explicitly since the ARM base
