@@ -112,11 +112,19 @@ vulnerabilities.
 
 [Feature matrix and Roadmap](https://docs.openbasil.org/reference/feature-matrix/)
 
-Basil is pre-1.0 (currently 0.7.x) and under active development. The wire
-protocol and config formats can still change between minor versions; breaking
-changes are called out in the [CHANGELOG](CHANGELOG.md). It runs on Linux;
-the Unix-socket-plus-`SO_PEERCRED` design is load-bearing, so other platforms
-are not a near-term goal.
+Basil is pre-1.0 (currently 0.7.x) and under active development.
+All changes are documented in [CHANGELOG.md](CHANGELOG.md).
+
+Basil is committed to following Rust SEMVER conventions: any breaking api change or wire
+protocol change will incur at least a minor version update, e.g. 0.7.x -> 0.8.0;
+patch updates and `cargo update` should always be a safe non-breaking update.
+Enable github release notifications to be notified of updates and security patches.
+
+Primary production target platforms: Linux x86_64 (intel/amd), aarch64.
+MacOS (aarch64-darwin) is supported for development.
+Installers for several platforms are on [Releases](https://github.com/openbasil/basil/releases)
+
+---
 
 Not sure Basil fits? The docs include honest
 [comparisons](https://docs.openbasil.org/introduction/comparisons/) with
@@ -125,5 +133,4 @@ managers, including when you should pick those instead.
 
 ## License
 
-Apache-2.0. The repository is [REUSE](https://reuse.software/)-compliant;
-every file carries its license header.
+Apache-2.0. The repository is [REUSE](https://reuse.software/)-compliant.
