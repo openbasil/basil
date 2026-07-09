@@ -46,6 +46,16 @@ gen-release-workflow:
     grep -vF 'allow-dirty = ["ci"]' "$cfg_backup" > "$cfg"
     # Regenerate the dist-owned portion (this DROPS the hand-written jobs) ...
     "${dist_cmd[@]}" generate --mode ci
+    # dist 0.32.0 hardcodes a loose tag trigger ('**[0-9]+.[0-9]+.[0-9]+*') that
+    # also matches package-prefixed tags like `basil-v0.6.1`, which dist parses
+    # as a package tag for a binary-less crate (empty release matrix). Tighten
+    # it to the repo-wide tag convention shared with ci.yml and build.yml:
+    # strict `v{semver}` tags only (prerelease suffixes still match).
+    if ! grep -qF -- "- '**[0-9]+.[0-9]+.[0-9]+*'" "$workflow"; then
+      echo "error: dist tag-trigger glob not found in $workflow; dist changed its template -- update gen-release-workflow" >&2
+      exit 1
+    fi
+    sed -i "s/- '\*\*\[0-9\]+\.\[0-9\]+\.\[0-9\]+\*'/- 'v[0-9]+.[0-9]+.[0-9]+*'/" "$workflow"
     # ... then re-append the hand-written jobs, minus the anchor header.
     tail -n +"$((header_lines + 1))" "$fragment" >> "$workflow"
     # dist emits actions pinned to moving tags (`@v4`); dist 0.32 has no config

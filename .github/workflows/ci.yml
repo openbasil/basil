@@ -8,8 +8,10 @@ name: CI
 #
 # Triggers (mirrors build.yml): this workflow deliberately does NOT run on
 # branch pushes or pull requests. It runs only on:
-#   * push of a `v*` tag whose commit is on `main` -- a guard rejects tags
-#     that are not an ancestor of main; the full architecture matrix runs.
+#   * push of a `v{semver}` release tag (`vN.N.N[-suffix]`, the convention
+#     shared with build.yml and release.yml) whose commit is on `main` -- a
+#     guard rejects tags that are not an ancestor of main; the full
+#     architecture matrix runs.
 #   * manual `workflow_dispatch` -> test one chosen architecture (or `all`).
 #
 # The cargo gates run on every selected architecture. The cross-engine e2e and
@@ -19,7 +21,9 @@ name: CI
 on:
   push:
     tags:
-      - 'v*'
+      # Strict v{semver} (prerelease suffixes match via the trailing `*`):
+      # the same tag convention release.yml and build.yml trigger on.
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
   workflow_dispatch:
     inputs:
       architecture:

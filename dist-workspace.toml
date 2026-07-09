@@ -49,7 +49,10 @@ unix-archive = ".tar.xz"
 tap = "openbasil/homebrew-tap"
 # Release tags must use `v{semver}`. cargo-dist 0.32.0 parses `basil-v0.7.0`
 # as a singular package tag for the `basil` Rust client crate, which has no
-# distributable binaries, so the release matrix comes out empty.
+# distributable binaries, so the release matrix comes out empty. For that
+# reason `just gen-release-workflow` tightens the dist-generated tag trigger
+# in release.yml from dist's loose '**[0-9]+.[0-9]+.[0-9]+*' glob to the
+# strict 'v[0-9]+.[0-9]+.[0-9]+*' convention ci.yml and build.yml share.
 publish-jobs = ["homebrew"]
 # Only run `dist plan` on PRs (no artifact uploads).
 pr-run-mode = "plan"

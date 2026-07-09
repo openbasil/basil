@@ -6,8 +6,9 @@ name: Build
 # this workflow -- bumping rust-toolchain.toml is the single source of truth.
 #
 # Triggers:
-#   * push of a `v*` tag -> build ALL THREE platforms (release build). A
-#     guard rejects tags whose commit is not on `main`.
+#   * push of a `v{semver}` release tag (`vN.N.N[-suffix]`, the convention
+#     shared with ci.yml and release.yml) -> build ALL THREE platforms
+#     (release build). A guard rejects tags whose commit is not on `main`.
 #   * manual `workflow_dispatch` -> build one chosen architecture (or `all`)
 #     from a chosen branch (default `main`).
 # It deliberately does NOT run on branch pushes or pull requests.
@@ -15,7 +16,9 @@ name: Build
 on:
   push:
     tags:
-      - 'v*'
+      # Strict v{semver} (prerelease suffixes match via the trailing `*`):
+      # the same tag convention ci.yml and release.yml trigger on.
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
   workflow_dispatch:
     inputs:
       architecture:
