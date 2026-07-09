@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 2,
+  "roles": {
+    "token-minter": ["mint", "get_public_key"]
+  },
+  "subjects": {
+    "web-service": { "allOf": [ { "kind": "unix", "uid": __UID__ } ] }
+  },
+  "rules": [
+    {
+      "id": "web-service-mints-only",
+      "subjects": ["web-service"],
+      "action": ["role:token-minter"],
+      "target": ["web.signing_key"],
+      "comment": "The service may mint JWTs and fetch the public half, and needs nothing else. No get/sign/rotate: the same uid cannot read the key material even though the key exists."
+    }
+  ],
+  "config": {
+    "names": {
+      "users": {
+        "__UID__": "__USER_NAME__"
+      },
+      "groups": {}
+    },
+    "memberships": {
+      "__UID__": []
+    }
+  }
+}

@@ -807,7 +807,7 @@ dependencies = [
 
 [[package]]
 name = "basil"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm",
@@ -835,7 +835,7 @@ dependencies = [
 
 [[package]]
 name = "basil-bin"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -843,6 +843,7 @@ dependencies = [
  "basil-core",
  "basil-nats",
  "clap",
+ "clap_complete",
  "hex",
  "mimalloc",
  "serde",
@@ -854,7 +855,7 @@ dependencies = [
 
 [[package]]
 name = "basil-core"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm",
@@ -907,6 +908,7 @@ dependencies = [
  "rustls 0.23.41",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
@@ -929,7 +931,7 @@ dependencies = [
 
 [[package]]
 name = "basil-cose"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm",
@@ -947,7 +949,7 @@ dependencies = [
 
 [[package]]
 name = "basil-keystore-backend"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm",
@@ -968,7 +970,7 @@ dependencies = [
 
 [[package]]
 name = "basil-nats"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "base64 0.22.1",
  "crypto_secretbox",
@@ -986,7 +988,7 @@ dependencies = [
 
 [[package]]
 name = "basil-nats-bridge"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -1010,7 +1012,7 @@ dependencies = [
 
 [[package]]
 name = "basil-proto"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "basil-cose",
  "p256",
@@ -1027,7 +1029,7 @@ dependencies = [
 
 [[package]]
 name = "basil-tests"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "async-nats",
  "base64 0.22.1",
@@ -1372,6 +1374,15 @@ dependencies = [
  "anstyle",
  "clap_lex",
  "strsim",
+]
+
+[[package]]
+name = "clap_complete"
+version = "4.6.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db8b397918185f0161ff3d6fcaa9e4bfc09b8367caf6e1d4a2848e5477ed027b"
+dependencies = [
+ "clap",
 ]
 
 [[package]]
@@ -4885,6 +4896,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_yaml"
+version = "0.9.34+deprecated"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
+dependencies = [
+ "indexmap 2.14.0",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
+]
+
+[[package]]
 name = "sha1_smol"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6107,6 +6131,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
+
+[[package]]
 name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6549,7 +6579,7 @@ checksum = "66fee0b777b0f5ac1c69bb06d361268faafa61cd4682ae064a171c16c433e9e4"
 
 [[package]]
 name = "xtask"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "basil-bin",

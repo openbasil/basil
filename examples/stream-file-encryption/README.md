@@ -6,6 +6,10 @@ SPDX-License-Identifier: Apache-2.0
 
 # stream-file-encryption
 
+> **Basil is a host-local secrets broker: your app never touches the key.** The kernel attests who's
+> calling, a default-deny policy decides, the key is used where it lives (OpenBao/Vault, KMS, or a
+> sealed local store), and every operation is audited.
+
 Encrypt a large file with `basil::stream`, where **Basil owns every nonce** and
 the container format is fixed by the library.
 

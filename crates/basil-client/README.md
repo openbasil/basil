@@ -6,6 +6,10 @@ SPDX-License-Identifier: Apache-2.0
 
 # basil (client)
 
+> **Basil is a host-local secrets broker: your app never touches the key.** The kernel attests who's
+> calling, a default-deny policy decides, the key is used where it lives (OpenBao/Vault, KMS, or a
+> sealed local store), and every operation is audited.
+
 The Rust client library for the [Basil broker](https://github.com/openbasil/basil). Your program connects to Basil's local Unix socket
 over gRPC and asks the broker to sign, verify, encrypt, decrypt, mint, or fetch on its behalf. The
 private key never enters your process: Basil attests you from the kernel (`SO_PEERCRED` uid/gid),

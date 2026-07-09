@@ -25,6 +25,12 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Init(args) => agent_cli::run_init(cli.socket.as_deref(), &args),
+        #[cfg(feature = "keystore-backend")]
+        Command::Demo(args) => basil_core::demo::run(&args),
+        Command::Completions(args) => {
+            basil_bin::write_completions(args.shell, &mut std::io::stdout())
+                .map_err(anyhow::Error::from)
+        }
         Command::Agent(args) => agent_cli::run_agent(args, basil_bin::VERSION).await,
         Command::Bundle(command) => agent_cli::run_bundle(*command),
         // Unified `explain`: offline file dry-run by default; `--live` queries the

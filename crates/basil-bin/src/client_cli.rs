@@ -407,7 +407,11 @@ pub enum Command {
     },
 
     /// Print the agent backend, version, and protocol.
-    Status,
+    Status {
+        /// Emit a machine-readable JSON object instead of human lines.
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Liveness probe: is the agent process up and serving the socket? Cheap; the
     /// agent does no backend I/O. Exits 0 when alive, nonzero on a connect/RPC
@@ -652,7 +656,7 @@ async fn dispatch(client: &mut Client, command: Command) -> Result<()> {
             ip_san,
             ttl_secs,
         } => issue_cert(client, &key_id, &common_name, &dns_san, &ip_san, ttl_secs).await,
-        Command::Status => status(client).await,
+        Command::Status { json } => status(client, json).await,
         Command::Health { json } => health(client, json).await,
         Command::Ready { json } => ready(client, json).await,
         Command::Reload { check, json } => reload(client, check, json).await,
@@ -1138,12 +1142,26 @@ fn pem_block(label: &str, der: &[u8]) -> String {
     out
 }
 
-async fn status(client: &mut Client) -> Result<()> {
+async fn status(client: &mut Client, json: bool) -> Result<()> {
     let status = client.status().await?;
-    println!("backend: {}", status.backend);
-    println!("version: {}", status.version);
-    println!("protocol: {}", status.protocol);
+    if json {
+        println!("{}", status_json(&status));
+    } else {
+        println!("backend: {}", status.backend);
+        println!("version: {}", status.version);
+        println!("protocol: {}", status.protocol);
+    }
     Ok(())
+}
+
+/// The stable one-line `--json` object for `basil status`. Pure: lifted out of
+/// [`status`] so the field set is unit-testable without a live broker.
+fn status_json(status: &basil::AgentStatus) -> serde_json::Value {
+    serde_json::json!({
+        "backend": status.backend,
+        "version": status.version,
+        "protocol": status.protocol,
+    })
 }
 
 /// Liveness probe. A returned health response means the agent is alive; we exit
@@ -1427,7 +1445,7 @@ mod tests {
     use super::{
         Command as ClientCommand, KeyMaterial, ManifestEntry, check_import_set, explain_json,
         health_json, key_material, ready_exit_code, ready_json, reload_exit_code, reload_json,
-        revoke_json,
+        revoke_json, status_json,
     };
     use crate::Cli;
     use basil::{
@@ -2148,6 +2166,25 @@ mod tests {
             obj.len(),
             2,
             "health --json carries exactly alive + version"
+        );
+    }
+
+    #[test]
+    fn status_json_shape_is_backend_version_protocol() {
+        let s = basil::AgentStatus {
+            backend: "keystore".to_string(),
+            version: "0.7.1".to_string(),
+            protocol: 1,
+        };
+        let v = status_json(&s);
+        assert_eq!(v["backend"], serde_json::json!("keystore"));
+        assert_eq!(v["version"], serde_json::json!("0.7.1"));
+        assert_eq!(v["protocol"], serde_json::json!(1));
+        let obj = v.as_object().expect("status --json is a JSON object");
+        assert_eq!(
+            obj.len(),
+            3,
+            "status --json carries exactly backend + version + protocol"
         );
     }
 

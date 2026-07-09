@@ -43,6 +43,8 @@ const BACKEND_NAME: &str = "primary";
 /// The least-privilege role granted to the running uid (sign + verify + the
 /// public-key read needed to verify).
 const SIGNER_ROLE: &str = "example-signer";
+/// The migration role `--from-sops` grants over the imported value stubs.
+const SOPS_ROLE: &str = "sops-migrator";
 
 /// `init` subcommand arguments.
 #[derive(Debug, Args)]
@@ -78,6 +80,14 @@ pub struct InitArgs {
     /// command. Only valid with `--unlock passphrase`.
     #[arg(long, value_name = "PATH")]
     passphrase_file: Option<PathBuf>,
+
+    /// Path to an existing sops secrets file (YAML or JSON). Adds one `value`
+    /// catalog entry and a read/write grant per secret found, so a sops-nix
+    /// migration starts from generated stubs instead of hand-authored JSON.
+    /// Only the key NAMES are read; the encrypted values are never touched
+    /// (the printed next-steps show the `sops -d`-to-`basil set` hand-off).
+    #[arg(long, value_name = "PATH")]
+    from_sops: Option<PathBuf>,
 
     /// Overwrite any target file that already exists. Without it, `init` refuses
     /// and reports which files are in the way (no clobber).
@@ -200,8 +210,16 @@ pub fn run(args: &InitArgs, socket: Option<&str>) -> Result<()> {
 
     let uid = current_uid();
 
-    let catalog = build_catalog(args, &layout);
-    let policy = build_policy(uid);
+    let mut catalog = build_catalog(args, &layout);
+    let mut policy = build_policy(uid);
+    let sops_secrets = match args.from_sops.as_deref() {
+        Some(path) => {
+            let secrets = sops_secret_names(path)?;
+            add_sops_entries(&mut catalog, &mut policy, args, &secrets)?;
+            secrets
+        }
+        None => Vec::new(),
+    };
 
     // Serialize the REAL schema/wire types (pretty), then validate the pair
     // through the SAME loader `check`/`run` use: fail closed if the scaffold is
@@ -218,6 +236,9 @@ pub fn run(args: &InitArgs, socket: Option<&str>) -> Result<()> {
     write_file(&layout.config, &config_toml)?;
 
     print_next_steps(args, &layout, uid);
+    if let Some(path) = args.from_sops.as_deref() {
+        print_sops_next_steps(path, &layout, &sops_secrets);
+    }
     Ok(())
 }
 
@@ -544,6 +565,194 @@ fn bundle_init_slot_flag(args: &InitArgs) -> String {
     }
 }
 
+/// One secret discovered in a sops file: the original key path (for the
+/// printed `sops -d --extract` hand-off) and the derived catalog name.
+#[derive(Debug)]
+struct SopsSecret {
+    /// The key path inside the sops document, outermost first.
+    segments: Vec<String>,
+    /// The sanitized dotted catalog key name (`app.db_password`).
+    name: String,
+}
+
+/// Read the secret NAMES out of a sops file (YAML or JSON; YAML is a strict
+/// superset, so one parser covers both). Only the mapping structure is used;
+/// the encrypted values are never interpreted. The top-level `sops` metadata
+/// block is skipped.
+fn sops_secret_names(path: &Path) -> Result<Vec<SopsSecret>> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading sops file {}", path.display()))?;
+    let doc: serde_yaml::Value = serde_yaml::from_str(&raw)
+        .with_context(|| format!("parsing {} as YAML/JSON", path.display()))?;
+    let serde_yaml::Value::Mapping(mapping) = doc else {
+        bail!(
+            "{} is not a mapping at the top level; sops secrets files are key/value documents",
+            path.display()
+        );
+    };
+
+    let mut out = Vec::new();
+    for (key, value) in &mapping {
+        let Some(key) = key.as_str() else { continue };
+        // The sops envelope's own metadata is not a secret.
+        if key == "sops" {
+            continue;
+        }
+        flatten_sops(value, &[key.to_string()], &mut out);
+    }
+    if out.is_empty() {
+        bail!(
+            "{} holds no secrets to import (nothing but the sops metadata block?)",
+            path.display()
+        );
+    }
+    Ok(out)
+}
+
+/// Depth-first flatten: nested mappings extend the dotted name; every other
+/// node (scalar, sequence) is one secret leaf.
+fn flatten_sops(value: &serde_yaml::Value, segments: &[String], out: &mut Vec<SopsSecret>) {
+    if let serde_yaml::Value::Mapping(mapping) = value {
+        for (key, child) in mapping {
+            let Some(key) = key.as_str() else { continue };
+            let mut next = segments.to_vec();
+            next.push(key.to_string());
+            flatten_sops(child, &next, out);
+        }
+        return;
+    }
+    let name = segments
+        .iter()
+        .map(|s| sanitize_sops_segment(s))
+        .collect::<Vec<_>>()
+        .join(".");
+    out.push(SopsSecret {
+        segments: segments.to_vec(),
+        name,
+    });
+}
+
+/// Catalog key names stay on a conservative charset; anything else becomes `-`.
+fn sanitize_sops_segment(segment: &str) -> String {
+    segment
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// Add one `value` catalog entry + a get/set grant per imported sops secret.
+/// Entries are `missing: warn` stubs: the broker boots before the values are
+/// migrated, and `doctor --keys` lists what is still absent.
+fn add_sops_entries(
+    catalog: &mut Catalog,
+    policy: &mut RawPolicy,
+    args: &InitArgs,
+    secrets: &[SopsSecret],
+) -> Result<()> {
+    let backend = catalog
+        .backends
+        .get_mut(BACKEND_NAME)
+        .context("init catalog is missing its own backend (internal bug)")?;
+    if !backend.engines.contains(&Engine::Kv2) {
+        backend.engines.push(Engine::Kv2);
+    }
+
+    for secret in secrets {
+        let slug = secret
+            .segments
+            .iter()
+            .map(|s| sanitize_sops_segment(s))
+            .collect::<Vec<_>>()
+            .join("/");
+        // The backend-native locator: mount-qualified for the vault-family KV
+        // v2 engine, a bare path for the keystore.
+        let path = match args.backend {
+            InitBackend::Openbao | InitBackend::Vault => format!("secret/data/sops/{slug}"),
+            InitBackend::Keystore => format!("sops/{slug}"),
+        };
+        if catalog
+            .keys
+            .insert(
+                secret.name.clone(),
+                KeyEntry {
+                    class: Class::Value,
+                    key_type: None,
+                    backend: BACKEND_NAME.to_string(),
+                    engine: Some(Engine::Kv2),
+                    path,
+                    public_path: None,
+                    writable: true,
+                    missing: MissingPolicy::Warn,
+                    generate: None,
+                    sealing_pin: None,
+                    labels: Labels::default(),
+                    description: format!(
+                        "Imported from sops key `{}` by `basil init --from-sops`; value still \
+                         lives in sops until migrated with `basil set`.",
+                        secret.segments.join(".")
+                    ),
+                },
+            )
+            .is_some()
+        {
+            bail!(
+                "sops import produced the duplicate catalog key `{}` (two sops paths sanitize \
+                 to the same name); rename one in the sops file first",
+                secret.name
+            );
+        }
+    }
+
+    policy
+        .roles
+        .insert(SOPS_ROLE.to_string(), BTreeSet::from([Op::Get, Op::Set]));
+    policy.rules.push(RawRule {
+        id: "sops-migration-read-write".to_string(),
+        subjects: vec!["init.user".to_string()],
+        action: vec![format!("role:{SOPS_ROLE}")],
+        target: secrets.iter().map(|s| s.name.clone()).collect(),
+        comment: Some(
+            "Migration grant: the uid that ran `basil init --from-sops` may write (migrate) \
+             and read the imported secrets. Drop `set` from the role once migration is done."
+                .to_string(),
+        ),
+    });
+    Ok(())
+}
+
+/// Print the per-secret migration hand-off: `sops -d --extract` piped into
+/// `basil set`, so the plaintext only ever transits the operator's shell.
+fn print_sops_next_steps(sops_path: &Path, layout: &Layout, secrets: &[SopsSecret]) {
+    println!();
+    println!(
+        "Imported {} secret name(s) from {} as `value` catalog stubs (missing: warn).",
+        secrets.len(),
+        sops_path.display()
+    );
+    println!("The encrypted values stay in sops until you migrate each one:");
+    println!();
+    for secret in secrets {
+        let mut extract = String::new();
+        for segment in &secret.segments {
+            let _ = write!(extract, "[\"{segment}\"]");
+        }
+        println!(
+            "    basil --socket {} set --key-id {} \"$(sops -d --extract '{extract}' {})\"",
+            layout.socket.display(),
+            secret.name,
+            sops_path.display()
+        );
+    }
+    println!();
+    println!("Then verify with `basil doctor --keys` and retire the sops entries.");
+}
+
 /// Resolve the unix-socket path written into the generated `basil-agent.toml`.
 ///
 /// Precedence, highest first: `explicit` (the global `--socket <path>` flag),
@@ -604,6 +813,7 @@ mod tests {
             addr: "http://127.0.0.1:8200".to_string(),
             transit_mount: "transit".to_string(),
             passphrase_file: None,
+            from_sops: None,
             force: false,
         }
     }
@@ -834,6 +1044,110 @@ mod tests {
             err.to_string().contains("--unlock passphrase"),
             "got: {err}"
         );
+    }
+
+    /// A realistic sops YAML: nested keys flatten to dotted names, the `sops`
+    /// metadata block is skipped, and odd characters sanitize to `-`.
+    #[test]
+    fn sops_names_flatten_skip_metadata_and_sanitize() {
+        let dir = temp_dir();
+        let sops = dir.join("secrets.yaml");
+        std::fs::write(
+            &sops,
+            concat!(
+                "db_password: ENC[AES256_GCM,data:abc,type:str]\n",
+                "app:\n",
+                "  api/token: ENC[AES256_GCM,data:def,type:str]\n",
+                "  nested:\n",
+                "    deep: ENC[AES256_GCM,data:ghi,type:str]\n",
+                "sops:\n",
+                "  kms: []\n",
+                "  lastmodified: \"2026-07-01T00:00:00Z\"\n",
+            ),
+        )
+        .expect("write sops fixture");
+
+        let secrets = sops_secret_names(&sops).expect("parse sops fixture");
+        let names: Vec<&str> = secrets.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["db_password", "app.api-token", "app.nested.deep"]);
+        // The extract path keeps the ORIGINAL segments, not the sanitized ones.
+        let token = secrets.get(1).expect("second secret");
+        assert_eq!(token.segments, ["app", "api/token"]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `--from-sops` catalogs pass the real loader for every backend, carry
+    /// `value`/kv2 stubs with `missing: warn`, and grant get+set to only the
+    /// init user.
+    #[test]
+    fn from_sops_pair_passes_loader_for_every_backend() {
+        for backend in [
+            InitBackend::Openbao,
+            InitBackend::Vault,
+            InitBackend::Keystore,
+        ] {
+            let dir = temp_dir();
+            let sops = dir.join("secrets.yaml");
+            std::fs::write(&sops, "wg_key: ENC[...]\napp:\n  db: ENC[...]\n")
+                .expect("write sops fixture");
+            let args = InitArgs {
+                from_sops: Some(sops.clone()),
+                ..args_for(backend, InitUnlock::Bip39, &dir)
+            };
+            let layout = Layout::new(&dir, None);
+            let mut catalog = build_catalog(&args, &layout);
+            let mut policy = build_policy(4242);
+            let secrets = sops_secret_names(&sops).expect("names");
+            add_sops_entries(&mut catalog, &mut policy, &args, &secrets).expect("augment");
+
+            let entry = catalog.keys.get("app.db").expect("imported entry");
+            assert_eq!(entry.class, Class::Value);
+            assert_eq!(entry.engine, Some(Engine::Kv2));
+            assert_eq!(entry.missing, MissingPolicy::Warn);
+            let backend_ref = catalog.backends.get(BACKEND_NAME).expect("backend");
+            assert!(backend_ref.engines.contains(&Engine::Kv2));
+
+            let catalog_json = serde_json::to_string_pretty(&catalog).expect("ser catalog");
+            let policy_json = serde_json::to_string_pretty(&policy).expect("ser policy");
+            crate::load(&catalog_json, &policy_json)
+                .unwrap_or_else(|e| panic!("{backend:?} sops pair must load clean: {e}"));
+
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// Two sops paths sanitizing to one catalog name is an error, not a silent
+    /// overwrite.
+    #[test]
+    fn from_sops_rejects_colliding_names() {
+        let dir = temp_dir();
+        let sops = dir.join("secrets.yaml");
+        std::fs::write(&sops, "a/b: ENC[...]\na-b: ENC[...]\n").expect("write sops fixture");
+        let args = InitArgs {
+            from_sops: Some(sops.clone()),
+            ..args_for(InitBackend::Keystore, InitUnlock::Bip39, &dir)
+        };
+        let layout = Layout::new(&dir, None);
+        let mut catalog = build_catalog(&args, &layout);
+        let mut policy = build_policy(4242);
+        let secrets = sops_secret_names(&sops).expect("names");
+        let err = add_sops_entries(&mut catalog, &mut policy, &args, &secrets)
+            .expect_err("collision must be rejected");
+        assert!(err.to_string().contains("duplicate catalog key"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A sops file with nothing but the metadata block imports nothing and
+    /// says so.
+    #[test]
+    fn from_sops_rejects_metadata_only_files() {
+        let dir = temp_dir();
+        let sops = dir.join("secrets.yaml");
+        std::fs::write(&sops, "sops:\n  kms: []\n").expect("write sops fixture");
+        let err = sops_secret_names(&sops).expect_err("metadata-only file must be rejected");
+        assert!(err.to_string().contains("no secrets"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -10,6 +10,10 @@ SPDX-License-Identifier: Apache-2.0
 
 **Broker for Attestation, Secrets, Identity & Leases**
 
+> **Basil is a host-local secrets broker: your app never touches the key.** The kernel attests who's
+> calling, a default-deny policy decides, the key is used where it lives (OpenBao/Vault, KMS, or a
+> sealed local store), and every operation is audited.
+
 Basil is a small agent that gives the workloads on a host identity, secrets,
 signatures, and short-lived credentials, without putting private keys in their
 hands. Keys stay inside the backend (OpenBao, HashiCorp Vault, AWS KMS, GCP
@@ -32,41 +36,49 @@ A service can sign a release, terminate TLS, mint a short-lived JWT, or decrypt
 a backup, while the private key never appears in its memory, its environment,
 or on its disk.
 
-[![asciicast](https://asciinema.org/a/Dwz9uMVw6y1IfP6U.svg)](https://asciinema.org/a/Dwz9uMVw6y1IfP6U)
+[![asciicast](https://asciinema.org/a/NJFB7lDcdoU9mx4Y.svg)](https://asciinema.org/a/NJFB7lDcdoU9mx4Y)
 
-## Try it in two minutes
+## Try it in sixty seconds
 
-The repository ships a self-contained example that needs no external backend.
-It uses the built-in `db-keystore` backend (encrypted SQLite file using turso).
+`basil demo` is a one-command guided tour with **no external backend, no
+config authoring, and nothing else to install**. It scaffolds a throwaway
+broker on the built-in `db-keystore` backend (one encrypted SQLite file),
+starts it, and then signs, verifies, encrypts, and mints a short-lived JWT
+through it. It also runs one operation the policy denies, and shows
+`basil explain` producing the receipt for the denial and the audit event that
+recorded it. Every step is printed as a copy-paste command.
 
 ```sh
-git clone https://github.com/openbasil/basil
-cd basil
-examples/db-keystore/run.sh
+nix run github:openbasil/basil -- demo   # zero-install path
+# or, with basil installed:
+basil demo
 ```
 
-The script builds the binary, seals a credential bundle, starts the broker on
-a throwaway socket, and then signs, verifies, encrypts, decrypts, and mints a
-JWT through it. Read the script to see there is no magic: it is the same CLI
-you would use in production.
-
-From there, the [quickstart](https://docs.openbasil.org/getting-started/quickstart/)
-walks through the same loop against OpenBao, and
+The demo ends with "try it yourself" commands against its still-scaffolded
+workdir. From there, the
+[quickstart](https://docs.openbasil.org/getting-started/quickstart/) walks the
+same loop against OpenBao, `basil init` scaffolds a starter set for your own
+broker, and
 [make it your own](https://docs.openbasil.org/getting-started/make-it-your-own/)
 covers writing your own catalog and policy.
 
 ## Install
 
-- **Nix**: `nix run github:openbasil/basil` runs the CLI directly, or
-  `nix profile install github:openbasil/basil` to keep it. A NixOS module is
-  included under `nix/`.
-- **From source**: `cargo build --release -p basil-bin` produces
-  `target/release/basil`. The toolchain is pinned by `rust-toolchain.toml`,
-  so rustup picks the right compiler automatically.
-- **Signed release binaries** land with the first tagged public release, along
-  with deb and Arch packages. Release artifacts carry GitHub artifact
-  attestations; verify a download with
-  `gh attestation verify <file> --repo openbasil/basil`.
+| Method        | Command                                                                                                    |
+| ------------- | ---------------------------------------------------------------------------------------------------------- |
+| Nix           | `nix run github:openbasil/basil` (or `nix profile install github:openbasil/basil`)                         |
+| Homebrew      | `brew install openbasil/tap/basil`                                                                         |
+| Debian/Ubuntu | `.deb` from the [latest release](https://github.com/openbasil/basil/releases/latest)                       |
+| Arch          | `.pkg.tar.zst` from the [latest release](https://github.com/openbasil/basil/releases/latest) (`basil-bin`) |
+| Cargo         | `cargo install basil-bin`                                                                                  |
+| From source   | `cargo build --release -p basil-bin` (toolchain pinned by `rust-toolchain.toml`)                           |
+
+Release artifacts are built in CI and carry GitHub artifact attestations;
+verify a download with `gh attestation verify <file> --repo openbasil/basil`.
+The deb, Arch, and Nix packages ship man pages and bash/zsh/fish completions
+(`basil completions <shell>` generates them anywhere else). A NixOS module is
+included under `nix/`, and `nix build .#basil-oci-thin` builds a
+`docker load`-ready container image.
 
 See [installation](https://docs.openbasil.org/getting-started/installation/)
 for details and backend prerequisites.
@@ -100,7 +112,7 @@ vulnerabilities.
 
 [Feature matrix and Roadmap](https://docs.openbasil.org/reference/feature-matrix/)
 
-Basil is pre-1.0 (currently 0.6.x) and under active development. The wire
+Basil is pre-1.0 (currently 0.7.x) and under active development. The wire
 protocol and config formats can still change between minor versions; breaking
 changes are called out in the [CHANGELOG](CHANGELOG.md). It runs on Linux;
 the Unix-socket-plus-`SO_PEERCRED` design is load-bearing, so other platforms

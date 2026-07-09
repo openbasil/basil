@@ -18,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["info@openbasil.org"]
@@ -27,14 +27,14 @@ homepage = "https://github.com/openbasil/basil"
 documentation = "https://docs.openbasil.org"
 
 [workspace.dependencies]
-basil = { version = "0.7.0", path = "crates/basil-client" }
-basil-cose = { version = "0.7.0", path = "crates/basil-cose" }
-basil-proto = { version = "0.7.0", path = "crates/basil-proto" }
-basil-nats = { version = "0.7.0", path = "crates/basil-nats" }
-basil-nats-bridge = { version = "0.7.0", path = "crates/basil-nats-bridge" }
-basil-keystore-backend = { version = "0.7.0", path = "crates/basil-keystore-backend" }
-basil-core = { version = "0.7.0", path = "crates/basil-core", default-features = false }
-basil-bin = { version = "0.7.0", path = "crates/basil-bin" }
+basil = { version = "0.7.1", path = "crates/basil-client" }
+basil-cose = { version = "0.7.1", path = "crates/basil-cose" }
+basil-proto = { version = "0.7.1", path = "crates/basil-proto" }
+basil-nats = { version = "0.7.1", path = "crates/basil-nats" }
+basil-nats-bridge = { version = "0.7.1", path = "crates/basil-nats-bridge" }
+basil-keystore-backend = { version = "0.7.1", path = "crates/basil-keystore-backend" }
+basil-core = { version = "0.7.1", path = "crates/basil-core", default-features = false }
+basil-bin = { version = "0.7.1", path = "crates/basil-bin" }
 
 # `aes` is depended on directly (alongside aes-gcm's own `zeroize` feature, which
 # only scrubs the GHASH key) so its `zeroize` feature zeroizes AES round-key
@@ -62,6 +62,7 @@ bytes = "1"
 # `zeroize` dependency is non-optional), so no feature flag is needed.
 chacha20poly1305 = { version = "0.10", default-features = false }
 clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
 crypto_secretbox = { version = "0.1.1", default-features = false, features = ["alloc", "salsa20"] }
 data-encoding = { version = "2", default-features = false, features = ["alloc"] }
 db-keystore = "0.4.3"
@@ -117,6 +118,10 @@ rustls = { version = "0.23.41", default-features = false, features = ["ring", "s
 salsa20 = { version = "0.10", features = ["zeroize"] }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
 serde_bytes = "0.11"
+# `basil init --from-sops`: reads key NAMES out of an existing sops secrets
+# file (YAML or JSON; YAML is a superset so one parser covers both). Values
+# stay encrypted and are never parsed as secrets.
+serde_yaml = "0.9"
 serde_json = { version = "1", default-features = false, features = ["alloc", "arbitrary_precision"] }
 sha2 = { version = "0.10", default-features = false }
 sha3 = { version = "0.10", default-features = false }

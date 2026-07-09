@@ -45,6 +45,8 @@ pub(crate) fn ensure_crypto_provider() {
 pub mod agent_cli;
 pub mod bundle_cli;
 pub mod core;
+#[cfg(feature = "keystore-backend")]
+pub mod demo;
 pub mod doctor;
 pub mod init;
 pub mod service;

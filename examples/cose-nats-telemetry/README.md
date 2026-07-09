@@ -6,6 +6,10 @@ SPDX-License-Identifier: Apache-2.0
 
 # cose-nats-telemetry
 
+> **Basil is a host-local secrets broker: your app never touches the key.** The kernel attests who's
+> calling, a default-deny policy decides, the key is used where it lives (OpenBao/Vault, KMS, or a
+> sealed local store), and every operation is audited.
+
 Two services exchange **COSE-signed telemetry over NATS** using nothing but
 Basil-minted **leases** and **in-place signatures**. No long-lived secret is
 ever held by either service.

@@ -6,7 +6,58 @@ SPDX-License-Identifier: Apache-2.0
 
 # Changelog
 
-## Unreleased
+## 0.7.1 2026-07-08
+
+### `basil demo`: a zero-dependency guided tour
+
+- New `basil demo` subcommand: one command, no external backend, no config
+  authoring. It scaffolds a throwaway workdir on the built-in db-keystore
+  backend, seals the credential bundle, starts the broker on a temp socket,
+  and drives a scripted sequence: status → list → sign → verify → a
+  deliberately DENIED `get` → `basil explain` for the deny and the allow →
+  encrypt → mint-jwt → the audit trail (one JSON event per decision). Every
+  step prints as a copy-paste command, and the run ends with "try it
+  yourself" commands against the still-scaffolded workdir. `--paced` adds
+  human pacing for watching/recording; `--dir`/`--force` control the workdir
+  (wiped only when it carries the demo's marker file). The screencast in
+  `basil.demo/` is now simply a recording of `basil demo --paced`.
+
+### CLI additions
+
+- `basil completions bash|zsh|fish` prints a shell completion script;
+  the deb, Arch, and Nix packages now install completions for all three
+  shells (deb also keeps shipping man pages; Nix gzips pages as before).
+- `basil status --json` emits the stable one-line JSON object pattern that
+  `health`/`ready`/`explain`/`doctor` already support.
+- `basil init --from-sops <secrets.yaml>` imports the key NAMES from an
+  existing sops secrets file (YAML or JSON) and generates one `value`/kv2
+  catalog stub per secret (`missing: warn`) plus a scoped `sops-migrator`
+  get+set grant, then prints the per-secret `sops -d`-to-`basil set`
+  migration commands. Values are never decrypted or parsed. Adds the
+  `serde_yaml` dependency to basil-core.
+
+### New examples
+
+- `examples/web-service-axum/`: a minimal axum service that mints JWTs via
+  the broker and holds no key material, with the 5-line policy that grants
+  exactly that (plus the denied raw-key read).
+- `clients/go/examples/web-service/`: the same story over Go `net/http`.
+- `examples/python-grpc/`: plain `grpcio` against `basil-proto`, proving the
+  socket speaks standard gRPC from any language (no Python client library;
+  that remains roadmap).
+- `examples/nixos-vm/`: the sops-nix migration companion: build the same
+  NixOS service twice, secret-on-disk vs. brokered by Basil, and diff.
+
+### Packaging and docs
+
+- New `nix build .#basil-playground-oci` image: `docker run -it` lands in a
+  shell right after `basil demo`, with the demo broker restarted and
+  `BASIL_SOCKET` set: the zero-install trial path.
+- README front door rewritten around `basil demo` with a one-line install
+  matrix (nix / brew / deb / arch / cargo / source).
+- New and updated docs.openbasil.org pages: the five-minute demo, homelab
+  TLS issuance, NATS credential minting without `nsc`, web-service
+  integration (Rust + Go), `--from-sops` in the sops-nix migration guide.
 
 ### Example fixes
 

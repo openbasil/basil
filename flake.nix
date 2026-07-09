@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 {
-  description = "Basil: Broker for Attestation, Secrets, Identity & Leases";
+  description = "Basil, a host-local secrets broker: your app never touches the key";
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-utils.url = "github:numtide/flake-utils";
@@ -81,6 +81,14 @@
                 $out/bin/xtask -o $out/share/man/man1
                 rm -f $out/bin/xtask
                 gzip -9 -n $out/share/man/man1/*.1
+
+                mkdir -p \
+                  $out/share/bash-completion/completions \
+                  $out/share/zsh/site-functions \
+                  $out/share/fish/vendor_completions.d
+                $out/bin/basil completions bash > $out/share/bash-completion/completions/basil
+                $out/bin/basil completions zsh > $out/share/zsh/site-functions/_basil
+                $out/bin/basil completions fish > $out/share/fish/vendor_completions.d/basil.fish
               '';
             in
             (packageSet.makeRustPlatform {
@@ -110,7 +118,7 @@
                 # point at nixpkgs' bundle explicitly for the check phase.
                 SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
                 meta = with packageSet.lib; {
-                  description = "Basil: Broker for Attestation, Secrets, Identity & Leases";
+                  description = "Host-local secrets broker: your app never touches the key";
                   homepage = "https://github.com/openbasil/basil";
                   license = licenses.asl20;
                   mainProgram = "basil";
@@ -228,6 +236,62 @@
               };
             };
 
+            # The interactive trial image: `docker run -it basil-playground:<tag>`
+            # runs the self-contained `basil demo` (built-in db-keystore backend,
+            # no external services), restarts the demo broker, and drops into a
+            # shell with BASIL_SOCKET set so the visitor can try commands
+            # immediately. This is the zero-install trial path for people who
+            # won't install anything; load it like basil-oci-thin above.
+            #   nix build .#basil-playground-oci
+            #   docker load < result
+            #   docker run --rm -it basil-playground:<version>-<arch>
+            basil-playground-oci =
+              let
+                entry = pkgs.writeShellApplication {
+                  name = "basil-playground";
+                  text = ''
+                    basil demo --dir /tmp/basil-demo --force "$@"
+                    export BASIL_SOCKET=/tmp/basil-demo/basil.sock
+                    basil agent --config /tmp/basil-demo/basil-agent.toml \
+                      > /tmp/basil-demo/agent.log 2>&1 &
+                    for _ in $(seq 1 100); do
+                      [ -S "$BASIL_SOCKET" ] && break
+                      sleep 0.1
+                    done
+                    echo
+                    echo "The demo broker is running again and BASIL_SOCKET is set."
+                    echo "Try: basil status | basil list | basil sign --key-id demo.signing_key 'hi'"
+                    exec bash -i
+                  '';
+                };
+              in
+              pkgs.dockerTools.buildLayeredImage {
+                name = "basil-playground";
+                tag = "${workspace_version}-${dockerArch}";
+                contents = pkgs.buildEnv {
+                  name = "basil-playground-root";
+                  paths = [
+                    basil
+                    entry
+                    pkgs.bashInteractive
+                    pkgs.coreutils
+                  ];
+                  pathsToLink = [ "/bin" ];
+                };
+                config = {
+                  Entrypoint = [ "/bin/basil-playground" ];
+                  WorkingDir = "/";
+                  Env = [ "PATH=/bin" ];
+                  Labels = {
+                    "org.opencontainers.image.description" =
+                      "Basil guided-tour playground: basil demo plus an interactive shell";
+                    "org.opencontainers.image.source" = "https://github.com/openbasil/basil";
+                    "org.opencontainers.image.title" = "basil-playground";
+                    "org.opencontainers.image.version" = workspace_version;
+                  };
+                };
+              };
+
             # A Debian package assembled with `dpkg-deb` (no ruby/fpm): the two
             # binaries under `/usr/bin` and the gzipped man pages under
             # `/usr/share/man/man1`, from the single `basilDist` build. The arch
@@ -262,7 +326,7 @@
                     echo "Maintainer: Basil maintainers <info@openbasil.org>"
                     echo "Homepage: https://github.com/openbasil/basil"
                     echo "Depends: libc6"
-                    echo "Description: Broker for Attestation, Secrets, Identity and Leases"
+                    echo "Description: Basil, a host-local secrets broker: your app never touches the key"
                     echo " Basil brokers cryptographic operations, workload identity (SPIFFE),"
                     echo " and short-lived leases, with keys kept in the backend and used in"
                     echo " place. Ships the unified basil broker/CLI and the basil-nats-bridge"

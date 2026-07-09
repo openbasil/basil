@@ -6,6 +6,10 @@ SPDX-License-Identifier: Apache-2.0
 
 # db-keystore Backend Example
 
+> **Basil is a host-local secrets broker: your app never touches the key.** The kernel attests who's
+> calling, a default-deny policy decides, the key is used where it lives (OpenBao/Vault, KMS, or a
+> sealed local store), and every operation is audited.
+
 This example runs the unified `basil` binary against the optional `db-keystore`
 backend and uses the same CLI to mint a JWT, encrypt/decrypt, and sign/verify.
 

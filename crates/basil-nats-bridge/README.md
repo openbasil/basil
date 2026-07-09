@@ -6,6 +6,10 @@ SPDX-License-Identifier: Apache-2.0
 
 # basil-nats-bridge
 
+> **Basil is a host-local secrets broker: your app never touches the key.** The kernel attests who's
+> calling, a default-deny policy decides, the key is used where it lives (OpenBao/Vault, KMS, or a
+> sealed local store), and every operation is audited.
+
 `basil-nats-bridge` is a NATS request/reply courier for Basil sealed invocation
 messages. It subscribes to one NATS subject, accepts raw tagged COSE bytes,
 wraps those bytes in Basil's thin [`SealedRequest` gRPC](https://docs.openbasil.org/clients/sealed-invocations/) carrier over the

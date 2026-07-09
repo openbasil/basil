@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "backends": {
+    "local-db": {
+      "kind": "keystore",
+      "addr": "__DB_PATH__",
+      "engines": ["transit"],
+      "capabilities": [],
+      "mintKeyTypes": ["ed25519"]
+    }
+  },
+  "keys": {
+    "web.signing_key": {
+      "class": "asymmetric",
+      "keyType": "ed25519",
+      "backend": "local-db",
+      "engine": "transit",
+      "path": "web/signing-key",
+      "writable": true,
+      "missing": "generate",
+      "labels": ["tier=example"],
+      "description": "Ed25519 JWT-signing key; the web service mints under it but never reads it."
+    }
+  }
+}

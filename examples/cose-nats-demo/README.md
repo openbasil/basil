@@ -6,6 +6,10 @@ SPDX-License-Identifier: Apache-2.0
 
 # COSE over NATS Demo
 
+> **Basil is a host-local secrets broker: your app never touches the key.** The kernel attests who's
+> calling, a default-deny policy decides, the key is used where it lives (OpenBao/Vault, KMS, or a
+> sealed local store), and every operation is audited.
+
 This example runs an Alice/Bob peer messaging flow over NATS using the current
 `basil-cose` sealed-message helpers.
 

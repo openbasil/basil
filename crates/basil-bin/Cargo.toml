@@ -4,7 +4,7 @@
 
 [package]
 name = "basil-bin"
-description = "Unified Basil operator and client binary."
+description = "Basil is a host-local secrets broker: your app never touches the key. Unified broker daemon, operator tool, and client CLI."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -59,6 +59,7 @@ basil-nats = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true, features = ["std"] }
 clap = { workspace = true }
+clap_complete = { workspace = true }
 hex = { workspace = true }
 mimalloc = { workspace = true }
 serde = { workspace = true, features = ["std"] }

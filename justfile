@@ -67,7 +67,8 @@ check:
     fd -e rs -x rustfmt --edition 2024
     typos
 
-# Run all examples
+# Run all examples (every examples/*/run.sh, including web-service-axum and
+# python-grpc; python-grpc SKIPs cleanly when grpcio is not installed).
 # before running, either
 #    set BASIL_BIN and BASIL_NATS_BRIDGE_BIN
 #    or ensure `basil` and `basil-nats-bridge` are in your PATH

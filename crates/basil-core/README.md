@@ -6,6 +6,10 @@ SPDX-License-Identifier: Apache-2.0
 
 # basil-core
 
+> **Basil is a host-local secrets broker: your app never touches the key.** The kernel attests who's
+> calling, a default-deny policy decides, the key is used where it lives (OpenBao/Vault, KMS, or a
+> sealed local store), and every operation is audited.
+
 The [Basil daemon](https://github.com/openbasil/basil) as a library: broker core, backend adapters, gRPC services, transport, and the
 offline operator command implementations. The [`basil-bin`](../basil-bin) binary is a thin
 cli wrapper over this crate; embedders and the integration tests link it directly.

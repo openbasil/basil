@@ -1,0 +1,26 @@
+
+_default:
+    just --list
+
+# Build both VM runners (no KVM needed to build).
+build: build-before build-after
+
+# Build the sops-nix-style VM: ./result-before/bin/run-before-vm
+build-before:
+    nix-build ./vm.nix -A before -o result-before
+
+# Build the Basil-served VM: ./result-after/bin/run-after-vm
+build-after:
+    nix-build ./vm.nix -A after -o result-after
+
+# Build and boot the sops-nix-style VM (needs KVM; quit with Ctrl-a x).
+run-before: build-before
+    ./result-before/bin/run-before-vm
+
+# Build and boot the Basil VM (needs KVM; quit with Ctrl-a x).
+run-after: build-after
+    ./result-after/bin/run-after-vm
+
+# Evaluate both system derivations without building anything.
+check:
+    nix-instantiate ./vm.nix -A before -A after

@@ -6,6 +6,10 @@ SPDX-License-Identifier: Apache-2.0
 
 # basil-bin
 
+> **Basil is a host-local secrets broker: your app never touches the key.** The kernel attests who's
+> calling, a default-deny policy decides, the key is used where it lives (OpenBao/Vault, KMS, or a
+> sealed local store), and every operation is audited.
+
 The unified `basil` binary: one signed binary is broker service (`basil agent`), the operator
 tools (`basil init`, `basil bundle`, `basil explain`, `basil doctor`) and the client used
 to invoke the broker over its Unix socket (`basil sign`, `basil get`, and the other client commands).
