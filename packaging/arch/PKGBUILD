@@ -14,7 +14,7 @@
 # `updpkgsums` then `makepkg --printsrcinfo > .SRCINFO`, and push both files.
 
 pkgname=basil-bin
-pkgver=0.7.0
+pkgver=0.7.1
 pkgrel=1
 pkgdesc="Basil, a host-local secrets broker: your app never touches the key (broker/CLI + NATS bridge, prebuilt binaries)"
 arch=('x86_64' 'aarch64')
