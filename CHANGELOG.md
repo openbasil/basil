@@ -6,7 +6,22 @@ SPDX-License-Identifier: Apache-2.0
 
 # Changelog
 
-## 0.7.1 2026-07-08
+## Unreleased
+
+### Added
+
+- 2026-07-14: Compose Phase 1 feasibility-evidence infrastructure (test-only,
+  no runtime changes): `scripts/compose-phase1-artifacts.sh` pins and
+  OpenPGP-verifies the qualified VM lane images (Fedora 44 Cloud x86_64,
+  Ubuntu 24.04 cloud amd64/arm64) against `scripts/compose-phase1-artifacts.lock.tsv`;
+  `scripts/compose-phase1-evidence.sh` is the retained-evidence run lifecycle
+  (prepare/run/collect/verify-run/destroy/status) with typed statuses, a
+  versioned sanitized JSONL event schema, manifest hashing, and exact-identity
+  cleanup; `interop-tests/compose-phase1/` carries the lane lock, cloud-init
+  guest foundations, bounded guest fact/capacity-preflight scripts, and the
+  harness fault self-test; `compose_phase1_probe` (basil-tests bin, behind the
+  `compose-phase1-probe` feature) probes host/process facts, `SO_PEERCRED`
+  peer pinning, and capacity metadata.
 
 ### `basil demo`: a zero-dependency guided tour
 

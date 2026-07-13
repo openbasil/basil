@@ -1,0 +1,93 @@
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+schema = "basil-compose-phase1-lock"
+schema_version = 1
+design = "Design 0001 revision 1.1"
+feature = "Compose integration 1.0"
+
+[evidence]
+event_schema = "basil.compose.phase1.event"
+event_schema_version = 1
+manifest_schema = "basil.compose.phase1.manifest"
+manifest_schema_version = 1
+maximum_event_bytes = 16777216
+maximum_events = 10000
+
+[suites.lane-smoke]
+required_tests = [
+  "lane.artifacts",
+  "lane.cgroup-v2",
+  "lane.lsm-enforcing",
+  "lane.runtime-mode",
+  "lane.network-isolation",
+]
+
+[suites.runtime-evidence]
+required_tests = [
+  "runtime.peer-correlation",
+  "runtime.pid-start-time",
+  "runtime.same-uid-isolation",
+  "runtime.realm-overlap",
+  "runtime.stale-and-conflicting",
+]
+
+[suites.wrapper-feasibility]
+required_tests = [
+  "wrapper.argv",
+  "wrapper.pid1-signals-exit",
+  "wrapper.tmpfs-and-cleanup",
+  "wrapper.lsm",
+  "wrapper.platform",
+]
+
+[suites.capacity]
+required_tests = [
+  "capacity.preflight",
+  "capacity.resources",
+  "capacity.latency",
+  "capacity.overload",
+  "capacity.teardown",
+]
+
+[lanes.fedora-44-x86_64]
+architecture = "x86_64"
+acceleration = "kvm"
+distribution = "Fedora 44"
+runtime = "podman-rootless"
+lsm = "selinux-enforcing"
+cloud_init = "cloud-init/fedora-44.yaml"
+artifacts = ["fedora-44-cloud-x86_64"]
+machine = "q35"
+base_format = "qcow2"
+overlay_format = "qcow2"
+memory_mib = 4096
+vcpus = 4
+network = "user-loopback-only"
+driver = ""
+qualification = true
+performance = true
+
+[lanes."ubuntu-24.04-x86_64"]
+architecture = "x86_64"
+acceleration = "kvm"
+distribution = "Ubuntu 24.04 LTS"
+runtime = "docker-rootful"
+lsm = "apparmor-enforcing"
+cloud_init = "cloud-init/ubuntu-24.04.yaml"
+artifacts = ["ubuntu-24.04-cloud-x86_64"]
+driver = ""
+qualification = true
+performance = true
+
+[lanes."ubuntu-24.04-aarch64"]
+architecture = "aarch64"
+acceleration = "tcg"
+distribution = "Ubuntu 24.04 LTS"
+runtime = "functional-only"
+lsm = "not-qualified"
+cloud_init = "cloud-init/ubuntu-24.04.yaml"
+artifacts = ["ubuntu-24.04-cloud-aarch64"]
+driver = ""
+qualification = false
+performance = false

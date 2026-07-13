@@ -1,0 +1,62 @@
+#cloud-config
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+preserve_hostname: false
+hostname: basil-phase1-fedora44
+manage_etc_hosts: true
+ssh_pwauth: false
+disable_root: true
+
+users:
+  - default
+  - name: basil-ci
+    gecos: Basil Phase 1 harness
+    shell: /bin/bash
+    lock_passwd: true
+    ssh_authorized_keys:
+      - __BASIL_PHASE1_SSH_PUBLIC_KEY__
+  - name: phase1-a
+    gecos: Rootless Podman realm A
+    shell: /bin/bash
+    lock_passwd: true
+  - name: phase1-b
+    gecos: Rootless Podman realm B
+    shell: /bin/bash
+    lock_passwd: true
+
+write_files:
+  - path: /etc/basil-phase1-lane
+    owner: root:root
+    permissions: '0600'
+    content: |
+      lane=fedora-44-x86_64
+      design=Design 0001 revision 1.1
+      purpose=feasibility-evidence-only
+  - path: /etc/systemd/system/basil-phase1-foundation.service
+    owner: root:root
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Validate Fedora Phase 1 foundation without weakening SELinux
+      After=multi-user.target
+      ConditionPathExists=/etc/basil-phase1-lane
+
+      [Service]
+      Type=oneshot
+      ExecStart=/bin/sh -c 'test "$(/usr/sbin/getenforce)" = Enforcing'
+      ExecStart=/bin/sh -c 'test "$(/usr/bin/stat -fc %%T /sys/fs/cgroup)" = cgroup2fs'
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - [usermod, --add-subuids, '100000-165535', --add-subgids, '100000-165535', phase1-a]
+  - [usermod, --add-subuids, '200000-265535', --add-subgids, '200000-265535', phase1-b]
+  - [loginctl, enable-linger, phase1-a]
+  - [loginctl, enable-linger, phase1-b]
+  - [systemctl, daemon-reload]
+  - [systemctl, enable, --now, basil-phase1-foundation.service]
+
+final_message: "Basil Compose Phase 1 Fedora foundation ready; runtime packages remain lane-provisioning inputs"

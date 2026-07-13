@@ -16,6 +16,8 @@ publish = false
 [features]
 default = []
 live-e2e = []
+# Test-only native host/guest feasibility probe for Compose Phase 1 evidence.
+compose-phase1-probe = []
 # Harness opt-in for live tests that need the broker's JWKS/OIDC HTTP surface.
 # This forwards to the separately built `basil-bin` process in `ensure_binaries_built`.
 http = []
@@ -30,7 +32,10 @@ basil-core = { workspace = true, features = ["http", "unlock-age-yubikey", "unlo
 # rustls `CryptoProvider` before any test builds a `reqwest` client (see
 # `ensure_crypto_provider`). `reqwest` itself stays test-only below.
 rustls = { workspace = true }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
 spiffe = { workspace = true }
+tokio = { workspace = true }
 zero-secrets = { workspace = true }
 zeroize = { workspace = true }
 
@@ -50,10 +55,7 @@ minicbor = { workspace = true, features = ["alloc", "std"] }
 jsonwebtoken = { workspace = true }
 pkcs8 = { workspace = true }
 reqwest = { workspace = true }
-serde = { workspace = true, features = ["std"] }
-serde_json = { workspace = true, features = ["std"] }
 spiffe-rustls = { workspace = true }
-tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
@@ -159,6 +161,11 @@ required-features = ["live-e2e", "unlock-bip39"]
 name = "nats_bridge_cose_e2e"
 path = "tests/nats_bridge_cose_e2e.rs"
 required-features = ["live-e2e"]
+
+[[bin]]
+name = "compose_phase1_probe"
+path = "src/bin/compose_phase1_probe.rs"
+required-features = ["compose-phase1-probe"]
 
 [lints]
 workspace = true

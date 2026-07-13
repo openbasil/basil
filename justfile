@@ -147,6 +147,14 @@ test-all: test-rust test-go test-interop
 test-tpm:
     scripts/tpm-unlock-e2e.sh
 
+# Compose Phase 1 evidence-infrastructure self-tests: artifact fetcher/verifier
+# self-test, evidence-runner fault tests, and the test-only feasibility probe's
+# unit tests. Does not fetch images or boot VM lanes.
+test-compose-phase1-self:
+    scripts/compose-phase1-artifacts.sh self-test
+    interop-tests/compose-phase1/harness/test-evidence.sh
+    cargo test -p basil-tests --features compose-phase1-probe --bin compose_phase1_probe
+
 # Each engine runs on its own dev-server port; a missing engine binary SKIPs
 # cleanly (not a failure); exits non-zero iff any engine's e2e FAILED.
 #   just test-e2e [openbao|vault|both]   (default: both)
