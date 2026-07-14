@@ -63,8 +63,9 @@ Raw output is private evidence. It must not be attached to public issues without
 an independent review. Never retain credentials, SSH private keys, complete
 environments, registry authentication, raw Compose rendering, arbitrary runtime
 inspect payloads, synthetic canary values, or guest overlays. The transient SSH
-key, QMP socket, overlays, and other run-owned VM state are removed after
-collection by default.
+key, overlays, and other run-owned VM state are removed after collection by
+default. The QMP socket lives in the driver sandbox's private `/tmp` tmpfs and
+disappears when that sandbox exits.
 
 ## Event schema
 
@@ -101,7 +102,8 @@ Future lane drivers must retain these boundaries:
 - QEMU runs unprivileged with `-nodefaults`, explicit disk formats and resources,
   immutable verified base images, and per-run qcow2 overlays;
 - networking is loopback-only user networking with a private forwarded SSH port;
-- QMP and SSH material stay below the run's private transient directory;
+- QMP uses a fixed short socket path inside the sandbox-private `/tmp` tmpfs;
+  SSH material stays below the run's private transient directory;
 - each run gets a fresh SSH key and serial-established host-key pin;
 - password login, root SSH, agent forwarding, `StrictHostKeyChecking=no`, 9p,
   repository shares, evidence-directory mounts, and host runtime sockets are
@@ -122,7 +124,9 @@ A driver runs under a read-only Bubblewrap view. The whole filesystem is bound
 read-only except a fresh `/dev`, a private `/tmp`, and one writable scratch
 directory that holds the result file. The sandbox starts from a cleared
 environment, joins fresh user/IPC/UTS/cgroup/network namespaces, dies with the
-runner, and is bounded by a timeout.
+runner, and is bounded by a timeout. `/dev`, `/tmp`, and driver scratch are
+transient writable surfaces, not retained evidence; the runner copies required
+artifacts into `raw/` only after bounded size and SHA-256 verification.
 
 A driver communicates results **only** by writing the bounded result contract at
 `$BASIL_DRIVER_RESULT`. That file uses schema `basil.compose.phase1.driver-result`
@@ -137,9 +141,10 @@ manifest. A nonzero driver exit, a missing or malformed result, or an invalid
 result degrades to `INFRA_ERROR` and never becomes a pass.
 
 `drivers/lib/qemu-unpriv.sh` is a shared library (source it; do not execute it)
-that assembles the boundary-conforming unprivileged QEMU argv above and re-checks
-an argv against the forbidden surface (filesystem shares, bridged or tap
-networking, privilege re-entry) so a driver can fail closed before boot.
+that supplies the short sandbox-private QMP path, assembles the
+boundary-conforming unprivileged QEMU argv above, and re-checks an argv against
+the forbidden surface (filesystem shares, bridged or tap networking, privilege
+re-entry) so a driver can fail closed before boot.
 
 `drivers/null.sh` is a development-only mock driver that boots no guest; it
 exercises the contract and confirms the read-only sandbox. It is reachable only
@@ -423,32 +428,51 @@ AppArmor enablement and rootful Docker without a reported user-namespace remap.
 It never emits environments or raw runtime responses and does not claim the
 host-side QEMU network or artifact tests.
 
-## Capacity preflight (readiness for a 1,000-container ladder)
+## Capacity preflight (sizing checks before a 1,000-container ladder)
 
 `guest/capacity-preflight.sh` is a bounded, sanitized readiness probe for a
 serial 1,000-container measurement ladder. It is **environment readiness only** —
 it creates no containers and is **not** the later `basil-9tj.4` attestor/broker
-resource-ceiling measurement. It emits versioned JSONL
-(`basil.compose.phase1.capacity-preflight/v1`): a host snapshot (cpu, memory,
-disk/inodes, file descriptors, `pid_max`/`threads-max`, per-user process and
-namespace limits, cgroup v2 `pids.max`/`memory.max`), one snapshot per
-container runtime (storage driver, cgroup driver/manager, Podman `freeLocks`,
-rootful/rootless mode), an **evidence-retention projection** (bytes per retained
-run times the ladder length, checked against the evidence filesystem), and
-**derived stop conditions** computed from the measured numbers. The optional
-`compose_phase1_probe` (basil-tests bin) enriches the host run with SO_PEERCRED
-and projection sizing; it is a host-side supplement and its absence in a distro
-guest is a warning, not a blocker.
+resource-ceiling measurement. Passing a named profile proves only that its
+conservative sizing and prerequisite checks passed; it does not prove that the
+environment can run 1,000 containers. Versioned JSONL
+(`basil.compose.phase1.capacity-preflight/v2`) records the explicit execution
+profile, a host/guest snapshot (cpu, memory, local disk/inodes, file descriptors,
+`pid_max`/`threads-max`, per-user process and namespace limits, cgroup v2
+`pids.max`/`memory.max`), one snapshot per container runtime, a host-anchored
+**evidence-retention projection**, and **derived stop conditions**.
+
+The default `host` profile retains the original 8 CPU / 32 GiB available memory /
+40 GiB local-disk thresholds. Guest execution must select `guest_small` (2 CPU /
+1 GiB / 10 GiB) or `guest_medium` (4 CPU / 4 GiB / 24 GiB); both retain the
+`nofile` 32768, PID, namespace, fixed-inode-pool, and 1,000-container runtime
+prerequisites. Filesystems such as Btrfs that report no fixed inode pool retain
+byte-headroom checks and expose a null inode floor instead of a false zero-inode
+blocker. CPU and memory readiness use the minimum of machine availability and
+the effective cgroup limit/headroom.
+`--evidence-root` is the locally checked filesystem. A guest may additionally
+receive `--host-evidence-snapshot`: the runner creates one canonical snapshot
+under `raw/`, records its byte count and SHA-256 in `meta/run.json`, and passes
+that read-only identity to the driver. The guest echoes the identity and digest,
+which the driver verifies before accepting retention evidence. Without that
+snapshot, retention fit is `NOT_MEASURED` with null measured headroom and
+`HOST_EVIDENCE_ROOT_NOT_SUPPLIED`; the guest rootfs is never used as a proxy for
+host retention. The optional `compose_phase1_probe` enriches host runs and remains
+a warning-only absence inside distro guests.
 
 The `[suites.capacity-preflight]` suite in `phase1.lock.toml` defines the
 runner-based contract (`preflight.host-baseline`, `preflight.runtime-baseline`,
 `preflight.evidence-retention`, `preflight.stop-conditions`) for **both**
-qualified lanes. The runner exports the selected suite as `BASIL_DRIVER_SUITE`;
-when a lane driver reads `capacity-preflight` it injects
-`guest/capacity-preflight.sh` into the booted guest over ssh stdin, runs it
-(rootless owner A with Podman on Fedora; root with the offline-provisioned
-rootful Docker on Ubuntu), retains the full bounded JSONL as
-`raw/guest-events.jsonl`, and maps it onto the four terminals. The terminals
+qualified VM lanes; this suite does not qualify the host. The runner exports the
+selected suite and the lock-derived effective VM shape. When a lane driver reads
+`capacity-preflight` it verifies and injects the runner's host snapshot plus
+`guest/capacity-preflight.sh`, and runs the `guest_medium` profile (rootless owner
+A with Podman on Fedora; root with the offline-provisioned rootful Docker on
+Ubuntu). Both x86 guests use 4 vCPUs, 8 GiB memory, and a 32-GiB sparse qcow2
+virtual disk for this suite. The runner atomically retains the driver's full
+bounded JSONL as `raw/guest-events.jsonl` after size and hash verification; a
+missing or changed artifact is `INFRA_ERROR`/`INCOMPLETE`, and `verify-run`
+requires the manifest inventory entry. The driver maps it onto the four terminals. The terminals
 assert complete readiness-evidence **collection** (plus the lane's required
 runtime mode); the guest's `ready`/blocker verdict is carried in the bounded
 messages and raw JSONL and is never converted into a pass. Any other suite
@@ -461,9 +485,9 @@ scripts/compose-phase1-evidence.sh collect    --run RUN_ID
 scripts/compose-phase1-evidence.sh verify-run --run RUN_ID
 ```
 
-Retained readiness evidence (under `~/.local/state/basil/ph1`; runner runs
-verify with `verify-run` exit `0`, artifacts carry a `README.md` label and
-`SHA256SUMS`):
+Historical v1 retained readiness evidence (under `~/.local/state/basil/ph1`;
+runner runs verify with `verify-run` exit `0`, artifacts carry a `README.md`
+label and `SHA256SUMS`):
 
 | kind | run id | verdict |
 | --- | --- | --- |
@@ -486,29 +510,35 @@ Headline measured numbers:
   `PASS`. Evidence-retention projection: ~0.6 KiB per container terminal, a
   1,000-container run ~0.6 MiB, the whole 8-step ladder ~1.8 MiB — fits with the
   40 GiB disk reserve intact.
-- **Both guests** were sized at **4 vcpus / 8 GiB** (capped per shared-host
-  guidance) and ship the cloud-image default **`nofile` soft = 1024** with a
-  small root/home filesystem. Against the host-scale readiness thresholds these
-  small guests honestly report `ready=false`; the confinement dimensions PASS
-  (Fedora: SELinux `Enforcing` + rootless Podman; Ubuntu: AppArmor active).
+- **Both historical v1 guest runs** used **4 vCPUs / 8 GiB** but were judged
+  against host-scale CPU/memory/disk thresholds and against their own rootfs for
+  evidence retention, so they honestly reported `ready=false`. In v2 the same
+  qualified sizing selects `guest_medium`, the sparse virtual disk grows to
+  32 GiB, and retention is evaluated against the supplied host evidence snapshot.
+  The cloud images still surface the genuine **`nofile` soft = 1024** prerequisite;
+  confinement remains enforced (Fedora SELinux + rootless Podman, Ubuntu AppArmor
+  + rootful Docker).
 
 Safe scale-ladder **stop conditions** (abort the serial ladder when a live
-reading crosses these; derived from the measured host facts):
+reading crosses these). Filesystem thresholds are emitted once per unique
+device identity across local, runtime, and evidence storage:
 
 | condition | threshold | basis |
 | --- | --- | --- |
-| memory floor | stop below `max(4 GiB, 10% of MemTotal)` (~9.9 GiB on this host) | measured |
-| disk floor | stop below `max(40 GiB reserve, 5% of evidence fs)` | measured |
-| inode floor | stop below the readiness inode reserve | measured |
+| memory floor | stop below `max(profile stop reserve, 10% of MemTotal)` (host profile retains the 4 GiB minimum) | measured + readiness constant |
+| disk floor | stop below `max(profile local-disk reserve, 5% of each applicable filesystem)` | measured + readiness constant |
+| inode floor | stop below the readiness inode reserve; null for the dynamic-inode zero pair | measured + readiness constant |
 | fd headroom | keep soft `nofile` above `containers * 16` fds | measured + estimate |
 | pid headroom | keep `pid_max`/cgroup `pids.max` above `containers * 4` tasks | measured + estimate |
-| per-step latency | stop above the runbook per-step wall-clock ceiling (default 5 min) | runbook constant |
-| evidence retention | stop before the projected ladder evidence would breach the disk reserve | measured |
+| per-step latency | stop above the runbook per-step wall-clock ceiling (default 5 min) | readiness constant |
+| evidence retention | stop before the projected ladder evidence would breach the disk reserve | measured + estimate + readiness constant |
 
 **Readiness prerequisite surfaced by the guest preflights:** the cloud-image
 default `nofile` soft limit of 1024 is far below a 1,000-container ladder's need,
-so the ladder driver must raise `LimitNOFILE`/`ulimit -n` in-guest and run on a
-sufficiently large storage volume before any measurement.
+so the ladder driver must raise `LimitNOFILE`/`ulimit -n` in-guest and retain the
+profile's disk headroom before any measurement. The preflight reads filesystem
+metadata only; the 32-GiB guest overlay is sparse, and no disk-performance write
+loop or large allocation is part of the check.
 
 ## Development versus qualification
 

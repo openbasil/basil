@@ -23,6 +23,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::runtime::Builder;
 
+#[path = "compose_phase1_probe/grpc_status_load.rs"]
+mod grpc_status_load;
+
 const SCHEMA: &str = "basil.compose.phase1.probe/v1";
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
@@ -32,10 +35,12 @@ const MAX_PATH_BYTES: usize = 4_096;
 const MAX_CGROUP_ENTRIES: usize = 64;
 const MAX_MAP_RANGES: usize = 64;
 const MAX_CONTROLLERS: usize = 64;
+const MAX_COMMAND_ARGS: usize = 6;
+const MAX_ARGUMENT_BYTES: usize = MAX_PATH_BYTES;
 const MAX_PROJECTION_DEPTH: usize = 64;
 const MAX_PROJECTION_NODES: usize = 1_000_000;
 const DEFAULT_PEER_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_PEER_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_PEER_TIMEOUT: Duration = Duration::from_mins(1);
 const TARGET_CONTAINERS: u64 = 1_000;
 const SCALE_LADDER: [u64; 8] = [1, 10, 50, 100, 250, 500, 750, 1_000];
 
@@ -295,21 +300,57 @@ impl Drop for SocketPathGuard {
 }
 
 fn main() -> ExitCode {
-    let mut args = env::args_os();
-    let _program = args.next();
-    let args: Vec<OsString> = args.take(5).collect();
-    let command = args
-        .first()
+    let mut raw_args = env::args_os();
+    let _program = raw_args.next();
+    let command = raw_args.next();
+    let command_kind = command
+        .as_ref()
         .and_then(|value| value.to_str())
-        .unwrap_or("usage");
+        .map_or_else(|| "usage".to_owned(), |value| bounded_text(value, 64));
+    let result = collect_arguments(command, raw_args).and_then(|args| run(&args));
 
-    match run(&args) {
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            emit_error(command, &error);
+            emit_error(&command_kind, &error);
             ExitCode::from(2)
         }
     }
+}
+
+fn collect_arguments(
+    command: Option<OsString>,
+    remaining: impl Iterator<Item = OsString>,
+) -> ProbeResult<Vec<OsString>> {
+    let mut args = Vec::new();
+    args.try_reserve_exact(MAX_COMMAND_ARGS).map_err(|error| {
+        ProbeError::new(
+            "ALLOCATION_FAILED",
+            format!("reserve command argument vector: {error}"),
+        )
+    })?;
+    if let Some(command) = command {
+        validate_argument(&command)?;
+        args.push(command);
+    }
+    for argument in remaining {
+        if args.len() >= MAX_COMMAND_ARGS {
+            return Err(ProbeError::new("USAGE", "too many command arguments"));
+        }
+        validate_argument(&argument)?;
+        args.push(argument);
+    }
+    Ok(args)
+}
+
+fn validate_argument(argument: &OsStr) -> ProbeResult<()> {
+    if argument.as_bytes().len() > MAX_ARGUMENT_BYTES {
+        return Err(ProbeError::new(
+            "ARGUMENT_LIMIT",
+            "command argument exceeded the fixed byte limit",
+        ));
+    }
+    Ok(())
 }
 
 fn run(args: &[OsString]) -> ProbeResult<()> {
@@ -353,12 +394,15 @@ fn run(args: &[OsString]) -> ProbeResult<()> {
             emit_success(command, projection_size(source)?)
         }
         "capacity-metadata" if args.len() == 1 => emit_success(command, capacity_metadata()),
+        "grpc-status-load" if (5..=6).contains(&args.len()) => {
+            emit_success(command, grpc_status_load::run(args)?)
+        }
         _ => Err(ProbeError::new("USAGE", usage())),
     }
 }
 
 const fn usage() -> &'static str {
-    "usage: compose_phase1_probe <host-process-snapshot|process-facts [PID]|process-compare PID [INTERVAL_MS]|peer-listen SOCKET [TIMEOUT_MS]|peer-connect SOCKET [TIMEOUT_MS]|projection-size [FILE|-]|capacity-metadata>"
+    "usage: compose_phase1_probe <host-process-snapshot|process-facts [PID]|process-compare PID [INTERVAL_MS]|peer-listen SOCKET [TIMEOUT_MS]|peer-connect SOCKET [TIMEOUT_MS]|projection-size [FILE|-]|capacity-metadata|grpc-status-load SOCKET CONNECTIONS IN_FLIGHT REQUESTS [HOLD_MS]>"
 }
 
 fn required_arg<'a>(args: &'a [OsString], index: usize, name: &str) -> ProbeResult<&'a OsStr> {
@@ -1258,6 +1302,28 @@ mod tests {
     fn limited_reader_stops_after_limit_plus_one() {
         let bytes = read_limited(Cursor::new(vec![0_u8; 100]), 32).unwrap();
         assert_eq!(bytes.len(), 33);
+    }
+
+    #[test]
+    fn bounded_argument_collection_rejects_extras() {
+        let command = Some(OsString::from("grpc-status-load"));
+        let remaining = vec![
+            OsString::from("/tmp/basil.sock"),
+            OsString::from("1"),
+            OsString::from("1"),
+            OsString::from("1"),
+            OsString::from("0"),
+            OsString::from("extra"),
+        ];
+        let error = collect_arguments(command, remaining.into_iter()).unwrap_err();
+        assert_eq!(error.code, "USAGE");
+    }
+
+    #[test]
+    fn bounded_argument_collection_rejects_oversized_values() {
+        let oversized = OsString::from("x".repeat(MAX_ARGUMENT_BYTES.saturating_add(1)));
+        let error = collect_arguments(Some(oversized), std::iter::empty()).unwrap_err();
+        assert_eq!(error.code, "ARGUMENT_LIMIT");
     }
 
     #[test]

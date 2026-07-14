@@ -9,9 +9,10 @@
 # `driver` field of lane `fedora-44-x86_64`.
 #
 # Contract (see interop-tests/compose-phase1/README.md): this driver runs under
-# the runner's read-only Bubblewrap view with only its scratch directory
-# writable, a fresh network namespace (no host network; QEMU user-mode slirp is
-# entirely in-namespace), a cleared environment, and a timeout. It communicates
+# the runner's read-only Bubblewrap view with only its retained scratch directory
+# and private /tmp tmpfs writable, a fresh network namespace (no host network;
+# QEMU user-mode slirp is entirely in-namespace), a cleared environment, and a
+# timeout. It communicates
 # ONLY by writing the bounded result contract at $BASIL_DRIVER_RESULT; it writes
 # no JSONL events, manifests, or sequence numbers. The runner alone emits events
 # and finalizes.
@@ -47,20 +48,12 @@ readonly RESULT_SCHEMA="${BASIL_DRIVER_RESULT_SCHEMA:-basil.compose.phase1.drive
 readonly RESULT_SCHEMA_VERSION="${BASIL_DRIVER_RESULT_SCHEMA_VERSION:-1}"
 readonly DRIVER_NAME="fedora-selinux-rootless"
 
-# Fixed lane resources; mirror phase1.lock.toml [lanes.fedora-44-x86_64]. The
-# host is shared, so the guest stays modest. accel=kvm:tcg uses KVM when the
-# runner sandbox exposes /dev/kvm and degrades to TCG functional-only emulation
-# when it does not (the stock sandbox's --dev /dev omits /dev/kvm; basil-k78).
-# The capacity ladder (basil-9tj.4) needs a bigger guest for 1,000 rootless
-# containers; the host is the exclusive measurement host and guests run serially,
-# so size up for that suite only (every other suite keeps the lock sizing).
-if [[ ${BASIL_DRIVER_SUITE:-} == capacity ]]; then
-  readonly MEMORY_MIB=20480
-  readonly VCPUS=8
-else
-  readonly MEMORY_MIB=4096
-  readonly VCPUS=4
-fi
+# Effective VM sizing is selected and recorded by the runner from the phase
+# lock. Drivers consume the contract verbatim so both qualified lanes have the
+# same suite shape and retained metadata describes the machine that actually ran.
+readonly MEMORY_MIB="${BASIL_VM_MEMORY_MIB:?BASIL_VM_MEMORY_MIB must be set by the runner}"
+readonly VCPUS="${BASIL_VM_VCPUS:?BASIL_VM_VCPUS must be set by the runner}"
+readonly DISK_GIB="${BASIL_VM_DISK_GIB:?BASIL_VM_DISK_GIB must be set by the runner}"
 readonly MACHINE="q35,accel=kvm:tcg"
 readonly BOOT_MARKER_TIMEOUT=480
 readonly SSH_UP_TIMEOUT=240
@@ -133,6 +126,32 @@ QEMU_PID=""
 GUEST_LOG="$SCRATCH/guest-events.jsonl"
 
 log() { printf '[fedora-driver] %s\n' "$*" >&2; }
+
+verify_host_evidence_snapshot() {
+  local path=${BASIL_HOST_EVIDENCE_SNAPSHOT:?} expected_bytes=${BASIL_HOST_EVIDENCE_SNAPSHOT_BYTES:?}
+  local expected_hash=${BASIL_HOST_EVIDENCE_SNAPSHOT_SHA256:?}
+  [[ $path != -* && -f $path && ! -L $path && $expected_bytes =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ $(stat -c '%s' -- "$path") == "$expected_bytes" ]] || return 1
+  [[ $(sha256sum -- "$path" | cut -d ' ' -f 1) == "$expected_hash" ]] || return 1
+  jq -e -s --arg id "${BASIL_HOST_EVIDENCE_SNAPSHOT_ID:?}" '
+    length == 1 and .[0].source == "host-evidence-root"
+    and .[0].snapshot_id == $id
+  ' -- "$path" >/dev/null
+}
+
+retain_guest_events() {
+  local source=$1 destination=$2 bytes digest
+  local temporary="${destination}.tmp.$$"
+  [[ -f $source && ! -L $source ]] || return 1
+  bytes=$(stat -c '%s' -- "$source") || return 1
+  (( bytes > 0 && bytes <= 16 * 1024 * 1024 )) || return 1
+  digest=$(sha256sum -- "$source" | cut -d ' ' -f 1) || return 1
+  install -m 0600 -- "$source" "$temporary" || { rm -f -- "$temporary"; return 1; }
+  [[ $(stat -c '%s' -- "$temporary") == "$bytes" \
+    && $(sha256sum -- "$temporary" | cut -d ' ' -f 1) == "$digest" ]] \
+    || { rm -f -- "$temporary"; return 1; }
+  mv -f -- "$temporary" "$destination"
+}
 
 set_res() { ST[$1]=$2; RE[$1]=$3; MS[$1]=${4:-}; }
 
@@ -259,25 +278,26 @@ main() {
     || { fail_all SEED_BUILD_FAILED "xorriso failed"; emit_result; return 0; }
 
   local overlay="$SCRATCH/overlay.qcow2"
-  # The capacity ladder wants disk headroom for 1,000 containers; grow the overlay
-  # virtual size (cloud-init growpart expands the guest root). Other suites keep
-  # the base image's virtual size (no size argument).
-  local overlay_size=()
-  [[ $SUITE == capacity ]] && overlay_size=(40G)
-  qemu-img create -q -f qcow2 -F qcow2 -b "$base" "$overlay" "${overlay_size[@]}" >/dev/null \
+  # Capacity profiles need explicit disk headroom; qcow2 virtual growth is sparse,
+  # and cloud-init growpart expands the guest root without preallocating the file.
+  [[ $MEMORY_MIB =~ ^[1-9][0-9]*$ && $VCPUS =~ ^[1-9][0-9]*$ \
+    && $DISK_GIB =~ ^[1-9][0-9]*$ ]] \
+    || { fail_all VM_SIZING_INVALID "runner effective VM sizing is invalid"; emit_result; return 0; }
+  qemu-img create -q -f qcow2 -F qcow2 -b "$base" "$overlay" "${DISK_GIB}G" >/dev/null \
     || { fail_all OVERLAY_FAILED "qemu-img create failed"; emit_result; return 0; }
 
   SSH_PORT=$(( (RANDOM % 20000) + 30000 ))
-  # QMP is unused by this driver, but the boundary builder always adds it. Use a
-  # short RELATIVE socket name: QEMU's cwd is the scratch dir (bwrap --chdir), so
-  # the socket lands in scratch while staying under the 108-byte AF_UNIX sun_path
-  # limit that an absolute evidence-root path would exceed.
-  local serial="$SCRATCH/serial.log" qmp="qmp.sock"
-  : >"$serial"
 
   # Boundary-conforming unprivileged QEMU argv (restrict=on loopback user net).
   # shellcheck source=lib/qemu-unpriv.sh disable=SC1091
   source "$LIB_DIR/qemu-unpriv.sh"
+  # QMP is unused by this driver, but the boundary builder always adds it. Keep
+  # its socket in the sandbox-private /tmp so the default evidence-root length
+  # cannot exceed AF_UNIX sun_path and the socket disappears with the sandbox.
+  local serial="$SCRATCH/serial.log" qmp
+  qmp=$(qemu_unpriv_qmp_socket_path)
+  : >"$serial"
+
   local -a qargv=()
   qemu_unpriv_build_argv qargv \
     "$base" "$overlay" "$serial" "$qmp" "$SSH_PORT" "$seed" \
@@ -546,18 +566,24 @@ map_runtime_evidence() {
 run_capacity_preflight() {
   local pf="$FIXTURE_ROOT/guest/capacity-preflight.sh"
   local out="$SCRATCH/preflight.jsonl" rc=0
+  local host_evidence=${BASIL_HOST_EVIDENCE_SNAPSHOT:?}
   if [[ ! -f $pf ]]; then
     fail_all PREFLIGHT_SOURCE_MISSING "guest/capacity-preflight.sh not found"
     return 0
   fi
+  if ! verify_host_evidence_snapshot; then
+    fail_all HOST_EVIDENCE_SNAPSHOT_FAILED "runner host filesystem snapshot failed size/digest verification"
+    return 0
+  fi
   # Pipe over ssh stdin (never scp: its port flag differs) and run with the
   # rootless user manager runtime dir so podman info works.
-  if ! ssh_user phase1-a 'cat >/tmp/capacity-preflight.sh' <"$pf" 2>/dev/null; then
-    fail_all PREFLIGHT_INJECT_FAILED "could not copy preflight into guest"
+  if ! ssh_user phase1-a 'cat >/tmp/capacity-preflight.sh' <"$pf" 2>/dev/null \
+    || ! ssh_user phase1-a 'cat >/tmp/host-evidence-snapshot.json' <"$host_evidence" 2>/dev/null; then
+    fail_all PREFLIGHT_INJECT_FAILED "could not copy preflight inputs into guest"
     return 0
   fi
   # shellcheck disable=SC2016  # $(id -u) must expand on the GUEST side.
-  ssh_user phase1-a 'export XDG_RUNTIME_DIR=/run/user/$(id -u); bash /tmp/capacity-preflight.sh --runtime podman --lane-id fedora-44-x86_64 --evidence-root /tmp --run-id capacity-preflight' \
+  ssh_user phase1-a "export XDG_RUNTIME_DIR=/run/user/\$(id -u); bash /tmp/capacity-preflight.sh --profile guest_medium --runtime podman --lane-id fedora-44-x86_64 --evidence-root / --host-evidence-snapshot /tmp/host-evidence-snapshot.json --host-evidence-snapshot-id '${BASIL_HOST_EVIDENCE_SNAPSHOT_ID}' --host-evidence-snapshot-sha256 '${BASIL_HOST_EVIDENCE_SNAPSHOT_SHA256}' --run-id capacity-preflight" \
     >"$out" 2>"$SCRATCH/preflight.stderr.log" || rc=$?
   # rc 1 = readiness blockers reported (expected in a deliberately small guest);
   # anything else without parseable output is an infrastructure failure.
@@ -565,7 +591,10 @@ run_capacity_preflight() {
     fail_all GUEST_PREFLIGHT_NO_OUTPUT "preflight produced no parseable JSONL (rc=$rc)"
     return 0
   fi
-  cat "$out" >>"$GUEST_LOG" 2>/dev/null || true
+  if ! retain_guest_events "$out" "$GUEST_LOG"; then
+    fail_all GUEST_EVENTS_RETENTION_FAILED "could not retain bounded guest preflight JSONL atomically"
+    return 0
+  fi
 
   local ready blockers
   ready=$(jq -r -s '[.[] | select(.event == "end")][0].data.ready // false' "$out" 2>/dev/null) || ready=false
@@ -573,13 +602,18 @@ run_capacity_preflight() {
   blockers=${blockers:0:300}
 
   # preflight.host-baseline: the full host fact set was collected in-guest.
-  if jq -e -s '[.[] | select(.event == "host_snapshot")][0].data
-      | (.cgroup.version_2 == true)
+  if jq -e -s '[.[] | select(.event == "host_snapshot" and .schema_version == "basil.compose.phase1.capacity-preflight/v2")][0]
+      | (.status == "PASS") and (.data | (.profile == "guest_medium") and (.execution_scope == "guest")
+      and (.cgroup.version_2 == true)
       and (.logical_cpus | type == "number")
-      and (.memory.available_bytes | type == "number")
+      and (.effective_cpu_millis | type == "number")
+      and (.memory.effective_available_bytes | type == "number")
       and (.file_descriptors.soft | test("^[0-9]+$"))
       and (.processes.pid_max | test("^[0-9]+$"))
-      and (.namespace_limits | type == "object")' "$out" >/dev/null 2>&1; then
+      and (.namespace_limits | type == "object")
+      and (.local_filesystem.available == true)
+      and (.local_filesystem.bytes_available | type == "number")
+      and (.local_filesystem.inodes_available | type == "number")))' "$out" >/dev/null 2>&1; then
     set_res preflight.host-baseline PASS GUEST_HOST_BASELINE_RECORDED \
       "readiness verdict ready=$ready blockers=${blockers:-none}"
   else
@@ -590,6 +624,7 @@ run_capacity_preflight() {
   # preflight.runtime-baseline: rootless Podman on cgroup v2 observed PASS.
   if jq -e -s '[.[] | select(.event == "runtime_snapshot" and .runtime == "podman")][0]
       | (.status == "PASS") and (.data.mode == "rootless")
+      and (.data.blocker_free == true) and (.data.filesystem.available == true)
       and (.data.info.host.cgroup_version | tostring | IN("2","v2"))' "$out" >/dev/null 2>&1; then
     local locks
     locks=$(jq -r -s '[.[] | select(.event == "runtime_snapshot" and .runtime == "podman")][0].data.lock_readiness.free_locks // "unknown"' "$out" 2>/dev/null) || locks=unknown
@@ -600,23 +635,28 @@ run_capacity_preflight() {
       "rootless podman snapshot missing or not PASS"
   fi
 
-  # preflight.evidence-retention: the ladder retention projection was computed.
+  # preflight.evidence-retention: the projection is anchored to the runner's host
+  # evidence filesystem, never to the guest rootfs.
   if jq -e -s '[.[] | select(.event == "capacity_projection")][0].data.evidence_projection
-      | (.per_container_event_bytes > 0) and (.bytes_at_target_run > 0)
-      and (.total_ladder_bytes > 0)' "$out" >/dev/null 2>&1; then
+      | (.source == "host-evidence-root") and (.evaluated == true)
+      and (.snapshot_id == env.BASIL_HOST_EVIDENCE_SNAPSHOT_ID)
+      and (.snapshot_sha256 == env.BASIL_HOST_EVIDENCE_SNAPSHOT_SHA256)
+      and (.per_container_event_bytes > 0) and (.bytes_at_target_run > 0)
+      and (.total_ladder_bytes > 0) and (.fits | type == "boolean")' "$out" >/dev/null 2>&1; then
     local total fits
     total=$(jq -r -s '[.[] | select(.event == "capacity_projection")][0].data.evidence_projection.total_ladder_bytes' "$out" 2>/dev/null) || total=unknown
     fits=$(jq -r -s '[.[] | select(.event == "capacity_projection")][0].data.evidence_projection.fits' "$out" 2>/dev/null) || fits=unknown
-    set_res preflight.evidence-retention PASS LADDER_RETENTION_PROJECTED \
-      "total_ladder_bytes=$total guest_fs_fits=$fits; host-side retention sized by the host preflight"
+    set_res preflight.evidence-retention PASS HOST_LADDER_RETENTION_PROJECTED \
+      "total_ladder_bytes=$total host_evidence_fs_fits=$fits"
   else
-    set_res preflight.evidence-retention TEST_FAIL LADDER_RETENTION_NOT_PROJECTED \
-      "capacity_projection event missing or incomplete"
+    set_res preflight.evidence-retention TEST_FAIL HOST_LADDER_RETENTION_NOT_PROJECTED \
+      "host-anchored capacity_projection event missing or incomplete"
   fi
 
   # preflight.stop-conditions: measured thresholds + all stop categories derived.
   if jq -e -s '[.[] | select(.event == "capacity_projection")][0].data.derived_stop_thresholds
       | has("memory_floor_bytes") and has("disk_floor_bytes")
+      and (.filesystems | type == "array" and length > 0)
       and has("fd_soft_headroom") and has("pid_headroom")
       and has("per_step_latency_ceiling_ms") and has("evidence_reserve_bytes")' "$out" >/dev/null 2>&1 \
     && jq -e -s '[.[] | select(.event == "end")][0].data.scale_ladder_stop_conditions

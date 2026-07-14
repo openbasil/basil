@@ -10,14 +10,20 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-rust-version = "1.88"
+rust-version = "1.96"
 publish = false
 
 [features]
-default = []
+default = ["compose-phase1-probe"]
 live-e2e = []
 # Test-only native host/guest feasibility probe for Compose Phase 1 evidence.
-compose-phase1-probe = []
+compose-phase1-probe = [
+  "dep:basil-proto",
+  "dep:hyper-util",
+  "dep:rustix",
+  "dep:tonic",
+  "dep:tower",
+]
 # Harness opt-in for live tests that need the broker's JWKS/OIDC HTTP surface.
 # This forwards to the separately built `basil-bin` process in `ensure_binaries_built`.
 http = []
@@ -28,6 +34,11 @@ unlock-bip39 = ["basil-core/unlock-bip39"]
 
 [dependencies]
 basil-core = { workspace = true, features = ["http", "unlock-age-yubikey", "unlock-bip39"] }
+basil-proto = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+rustix = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
 # Not a dev-dep: the shared harness (`src/lib.rs`) installs the pure-Rust `ring`
 # rustls `CryptoProvider` before any test builds a `reqwest` client (see
 # `ensure_crypto_provider`). `reqwest` itself stays test-only below.

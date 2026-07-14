@@ -161,6 +161,20 @@ fn parse_op(s: &str) -> Result<crate::catalog::Op, String> {
     crate::catalog::Op::parse(s).map_err(|e| e.to_string())
 }
 
+const MAX_ROOTLESS_EXPECTED_CONTAINERS: u32 = 1_000;
+
+fn parse_rootless_expected_containers(value: &str) -> Result<u32, String> {
+    let count = value
+        .parse::<u32>()
+        .map_err(|err| format!("expected container count must be an integer: {err}"))?;
+    if !(1..=MAX_ROOTLESS_EXPECTED_CONTAINERS).contains(&count) {
+        return Err(format!(
+            "expected container count must be between 1 and {MAX_ROOTLESS_EXPECTED_CONTAINERS}"
+        ));
+    }
+    Ok(count)
+}
+
 /// Arguments for the preflight **`doctor`** path (`basil-f0j`).
 ///
 /// Resolves the same catalog/policy/bundle/socket config `run` uses, then runs a
@@ -186,6 +200,16 @@ pub struct DoctorArgs {
     #[arg(long)]
     keys: bool,
 
+    /// Expected rootless container count for the Linux keyring quota readiness
+    /// check. Omit this flag to omit the check entirely (for example on a
+    /// rootful-only host).
+    #[arg(
+        long,
+        value_name = "COUNT",
+        value_parser = parse_rootless_expected_containers
+    )]
+    rootless_expected_containers: Option<u32>,
+
     /// Treat warnings as failures: exit non-zero if any check is a warning, not
     /// just on a fatal condition.
     #[arg(long)]
@@ -193,6 +217,15 @@ pub struct DoctorArgs {
 
     #[command(flatten)]
     overrides: ConfigOverrides,
+}
+
+impl DoctorArgs {
+    /// Expected rootless container count requested for the keyring quota check.
+    /// `None` means the check is omitted entirely.
+    #[must_use]
+    pub const fn rootless_expected_containers(&self) -> Option<u32> {
+        self.rootless_expected_containers
+    }
 }
 
 /// Backend-connection defaults applied to every cred that pins none of its own:
@@ -1912,7 +1945,10 @@ fn spawn_retention_sweep(state: Arc<BrokerState>, interval_secs: u64) {
 /// using the same path/socket resolution `run` uses. A missing required path
 /// (catalog/policy/bundle) is a clean config error (non-zero exit): that is a
 /// usage error, distinct from a diagnostic failure.
-fn load_doctor_inputs(overrides: &ConfigOverrides) -> Result<doctor::DoctorInputs> {
+fn load_doctor_inputs(
+    overrides: &ConfigOverrides,
+    rootless_expected_containers: Option<u32>,
+) -> Result<doctor::DoctorInputs> {
     let file = load_config_file(overrides)?;
     let invocation = resolve_invocation_config(&file.broker_identity, &file.invocation)?;
     let setup = build_setup(&file, overrides)?;
@@ -1939,6 +1975,7 @@ fn load_doctor_inputs(overrides: &ConfigOverrides) -> Result<doctor::DoctorInput
         unlock_passphrase_selected,
         unlock_bip39_selected,
         unlock_age_yubikey_selected,
+        rootless_expected_containers,
     })
 }
 
@@ -1948,7 +1985,7 @@ fn load_doctor_inputs(overrides: &ConfigOverrides) -> Result<doctor::DoctorInput
 /// binds the socket, or mutates anything; `--keys` explicitly unlocks only to run
 /// the authenticated read-only per-key existence probe.
 async fn run_doctor(args: DoctorArgs) -> Result<()> {
-    let inputs = load_doctor_inputs(&args.overrides)?;
+    let inputs = load_doctor_inputs(&args.overrides, args.rootless_expected_containers)?;
     let mut report = doctor::run_doctor(&inputs, doctor::EnabledFeatures::current()).await;
     if args.keys {
         let mut key_rows = doctor_key_material_rows(&args.overrides).await;

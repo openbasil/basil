@@ -88,9 +88,18 @@ case "$valid_status" in
   "$EXIT_INCOMPLETE"|"$EXIT_NOT_MEASURED"|"$EXIT_INFRA_ERROR") ;;
   *) fail "valid non-passing run returned unexpected exit $valid_status" ;;
 esac
-expect_exit "$valid_status" bash "$RUNNER" verify-run --run "$valid_id" \
-  --evidence-root "$TEST_ROOT/runs"
-pass "valid finalized evidence preserves typed verification status"
+set +e
+valid_verify_output=$(bash "$RUNNER" verify-run --run "$valid_id" \
+  --evidence-root "$TEST_ROOT/runs")
+valid_verify_status=$?
+set -e
+[[ $valid_verify_status == "$valid_status" ]] \
+  || fail "verify-run returned $valid_verify_status, expected $valid_status"
+valid_manifest_sha256=$(jq -er '.manifest_sha256' <<<"$valid_verify_output") \
+  || fail "verify-run did not report manifest_sha256"
+[[ $valid_manifest_sha256 == "$(sha256_file "$TEST_ROOT/runs/$valid_id/manifest.json")" ]] \
+  || fail "verify-run reported the wrong manifest_sha256"
+pass "valid finalized evidence reports its manifest hash and preserves typed status"
 
 # Interrupted/stale RUNNING state becomes retained INCOMPLETE evidence, never PASS.
 interrupted_id=$(prepare_run)
@@ -299,16 +308,281 @@ sandbox_status=$(jq -r 'select(.test_id == "dev.sandbox-readonly") | .status' \
   || fail "null driver did not run under a read-only sandbox (status=$sandbox_status)"
 pass "development null-driver run yields verifiable PASS evidence under a read-only sandbox"
 
-# The shared unprivileged-QEMU helper enforces the documented VM boundary.
+# Capacity-preflight v2 profiles and host-evidence anchoring are pure decision
+# logic, so exercise them with a bounded fake Docker info response. The test
+# creates only tiny scripts/JSON; it does not benchmark disk or write large files.
+preflight="$REPO_ROOT/interop-tests/compose-phase1/guest/capacity-preflight.sh"
+preflight_root="$TEST_ROOT/capacity-preflight"
+fake_bin="$preflight_root/bin"
+fake_runtime_root="$preflight_root/runtime-root"
+mkdir -p "$fake_bin" "$fake_runtime_root"
+cat >"$fake_bin/docker" <<'FAKE_DOCKER'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ ${1:-} == info ]] || exit 2
+jq -cn --arg root "${FAKE_DOCKER_ROOT:?}" '{
+  ServerVersion:"test", Driver:"overlay2", CgroupDriver:"systemd",
+  CgroupVersion:"2", DockerRootDir:$root, NCPU:8, MemTotal:68719476736,
+  Containers:0, ContainersRunning:0, ContainersPaused:0, ContainersStopped:0,
+  Images:0, SecurityOptions:["name=apparmor"]
+}'
+FAKE_DOCKER
+chmod +x "$fake_bin/docker"
+
+run_preflight_profile() {
+  local name=$1
+  shift
+  local out="$preflight_root/$name.jsonl" rc
+  set +e
+  env -u BASIL_CAPACITY_PROFILE -u BASIL_HOST_EVIDENCE_SNAPSHOT \
+    -u BASIL_HOST_EVIDENCE_SNAPSHOT_ID -u BASIL_HOST_EVIDENCE_SNAPSHOT_SHA256 \
+    PATH="$fake_bin:$PATH" FAKE_DOCKER_ROOT="$fake_runtime_root" \
+    bash "$preflight" --runtime docker --probe /nonexistent \
+      --evidence-root "$preflight_root" --run-id "$name" --lane-id test-x86_64 \
+      "$@" >"$out" 2>"$preflight_root/$name.stderr"
+  rc=$?
+  set -e
+  [[ $rc == 0 || $rc == 1 ]] || fail "capacity preflight $name exited $rc"
+  jq -e -s 'length >= 4 and all(.[]; type == "object")' "$out" >/dev/null \
+    || fail "capacity preflight $name did not emit bounded JSONL"
+}
+
+run_preflight_profile host-default
+jq -e -s '
+  ([.[] | select(.event == "start")][0]
+    | .schema_version == "basil.compose.phase1.capacity-preflight/v2"
+      and .data.profile == "host" and .data.execution_scope == "host")
+  and ([.[] | select(.event == "end")][0].data.thresholds
+    | .profile == "host" and .min_cpus == 8
+      and .min_memory_bytes == 34359738368
+      and .min_disk_bytes_per_checked_local_filesystem == 42949672960)
+' "$preflight_root/host-default.jsonl" >/dev/null \
+  || fail "default host profile thresholds changed"
+
+run_preflight_profile guest-small --profile guest_small
+jq -e -s '
+  ([.[] | select(.event == "end")][0].data.thresholds
+    | .profile == "guest_small" and .execution_scope == "guest"
+      and .min_cpus == 2 and .min_memory_bytes == 1073741824
+      and .min_disk_bytes_per_checked_local_filesystem == 10737418240
+      and .min_fd_soft == 32768)
+  and ([.[] | select(.event == "capacity_projection")][0]
+    | .status == "NOT_MEASURED"
+      and .reason_code == "HOST_EVIDENCE_ROOT_NOT_SUPPLIED"
+      and .data.evidence_projection.source == "not-measured"
+      and .data.evidence_projection.evaluated == false
+      and .data.evidence_projection.evidence_bytes_available == null
+      and .data.evidence_projection.headroom_after_ladder_bytes == null
+      and .data.evidence_projection.disk_reserve_source == "profile-readiness-constant"
+      and .data.evidence_projection.fits == null)
+  and ([.[] | select(.event == "end")][0].data
+    | any(.warnings[]; .code == "HOST_EVIDENCE_ROOT_NOT_SUPPLIED")
+      and (all(.block_reasons[]; .code != "EVIDENCE_RETENTION_INSUFFICIENT")))
+' "$preflight_root/guest-small.jsonl" >/dev/null \
+  || fail "guest_small profile did not skip unanchored retention honestly"
+
+host_snapshot="$preflight_root/host-evidence-snapshot.json"
+jq -n -c '{source:"host-evidence-root",snapshot_id:"test-host-snapshot",path_label:"test-host-evidence-root",fs_type:"testfs",device_id:"42",bytes_available:107374182400,bytes_total:214748364800,inodes_available:1000000,inodes_total:2000000}' \
+  >"$host_snapshot"
+host_snapshot_sha256=$(sha256_file "$host_snapshot")
+run_preflight_profile guest-medium --profile guest_medium \
+  --host-evidence-snapshot "$host_snapshot" \
+  --host-evidence-snapshot-id test-host-snapshot \
+  --host-evidence-snapshot-sha256 "$host_snapshot_sha256"
+jq -e -s '
+  ([.[] | select(.event == "end")][0].data.thresholds
+    | .profile == "guest_medium" and .execution_scope == "guest"
+      and .min_cpus == 4 and .min_memory_bytes == 4294967296
+      and .min_disk_bytes_per_checked_local_filesystem == 25769803776
+      and .host_evidence_reserve_bytes == 42949672960
+      and .min_fd_soft == 32768)
+  and ([.[] | select(.event == "host_snapshot")][0].data
+    | .retention_anchor_supplied == true
+      and .evidence_filesystem.source == "host-evidence-root"
+      and .evidence_filesystem.path == "test-host-evidence-root"
+      and .evidence_filesystem.snapshot_id == "test-host-snapshot")
+  and ([.[] | select(.event == "capacity_projection")][0].data.evidence_projection
+    | .source == "host-evidence-root" and .evaluated == true
+      and .snapshot_id == "test-host-snapshot"
+      and .evidence_bytes_available == 107374182400
+      and .disk_reserve_bytes == 42949672960 and .fits == true
+      and .retention_basis == "measured filesystem counters + evidence-size estimate + profile readiness constant")
+  and ([.[] | select(.event == "capacity_projection")][0].data.derived_stop_thresholds.filesystems
+    | (map(.filesystem_identity) | length == (unique | length))
+      and any(.[]; (.scopes | index("guest-local")) and (.scopes | index("docker")))
+      and any(.[]; .filesystem_identity == "host-device:42:testfs"))
+' "$preflight_root/guest-medium.jsonl" >/dev/null \
+  || fail "guest_medium profile did not use the supplied host evidence anchor"
+pass "capacity preflight profiles preserve host defaults and host-anchor guest retention"
+
+# Snapshot parsing is exactly-one-object, digest-bound, dash-path-safe, and
+# accepts the dynamic-inode zero pair without inventing an inode reserve.
+dynamic_snapshot="$preflight_root/dynamic-inodes.json"
+jq -n -c '{source:"host-evidence-root",snapshot_id:"dynamic-inodes",path_label:"dynamic",fs_type:"btrfs",device_id:"77",bytes_available:107374182400,bytes_total:214748364800,inodes_available:0,inodes_total:0}' \
+  >"$dynamic_snapshot"
+dynamic_sha256=$(sha256_file "$dynamic_snapshot")
+run_preflight_profile dynamic-inodes --profile guest_small \
+  --host-evidence-snapshot "$dynamic_snapshot" \
+  --host-evidence-snapshot-id dynamic-inodes \
+  --host-evidence-snapshot-sha256 "$dynamic_sha256"
+jq -e -s '[.[] | select(.event == "capacity_projection")][0].data.derived_stop_thresholds.filesystems
+  | any(.[]; .filesystem_identity == "host-device:77:btrfs"
+      and .inodes.applicable == false and .inodes.stop_below == null)' \
+  "$preflight_root/dynamic-inodes.jsonl" >/dev/null \
+  || fail "dynamic inode counters were treated as a fixed inode pool"
+
+multiple_snapshot="$preflight_root/multiple.json"
+printf '%s\n%s\n' "$(<"$host_snapshot")" "$(<"$host_snapshot")" >"$multiple_snapshot"
+multiple_sha256=$(sha256_file "$multiple_snapshot")
+expect_exit 2 env -u BASIL_CAPACITY_PROFILE -u BASIL_HOST_EVIDENCE_SNAPSHOT \
+  PATH="$fake_bin:$PATH" FAKE_DOCKER_ROOT="$fake_runtime_root" bash "$preflight" \
+  --profile guest_medium --runtime docker --probe /nonexistent \
+  --evidence-root "$preflight_root" --run-id hostile --lane-id test-x86_64 \
+  --host-evidence-snapshot "$multiple_snapshot" \
+  --host-evidence-snapshot-id test-host-snapshot \
+  --host-evidence-snapshot-sha256 "$multiple_sha256"
+expect_exit 2 bash "$preflight" --profile guest_small --runtime docker \
+  --host-evidence-snapshot -snapshot --host-evidence-snapshot-id invalid \
+  --host-evidence-snapshot-sha256 "$host_snapshot_sha256"
+pass "capacity snapshot parsing rejects multiple objects and dash-prefixed paths"
+
+run_preflight_profile unavailable-local --profile guest_small \
+  --evidence-root "$preflight_root/does-not-exist"
+jq -e -s '
+  ([.[] | select(.event == "host_snapshot")][0]
+    | .status == "INCOMPLETE" and .data.local_filesystem.available == false)
+  and ([.[] | select(.event == "capacity_projection")][0].data.derived_stop_thresholds.disk_floor_bytes
+    | .source == "not-measured" and .stop_below == null and .current_headroom_bytes == null)
+' "$preflight_root/unavailable-local.jsonl" >/dev/null \
+  || fail "unavailable filesystem claimed measured stop-threshold provenance"
+pass "unavailable filesystem thresholds remain explicitly not measured"
+
+# Effective VM resources and the host snapshot are runner-owned retained facts.
+preflight_meta_id=$(bash "$RUNNER" prepare --lane fedora-44-x86_64 \
+  --suite capacity-preflight --development --evidence-root "$TEST_ROOT/runs")
+preflight_meta_run="$TEST_ROOT/runs/$preflight_meta_id"
+capacity_meta_id=$(bash "$RUNNER" prepare --lane fedora-44-x86_64 \
+  --suite capacity --development --evidence-root "$TEST_ROOT/runs")
+capacity_meta_run="$TEST_ROOT/runs/$capacity_meta_id"
+jq -e '
+  .effective_vm == {disk_gib:32,memory_mib:8192,vcpus:4}
+  and .lane.disk_gib == 20 and .lane.memory_mib == 4096 and .lane.vcpus == 4
+  and (.host_evidence_snapshot.path == "raw/host-filesystem-snapshot.json")
+' "$preflight_meta_run/meta/run.json" >/dev/null \
+  || fail "capacity-preflight effective VM shape was not runner-owned"
+jq -e --argjson preflight "$(jq -c '.effective_vm' "$preflight_meta_run/meta/run.json")" '
+  .effective_vm.memory_mib >= $preflight.memory_mib
+  and .effective_vm.vcpus >= $preflight.vcpus
+  and .effective_vm.disk_gib >= $preflight.disk_gib
+' "$capacity_meta_run/meta/run.json" >/dev/null \
+  || fail "capacity VM shape is smaller than capacity-preflight"
+snapshot_rel=$(jq -r '.host_evidence_snapshot.path' "$preflight_meta_run/meta/run.json")
+snapshot_bytes=$(jq -r '.host_evidence_snapshot.bytes' "$preflight_meta_run/meta/run.json")
+snapshot_hash=$(jq -r '.host_evidence_snapshot.sha256' "$preflight_meta_run/meta/run.json")
+[[ $(stat -c '%s' -- "$preflight_meta_run/$snapshot_rel") == "$snapshot_bytes" \
+  && $(sha256_file "$preflight_meta_run/$snapshot_rel") == "$snapshot_hash" ]] \
+  || fail "runner host snapshot metadata does not match retained raw bytes"
+pass "runner records effective VM resources and a digest-bound host snapshot"
+
+# Capacity-preflight verification requires its raw guest JSONL inventory entry.
+finish_run "$preflight_meta_run" INCOMPLETE TEST_MISSING_GUEST_EVENTS
+expect_exit "$EXIT_INCOMPLETE" bash "$RUNNER" verify-run --run "$preflight_meta_id" \
+  --evidence-root "$TEST_ROOT/runs"
+artifact_meta_id=$(bash "$RUNNER" prepare --lane fedora-44-x86_64 \
+  --suite capacity-preflight --development --evidence-root "$TEST_ROOT/runs")
+artifact_meta_run="$TEST_ROOT/runs/$artifact_meta_id"
+guest_scratch="$artifact_meta_run/transient/driver/scratch"
+ensure_private_directory "$artifact_meta_run/transient/driver"
+ensure_private_directory "$guest_scratch"
+printf '{"bounded":true}\n' >"$guest_scratch/guest-events.jsonl"
+retain_guest_events_artifact "$artifact_meta_run" "$guest_scratch" \
+  || fail "bounded raw guest events were not retained"
+[[ $(sha256_file "$guest_scratch/guest-events.jsonl") \
+  == "$(sha256_file "$artifact_meta_run/raw/guest-events.jsonl")" ]] \
+  || fail "retained raw guest events changed bytes"
+rm -f -- "$guest_scratch/guest-events.jsonl"
+if retain_guest_events_artifact "$artifact_meta_run" "$guest_scratch"; then
+  fail "missing capacity guest events were accepted"
+fi
+pass "raw capacity guest events are retained atomically and required fail closed"
+
+# The shared unprivileged-QEMU helper enforces the documented VM boundary and
+# supplies every x86 lane with one short path inside the sandbox-private /tmp.
 # shellcheck source=/dev/null
 source "$REPO_ROOT/interop-tests/compose-phase1/drivers/lib/qemu-unpriv.sh"
+require_tool python3 >/dev/null || fail "python3 is required for the QMP socket test"
 qemu_unpriv_selfcheck || fail "unprivileged-QEMU boundary self-check failed"
+qmp_socket=$(qemu_unpriv_qmp_socket_path)
+[[ $qmp_socket == /tmp/* && ${#qmp_socket} -lt 108 ]] \
+  || fail "QMP socket path is not short and sandbox-private: $qmp_socket"
+for x86_driver in fedora-selinux-rootless.sh ubuntu-2404.sh; do
+  grep -Eq '^[[:space:]]*qmp=\$\(qemu_unpriv_qmp_socket_path\)$' \
+    "$REPO_ROOT/interop-tests/compose-phase1/drivers/$x86_driver" \
+    || fail "$x86_driver does not use the shared private-/tmp QMP path"
+done
+
+# Prove the shared path is usable inside the actual Bubblewrap boundary. The
+# probe deliberately leaves the socket pathname behind; sandbox teardown must
+# discard the private /tmp mount without changing any pre-existing host entry.
+# Use lstat-style metadata so a stale host socket or symlink is preserved rather
+# than making host state a prerequisite for this isolation test.
+qmp_host_before=$(stat -c '%d:%i:%F' -- "$qmp_socket" 2>/dev/null || printf 'absent\n')
+qmp_probe_id=$(prepare_dev_run)
+qmp_probe_run="$TEST_ROOT/runs/$qmp_probe_id"
+qmp_probe_scratch="$qmp_probe_run/transient/qmp-probe"
+ensure_private_directory "$qmp_probe_scratch"
+printf '%s\n' "$qmp_socket" >"$qmp_probe_scratch/qmp-path"
+qmp_probe_driver="$qmp_probe_scratch/probe.sh"
+cat >"$qmp_probe_driver" <<'QMP_PROBE'
+#!/usr/bin/env bash
+set -euo pipefail
+qmp=$(<"$BASIL_DRIVER_SCRATCH/qmp-path")
+python3 - "$qmp" "$BASIL_DRIVER_SCRATCH/qmp-bound" <<'PY'
+import socket
+import sys
+from pathlib import Path
+
+path, marker = sys.argv[1:]
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+    listener.bind(path)
+    Path(marker).write_text(path, encoding="utf-8")
+PY
+QMP_PROBE
+chmod 0700 "$qmp_probe_driver"
+invoke_driver "$qmp_probe_run" "$qmp_probe_driver" "$qmp_probe_scratch" \
+  || fail "sandbox-private QMP socket probe failed"
+[[ $(<"$qmp_probe_scratch/qmp-bound") == "$qmp_socket" ]] \
+  || fail "QMP socket probe did not bind the shared path"
+qmp_host_after=$(stat -c '%d:%i:%F' -- "$qmp_socket" 2>/dev/null || printf 'absent\n')
+[[ $qmp_host_after == "$qmp_host_before" ]] \
+  || fail "sandbox-private QMP socket changed the pre-existing host path"
+pass "QMP socket binds inside private /tmp and is discarded with the sandbox"
+
 # shellcheck disable=SC2054  # QEMU arguments use commas intentionally.
 bridge_argv=(qemu-system-x86_64 -nodefaults -netdev bridge,id=net0 \
-  -device virtio-net-pci,netdev=net0)
+  -device virtio-net-pci,netdev=net0 \
+  -qmp "unix:$qmp_socket,server=on,wait=off")
 if qemu_unpriv_assert_boundary "${bridge_argv[@]}"; then
   fail "QEMU boundary accepted bridged networking"
 fi
-pass "unprivileged-QEMU helper enforces the documented VM boundary"
+
+# shellcheck disable=SC2054  # QEMU arguments use commas intentionally.
+tcp_qmp_argv=(qemu-system-x86_64 -nodefaults \
+  -netdev user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:2222-:22 \
+  -device virtio-net-pci,netdev=net0 -qmp tcp:127.0.0.1:4444,server=on,wait=off)
+if qemu_unpriv_assert_boundary "${tcp_qmp_argv[@]}"; then
+  fail "QEMU boundary accepted a TCP QMP endpoint"
+fi
+
+long_qmp_path="/tmp/$(printf '%0103d' 0)"
+# shellcheck disable=SC2054  # QEMU arguments use commas intentionally.
+long_qmp_argv=(qemu-system-x86_64 -nodefaults \
+  -netdev user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:2222-:22 \
+  -device virtio-net-pci,netdev=net0 \
+  -qmp "unix:$long_qmp_path,server=on,wait=off")
+if qemu_unpriv_assert_boundary "${long_qmp_argv[@]}"; then
+  fail "QEMU boundary accepted an overlong QMP socket path"
+fi
+pass "unprivileged-QEMU helper enforces the VM boundary and short QMP path"
 
 printf 'PASS: Compose Phase 1 evidence fault tests\n'

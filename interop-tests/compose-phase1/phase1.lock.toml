@@ -50,25 +50,30 @@ required_tests = [
   "capacity.teardown",
 ]
 
+[suites.capacity.vm]
+memory_mib = 24576
+vcpus = 8
+disk_gib = 40
+
 # Readiness-only capacity preflight (basil-ge9). Distinct from `[suites.capacity]`
 # above, which is the later basil-9tj.4 measurement suite. This suite qualifies
-# the ENVIRONMENT for a serial 1,000-container ladder — host and both guests — and
-# makes no broker/attestor/protocol ceiling claim. It runs on BOTH qualified
+# the two qualified VM environments for a serial 1,000-container ladder and
+# makes no host, broker, attestor, or protocol ceiling claim. It runs on BOTH qualified
 # lanes (fedora-44-x86_64, ubuntu-24.04-x86_64): the runner exports
 # BASIL_DRIVER_SUITE, and each lane driver, when it reads capacity-preflight,
-# runs guest/capacity-preflight.sh inside the booted guest and maps its bounded
-# JSONL (retained as raw/guest-events.jsonl) onto these four terminals:
+# runs guest/capacity-preflight.sh with guest_medium plus the runner's bounded,
+# digest-bound filesystem snapshot anchored to the host evidence root. Its JSONL is retained as
+# raw/guest-events.jsonl and mapped onto these four terminals:
 #   preflight.host-baseline     full cpu/mem/disk/fd/pid/namespace/cgroup fact
 #                               set collected (guest verdict in the message)
 #   preflight.runtime-baseline  the lane's required runtime mode observed
 #                               (rootless podman / rootful docker on cgroup v2)
-#   preflight.evidence-retention  ladder evidence sizing projection computed
+#   preflight.evidence-retention  host-anchored ladder retention projection computed
 #   preflight.stop-conditions   derived safe scale-ladder stop thresholds present
 # These terminals assert complete readiness-evidence COLLECTION; the guest's
 # ready/blocker verdict is never converted into a pass — it travels in the
-# bounded messages and the retained raw JSONL. Host-side readiness (and the
-# host-scale retention fit) is retained as the labeled host-preflight artifact
-# under the evidence root.
+# bounded messages and the retained raw JSONL. Direct guest execution without a
+# host snapshot labels retention NOT_MEASURED rather than judging the guest rootfs.
 [suites.capacity-preflight]
 required_tests = [
   "preflight.host-baseline",
@@ -76,6 +81,11 @@ required_tests = [
   "preflight.evidence-retention",
   "preflight.stop-conditions",
 ]
+
+[suites.capacity-preflight.vm]
+memory_mib = 8192
+vcpus = 4
+disk_gib = 32
 
 [lanes.fedora-44-x86_64]
 architecture = "x86_64"
@@ -90,6 +100,7 @@ base_format = "qcow2"
 overlay_format = "qcow2"
 memory_mib = 4096
 vcpus = 4
+disk_gib = 20
 network = "user-loopback-only"
 driver = "fedora-selinux-rootless"
 qualification = true
@@ -124,6 +135,7 @@ base_format = "qcow2"
 overlay_format = "qcow2"
 memory_mib = 4096
 vcpus = 4
+disk_gib = 20
 network = "user-loopback-only"
 driver = "ubuntu-2404"
 qualification = true
@@ -150,6 +162,7 @@ base_format = "qcow2"
 overlay_format = "qcow2"
 memory_mib = 4096
 vcpus = 4
+disk_gib = 20
 network = "user-loopback-only"
 driver = "ubuntu-2404-arm64"
 qualification = false
@@ -181,6 +194,9 @@ distribution = "development-mock"
 runtime = "none"
 lsm = "none"
 artifacts = []
+memory_mib = 1
+vcpus = 1
+disk_gib = 1
 driver = "null"
 development_only = true
 qualification = false

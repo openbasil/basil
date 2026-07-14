@@ -157,4 +157,37 @@ mod tests {
         ]);
         assert!(matches!(cli.command, Command::Bundle(_)));
     }
+
+    #[test]
+    fn doctor_rootless_expected_containers_is_absent_by_default() {
+        let cli = parse(&["basil", "doctor"]);
+        let Command::Doctor(args) = cli.command else {
+            panic!("doctor command expected");
+        };
+        assert_eq!(args.rootless_expected_containers(), None);
+    }
+
+    #[test]
+    fn doctor_rootless_expected_containers_accepts_boundaries() {
+        for count in ["1", "1000"] {
+            let cli = parse(&["basil", "doctor", "--rootless-expected-containers", count]);
+            let Command::Doctor(args) = cli.command else {
+                panic!("doctor command expected");
+            };
+            assert_eq!(
+                args.rootless_expected_containers(),
+                count.parse::<u32>().ok()
+            );
+        }
+    }
+
+    #[test]
+    fn doctor_rootless_expected_containers_rejects_out_of_range() {
+        for count in ["0", "1001"] {
+            let err =
+                Cli::try_parse_from(["basil", "doctor", "--rootless-expected-containers", count])
+                    .expect_err("out-of-range rootless container count must reject");
+            assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+        }
+    }
 }

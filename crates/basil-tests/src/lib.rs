@@ -115,7 +115,7 @@ const DEV_SEM_LOCK_PREFIX: &str = "basil-spiffe-test-devsem";
 /// process and is reclaimable, mirroring the `alloc_addr` stale-lock steal. The
 /// ceiling is generous: a dev server's whole boot→test→teardown lifetime fits
 /// well under it, so a live holder is never wrongly reclaimed.
-const DEV_SEM_STALE: Duration = Duration::from_secs(10 * 60);
+const DEV_SEM_STALE: Duration = Duration::from_mins(10);
 
 /// RAII: removes its lock file on drop so a panic in the critical section (or a
 /// held semaphore permit) still releases the cross-process lock; otherwise the
@@ -158,7 +158,7 @@ fn acquire_dev_server_permit() -> DevServerPermit {
     // Generous ceiling: a whole engine's boot+test+teardown can take many seconds
     // and up to `permits` of them serialize behind a saturated pool, so allow
     // minutes before declaring the pool wedged.
-    let deadline = Instant::now() + Duration::from_secs(5 * 60);
+    let deadline = Instant::now() + Duration::from_mins(5);
     loop {
         for i in 0..permits {
             let slot = dir.join(format!("{DEV_SEM_LOCK_PREFIX}.{i}.lock"));

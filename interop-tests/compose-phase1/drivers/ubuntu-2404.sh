@@ -16,8 +16,9 @@
 # Contract: this driver speaks to the runner ONLY by writing the bounded result
 # file at $BASIL_DRIVER_RESULT. It never writes JSONL events, manifests, or
 # sequence numbers, and never sources guest output into runner events. It runs
-# inside the runner's read-only Bubblewrap view (only its scratch is writable,
-# a fresh network namespace, cleared environment). Any infrastructure failure is
+# inside the runner's read-only Bubblewrap view (only its retained scratch and
+# private /tmp tmpfs are writable, with a fresh network namespace and cleared
+# environment). Any infrastructure failure is
 # reported as `INFRA_ERROR`; nothing degrades into a false pass.
 #
 # Guest inputs are staged out of band (fetched and pinned by the provisioning
@@ -102,6 +103,32 @@ fi
 
 log() { printf '%s\n' "$*"; }
 err() { printf '%s\n' "$*" >&2; }
+
+verify_host_evidence_snapshot() {
+  local path=${BASIL_HOST_EVIDENCE_SNAPSHOT:?} expected_bytes=${BASIL_HOST_EVIDENCE_SNAPSHOT_BYTES:?}
+  local expected_hash=${BASIL_HOST_EVIDENCE_SNAPSHOT_SHA256:?}
+  [[ $path != -* && -f $path && ! -L $path && $expected_bytes =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ $(stat -c '%s' -- "$path") == "$expected_bytes" ]] || return 1
+  [[ $(sha256sum -- "$path" | cut -d ' ' -f 1) == "$expected_hash" ]] || return 1
+  jq -e -s --arg id "${BASIL_HOST_EVIDENCE_SNAPSHOT_ID:?}" '
+    length == 1 and .[0].source == "host-evidence-root"
+    and .[0].snapshot_id == $id
+  ' -- "$path" >/dev/null
+}
+
+retain_guest_events() {
+  local source=$1 destination=$2 bytes digest
+  local temporary="${destination}.tmp.$$"
+  [[ -f $source && ! -L $source ]] || return 1
+  bytes=$(stat -c '%s' -- "$source") || return 1
+  (( bytes > 0 && bytes <= 16 * 1024 * 1024 )) || return 1
+  digest=$(sha256sum -- "$source" | cut -d ' ' -f 1) || return 1
+  install -m 0600 -- "$source" "$temporary" || { rm -f -- "$temporary"; return 1; }
+  [[ $(stat -c '%s' -- "$temporary") == "$bytes" \
+    && $(sha256sum -- "$temporary" | cut -d ' ' -f 1) == "$digest" ]] \
+    || { rm -f -- "$temporary"; return 1; }
+  mv -f -- "$temporary" "$destination"
+}
 
 # Collected per-test verdicts, keyed by test id -> "STATUS REASON [message]".
 declare -A VERDICT=()
@@ -254,6 +281,8 @@ GUEST_EOF
 # exec the injected readiness preflight. Its stdout is pure bounded JSONL; all
 # provisioning output goes to guest-local files.
 capacity_guest_program() {
+  printf 'BASIL_HOST_SNAPSHOT_ID=%q\n' "${BASIL_HOST_EVIDENCE_SNAPSHOT_ID:?}"
+  printf 'BASIL_HOST_SNAPSHOT_SHA256=%q\n' "${BASIL_HOST_EVIDENCE_SNAPSHOT_SHA256:?}"
   cat <<'GUEST_EOF'
 #!/usr/bin/env bash
 set -u
@@ -263,7 +292,12 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 systemctl start docker >/dev/null 2>&1 || true
 for _ in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
-exec bash "$IN"/capacity-preflight.sh --runtime docker --lane-id ubuntu-24.04-x86_64 --evidence-root /tmp --run-id capacity-preflight
+exec bash "$IN"/capacity-preflight.sh --profile guest_medium --runtime docker \
+  --lane-id ubuntu-24.04-x86_64 --evidence-root / \
+  --host-evidence-snapshot "$IN"/host-evidence-snapshot.json \
+  --host-evidence-snapshot-id "$BASIL_HOST_SNAPSHOT_ID" \
+  --host-evidence-snapshot-sha256 "$BASIL_HOST_SNAPSHOT_SHA256" \
+  --run-id capacity-preflight
 GUEST_EOF
 }
 
@@ -279,11 +313,17 @@ run_capacity_preflight() {
   local fixture_root=$1 scratch=$2
   local pf="$fixture_root/guest/capacity-preflight.sh"
   local out="$scratch/preflight.jsonl" rc=0
+  local host_evidence=${BASIL_HOST_EVIDENCE_SNAPSHOT:?}
   [[ -f $pf ]] || fail_infra PREFLIGHT_SOURCE_MISSING "$pf"
+  verify_host_evidence_snapshot \
+    || fail_infra HOST_EVIDENCE_SNAPSHOT_FAILED "runner snapshot size/digest mismatch"
   # Pipe over ssh stdin (never scp for scripts: its port flag differs).
   "${ssh_base[@]}" "$SSH_USER@$SSH_HOST" 'cat >/home/basil-ci/in/capacity-preflight.sh' <"$pf" 2>/dev/null \
     || fail_infra PREFLIGHT_INJECT_FAILED ""
-  capacity_guest_program | "${ssh_base[@]}" "$SSH_USER@$SSH_HOST" 'cat >/home/basil-ci/in/capacity.sh' 2>/dev/null \
+  "${ssh_base[@]}" "$SSH_USER@$SSH_HOST" 'cat >/home/basil-ci/in/host-evidence-snapshot.json' <"$host_evidence" 2>/dev/null \
+    || fail_infra HOST_EVIDENCE_SNAPSHOT_INJECT_FAILED ""
+  capacity_guest_program | "${ssh_base[@]}" "$SSH_USER@$SSH_HOST" \
+    'cat >/home/basil-ci/in/capacity.sh' 2>/dev/null \
     || fail_infra PREFLIGHT_PROGRAM_COPY_FAILED ""
   "${ssh_base[@]}" "$SSH_USER@$SSH_HOST" 'sudo -n bash /home/basil-ci/in/capacity.sh' \
     >"$out" 2>"$scratch/preflight.stderr.log" || rc=$?
@@ -294,7 +334,8 @@ run_capacity_preflight() {
   fi
   # Retain the full bounded preflight JSONL as raw evidence (collected by the
   # runner as raw/guest-events.jsonl).
-  cp "$out" "$scratch/guest-events.jsonl" 2>/dev/null || true
+  retain_guest_events "$out" "$scratch/guest-events.jsonl" \
+    || fail_infra GUEST_EVENTS_RETENTION_FAILED ""
 
   local ready blockers
   ready=$(jq -r -s '[.[] | select(.event == "end")][0].data.ready // false' "$out" 2>/dev/null) || ready=false
@@ -302,13 +343,18 @@ run_capacity_preflight() {
   blockers=${blockers:0:300}
 
   # preflight.host-baseline: the full host fact set was collected in-guest.
-  if jq -e -s '[.[] | select(.event == "host_snapshot")][0].data
-      | (.cgroup.version_2 == true)
+  if jq -e -s '[.[] | select(.event == "host_snapshot" and .schema_version == "basil.compose.phase1.capacity-preflight/v2")][0]
+      | (.status == "PASS") and (.data | (.profile == "guest_medium") and (.execution_scope == "guest")
+      and (.cgroup.version_2 == true)
       and (.logical_cpus | type == "number")
-      and (.memory.available_bytes | type == "number")
+      and (.effective_cpu_millis | type == "number")
+      and (.memory.effective_available_bytes | type == "number")
       and (.file_descriptors.soft | test("^[0-9]+$"))
       and (.processes.pid_max | test("^[0-9]+$"))
-      and (.namespace_limits | type == "object")' "$out" >/dev/null 2>&1; then
+      and (.namespace_limits | type == "object")
+      and (.local_filesystem.available == true)
+      and (.local_filesystem.bytes_available | type == "number")
+      and (.local_filesystem.inodes_available | type == "number")))' "$out" >/dev/null 2>&1; then
     set_verdict preflight.host-baseline PASS GUEST_HOST_BASELINE_RECORDED \
       "readiness verdict ready=$ready blockers=${blockers:-none}"
   else
@@ -319,6 +365,7 @@ run_capacity_preflight() {
   # preflight.runtime-baseline: rootful Docker on cgroup v2 observed PASS.
   if jq -e -s '[.[] | select(.event == "runtime_snapshot" and .runtime == "docker")][0]
       | (.status == "PASS") and (.data.mode == "rootful")
+      and (.data.blocker_free == true) and (.data.filesystem.available == true)
       and (.data.info.cgroup_version | tostring | IN("2","v2"))' "$out" >/dev/null 2>&1; then
     local driver_name
     driver_name=$(jq -r -s '[.[] | select(.event == "runtime_snapshot" and .runtime == "docker")][0].data.info.storage_driver // "unknown"' "$out" 2>/dev/null) || driver_name=unknown
@@ -329,23 +376,28 @@ run_capacity_preflight() {
       "rootful docker snapshot missing or not PASS"
   fi
 
-  # preflight.evidence-retention: the ladder retention projection was computed.
+  # preflight.evidence-retention: the projection is anchored to the runner's host
+  # evidence filesystem, never to the guest rootfs.
   if jq -e -s '[.[] | select(.event == "capacity_projection")][0].data.evidence_projection
-      | (.per_container_event_bytes > 0) and (.bytes_at_target_run > 0)
-      and (.total_ladder_bytes > 0)' "$out" >/dev/null 2>&1; then
+      | (.source == "host-evidence-root") and (.evaluated == true)
+      and (.snapshot_id == env.BASIL_HOST_EVIDENCE_SNAPSHOT_ID)
+      and (.snapshot_sha256 == env.BASIL_HOST_EVIDENCE_SNAPSHOT_SHA256)
+      and (.per_container_event_bytes > 0) and (.bytes_at_target_run > 0)
+      and (.total_ladder_bytes > 0) and (.fits | type == "boolean")' "$out" >/dev/null 2>&1; then
     local total fits
     total=$(jq -r -s '[.[] | select(.event == "capacity_projection")][0].data.evidence_projection.total_ladder_bytes' "$out" 2>/dev/null) || total=unknown
     fits=$(jq -r -s '[.[] | select(.event == "capacity_projection")][0].data.evidence_projection.fits' "$out" 2>/dev/null) || fits=unknown
-    set_verdict preflight.evidence-retention PASS LADDER_RETENTION_PROJECTED \
-      "total_ladder_bytes=$total guest_fs_fits=$fits; host-side retention sized by the host preflight"
+    set_verdict preflight.evidence-retention PASS HOST_LADDER_RETENTION_PROJECTED \
+      "total_ladder_bytes=$total host_evidence_fs_fits=$fits"
   else
-    set_verdict preflight.evidence-retention TEST_FAIL LADDER_RETENTION_NOT_PROJECTED \
-      "capacity_projection event missing or incomplete"
+    set_verdict preflight.evidence-retention TEST_FAIL HOST_LADDER_RETENTION_NOT_PROJECTED \
+      "host-anchored capacity_projection event missing or incomplete"
   fi
 
   # preflight.stop-conditions: measured thresholds + all stop categories derived.
   if jq -e -s '[.[] | select(.event == "capacity_projection")][0].data.derived_stop_thresholds
       | has("memory_floor_bytes") and has("disk_floor_bytes")
+      and (.filesystems | type == "array" and length > 0)
       and has("fd_soft_headroom") and has("pid_headroom")
       and has("per_step_latency_ceiling_ms") and has("evidence_reserve_bytes")' "$out" >/dev/null 2>&1 \
     && jq -e -s '[.[] | select(.event == "end")][0].data.scale_ladder_stop_conditions
@@ -575,22 +627,17 @@ main() {
   fixture_root=$(dirname -- "$driver_dir")
 
   # Lane configuration travels in the run metadata (`.lane` is the full lock row).
-  local memory_mib vcpus machine cloud_init_rel
-  memory_mib=$(jq -er '.lane.memory_mib' "$run/meta/run.json") || fail_infra LANE_MEMORY_UNSET ""
-  vcpus=$(jq -er '.lane.vcpus' "$run/meta/run.json") || fail_infra LANE_VCPUS_UNSET ""
+  local memory_mib vcpus disk_gib machine cloud_init_rel
+  memory_mib=${BASIL_VM_MEMORY_MIB:?BASIL_VM_MEMORY_MIB must be set by the runner}
+  vcpus=${BASIL_VM_VCPUS:?BASIL_VM_VCPUS must be set by the runner}
+  disk_gib=${BASIL_VM_DISK_GIB:?BASIL_VM_DISK_GIB must be set by the runner}
   machine=$(jq -er '.lane.machine' "$run/meta/run.json") || fail_infra LANE_MACHINE_UNSET ""
   cloud_init_rel=$(jq -er '.lane.cloud_init' "$run/meta/run.json") || fail_infra LANE_CLOUDINIT_UNSET ""
   local cloud_init_template="$fixture_root/$cloud_init_rel"
   [[ -f $cloud_init_template ]] || fail_infra CLOUDINIT_TEMPLATE_MISSING "$cloud_init_rel"
 
-  # Capacity ladder (basil-9tj.4) needs a bigger guest than the lane default:
-  # 1,000 rootful-Docker containers plus the daemon. The host is exclusively the
-  # measurement host (16 cpu / 92 GiB), guests run serially, so size up. This
-  # overrides only the capacity suite; every other suite keeps the lock sizing.
-  if [[ $SUITE == capacity ]]; then
-    memory_mib=24576
-    vcpus=8
-  fi
+  [[ $memory_mib =~ ^[1-9][0-9]*$ && $vcpus =~ ^[1-9][0-9]*$ \
+    && $disk_gib =~ ^[1-9][0-9]*$ ]] || fail_infra VM_SIZING_INVALID ""
 
   # The runner's sandbox clears the environment, so recover the invoking user's
   # cache root from the password database (same default artifacts.sh computes).
@@ -628,17 +675,26 @@ main() {
   [[ -f $workload ]] || fail_infra STAGED_WORKLOAD_MISSING "$workload"
   [[ -f $compose_file ]] || fail_infra STAGED_COMPOSE_MISSING "$compose_file"
 
+  # Load the boundary helper before selecting the sandbox-private QMP endpoint.
+  # shellcheck source=/dev/null
+  source "$driver_dir/lib/qemu-unpriv.sh" || fail_infra QEMU_LIB_MISSING ""
+
   # Build the per-run overlay and the NoCloud seed inside the writable scratch.
   local overlay="$scratch/overlay.qcow2"
   local seed="$scratch/seed.iso"
   local serial="$scratch/serial.log"
-  local qmp="$scratch/q.sock"
+  local qmp
+  qmp=$(qemu_unpriv_qmp_socket_path)
   local known_hosts="$scratch/known_hosts"
   local user_data="$scratch/user-data"
   local meta_data="$scratch/meta-data"
   local qemu_err="$scratch/qemu.stderr.log"
 
-  qemu-img create -f qcow2 -F qcow2 -b "$base_image" "$overlay" 20G >/dev/null 2>&1 \
+  # The guest_medium preflight uses a 32-GiB sparse virtual disk so the local
+  # 24-GiB readiness expectation can be evaluated without preallocating or
+  # repeatedly writing a large test file. Other suites retain the existing 20G.
+  local overlay_size="${disk_gib}G"
+  qemu-img create -f qcow2 -F qcow2 -b "$base_image" "$overlay" "$overlay_size" >/dev/null 2>&1 \
     || fail_infra OVERLAY_CREATE_FAILED ""
   sed "s|__BASIL_PHASE1_SSH_PUBLIC_KEY__|$(cat "$ssh_pub")|" "$cloud_init_template" >"$user_data" \
     || fail_infra CLOUDINIT_RENDER_FAILED ""
@@ -647,10 +703,9 @@ main() {
   "$geniso" -quiet -output "$seed" -volid CIDATA -joliet -rock "$user_data" "$meta_data" \
     >/dev/null 2>&1 || fail_infra SEED_BUILD_FAILED ""
 
-  # Assemble the boundary-conforming unprivileged QEMU argv, fail closed if the
-  # library rejects it, then boot. Acceleration rides on the lane's `machine`.
-  # shellcheck source=/dev/null
-  source "$driver_dir/lib/qemu-unpriv.sh" || fail_infra QEMU_LIB_MISSING ""
+  # Assemble the boundary-conforming unprivileged QEMU argv with its short QMP
+  # socket in the sandbox-private /tmp, then fail closed if the library rejects
+  # it. Acceleration rides on the lane's `machine`.
   local -a qemu_argv=()
   qemu_unpriv_build_argv qemu_argv \
     "$base_image" "$overlay" "$serial" "$qmp" "$SSH_PORT" "$seed" \

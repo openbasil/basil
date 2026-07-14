@@ -29,6 +29,8 @@ readonly MAX_EVENT_BYTES=$((16 * 1024 * 1024))
 readonly MAX_EVENTS=10000
 readonly MAX_DRIVER_RESULT_BYTES=$((64 * 1024))
 readonly MAX_DRIVER_RESULTS=1024
+readonly MAX_GUEST_EVENTS_BYTES=$((16 * 1024 * 1024))
+readonly MAX_HOST_SNAPSHOT_BYTES=$((16 * 1024))
 readonly DEFAULT_DRIVER_TIMEOUT_SECONDS=900
 
 readonly EXIT_PASS=0
@@ -261,6 +263,77 @@ required_tests_lines() {
   required_tests_json "$1" | jq -r '.[]'
 }
 
+effective_vm_json() {
+  local lane_json=$1 suite=$2 suite_vm effective preflight_vm
+  suite_vm=$(lock_python suites "$suite" vm 2>/dev/null || printf '{}')
+  effective=$(jq -e -n -c --argjson lane "$lane_json" --argjson suite_vm "$suite_vm" '
+    {
+      memory_mib: ($suite_vm.memory_mib // $lane.memory_mib),
+      vcpus: ($suite_vm.vcpus // $lane.vcpus),
+      disk_gib: ($suite_vm.disk_gib // $lane.disk_gib)
+    }
+    | select(
+        (.memory_mib | type == "number" and floor == . and . > 0)
+        and (.vcpus | type == "number" and floor == . and . > 0)
+        and (.disk_gib | type == "number" and floor == . and . > 0)
+      )
+  ') || return "$EXIT_INFRA_ERROR"
+  if [[ $suite == capacity ]]; then
+    preflight_vm=$(lock_python suites capacity-preflight vm) || return "$EXIT_INFRA_ERROR"
+    jq -e -n --argjson capacity "$effective" --argjson preflight "$preflight_vm" '
+      $capacity.memory_mib >= $preflight.memory_mib
+      and $capacity.vcpus >= $preflight.vcpus
+      and $capacity.disk_gib >= $preflight.disk_gib
+    ' >/dev/null || return "$EXIT_INFRA_ERROR"
+  fi
+  printf '%s\n' "$effective"
+}
+
+create_host_filesystem_snapshot() {
+  local run=$1 run_id=$2
+  local destination="$run/raw/host-filesystem-snapshot.json"
+  local fs_type device_id block_size blocks_available blocks_total
+  local inodes_available inodes_total inode_applicable snapshot_id bytes digest
+  fs_type=$(stat -f -c '%T' -- "$run") || return "$EXIT_INFRA_ERROR"
+  device_id=$(stat -c '%d' -- "$run") || return "$EXIT_INFRA_ERROR"
+  block_size=$(stat -f -c '%S' -- "$run") || return "$EXIT_INFRA_ERROR"
+  blocks_available=$(stat -f -c '%a' -- "$run") || return "$EXIT_INFRA_ERROR"
+  blocks_total=$(stat -f -c '%b' -- "$run") || return "$EXIT_INFRA_ERROR"
+  inodes_available=$(stat -f -c '%d' -- "$run") || return "$EXIT_INFRA_ERROR"
+  inodes_total=$(stat -f -c '%c' -- "$run") || return "$EXIT_INFRA_ERROR"
+  [[ $device_id =~ ^[0-9]+$ && $block_size =~ ^[0-9]+$ \
+    && $blocks_available =~ ^[0-9]+$ && $blocks_total =~ ^[0-9]+$ \
+    && $inodes_available =~ ^[0-9]+$ && $inodes_total =~ ^[0-9]+$ \
+    && $blocks_available -le $blocks_total ]] || return "$EXIT_INFRA_ERROR"
+  if (( inodes_total == 0 && inodes_available == 0 )); then
+    inode_applicable=false
+  elif (( inodes_total > 0 && inodes_available <= inodes_total )); then
+    inode_applicable=true
+  else
+    return "$EXIT_INFRA_ERROR"
+  fi
+  snapshot_id="${run_id}-host-filesystem"
+  write_json_atomic "$destination" "$(jq -n -c \
+    --arg snapshot_id "$snapshot_id" --arg fs_type "${fs_type:0:64}" \
+    --arg device_id "$device_id" \
+    --argjson bytes_available "$((block_size * blocks_available))" \
+    --argjson bytes_total "$((block_size * blocks_total))" \
+    --argjson inodes_available "$inodes_available" \
+    --argjson inodes_total "$inodes_total" \
+    --argjson inode_applicable "$inode_applicable" \
+    '{source:"host-evidence-root",snapshot_id:$snapshot_id,
+      path_label:"runner-evidence-root",fs_type:$fs_type,device_id:$device_id,
+      bytes_available:$bytes_available,bytes_total:$bytes_total,
+      inodes_available:$inodes_available,inodes_total:$inodes_total,
+      inode_applicable:$inode_applicable}')"
+  bytes=$(stat -c '%s' -- "$destination") || return "$EXIT_INFRA_ERROR"
+  (( bytes > 0 && bytes <= MAX_HOST_SNAPSHOT_BYTES )) || return "$EXIT_INFRA_ERROR"
+  digest=$(sha256_file "$destination") || return "$EXIT_INFRA_ERROR"
+  jq -n -c --arg path raw/host-filesystem-snapshot.json \
+    --arg snapshot_id "$snapshot_id" --argjson bytes "$bytes" --arg sha256 "$digest" \
+    '{path:$path,snapshot_id:$snapshot_id,bytes:$bytes,sha256:$sha256}'
+}
+
 source_snapshot_json() {
   local commit dirty=true summary
   commit=$(jj log -r @ --no-graph -T 'commit_id.short(12)' 2>/dev/null || printf 'unknown')
@@ -423,7 +496,6 @@ collect_outputs() {
   copy_retained_file "$scratch/qemu.stderr.log" "$run/raw/qemu.stderr.log"
   copy_retained_file "$scratch/driver.stdout.log" "$run/raw/driver.stdout.log"
   copy_retained_file "$scratch/driver.stderr.log" "$run/raw/driver.stderr.log"
-  copy_retained_file "$scratch/guest-events.jsonl" "$run/raw/guest-events.jsonl"
   jq -S -c '{schema,schema_version,run_id,lane_id,seq,time,event,status,reason_code,test_id,message,details}' \
     "$run/sanitized/events.jsonl" >"$run/sanitized/events.canonical.jsonl"
   chmod 0600 "$run/sanitized/events.canonical.jsonl"
@@ -628,6 +700,7 @@ prepare_ssh_material() {
 
 prepare_command() {
   local lane='' suite=lane-smoke root_requested qualification=development root run_id run source lane_json
+  local effective_vm host_snapshot
   root_requested=$(default_evidence_root)
   while (( $# > 0 )); do
     case "$1" in
@@ -647,6 +720,8 @@ prepare_command() {
     return "$EXIT_UNSUPPORTED"
   fi
   required_tests_json "$suite" >/dev/null || { log "unsupported suite: $suite"; return "$EXIT_UNSUPPORTED"; }
+  effective_vm=$(effective_vm_json "$lane_json" "$suite") \
+    || { log "INFRA_ERROR: invalid effective VM sizing for lane=$lane suite=$suite"; return "$EXIT_INFRA_ERROR"; }
   root=$(ensure_evidence_root "$root_requested" "$qualification") || return $?
   run_id=$(new_run_id)
   run=$(run_path "$root" "$run_id")
@@ -661,13 +736,17 @@ prepare_command() {
   chmod 0600 "$run/meta/seq"
   : >"$run/sanitized/events.jsonl"
   chmod 0600 "$run/sanitized/events.jsonl"
+  host_snapshot=$(create_host_filesystem_snapshot "$run" "$run_id") \
+    || { log "INFRA_ERROR: host evidence filesystem snapshot failed"; return "$EXIT_INFRA_ERROR"; }
   source=$(source_snapshot_json)
   write_json_atomic "$run/meta/run.json" "$(jq -n -c \
     --arg run_id "$run_id" --arg lane_id "$lane" --arg suite "$suite" \
     --arg qualification "$qualification" --arg created_at "$(utc_now)" \
     --argjson source "$source" --argjson lane "$lane_json" \
+    --argjson effective_vm "$effective_vm" --argjson host_snapshot "$host_snapshot" \
     '{run_id:$run_id,lane_id:$lane_id,suite:$suite,qualification:$qualification,
-      created_at:$created_at,source:$source,lane:$lane}')"
+      created_at:$created_at,source:$source,lane:$lane,effective_vm:$effective_vm,
+      host_evidence_snapshot:$host_snapshot}')"
   write_json_atomic "$run/RUNNING" "$(jq -n -c --arg run_id "$run_id" --arg started_at "$(utc_now)" \
     '{run_id:$run_id,started_at:$started_at}')"
   prepare_ssh_material "$run"
@@ -746,9 +825,19 @@ resolve_driver() {
 # time-bounded, dies with the runner, and starts from a cleared environment.
 invoke_driver() {
   local run=$1 driver_path=$2 scratch=$3 run_id lane_id suite
+  local vm_memory_mib vm_vcpus vm_disk_gib snapshot_rel snapshot snapshot_bytes snapshot_sha256 snapshot_id
   run_id=$(run_metadata_field "$run" '.run_id') || return "$EXIT_INFRA_ERROR"
   lane_id=$(run_metadata_field "$run" '.lane_id') || return "$EXIT_INFRA_ERROR"
   suite=$(run_metadata_field "$run" '.suite') || return "$EXIT_INFRA_ERROR"
+  vm_memory_mib=$(run_metadata_field "$run" '.effective_vm.memory_mib') || return "$EXIT_INFRA_ERROR"
+  vm_vcpus=$(run_metadata_field "$run" '.effective_vm.vcpus') || return "$EXIT_INFRA_ERROR"
+  vm_disk_gib=$(run_metadata_field "$run" '.effective_vm.disk_gib') || return "$EXIT_INFRA_ERROR"
+  snapshot_rel=$(run_metadata_field "$run" '.host_evidence_snapshot.path') || return "$EXIT_INFRA_ERROR"
+  snapshot="$run/$snapshot_rel"
+  snapshot_bytes=$(run_metadata_field "$run" '.host_evidence_snapshot.bytes') || return "$EXIT_INFRA_ERROR"
+  snapshot_sha256=$(run_metadata_field "$run" '.host_evidence_snapshot.sha256') || return "$EXIT_INFRA_ERROR"
+  snapshot_id=$(run_metadata_field "$run" '.host_evidence_snapshot.snapshot_id') || return "$EXIT_INFRA_ERROR"
+  [[ -f $snapshot && ! -L $snapshot ]] || return "$EXIT_INFRA_ERROR"
   require_tool bwrap >/dev/null || return "$EXIT_INFRA_ERROR"
   require_tool timeout >/dev/null || return "$EXIT_INFRA_ERROR"
   local -a sandbox=(
@@ -776,6 +865,13 @@ invoke_driver() {
     --setenv BASIL_RUN_ID "$run_id"
     --setenv BASIL_LANE_ID "$lane_id"
     --setenv BASIL_DRIVER_SUITE "$suite"
+    --setenv BASIL_VM_MEMORY_MIB "$vm_memory_mib"
+    --setenv BASIL_VM_VCPUS "$vm_vcpus"
+    --setenv BASIL_VM_DISK_GIB "$vm_disk_gib"
+    --setenv BASIL_HOST_EVIDENCE_SNAPSHOT "$snapshot"
+    --setenv BASIL_HOST_EVIDENCE_SNAPSHOT_BYTES "$snapshot_bytes"
+    --setenv BASIL_HOST_EVIDENCE_SNAPSHOT_SHA256 "$snapshot_sha256"
+    --setenv BASIL_HOST_EVIDENCE_SNAPSHOT_ID "$snapshot_id"
     --setenv BASIL_DRIVER_RESULT_SCHEMA "$DRIVER_RESULT_SCHEMA"
     --setenv BASIL_DRIVER_RESULT_SCHEMA_VERSION "$DRIVER_RESULT_SCHEMA_VERSION"
     --setenv BASIL_MAX_RESULT_BYTES "$MAX_DRIVER_RESULT_BYTES"
@@ -784,6 +880,30 @@ invoke_driver() {
   )
   timeout --signal=TERM --kill-after=10 "$DEFAULT_DRIVER_TIMEOUT_SECONDS" \
     "${sandbox[@]}" >"$scratch/driver.stdout.log" 2>"$scratch/driver.stderr.log"
+}
+
+retain_guest_events_artifact() {
+  local run=$1 scratch=$2 suite source destination temporary bytes source_hash retained_hash
+  suite=$(run_metadata_field "$run" '.suite') || return "$EXIT_INFRA_ERROR"
+  source="$scratch/guest-events.jsonl"
+  destination="$run/raw/guest-events.jsonl"
+  if [[ ! -f $source || -L $source ]]; then
+    [[ $suite != capacity-preflight ]] && return 0
+    return "$EXIT_INFRA_ERROR"
+  fi
+  bytes=$(stat -c '%s' -- "$source") || return "$EXIT_INFRA_ERROR"
+  (( bytes > 0 && bytes <= MAX_GUEST_EVENTS_BYTES )) || return "$EXIT_INFRA_ERROR"
+  source_hash=$(sha256_file "$source") || return "$EXIT_INFRA_ERROR"
+  temporary="${destination}.tmp.$$"
+  install -m 0600 -- "$source" "$temporary" || { rm -f -- "$temporary"; return "$EXIT_INFRA_ERROR"; }
+  [[ $(stat -c '%s' -- "$temporary") == "$bytes" ]] \
+    || { rm -f -- "$temporary"; return "$EXIT_INFRA_ERROR"; }
+  retained_hash=$(sha256_file "$temporary") || { rm -f -- "$temporary"; return "$EXIT_INFRA_ERROR"; }
+  [[ $retained_hash == "$source_hash" ]] \
+    || { rm -f -- "$temporary"; return "$EXIT_INFRA_ERROR"; }
+  mv -f -- "$temporary" "$destination"
+  [[ $(stat -c '%s' -- "$destination") == "$bytes" \
+    && $(sha256_file "$destination") == "$source_hash" ]] || return "$EXIT_INFRA_ERROR"
 }
 
 # Validate the bounded driver result contract: size-capped, single object with
@@ -863,6 +983,10 @@ execute_driver_lane() {
   set -e
   if (( rc != 0 )); then
     printf '%s %s\n' INFRA_ERROR DRIVER_EXECUTION_FAILED
+    return 0
+  fi
+  if ! retain_guest_events_artifact "$run" "$scratch"; then
+    printf '%s %s\n' INFRA_ERROR GUEST_EVENTS_RETENTION_FAILED
     return 0
   fi
   required=$(required_tests_json "$(run_metadata_field "$run" '.suite')")
@@ -1076,6 +1200,12 @@ verify_run_directory() {
   [[ $run_id == "$(run_metadata_field "$run" '.run_id')" ]] || return "$EXIT_INCOMPLETE"
   [[ $lane_id == "$(run_metadata_field "$run" '.lane_id')" ]] || return "$EXIT_INCOMPLETE"
   [[ $suite == "$(run_metadata_field "$run" '.suite')" ]] || return "$EXIT_INCOMPLETE"
+  if [[ $suite == capacity-preflight ]]; then
+    [[ -f $run/raw/guest-events.jsonl && ! -L $run/raw/guest-events.jsonl ]] \
+      || return "$EXIT_INCOMPLETE"
+    jq -e '[.files[] | select(.path == "raw/guest-events.jsonl")] | length == 1' \
+      "$run/manifest.json" >/dev/null || return "$EXIT_INCOMPLETE"
+  fi
 
   required=$(jq -S -c '.required_tests' "$run/manifest.json")
   expected_required=$(required_tests_json "$suite" | jq -S -c .) || return "$EXIT_INCOMPLETE"
@@ -1130,7 +1260,7 @@ verify_run_command() {
     log "INCOMPLETE: retained evidence failed integrity or schema verification"
     return "$EXIT_INCOMPLETE"
   fi
-  printf '%s\n' "$(jq -c '{run_id,lane_id,status,reason_code,manifest_sha256}' \
+  printf '%s\n' "$(jq -c '{run_id,lane_id,status,reason_code,manifest_sha256:$manifest_sha256}' \
     --arg manifest_sha256 "$(sha256_file "$run/manifest.json")" "$run/manifest.json")"
   return "$exit_code"
 }

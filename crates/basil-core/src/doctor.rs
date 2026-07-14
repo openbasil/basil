@@ -62,6 +62,59 @@ pub const DOCTOR_SCHEMA_VERSION: u32 = 2;
 /// check, never hang the whole run.
 const REACHABILITY_TIMEOUT: Duration = Duration::from_secs(3);
 
+const ROOTLESS_KEYRING_QUOTA_CHECK: &str = "rootless_keyring_quota";
+const ROOTLESS_MAXKEYS_PATH: &str = "/proc/sys/kernel/keys/maxkeys";
+const ROOTLESS_MAXBYTES_PATH: &str = "/proc/sys/kernel/keys/maxbytes";
+const ROOTLESS_KEYS_PER_CONTAINER: u64 = 2;
+const ROOTLESS_BYTES_PER_CONTAINER: u64 = 2_000;
+const NIX_ROOTLESS_MAXKEYS: u64 = 2_000;
+const NIX_ROOTLESS_MAXBYTES: u64 = 2_000_000;
+
+/// One fixed production procfs reading supplied to the pure rootless keyring
+/// quota evaluator.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "Linux procfs readings are constructed only by Linux production builds"
+    )
+)]
+pub(crate) enum RootlessKeyringQuotaReading<'a> {
+    /// The procfs file was read and yielded these contents.
+    Contents(&'a str),
+    /// The procfs file could not be read.
+    Unreadable,
+}
+
+/// Platform-specific inputs to the pure rootless keyring quota evaluator.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RootlessKeyringQuotaReadings<'a> {
+    /// Linux procfs readings for both effective quota dimensions.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(
+            dead_code,
+            reason = "constructed only by Linux production builds and evaluator tests"
+        )
+    )]
+    Linux {
+        /// Effective `kernel.keys.maxkeys` contents.
+        maxkeys: RootlessKeyringQuotaReading<'a>,
+        /// Effective `kernel.keys.maxbytes` contents.
+        maxbytes: RootlessKeyringQuotaReading<'a>,
+    },
+    /// The requested readiness check is unavailable on this platform.
+    #[cfg_attr(
+        target_os = "linux",
+        allow(
+            dead_code,
+            reason = "constructed by non-Linux builds and evaluator tests"
+        )
+    )]
+    UnsupportedPlatform,
+}
+
 /// The outcome of a single diagnostic check.
 ///
 /// `Ok` passes; `Warn` is advisory (exits nonzero only under `--strict`); `Fatal`
@@ -229,6 +282,9 @@ pub struct DoctorInputs {
     pub unlock_bip39_selected: bool,
     /// Whether the age-yubikey unlock slot is enabled.
     pub unlock_age_yubikey_selected: bool,
+    /// Expected rootless container count for the opt-in keyring quota readiness
+    /// check. `None` omits the check entirely.
+    pub rootless_expected_containers: Option<u32>,
 }
 
 /// Which cargo features the running binary was compiled with, captured at the
@@ -306,10 +362,146 @@ pub async fn run_doctor(inputs: &DoctorInputs, features: EnabledFeatures) -> Doc
         inputs.socket_mode,
         inputs.socket_group.as_deref(),
     ));
+    if let Some(expected_containers) = inputs.rootless_expected_containers {
+        checks.push(rootless_keyring_quota_check(expected_containers));
+    }
     checks.extend(bundle_checks(&inputs.bundle));
     checks.push(backend_reachability_check(backends.as_ref()).await);
 
     DoctorReport::from_checks(checks)
+}
+
+/// Read the fixed production procfs paths and evaluate the opt-in rootless
+/// keyring quota readiness check.
+fn rootless_keyring_quota_check(expected_containers: u32) -> CheckResult {
+    #[cfg(target_os = "linux")]
+    {
+        let maxkeys = std::fs::read_to_string(ROOTLESS_MAXKEYS_PATH);
+        let maxbytes = std::fs::read_to_string(ROOTLESS_MAXBYTES_PATH);
+        let readings = RootlessKeyringQuotaReadings::Linux {
+            maxkeys: maxkeys.as_deref().map_or(
+                RootlessKeyringQuotaReading::Unreadable,
+                RootlessKeyringQuotaReading::Contents,
+            ),
+            maxbytes: maxbytes.as_deref().map_or(
+                RootlessKeyringQuotaReading::Unreadable,
+                RootlessKeyringQuotaReading::Contents,
+            ),
+        };
+        evaluate_rootless_keyring_quota(u64::from(expected_containers), readings)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        evaluate_rootless_keyring_quota(
+            u64::from(expected_containers),
+            RootlessKeyringQuotaReadings::UnsupportedPlatform,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootlessKeyringQuotaProblem {
+    Unreadable,
+    Unparseable,
+}
+
+impl RootlessKeyringQuotaProblem {
+    const fn detail(self) -> &'static str {
+        match self {
+            Self::Unreadable => "is unreadable",
+            Self::Unparseable => "does not contain an unsigned integer",
+        }
+    }
+}
+
+fn parse_rootless_keyring_quota(
+    reading: RootlessKeyringQuotaReading<'_>,
+) -> Result<u64, RootlessKeyringQuotaProblem> {
+    match reading {
+        RootlessKeyringQuotaReading::Contents(contents) => contents
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| RootlessKeyringQuotaProblem::Unparseable),
+        RootlessKeyringQuotaReading::Unreadable => Err(RootlessKeyringQuotaProblem::Unreadable),
+    }
+}
+
+/// Pure evaluator for the rootless-realm keyring quota readiness policy.
+///
+/// Future realm enrollment can call this same evaluator after deriving its
+/// expected container count automatically. Doctor deliberately calls it only
+/// for the explicit opt-in flag, avoiding false warnings on rootful-only hosts.
+pub(crate) fn evaluate_rootless_keyring_quota(
+    expected_containers: u64,
+    readings: RootlessKeyringQuotaReadings<'_>,
+) -> CheckResult {
+    let RootlessKeyringQuotaReadings::Linux { maxkeys, maxbytes } = readings else {
+        return CheckResult::warn(
+            ROOTLESS_KEYRING_QUOTA_CHECK,
+            format!(
+                "rootless keyring quota readiness for {expected_containers} expected container(s) is available only on Linux"
+            ),
+            "Run this requested check on the Linux host that will run the rootless realm; no sysctl command is applicable on this platform.",
+        );
+    };
+
+    let Some(required_keys) = expected_containers.checked_mul(ROOTLESS_KEYS_PER_CONTAINER) else {
+        return CheckResult::warn(
+            ROOTLESS_KEYRING_QUOTA_CHECK,
+            "rootless keyring quota requirement overflowed while computing required keys",
+            "Use a representable expected container count; no sysctl command is shown because the required value is unknown.",
+        );
+    };
+    let Some(required_bytes) = expected_containers.checked_mul(ROOTLESS_BYTES_PER_CONTAINER) else {
+        return CheckResult::warn(
+            ROOTLESS_KEYRING_QUOTA_CHECK,
+            "rootless keyring quota requirement overflowed while computing required bytes",
+            "Use a representable expected container count; no sysctl command is shown because the required value is unknown.",
+        );
+    };
+
+    let parsed_maxkeys = parse_rootless_keyring_quota(maxkeys);
+    let parsed_maxbytes = parse_rootless_keyring_quota(maxbytes);
+    let (Ok(effective_keys), Ok(effective_bytes)) = (parsed_maxkeys, parsed_maxbytes) else {
+        let mut problems = Vec::new();
+        if let Err(problem) = parsed_maxkeys {
+            problems.push(format!("kernel.keys.maxkeys {}", problem.detail()));
+        }
+        if let Err(problem) = parsed_maxbytes {
+            problems.push(format!("kernel.keys.maxbytes {}", problem.detail()));
+        }
+        return CheckResult::warn(
+            ROOTLESS_KEYRING_QUOTA_CHECK,
+            format!(
+                "could not evaluate effective Linux keyring quotas for {expected_containers} expected rootless container(s): {}",
+                problems.join("; ")
+            ),
+            format!(
+                "Read `{ROOTLESS_MAXKEYS_PATH}` and `{ROOTLESS_MAXBYTES_PATH}` as root, then set both dimensions at or above {required_keys} keys and {required_bytes} bytes. No sysctl command or exact NixOS assignment is shown because an unknown current value could be lowered. The NixOS `services.basil.raiseRootlessKeyringQuotas` option supplies only the {NIX_ROOTLESS_MAXKEYS}/{NIX_ROOTLESS_MAXBYTES} defaults for 1,000 containers; use explicit `boot.kernel.sysctl` values when the required or observed values are higher."
+            ),
+        );
+    };
+
+    if effective_keys >= required_keys && effective_bytes >= required_bytes {
+        return CheckResult::ok(
+            ROOTLESS_KEYRING_QUOTA_CHECK,
+            format!(
+                "effective Linux keyring quotas support {expected_containers} expected rootless container(s): maxkeys={effective_keys} (required {required_keys}), maxbytes={effective_bytes} (required {required_bytes})"
+            ),
+        );
+    }
+
+    let recommended_keys = effective_keys.max(required_keys);
+    let recommended_bytes = effective_bytes.max(required_bytes);
+    CheckResult::warn(
+        ROOTLESS_KEYRING_QUOTA_CHECK,
+        format!(
+            "effective Linux keyring quotas are below the {expected_containers}-container rootless target: maxkeys={effective_keys} (required {required_keys}), maxbytes={effective_bytes} (required {required_bytes})"
+        ),
+        format!(
+            "Run `sudo sysctl -w kernel.keys.maxkeys={recommended_keys} kernel.keys.maxbytes={recommended_bytes}`. On NixOS, persist the same non-lowering values with `boot.kernel.sysctl = {{ \"kernel.keys.maxkeys\" = {recommended_keys}; \"kernel.keys.maxbytes\" = {recommended_bytes}; }};`. The `services.basil.raiseRootlessKeyringQuotas` option supplies only the {NIX_ROOTLESS_MAXKEYS}/{NIX_ROOTLESS_MAXBYTES} defaults for 1,000 containers."
+        ),
+    )
 }
 
 /// A stable "skipped: catalog did not load" advisory row for a check that needs
@@ -1050,6 +1242,7 @@ mod tests {
             unlock_passphrase_selected: false,
             unlock_bip39_selected: false,
             unlock_age_yubikey_selected: false,
+            rootless_expected_containers: None,
         }
     }
 
@@ -1058,6 +1251,158 @@ mod tests {
             name: name.to_string(),
             status,
         }
+    }
+
+    const fn quota_readings<'a>(
+        maxkeys: &'a str,
+        maxbytes: &'a str,
+    ) -> RootlessKeyringQuotaReadings<'a> {
+        RootlessKeyringQuotaReadings::Linux {
+            maxkeys: RootlessKeyringQuotaReading::Contents(maxkeys),
+            maxbytes: RootlessKeyringQuotaReading::Contents(maxbytes),
+        }
+    }
+
+    // --- rootless keyring quota ---
+
+    #[test]
+    fn rootless_quota_exact_boundary_is_ok() {
+        let row = evaluate_rootless_keyring_quota(1_000, quota_readings("2000\n", "2000000\n"));
+        assert_eq!(row.name, ROOTLESS_KEYRING_QUOTA_CHECK);
+        assert_eq!(row.status, CheckStatus::Ok);
+        assert!(row.remediation.is_empty());
+    }
+
+    #[test]
+    fn rootless_quota_each_low_dimension_warns() {
+        let keys_low = evaluate_rootless_keyring_quota(1_000, quota_readings("1999", "2000000"));
+        assert_eq!(keys_low.status, CheckStatus::Warn);
+        assert!(keys_low.detail.contains("maxkeys=1999 (required 2000)"));
+        assert!(
+            keys_low
+                .remediation
+                .contains("sysctl -w kernel.keys.maxkeys=2000 kernel.keys.maxbytes=2000000")
+        );
+
+        let bytes_low = evaluate_rootless_keyring_quota(1_000, quota_readings("2000", "1999999"));
+        assert_eq!(bytes_low.status, CheckStatus::Warn);
+        assert!(
+            bytes_low
+                .detail
+                .contains("maxbytes=1999999 (required 2000000)")
+        );
+        assert!(
+            bytes_low
+                .remediation
+                .contains("sysctl -w kernel.keys.maxkeys=2000 kernel.keys.maxbytes=2000000")
+        );
+    }
+
+    #[test]
+    fn rootless_quota_both_low_warns() {
+        let row = evaluate_rootless_keyring_quota(10, quota_readings("1", "2"));
+        assert_eq!(row.status, CheckStatus::Warn);
+        assert!(row.detail.contains("maxkeys=1 (required 20)"));
+        assert!(row.detail.contains("maxbytes=2 (required 20000)"));
+    }
+
+    #[test]
+    fn rootless_quota_remediation_never_lowers_higher_dimension() {
+        let row = evaluate_rootless_keyring_quota(1_000, quota_readings("4000", "1000"));
+        assert_eq!(row.status, CheckStatus::Warn);
+        assert!(
+            row.remediation
+                .contains("sysctl -w kernel.keys.maxkeys=4000 kernel.keys.maxbytes=2000000")
+        );
+        assert!(row.remediation.contains("\"kernel.keys.maxkeys\" = 4000"));
+        assert!(
+            row.remediation
+                .contains("\"kernel.keys.maxbytes\" = 2000000")
+        );
+    }
+
+    #[test]
+    fn rootless_quota_future_realm_size_scales_non_lowering_nixos_remediation() {
+        let row = evaluate_rootless_keyring_quota(1_500, quota_readings("4000", "1000"));
+        assert_eq!(row.status, CheckStatus::Warn);
+        assert!(row.detail.contains("required 3000"));
+        assert!(row.detail.contains("required 3000000"));
+        assert!(
+            row.remediation
+                .contains("kernel.keys.maxkeys=4000 kernel.keys.maxbytes=3000000")
+        );
+        assert!(row.remediation.contains("\"kernel.keys.maxkeys\" = 4000"));
+        assert!(
+            row.remediation
+                .contains("\"kernel.keys.maxbytes\" = 3000000")
+        );
+    }
+
+    #[test]
+    fn rootless_quota_1000_container_recommendation_matches_nix_floors() {
+        let row = evaluate_rootless_keyring_quota(1_000, quota_readings("200", "20000"));
+        assert_eq!(row.status, CheckStatus::Warn);
+        assert!(
+            row.remediation
+                .contains("sudo sysctl -w kernel.keys.maxkeys=2000 kernel.keys.maxbytes=2000000")
+        );
+    }
+
+    #[test]
+    fn rootless_quota_parse_and_read_failures_warn_without_command() {
+        let unreadable = evaluate_rootless_keyring_quota(
+            1_000,
+            RootlessKeyringQuotaReadings::Linux {
+                maxkeys: RootlessKeyringQuotaReading::Unreadable,
+                maxbytes: RootlessKeyringQuotaReading::Contents("2000000"),
+            },
+        );
+        assert_eq!(unreadable.status, CheckStatus::Warn);
+        assert!(unreadable.detail.contains("maxkeys is unreadable"));
+        assert!(!unreadable.remediation.contains("sysctl -w"));
+
+        let unparseable =
+            evaluate_rootless_keyring_quota(1_000, quota_readings("not-a-number", "2000000"));
+        assert_eq!(unparseable.status, CheckStatus::Warn);
+        assert!(
+            unparseable
+                .detail
+                .contains("maxkeys does not contain an unsigned integer")
+        );
+        assert!(!unparseable.remediation.contains("sysctl -w"));
+    }
+
+    #[test]
+    fn rootless_quota_non_linux_requested_state_warns() {
+        let row = evaluate_rootless_keyring_quota(
+            1_000,
+            RootlessKeyringQuotaReadings::UnsupportedPlatform,
+        );
+        assert_eq!(row.status, CheckStatus::Warn);
+        assert!(row.detail.contains("only on Linux"));
+        assert!(!row.remediation.contains("sysctl -w"));
+    }
+
+    #[tokio::test]
+    async fn rootless_quota_check_is_omitted_without_opt_in() {
+        let dir = unique_dir();
+        let inputs = base_inputs(&dir);
+        let report = run_doctor(&inputs, all_features_off()).await;
+        assert!(
+            report
+                .checks
+                .iter()
+                .all(|row| row.name != ROOTLESS_KEYRING_QUOTA_CHECK)
+        );
+    }
+
+    #[test]
+    fn rootless_quota_warning_obeys_strict_exit_semantics() {
+        let row = evaluate_rootless_keyring_quota(1_000, quota_readings("200", "20000"));
+        let report = DoctorReport::from_checks(vec![row]);
+        assert!(!report.should_exit_nonzero(false));
+        assert!(report.should_exit_nonzero(true));
+        assert!(!report.summary.blocking);
     }
 
     // --- feature compatibility ---

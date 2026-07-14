@@ -165,6 +165,9 @@
           tpm-unlock-test = import ./nix/tests/tpm-unlock-test.nix {
             inherit pkgs basilTpm;
           };
+          rootless-keyring-quota-test = import ./nix/tests/rootless-keyring-quota-test.nix {
+            inherit pkgs basil;
+          };
 
           # Distribution build for the `.deb`: the two shipped binaries plus the
           # roff man pages the `xtask` crate emits (via `clap_mangen`). Scoped to
@@ -345,11 +348,17 @@
             nativeBuildInputs = shellTools ++ [ toolchainNightly ];
           };
         }
-        # Linux-only: nixosTest builds a NixOS guest VM, which only makes sense on
-        # linux systems. Keep it outside `checks` so `nix flake check` remains
-        # lightweight; run it explicitly as `nix build .#tests.<sys>.tpm-unlock`.
+        # Linux-only: nixosTest builds NixOS guest VMs, which only make sense on
+        # Linux systems. Keep them outside `checks` so `nix flake check` remains
+        # lightweight. The rootless-keyring-quota lane is x86_64-only; build it as
+        # `nix build .#tests.x86_64-linux.rootless-keyring-quota`.
         // lib.optionalAttrs (lib.hasSuffix "linux" system) {
-          tests.tpm-unlock = tpm-unlock-test;
+          tests = {
+            tpm-unlock = tpm-unlock-test;
+          }
+          // lib.optionalAttrs (system == "x86_64-linux") {
+            rootless-keyring-quota = rootless-keyring-quota-test;
+          };
         }
       );
 }

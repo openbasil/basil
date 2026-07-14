@@ -10,6 +10,24 @@ SPDX-License-Identifier: Apache-2.0
 
 ### Added
 
+- 2026-07-15: Compose Phase 1 follow-up tooling now includes a native,
+  concurrent `AdminService.Status` load probe with persistent Unix-socket
+  connections, bounded concurrency, latency histograms, throughput, failure
+  accounting, and an optional connection-hold interval. `basil doctor` adds the
+  opt-in `--rootless-expected-containers` readiness check for Linux keyring
+  quotas, with non-lowering live and NixOS remediation. Evidence `verify-run`
+  output now reports the verified `manifest_sha256` value, and x86 QMP boundary
+  tests enforce the short socket path inside the sandbox-private `/tmp`.
+
+- 2026-07-15: Compose capacity preflight now provides explicit `guest_small`
+  (2 CPU, 1 GiB memory, 10 GiB disk) and `guest_medium` (4 CPU, 4 GiB memory,
+  24 GiB disk) profiles. The runner records suite-effective VM resources,
+  retains and hashes the canonical host-filesystem snapshot, and passes that
+  bounded evidence to guests for identity and digest verification. Readiness
+  uses effective cgroup CPU/memory limits and per-filesystem byte/inode floors;
+  unavailable retention evidence is reported as not measured. Guest event
+  retention is atomic, size- and hash-verified, and required by `verify-run`.
+
 - 2026-07-14: NixOS module: new `services.basil.raiseRootlessKeyringQuotas`
   option (default `true`) raises the per-user kernel keyring quotas
   (`kernel.keys.maxkeys` → 2000, `kernel.keys.maxbytes` → 2000000, both
@@ -57,8 +75,10 @@ SPDX-License-Identifier: Apache-2.0
   Evidence-runner fixes surfaced by the lanes: the driver sandbox re-exposes
   `/dev/kvm` when present (guarded `--dev-bind`; VM lanes no longer silently
   degrade to TCG), drivers are no longer charged coverage for the runner-owned
-  `lane.artifacts` test (a real-driver `lane-smoke` run can now PASS), and the
-  guest podman fact uses the correctly-cased `SELinuxEnabled` template field.
+  `lane.artifacts` test (a real-driver `lane-smoke` run can now PASS), x86 QMP
+  sockets use a short path in the sandbox-private `/tmp` instead of overflowing
+  AF_UNIX under the default evidence root, and the guest podman fact uses the
+  correctly-cased `SELinuxEnabled` template field.
 - 2026-07-14: Compose Phase 1 artifact inventory completed (test-only): the two
   reserved `package-set` rows are populated from the qualified lanes' pins and
   the artifacts tool gained `package-set` fetch/verify/offline support. Each
@@ -77,11 +97,15 @@ SPDX-License-Identifier: Apache-2.0
   canonical-runner PASS in ~132 s) and a **capacity preflight** for the serial
   1,000-container ladder: the driver sandbox now exports `BASIL_DRIVER_SUITE`,
   both x86 lane drivers gained a strictly-additive `capacity-preflight` suite
-  path running `guest/capacity-preflight.sh` in-guest, and retained runs cover
-  the host (ready; ~1.8 MiB evidence per 8-step ladder) and both guests
-  (not-ready as-is: cloud-image `nofile soft=1024` and small disks — the
-  ladder must raise `LimitNOFILE` and mount a volume). Scale-ladder stop
-  conditions are documented with the evidence. All six Phase 1 environment
+  path running `guest/capacity-preflight.sh` in-guest. The v2 preflight now has
+  explicit `host`, `guest_small` (2 CPU/1 GiB/10 GiB), and `guest_medium`
+  (4 CPU/4 GiB/24 GiB) profiles while preserving the host defaults and surfaced
+  `nofile`/PID/namespace prerequisites. Both qualified x86 guests use
+  `guest_medium` with 8 GiB live memory and a sparse 32-GiB virtual disk; their
+  retention projection consumes a bounded snapshot of the runner's host evidence
+  filesystem instead of judging the guest rootfs (direct unanchored guest runs
+  report retention `NOT_MEASURED`). Scale-ladder stop conditions are documented
+  with the evidence. All six Phase 1 environment
   subtasks and their parent are closed; the Phase 1 prototype tasks are
   unblocked.
 - 2026-07-14: Compose Phase 1.1 runtime-evidence prototype (test-only): a

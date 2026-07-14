@@ -114,9 +114,9 @@ impl InvocationService for VerifyingInvocationService {
         let message = &request.get_ref().message;
         let validation = ValidationParams {
             now: self.now,
-            max_clock_skew: Duration::from_secs(60),
-            max_ttl: Duration::from_secs(300),
-            default_ttl: Duration::from_secs(300),
+            max_clock_skew: Duration::from_mins(1),
+            max_ttl: Duration::from_mins(5),
+            default_ttl: Duration::from_mins(5),
             allowed_audiences: BTreeSet::new(),
             role: MessageRole::Request,
         };
@@ -428,9 +428,9 @@ async fn nats_bridge_round_trips_sealed_cose() {
 
     let validation = ValidationParams {
         now,
-        max_clock_skew: Duration::from_secs(60),
-        max_ttl: Duration::from_secs(300),
-        default_ttl: Duration::from_secs(300),
+        max_clock_skew: Duration::from_mins(1),
+        max_ttl: Duration::from_mins(5),
+        default_ttl: Duration::from_mins(5),
         allowed_audiences: BTreeSet::new(),
         role: MessageRole::Response,
     };

@@ -135,8 +135,8 @@ fn validation(role: MessageRole) -> ValidationParams {
     ValidationParams {
         now: UnixTime(1_782_740_010),
         max_clock_skew: Duration::from_secs(30),
-        max_ttl: Duration::from_secs(300),
-        default_ttl: Duration::from_secs(60),
+        max_ttl: Duration::from_mins(5),
+        default_ttl: Duration::from_mins(1),
         allowed_audiences: BTreeSet::from([
             Subject::new("basil://broker.test".to_string()).expect("valid audience")
         ]),
