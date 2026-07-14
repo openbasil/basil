@@ -91,3 +91,24 @@ artifacts = ["ubuntu-24.04-cloud-aarch64"]
 driver = ""
 qualification = false
 performance = false
+
+# Development-only mock lane. It boots no guest and carries no artifacts; the
+# null driver exercises the driver contract and read-only sandbox so the harness
+# is testable without a VM. The runner refuses this lane under --qualification.
+[lanes.dev-null]
+architecture = "none"
+acceleration = "none"
+distribution = "development-mock"
+runtime = "none"
+lsm = "none"
+artifacts = []
+driver = "null"
+development_only = true
+qualification = false
+performance = false
+
+[suites.dev-null]
+required_tests = [
+  "dev.result-contract",
+  "dev.sandbox-readonly",
+]

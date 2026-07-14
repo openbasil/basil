@@ -1,14 +1,51 @@
 # SPDX-FileCopyrightText: 2026 OpenBasil Contributors
 # SPDX-License-Identifier: Apache-2.0
+#
+# Compose Phase 1 retained-evidence artifact inventory (schema_version 1).
+# Consumed only by scripts/compose-phase1-artifacts.sh. Tab-separated; lines
+# beginning with '#' and blank lines are ignored. Every row needs a non-empty
+# note. The 'status' column is either 'ready' (fully pinned and acquirable) or
+# 'not-yet-populated' (intentionally reserved; see below).
+#
+# Kinds and how each is verified:
+#   file-openpgp-clearsigned / file-openpgp-detached
+#       A downloadable file. The sha256 column pins the file; the checksum and
+#       signature columns pin an OpenPGP-signed upstream checksum manifest that
+#       is verified against the checked-in key (key_file / signer_fingerprint)
+#       under interop-tests/compose-phase1/keys/. Trust flows from the pinned
+#       signer, never from the mirror hostname.
+#   oci-image
+#       A digest-pinned multi-arch container image. The sha256 column holds the
+#       manifest-list (OCI image index) digest in lowercase hex WITHOUT the
+#       'sha256:' prefix; this digest is the SOLE trust anchor. The source
+#       column holds the tag-qualified reference registry/repo:tag used only to
+#       resolve that digest. filename is the on-disk OCI-layout directory name;
+#       size and every checksum/signature/key column are '-'. Acquisition is
+#       'skopeo copy --all' by digest into an OCI layout, re-verified offline:
+#       the pinned blob and every other blob must self-address, and index.json
+#       must reference the pinned digest. The full multi-arch index is retained
+#       so the arm64 lane can select its platform. Digests below were resolved
+#       with 'skopeo inspect --raw <ref> | sha256sum' (skopeo 1.23.0) on
+#       2026-07-14; each index carries linux/amd64 and linux/arm64.
+#   package-set
+#       A set of distribution packages (NEVRAs / versions plus signed repo or
+#       package hashes) installed inside a guest. Populated later by the lane
+#       provisioning issues, NOT here:
+#         fedora-44-runtime-packages-x86_64  -> basil-3kx (Fedora Podman/Compose)
+#         ubuntu-24.04-docker-packages-x86_64 -> basil-y0f (Ubuntu Docker/Compose)
+#       These rows stay 'not-yet-populated' by design. While ANY row is
+#       unpopulated, fetch-all / verify-all / offline finalize honestly with
+#       exit 3 instead of claiming completeness; per-artifact fetch/verify of the
+#       populated rows still succeed.
 schema_version	id	status	kind	platform	filename	size_bytes	sha256	source_url	checksum_url	checksum_size_bytes	checksum_sha256	signature_url	signature_size_bytes	signature_sha256	key_file	signer_fingerprint	note
 1	fedora-44-cloud-x86_64	ready	file-openpgp-clearsigned	linux/x86_64	Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2	583729152	28680fe5b371a5a82ebf43a31926e086a168e59949d03969c5093e7071f90b7f	https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2	https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-44-1.7-x86_64-CHECKSUM	2301	a436186ff0e930d77637d03e6f357206b686c4ef3fcde234b6f1da63041d4b32	-	-	-	fedora-44-signing-key.gpg	36F612DCF27F7D1A48A835E4DBFCF71C6D9F90A6	Fedora 44 Cloud Base Generic release 1.7; exact signed checksum verified with the Fedora 44 release key.
 1	ubuntu-24.04-cloud-x86_64	ready	file-openpgp-detached	linux/x86_64	ubuntu-24.04-server-cloudimg-amd64.img	621673984	ffe6203da54deeb6db5d2a98a83f9ec8e55f149d3f7ba622e1abe5fa966ee3d6	https://cloud-images.ubuntu.com/releases/24.04/release-20260705/ubuntu-24.04-server-cloudimg-amd64.img	https://cloud-images.ubuntu.com/releases/24.04/release-20260705/SHA256SUMS	7843	2c330110cd0df963b073b3a82f3136c82290b4a156a67e568560696036a32340	https://cloud-images.ubuntu.com/releases/24.04/release-20260705/SHA256SUMS.gpg	833	2bdb3623dc8f30a81a9845f4535aa54e57087632ecc2a0256bd267675a1bd20b	ubuntu-cloudimage-signing-key.gpg	D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81	Ubuntu 24.04 LTS amd64 dated release 20260705; exact detached signature and checksum verified.
 1	ubuntu-24.04-cloud-aarch64	ready	file-openpgp-detached	linux/aarch64	ubuntu-24.04-server-cloudimg-arm64.img	615630848	7df0201546f75b8bcc1044594c806c35749421ad3c9bc1be2a3ab806cfae39cc	https://cloud-images.ubuntu.com/releases/24.04/release-20260705/ubuntu-24.04-server-cloudimg-arm64.img	https://cloud-images.ubuntu.com/releases/24.04/release-20260705/SHA256SUMS	7843	2c330110cd0df963b073b3a82f3136c82290b4a156a67e568560696036a32340	https://cloud-images.ubuntu.com/releases/24.04/release-20260705/SHA256SUMS.gpg	833	2bdb3623dc8f30a81a9845f4535aa54e57087632ecc2a0256bd267675a1bd20b	ubuntu-cloudimage-signing-key.gpg	D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81	Ubuntu 24.04 LTS arm64 dated release 20260705; exact detached signature and checksum verified for the functional TCG lane.
-1	fedora-44-runtime-packages-x86_64	not-yet-populated	package-set	linux/x86_64	-	-	-	https://download.fedoraproject.org/pub/fedora/linux/releases/44/Everything/x86_64/os/	-	-	-	-	-	-	-	-	Exact Podman and Compose package NEVRAs plus signed repository metadata hashes are not selected by the lane provisioning issue.
-1	ubuntu-24.04-docker-packages-x86_64	not-yet-populated	package-set	linux/x86_64	-	-	-	https://download.docker.com/linux/ubuntu/dists/noble/pool/stable/amd64/	-	-	-	-	-	-	-	-	Exact Docker Engine and Compose package versions plus package hashes are not selected by the lane provisioning issue.
-1	workload-fedora	not-yet-populated	oci-image	linux/multiarch	-	-	-	registry.fedoraproject.org/fedora	-	-	-	-	-	-	-	-	An exact official Fedora workload image digest and platform manifests have not been selected.
-1	workload-alpine	not-yet-populated	oci-image	linux/multiarch	-	-	-	docker.io/library/alpine	-	-	-	-	-	-	-	-	An exact official Alpine workload image digest and platform manifests have not been selected.
-1	workload-debian	not-yet-populated	oci-image	linux/multiarch	-	-	-	docker.io/library/debian	-	-	-	-	-	-	-	-	An exact official Debian workload image digest and platform manifests have not been selected.
-1	workload-ubuntu	not-yet-populated	oci-image	linux/multiarch	-	-	-	docker.io/library/ubuntu	-	-	-	-	-	-	-	-	An exact official Ubuntu workload image digest and platform manifests have not been selected.
-1	workload-postgres	not-yet-populated	oci-image	linux/multiarch	-	-	-	docker.io/library/postgres	-	-	-	-	-	-	-	-	An exact official PostgreSQL workload image digest and platform manifests have not been selected for the unmodified-image acceptance case.
-1	workload-distroless	not-yet-populated	oci-image	linux/multiarch	-	-	-	gcr.io/distroless/static-debian12	-	-	-	-	-	-	-	-	An exact official distroless workload image digest and platform manifests have not been selected.
+1	fedora-44-runtime-packages-x86_64	not-yet-populated	package-set	linux/x86_64	-	-	-	https://download.fedoraproject.org/pub/fedora/linux/releases/44/Everything/x86_64/os/	-	-	-	-	-	-	-	-	Exact Podman and Compose package NEVRAs plus signed repository metadata hashes are populated later by lane issue basil-3kx, not here.
+1	ubuntu-24.04-docker-packages-x86_64	not-yet-populated	package-set	linux/x86_64	-	-	-	https://download.docker.com/linux/ubuntu/dists/noble/pool/stable/amd64/	-	-	-	-	-	-	-	-	Exact Docker Engine and Compose package versions plus package hashes are populated later by lane issue basil-y0f, not here.
+1	workload-fedora	ready	oci-image	linux/multiarch	image	-	daa24c5598b5313906863c4448685d34cd172871c5f79a1258bd8493f7572798	registry.fedoraproject.org/fedora:44	-	-	-	-	-	-	-	-	Official Fedora 44 workload image. Manifest-list digest resolved with skopeo inspect --raw (skopeo 1.23.0) on 2026-07-14; index covers linux/amd64,arm64,ppc64le,s390x.
+1	workload-alpine	ready	oci-image	linux/multiarch	image	-	14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce	docker.io/library/alpine:3.22	-	-	-	-	-	-	-	-	Official Alpine 3.22 workload image. Manifest-list digest resolved with skopeo inspect --raw (skopeo 1.23.0) on 2026-07-14; index covers linux/amd64 and linux/arm64 among eight platforms.
+1	workload-debian	ready	oci-image	linux/multiarch	image	-	fac46bff2e02f51425b6e33b0e1169f55dfb053d83511ca28aa50c09fd5ed7a4	docker.io/library/debian:13	-	-	-	-	-	-	-	-	Official Debian 13 (trixie) workload image. Manifest-list digest resolved with skopeo inspect --raw (skopeo 1.23.0) on 2026-07-14; index covers linux/amd64 and linux/arm64 among eight platforms.
+1	workload-ubuntu	ready	oci-image	linux/multiarch	image	-	4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90	docker.io/library/ubuntu:24.04	-	-	-	-	-	-	-	-	Official Ubuntu 24.04 LTS workload image. Manifest-list digest resolved with skopeo inspect --raw (skopeo 1.23.0) on 2026-07-14; index covers linux/amd64 and linux/arm64 among six platforms.
+1	workload-postgres	ready	oci-image	linux/multiarch	image	-	b076a8bcd593cf79cc6a72d66ee600740de46242ce09efbc04b459bbb7daaed5	docker.io/library/postgres:18	-	-	-	-	-	-	-	-	Official PostgreSQL 18 workload image for the unmodified-image acceptance case. Manifest-list digest resolved with skopeo inspect --raw (skopeo 1.23.0) on 2026-07-14; index covers linux/amd64 and linux/arm64 among eight platforms.
+1	workload-distroless	ready	oci-image	linux/multiarch	image	-	22fd79fd75eab2372585b44517f8a094349938919dc613aafc37e4bdc9967c82	gcr.io/distroless/static-debian12:latest	-	-	-	-	-	-	-	-	Official distroless static-debian12 workload image. Manifest-list digest resolved with skopeo inspect --raw (skopeo 1.23.0) on 2026-07-14; latest tag is mutable but the pinned digest is immutable; index covers linux/amd64,arm64,arm/v7,s390x,ppc64le.

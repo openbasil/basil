@@ -17,13 +17,19 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 readonly REPO_ROOT
 readonly FIXTURE_ROOT="$REPO_ROOT/interop-tests/compose-phase1"
 readonly LOCK_FILE="$FIXTURE_ROOT/phase1.lock.toml"
+readonly DRIVER_ROOT="$FIXTURE_ROOT/drivers"
 readonly ARTIFACT_TOOL="$SCRIPT_DIR/compose-phase1-artifacts.sh"
 readonly EVENT_SCHEMA="basil.compose.phase1.event"
 readonly EVENT_SCHEMA_VERSION=1
 readonly MANIFEST_SCHEMA="basil.compose.phase1.manifest"
 readonly MANIFEST_SCHEMA_VERSION=1
+readonly DRIVER_RESULT_SCHEMA="basil.compose.phase1.driver-result"
+readonly DRIVER_RESULT_SCHEMA_VERSION=1
 readonly MAX_EVENT_BYTES=$((16 * 1024 * 1024))
 readonly MAX_EVENTS=10000
+readonly MAX_DRIVER_RESULT_BYTES=$((64 * 1024))
+readonly MAX_DRIVER_RESULTS=1024
+readonly DEFAULT_DRIVER_TIMEOUT_SECONDS=900
 
 readonly EXIT_PASS=0
 readonly EXIT_TEST_FAIL=10
@@ -190,6 +196,24 @@ validate_identifier() {
   [[ $1 =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,95}$ ]]
 }
 
+validate_driver_name() {
+  [[ $1 =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]]
+}
+
+validate_process_role() {
+  [[ $1 =~ ^[a-z0-9][a-z0-9-]{0,47}$ ]]
+}
+
+lane_is_development_only() {
+  local run=$1
+  [[ $(run_metadata_field "$run" '.lane.development_only // false') == true ]]
+}
+
+required_test_contains() {
+  local suite=$1 test_id=$2
+  required_tests_json "$suite" | jq -e --arg test_id "$test_id" 'index($test_id) != null' >/dev/null
+}
+
 new_run_id() {
   local random
   random=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
@@ -351,7 +375,9 @@ validate_events() {
         . as $test
         | ([$events[] | select(.event == "test.end" and .test_id == $test)] | length) == 1))
       and (all($events[] | select(.event == "test.end");
-        (.test_id | type == "string" and length > 0)
+        .test_id as $test_id
+        | ($test_id | type == "string" and length > 0)
+        and ($required | index($test_id)) != null
         and (.status != "RUNNING")))
       and (([$events[] | select(.event == "test.end") | .test_id] | length)
         == ([$events[] | select(.event == "test.end") | .test_id] | unique | length))
@@ -389,9 +415,15 @@ copy_retained_file() {
 
 collect_outputs() {
   local run=$1
+  local scratch="$run/transient/driver/scratch"
   copy_retained_file "$run/transient/serial.log" "$run/raw/serial.log"
   copy_retained_file "$run/transient/qemu.stderr.log" "$run/raw/qemu.stderr.log"
   copy_retained_file "$run/transient/guest-events.jsonl" "$run/raw/guest-events.jsonl"
+  copy_retained_file "$scratch/serial.log" "$run/raw/serial.log"
+  copy_retained_file "$scratch/qemu.stderr.log" "$run/raw/qemu.stderr.log"
+  copy_retained_file "$scratch/driver.stdout.log" "$run/raw/driver.stdout.log"
+  copy_retained_file "$scratch/driver.stderr.log" "$run/raw/driver.stderr.log"
+  copy_retained_file "$scratch/guest-events.jsonl" "$run/raw/guest-events.jsonl"
   jq -S -c '{schema,schema_version,run_id,lane_id,seq,time,event,status,reason_code,test_id,message,details}' \
     "$run/sanitized/events.jsonl" >"$run/sanitized/events.canonical.jsonl"
   chmod 0600 "$run/sanitized/events.canonical.jsonl"
@@ -480,13 +512,27 @@ process_start_time() {
   perl -ne 'if (/^\d+ \(.*\) (.*)$/) { @f=split / /,$1; print $f[19] }' "/proc/$pid/stat" 2>/dev/null
 }
 
+process_marker_is_owned() {
+  local run=$1 marker=$2 token=$3 transient canonical_marker marker_value
+  [[ $marker = /* && -f $marker && ! -L $marker ]] || return 1
+  path_has_symlink_component "$marker" && return 1
+  transient=$(realpath -e -- "$run/transient") || return 1
+  canonical_marker=$(realpath -e -- "$marker") || return 1
+  [[ $canonical_marker == "$transient/"* ]] || return 1
+  marker_value=$(<"$marker")
+  [[ $marker_value == "$token" ]]
+}
+
 record_process() {
   local run=$1 role=$2 pid=$3 marker=$4 token=$5 executable start_time record
+  validate_process_role "$role" || return "$EXIT_INFRA_ERROR"
   [[ $pid =~ ^[1-9][0-9]*$ ]] || return "$EXIT_INFRA_ERROR"
+  process_marker_is_owned "$run" "$marker" "$token" || return "$EXIT_INFRA_ERROR"
   executable=$(readlink -f -- "/proc/$pid/exe")
   start_time=$(process_start_time "$pid")
   [[ -n $executable && -n $start_time ]] || return "$EXIT_INFRA_ERROR"
   record="$run/meta/process-$role.json"
+  [[ ! -e $record ]] || return "$EXIT_INFRA_ERROR"
   write_json_atomic "$record" "$(jq -n -c --arg role "$role" --argjson pid "$pid" \
     --arg start_time "$start_time" --arg executable "$executable" \
     --arg marker "$marker" --arg token "$token" \
@@ -494,7 +540,7 @@ record_process() {
 }
 
 process_record_matches() {
-  local record=$1 run=$2 pid start_time executable marker token actual_start actual_executable marker_value
+  local record=$1 run=$2 pid start_time executable marker token actual_start actual_executable
   [[ -f $record && ! -L $record ]] || return 1
   pid=$(jq -er '.pid' "$record") || return 1
   start_time=$(jq -er '.start_time' "$record") || return 1
@@ -502,9 +548,7 @@ process_record_matches() {
   marker=$(jq -er '.marker' "$record") || return 1
   token=$(jq -er '.token' "$record") || return 1
   [[ $pid =~ ^[1-9][0-9]*$ && -e /proc/$pid/stat ]] || return 1
-  [[ $marker == "$run/transient/markers/"* && -f $marker && ! -L $marker ]] || return 1
-  marker_value=$(<"$marker")
-  [[ $marker_value == "$token" ]] || return 1
+  process_marker_is_owned "$run" "$marker" "$token" || return 1
   actual_start=$(process_start_time "$pid")
   actual_executable=$(readlink -f -- "/proc/$pid/exe")
   [[ $actual_start == "$start_time" && $actual_executable == "$executable" ]]
@@ -598,6 +642,10 @@ prepare_command() {
   validate_identifier "$lane" || { log "invalid or missing lane"; return "$EXIT_USAGE"; }
   validate_identifier "$suite" || { log "invalid suite"; return "$EXIT_USAGE"; }
   lane_json=$(lock_python lanes "$lane") || { log "unsupported lane: $lane"; return "$EXIT_UNSUPPORTED"; }
+  if [[ $qualification == qualification && $(jq -r '.development_only // false' <<<"$lane_json") == true ]]; then
+    log "UNSUPPORTED: development-only lane refused under qualification: $lane"
+    return "$EXIT_UNSUPPORTED"
+  fi
   required_tests_json "$suite" >/dev/null || { log "unsupported suite: $suite"; return "$EXIT_UNSUPPORTED"; }
   root=$(ensure_evidence_root "$root_requested" "$qualification") || return $?
   run_id=$(new_run_id)
@@ -644,8 +692,178 @@ verify_lane_artifacts() {
   done < <(run_metadata_field "$run" '.lane.artifacts[]')
 }
 
+# Explicit fail-closed allowlist of scenario driver names. Only names listed
+# here may be resolved and executed; provisioning a real lane driver adds its
+# name to this predicate and drops the script under the driver root.
+driver_is_allowlisted() {
+  case "$1" in
+    null) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Resolve a driver name to an absolute, executable, non-symlink script strictly
+# under the driver root. Rejects traversal, arbitrary paths, and unlisted names.
+resolve_driver() {
+  local name=$1 root candidate canonical
+  validate_driver_name "$name" || {
+    log "INFRA_ERROR: invalid driver name"
+    return "$EXIT_INFRA_ERROR"
+  }
+  driver_is_allowlisted "$name" || {
+    log "INFRA_ERROR: driver is not allowlisted: $name"
+    return "$EXIT_INFRA_ERROR"
+  }
+  root=$(realpath -e -- "$DRIVER_ROOT" 2>/dev/null) || {
+    log "INFRA_ERROR: driver root is missing"
+    return "$EXIT_INFRA_ERROR"
+  }
+  candidate="$root/$name.sh"
+  [[ -f $candidate && ! -L $candidate ]] || {
+    log "INFRA_ERROR: unknown or unsafe driver: $name"
+    return "$EXIT_INFRA_ERROR"
+  }
+  canonical=$(realpath -e -- "$candidate" 2>/dev/null) || {
+    log "INFRA_ERROR: driver path did not resolve"
+    return "$EXIT_INFRA_ERROR"
+  }
+  [[ $canonical == "$root/"* ]] || {
+    log "INFRA_ERROR: driver escapes the driver root"
+    return "$EXIT_INFRA_ERROR"
+  }
+  [[ -x $canonical ]] || {
+    log "INFRA_ERROR: driver is not executable"
+    return "$EXIT_INFRA_ERROR"
+  }
+  printf '%s\n' "$canonical"
+}
+
+# Execute a resolved driver under a read-only Bubblewrap view: only the driver
+# scratch directory (which holds the result file) is writable. The sandbox is
+# time-bounded, dies with the runner, and starts from a cleared environment.
+invoke_driver() {
+  local run=$1 driver_path=$2 scratch=$3 run_id lane_id
+  run_id=$(run_metadata_field "$run" '.run_id') || return "$EXIT_INFRA_ERROR"
+  lane_id=$(run_metadata_field "$run" '.lane_id') || return "$EXIT_INFRA_ERROR"
+  require_tool bwrap >/dev/null || return "$EXIT_INFRA_ERROR"
+  require_tool timeout >/dev/null || return "$EXIT_INFRA_ERROR"
+  local -a sandbox=(
+    bwrap
+    --ro-bind / /
+    --dev /dev
+    --tmpfs /tmp
+    --bind "$scratch" "$scratch"
+    --chdir "$scratch"
+    --unshare-user --unshare-ipc --unshare-uts --unshare-cgroup --unshare-net
+    --die-with-parent --new-session --clearenv
+    --setenv PATH "$PATH"
+    --setenv HOME "$scratch"
+    --setenv TMPDIR /tmp
+    --setenv BASIL_DRIVER_RESULT "$scratch/result.json"
+    --setenv BASIL_DRIVER_SCRATCH "$scratch"
+    --setenv BASIL_RUN_ID "$run_id"
+    --setenv BASIL_LANE_ID "$lane_id"
+    --setenv BASIL_DRIVER_RESULT_SCHEMA "$DRIVER_RESULT_SCHEMA"
+    --setenv BASIL_DRIVER_RESULT_SCHEMA_VERSION "$DRIVER_RESULT_SCHEMA_VERSION"
+    --setenv BASIL_MAX_RESULT_BYTES "$MAX_DRIVER_RESULT_BYTES"
+    --
+    "$driver_path"
+  )
+  timeout --signal=TERM --kill-after=10 "$DEFAULT_DRIVER_TIMEOUT_SECONDS" \
+    "${sandbox[@]}" >"$scratch/driver.stdout.log" 2>"$scratch/driver.stderr.log"
+}
+
+# Validate the bounded driver result contract: size-capped, single object with
+# the pinned schema/version, and a bounded results array whose every test_id is
+# required by the suite, unique, and carries a typed status and reason code.
+validate_driver_result() {
+  local result=$1 required=$2 bytes
+  [[ -f $result && ! -L $result ]] || return 1
+  bytes=$(stat -c '%s' -- "$result" 2>/dev/null) || return 1
+  (( bytes > 0 && bytes <= MAX_DRIVER_RESULT_BYTES )) || return 1
+  jq -e \
+    --arg schema "$DRIVER_RESULT_SCHEMA" \
+    --argjson version "$DRIVER_RESULT_SCHEMA_VERSION" \
+    --argjson max_results "$MAX_DRIVER_RESULTS" \
+    --argjson required "$required" '
+      (type == "object")
+      and (.schema == $schema)
+      and (.schema_version == $version)
+      and (.driver | type == "string" and test("^[a-z0-9][a-z0-9-]{0,63}$"))
+      and (.results | type == "array" and length > 0 and length <= $max_results)
+      and (all(.results[];
+        (.test_id as $test_id
+          | ($test_id | type == "string")
+          and (($required | index($test_id)) != null))
+        and (.status | IN("PASS","TEST_FAIL","INFRA_ERROR","UNSUPPORTED","INCOMPLETE","NOT_MEASURED"))
+        and (.reason_code | type == "string" and test("^[A-Z][A-Z0-9_]{0,63}$"))
+        and ((.message // "") | type == "string" and length <= 512)
+        and ((.details // {}) | type == "object" and (tostring | length) <= 4096)))
+      and (([.results[].test_id] | length) == ([.results[].test_id] | unique | length))
+    ' "$result" >/dev/null 2>&1
+}
+
+# Emit one runner-owned test.end event per driver-reported result. The runner
+# alone assigns sequence numbers; the driver never writes events or manifests.
+ingest_driver_result() {
+  local run=$1 result=$2 count index test_id status reason message
+  count=$(jq '.results | length' "$result") || return "$EXIT_INFRA_ERROR"
+  for (( index = 0; index < count; index++ )); do
+    test_id=$(jq -r --argjson i "$index" '.results[$i].test_id' "$result")
+    status=$(jq -r --argjson i "$index" '.results[$i].status' "$result")
+    reason=$(jq -r --argjson i "$index" '.results[$i].reason_code' "$result")
+    message=$(jq -r --argjson i "$index" '.results[$i].message // ""' "$result")
+    emit_event "$run" test.end "$status" "$reason" "$test_id" "$message"
+  done
+}
+
+# Derive the overall run status/reason from a validated result. A pass requires
+# every required test reported and all reported statuses PASS; any failure or
+# incomplete coverage degrades honestly and never becomes a pass.
+driver_run_outcome() {
+  local result=$1 required=$2
+  jq -r --argjson required "$required" '
+    .results as $r
+    | ([$r[].test_id] | unique) as $reported
+    | ([$required[] | select(. as $t | ($reported | index($t)) == null)] | length == 0) as $full
+    | if any($r[]; .status == "INFRA_ERROR")   then "INFRA_ERROR DRIVER_TEST_INFRA_ERROR"
+      elif any($r[]; .status == "TEST_FAIL")   then "TEST_FAIL DRIVER_TEST_FAILED"
+      elif any($r[]; .status == "UNSUPPORTED") then "UNSUPPORTED DRIVER_TEST_UNSUPPORTED"
+      elif any($r[]; .status == "INCOMPLETE")  then "INCOMPLETE DRIVER_TEST_INCOMPLETE"
+      elif ($full and all($r[]; .status == "PASS")) then "PASS DRIVER_TESTS_PASSED"
+      else "INCOMPLETE DRIVER_INCOMPLETE_COVERAGE" end
+  ' "$result"
+}
+
+# Run one lane driver end to end and echo the run "STATUS REASON". Drivers speak
+# only through the bounded result file; the runner keeps sole event authority.
+execute_driver_lane() {
+  local run=$1 driver_path=$2 scratch result required rc
+  ensure_private_directory "$run/transient/driver"
+  scratch="$run/transient/driver/scratch"
+  ensure_private_directory "$scratch"
+  result="$scratch/result.json"
+  rm -f -- "$result"
+  set +e
+  invoke_driver "$run" "$driver_path" "$scratch"
+  rc=$?
+  set -e
+  if (( rc != 0 )); then
+    printf '%s %s\n' INFRA_ERROR DRIVER_EXECUTION_FAILED
+    return 0
+  fi
+  required=$(required_tests_json "$(run_metadata_field "$run" '.suite')")
+  if ! validate_driver_result "$result" "$required"; then
+    printf '%s %s\n' INFRA_ERROR DRIVER_RESULT_INVALID
+    return 0
+  fi
+  ingest_driver_result "$run" "$result"
+  driver_run_outcome "$result" "$required"
+}
+
 run_command() {
   local run_id='' root_requested root run token marker driver completed=false status reason exit_code
+  local suite driver_path resolve_rc outcome
   root_requested=$(default_evidence_root)
   while (( $# > 0 )); do
     case "$1" in
@@ -658,6 +876,7 @@ run_command() {
   run=$(run_path "$root" "$run_id") || return $?
   assert_run_directory "$run" "$root" || return $?
   [[ -f $run/RUNNING ]] || { log "INFRA_ERROR: run is already finalized"; return "$EXIT_INFRA_ERROR"; }
+  suite=$(run_metadata_field "$run" '.suite')
   token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
   marker="$run/transient/markers/orchestrator"
   printf '%s\n' "$token" >"$marker"
@@ -688,7 +907,9 @@ run_command() {
       status=INFRA_ERROR
       reason=ARTIFACT_VERIFICATION_FAILED
     fi
-    emit_event "$run" test.end "$status" "$reason" lane.artifacts
+    if required_test_contains "$suite" lane.artifacts; then
+      emit_event "$run" test.end "$status" "$reason" lane.artifacts
+    fi
     fill_missing_test_terminals "$run" NOT_MEASURED "$reason"
     rm -f -- "$run/meta/process-orchestrator.json"
     if ! cleanup_for_finalization "$run"; then
@@ -701,16 +922,38 @@ run_command() {
     return "$(status_exit_code "$status")"
   fi
 
-  emit_event "$run" test.end PASS ARTIFACTS_VERIFIED lane.artifacts
+  if required_test_contains "$suite" lane.artifacts; then
+    emit_event "$run" test.end PASS ARTIFACTS_VERIFIED lane.artifacts
+  fi
   driver=$(run_metadata_field "$run" '.lane.driver')
   if [[ -z $driver ]]; then
     status=NOT_MEASURED
     reason=LANE_NOT_PROVISIONED
     fill_missing_test_terminals "$run" NOT_MEASURED "$reason"
+  elif [[ $(run_metadata_field "$run" '.qualification') == qualification ]] && lane_is_development_only "$run"; then
+    # Qualification refuses the development-only lane before any driver runs.
+    status=UNSUPPORTED
+    reason=DEVELOPMENT_LANE_REFUSED
+    fill_missing_test_terminals "$run" UNSUPPORTED "$reason"
   else
-    status=INCOMPLETE
-    reason=DRIVER_CONTRACT_NOT_IMPLEMENTED
-    fill_missing_test_terminals "$run" NOT_MEASURED "$reason"
+    set +e
+    driver_path=$(resolve_driver "$driver")
+    resolve_rc=$?
+    set -e
+    if (( resolve_rc != 0 )); then
+      status=INFRA_ERROR
+      reason=DRIVER_UNRESOLVED
+      fill_missing_test_terminals "$run" NOT_MEASURED "$reason"
+    else
+      outcome=$(execute_driver_lane "$run" "$driver_path")
+      status=${outcome%% *}
+      reason=${outcome#* }
+      if [[ -z $status || $status == "$reason" ]]; then
+        status=INCOMPLETE
+        reason=DRIVER_OUTCOME_UNREADABLE
+      fi
+      fill_missing_test_terminals "$run" NOT_MEASURED DRIVER_DID_NOT_REPORT
+    fi
   fi
   rm -f -- "$run/meta/process-orchestrator.json"
   if ! cleanup_for_finalization "$run"; then

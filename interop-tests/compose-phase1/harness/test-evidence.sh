@@ -193,4 +193,122 @@ done
 [[ ! -e /proc/$sleeper/stat ]] || fail "exact cleanup identity did not terminate recorded process"
 pass "cleanup requires exact process identity and per-run marker"
 
+# --- Lane-driver contract -------------------------------------------------
+
+prepare_dev_run() {
+  bash "$RUNNER" prepare --lane dev-null --suite dev-null --development \
+    --evidence-root "$TEST_ROOT/runs"
+}
+
+mk_driver_result() {
+  local destination=$1 results=$2
+  jq -n -c --arg schema "$DRIVER_RESULT_SCHEMA" --argjson results "$results" \
+    '{schema:$schema,schema_version:1,driver:"null",results:$results}' >"$destination"
+}
+
+# Driver-name resolution is allowlisted and refuses traversal or arbitrary paths.
+for bad in "../../../etc/passwd" "../null" "lib/qemu-unpriv" "null.sh" \
+  "/etc/passwd" "n/../null" ".." "." "NULL" "nosuch" "notadriver"; do
+  set +e
+  resolve_driver "$bad" >/dev/null 2>&1
+  resolve_rc=$?
+  set -e
+  [[ $resolve_rc != 0 ]] || fail "resolve_driver accepted unsafe or unlisted name: $bad"
+done
+resolve_driver null >/dev/null 2>&1 || fail "allowlisted null driver failed to resolve"
+pass "driver-name resolution is allowlisted and traversal-safe"
+
+# Bounded result contract: a valid result is accepted; oversize, unlisted, and
+# duplicate results are refused.
+driver_scratch="$TEST_ROOT/driver-results"
+mkdir -p "$driver_scratch"
+dev_required=$(required_tests_json dev-null)
+mk_driver_result "$driver_scratch/ok.json" \
+  '[{"test_id":"dev.result-contract","status":"PASS","reason_code":"OK"},{"test_id":"dev.sandbox-readonly","status":"PASS","reason_code":"OK"}]'
+validate_driver_result "$driver_scratch/ok.json" "$dev_required" \
+  || fail "a valid driver result contract was rejected"
+mk_driver_result "$driver_scratch/unlisted.json" \
+  '[{"test_id":"dev.not-a-listed-test","status":"PASS","reason_code":"OK"}]'
+if validate_driver_result "$driver_scratch/unlisted.json" "$dev_required"; then
+  fail "driver result with an unlisted test id was accepted"
+fi
+mk_driver_result "$driver_scratch/duplicate.json" \
+  '[{"test_id":"dev.result-contract","status":"PASS","reason_code":"A"},{"test_id":"dev.result-contract","status":"PASS","reason_code":"B"}]'
+if validate_driver_result "$driver_scratch/duplicate.json" "$dev_required"; then
+  fail "driver result with a duplicate test id was accepted"
+fi
+head -c $((64 * 1024 + 1)) /dev/zero | tr '\0' 'a' >"$driver_scratch/oversize.json"
+if validate_driver_result "$driver_scratch/oversize.json" "$dev_required"; then
+  fail "oversize driver result file was accepted"
+fi
+pass "driver result contract rejects oversize, unlisted, and duplicate results"
+
+# A nonzero driver exit degrades to an infrastructure error and never a pass.
+badexit_id=$(prepare_dev_run)
+badexit_run="$TEST_ROOT/runs/$badexit_id"
+bad_driver="$TEST_ROOT/bad-exit-driver.sh"
+printf '#!/usr/bin/env bash\nexit 3\n' >"$bad_driver"
+chmod +x "$bad_driver"
+badexit_outcome=$(execute_driver_lane "$badexit_run" "$bad_driver")
+[[ $badexit_outcome == "INFRA_ERROR DRIVER_EXECUTION_FAILED" ]] \
+  || fail "nonzero driver exit was not classified as an infrastructure error: $badexit_outcome"
+pass "a nonzero driver exit degrades to INFRA_ERROR without a pass"
+
+# Qualification refuses the development-only lane before preparing a run.
+set +e
+bash "$RUNNER" prepare --lane dev-null --suite dev-null --qualification \
+  --evidence-root "$TEST_ROOT/runs" >/dev/null 2>&1
+qual_prepare_rc=$?
+set -e
+[[ $qual_prepare_rc == "$EXIT_UNSUPPORTED" ]] \
+  || fail "prepare accepted the development-only lane under qualification (rc=$qual_prepare_rc)"
+
+# Defense in depth: even a run whose metadata is promoted to qualification is
+# refused before the driver executes.
+qual_id=$(prepare_dev_run)
+qual_run="$TEST_ROOT/runs/$qual_id"
+jq -c '.qualification="qualification"' "$qual_run/meta/run.json" >"$qual_run/meta/run.json.tmp"
+mv -f -- "$qual_run/meta/run.json.tmp" "$qual_run/meta/run.json"
+set +e
+bash "$RUNNER" run --run "$qual_id" --evidence-root "$TEST_ROOT/runs" >/dev/null 2>&1
+qual_run_rc=$?
+set -e
+[[ $qual_run_rc == "$EXIT_UNSUPPORTED" ]] \
+  || fail "run executed the development-only lane under qualification (rc=$qual_run_rc)"
+grep -q DEVELOPMENT_LANE_REFUSED "$qual_run/sanitized/events.jsonl" \
+  || fail "qualification refusal reason was not recorded"
+if grep -q MOCK_CONTRACT_OK "$qual_run/sanitized/events.jsonl"; then
+  fail "the driver executed despite qualification refusal"
+fi
+pass "qualification refuses the development-only lane before driver execution"
+
+# End-to-end development null-driver run yields verifiable PASS evidence, and the
+# driver self-reports that it ran under the read-only sandbox.
+dev_id=$(prepare_dev_run)
+dev_run="$TEST_ROOT/runs/$dev_id"
+set +e
+bash "$RUNNER" run --run "$dev_id" --evidence-root "$TEST_ROOT/runs" >/dev/null 2>&1
+dev_rc=$?
+set -e
+[[ $dev_rc == "$EXIT_PASS" ]] || fail "null driver development run did not pass (rc=$dev_rc)"
+expect_exit "$EXIT_PASS" bash "$RUNNER" verify-run --run "$dev_id" \
+  --evidence-root "$TEST_ROOT/runs"
+sandbox_status=$(jq -r 'select(.test_id == "dev.sandbox-readonly") | .status' \
+  "$dev_run/sanitized/events.jsonl")
+[[ $sandbox_status == PASS ]] \
+  || fail "null driver did not run under a read-only sandbox (status=$sandbox_status)"
+pass "development null-driver run yields verifiable PASS evidence under a read-only sandbox"
+
+# The shared unprivileged-QEMU helper enforces the documented VM boundary.
+# shellcheck source=/dev/null
+source "$REPO_ROOT/interop-tests/compose-phase1/drivers/lib/qemu-unpriv.sh"
+qemu_unpriv_selfcheck || fail "unprivileged-QEMU boundary self-check failed"
+# shellcheck disable=SC2054  # QEMU arguments use commas intentionally.
+bridge_argv=(qemu-system-x86_64 -nodefaults -netdev bridge,id=net0 \
+  -device virtio-net-pci,netdev=net0)
+if qemu_unpriv_assert_boundary "${bridge_argv[@]}"; then
+  fail "QEMU boundary accepted bridged networking"
+fi
+pass "unprivileged-QEMU helper enforces the documented VM boundary"
+
 printf 'PASS: Compose Phase 1 evidence fault tests\n'

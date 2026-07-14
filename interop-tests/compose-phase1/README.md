@@ -109,10 +109,84 @@ Future lane drivers must retain these boundaries:
 - guest code is transferred only after artifact verification and is never
   downloaded-and-executed from an unverified source.
 
-Scenario-specific drivers must write only their documented bounded result
-contract. They must not source or evaluate guest/runtime output. The common
-runner remains the only authority that assigns final sequence numbers, validates
-required terminals, and finalizes the manifest.
+## Lane-driver contract
+
+Scenario drivers live under `drivers/` and are selected by a lane's `driver`
+field in `phase1.lock.toml`. The runner resolves a driver only through a
+fail-closed allowlist: the name must match `^[a-z0-9][a-z0-9-]{0,63}$`, be listed
+in the runner's allowlist, and resolve to a non-symlink executable strictly
+inside `drivers/`. Names with path separators, `..`, or that escape the driver
+root are refused before anything runs; there is no arbitrary-path execution.
+
+A driver runs under a read-only Bubblewrap view. The whole filesystem is bound
+read-only except a fresh `/dev`, a private `/tmp`, and one writable scratch
+directory that holds the result file. The sandbox starts from a cleared
+environment, joins fresh user/IPC/UTS/cgroup/network namespaces, dies with the
+runner, and is bounded by a timeout.
+
+A driver communicates results **only** by writing the bounded result contract at
+`$BASIL_DRIVER_RESULT`. That file uses schema `basil.compose.phase1.driver-result`
+version `1`, is capped at 64 KiB, and lists per-test `{test_id,status,reason_code}`
+records (with optional bounded `message`/`details`). The runner validates the
+file before trusting it: every `test_id` must be required by the selected suite,
+test ids must be unique, and statuses and reason codes must be typed. Drivers
+never source guest output, never write JSONL events or manifests, and never
+assign sequence numbers. The runner alone emits one event per validated result,
+fills any unreported required terminal as `NOT_MEASURED`, and finalizes the
+manifest. A nonzero driver exit, a missing or malformed result, or an invalid
+result degrades to `INFRA_ERROR` and never becomes a pass.
+
+`drivers/lib/qemu-unpriv.sh` is a shared library (source it; do not execute it)
+that assembles the boundary-conforming unprivileged QEMU argv above and re-checks
+an argv against the forbidden surface (filesystem shares, bridged or tap
+networking, privilege re-entry) so a driver can fail closed before boot.
+
+`drivers/null.sh` is a development-only mock driver that boots no guest; it
+exercises the contract and confirms the read-only sandbox. It is reachable only
+through the `dev-null` development lane, which the runner refuses under
+`--qualification` before any driver executes.
+
+## Artifact inventory
+
+`scripts/compose-phase1-artifacts.lock.tsv` is the checked-in inventory and
+`scripts/compose-phase1-artifacts.sh` is the only tool that reads it. Its header
+comments are the authoritative field reference; the file is tab-separated,
+schema version `1`. Each row has a `status` of `ready` (fully pinned and
+acquirable) or `not-yet-populated` (intentionally reserved), and one of three
+kinds:
+
+- **`file-openpgp-clearsigned` / `file-openpgp-detached`** — a downloadable file
+  (the Fedora and Ubuntu cloud base images). The `sha256` column pins the file;
+  an OpenPGP-signed upstream checksum manifest is verified against the checked-in
+  key under `keys/`, and trust flows from the pinned signer fingerprint, never
+  the mirror hostname.
+- **`oci-image`** — a digest-pinned multi-arch workload container image
+  (`workload-fedora`, `workload-alpine`, `workload-debian`, `workload-ubuntu`,
+  `workload-postgres`, `workload-distroless`). The `sha256` column holds the
+  manifest-list (OCI image index) digest, which is the **sole** trust anchor; the
+  `source` column holds the tag-qualified reference used only to resolve that
+  digest. `fetch` runs `skopeo copy --all` **by digest** into an OCI layout
+  (retaining every platform manifest so the arm64 lane can select its
+  architecture), then re-verifies offline: the pinned manifest-list blob and
+  every other blob must self-address, and `index.json` must reference the pinned
+  digest. Neither the tag nor the registry hostname is ever trusted. Skopeo, jq,
+  and find are required for these rows.
+- **`package-set`** — the in-guest runtime packages. These rows
+  (`fedora-44-runtime-packages-x86_64`, `ubuntu-24.04-docker-packages-x86_64`)
+  stay `not-yet-populated` by design and are filled in later, with exact NEVRAs
+  or package versions plus signed repository or package hashes, by the lane
+  provisioning issues — Fedora Podman/Compose by `basil-3kx`, Ubuntu
+  Docker/Compose by `basil-y0f`.
+
+Fail-closed is the whole point: no unverified bytes ever land in the cache under
+a verified name, and while **any** row is `not-yet-populated` (or any populated
+row is absent from the cache) `fetch-all`, `verify-all`, and `offline` finalize
+honestly with exit `3` instead of claiming completeness. Per-artifact `fetch`
+and `verify` of the populated rows still succeed. `verify ARTIFACT...` is the
+approved interface the runner uses to gate every lane artifact; `recovery` prints
+exact reacquisition instructions for an empty cache, and `self-test` exercises
+the inventory parser and both the file and OCI verification paths, including
+digest-mismatch and substituted-manifest rejection.
 
 ## Cleanup identity
 

@@ -22,6 +22,19 @@ SPDX-License-Identifier: Apache-2.0
   harness fault self-test; `compose_phase1_probe` (basil-tests bin, behind the
   `compose-phase1-probe` feature) probes host/process facts, `SO_PEERCRED`
   peer pinning, and capacity metadata.
+- 2026-07-14: Compose Phase 1 lane-driver contract and workload artifact
+  pinning (test-only): the evidence runner resolves lane drivers strictly by
+  allowlisted name under `interop-tests/compose-phase1/drivers/` and executes
+  them in a read-only Bubblewrap view (single writable scratch, cleared env,
+  timeout); drivers report only through a 64 KiB size-capped, schema-validated
+  result file while the runner keeps sole JSONL-event/finalize authority; a
+  development `null` driver (new `dev-null` lane) is refused under
+  `--qualification`, and `drivers/lib/qemu-unpriv.sh` centralizes the
+  unprivileged-QEMU boundary. `compose-phase1-artifacts.lock.tsv` now pins the
+  six workload container images as multi-arch OCI index digests with
+  kind-aware `oci-image` fetch/verify/offline support (digest-anchored
+  `skopeo copy --all`, offline blob re-verification, atomic cache placement);
+  package-set rows stay reserved and keep `verify-all`/`offline` fail-closed.
 
 ### `basil demo`: a zero-dependency guided tour
 

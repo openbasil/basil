@@ -85,6 +85,36 @@ is_approved_unpopulated_source() {
   esac
 }
 
+# Canonical registry/repository allow-list for populated OCI workload rows. Each
+# project's own registry is pinned; the tag is only how a digest was resolved,
+# never a trust anchor (see is_safe_oci_digest / verify_oci_layout).
+is_approved_oci_repo() {
+  case "$1" in
+    registry.fedoraproject.org/fedora \
+      | docker.io/library/alpine | docker.io/library/debian \
+      | docker.io/library/ubuntu | docker.io/library/postgres \
+      | gcr.io/distroless/static-debian12) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# A populated OCI source is a tag-qualified reference registry/repo:tag. The
+# digest is carried in the sha256 column, so a bare or digest-bearing source is
+# rejected here to keep the tag and the pinned digest in separate columns.
+is_approved_oci_ready_ref() {
+  local ref=$1 repo tag
+  [[ "$ref" != *@* ]] || return 1
+  [[ "$ref" == *:* ]] || return 1
+  repo=${ref%:*}
+  tag=${ref##*:}
+  [[ "$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$ ]] || return 1
+  is_approved_oci_repo "$repo"
+}
+
+is_safe_oci_digest() {
+  [[ "$1" =~ ^[0-9a-f]{64}$ ]]
+}
+
 declare -a IDS=()
 declare -A STATUS=()
 declare -A KIND=()
@@ -104,14 +134,45 @@ declare -A SIGNER_FINGERPRINT=()
 declare -A NOTE=()
 
 validate_ready_row() {
+  local line_no=$1 id=$2 kind=$3
+
+  case "$kind" in
+    file-openpgp-clearsigned | file-openpgp-detached) validate_ready_file_row "$@" ;;
+    oci-image) validate_ready_oci_row "$@" ;;
+    *) fail_inventory "line $line_no: ready entry '$id' has unsupported kind '$kind'" ;;
+  esac
+}
+
+# A populated OCI row pins a multi-arch manifest-list (image index) digest in the
+# sha256 column as the sole trust anchor. The source column holds the
+# tag-qualified reference used to resolve that digest, the filename column holds
+# the on-disk OCI-layout directory name, and every file-signature column is '-'
+# because the content-addressed digest — re-verified locally after acquisition —
+# authenticates the layout without a detached OpenPGP signature.
+validate_ready_oci_row() {
   local line_no=$1 id=$2 kind=$3 platform=$4 filename=$5 size_bytes=$6 sha256=$7
   local source_url=$8 checksum_url=$9 checksum_size=${10} checksum_sha=${11}
   local signature_url=${12} signature_size=${13} signature_sha=${14} key_file=${15} fingerprint=${16}
 
-  case "$kind" in
-    file-openpgp-clearsigned | file-openpgp-detached) ;;
-    *) fail_inventory "line $line_no: ready entry '$id' has unsupported kind '$kind'" ;;
-  esac
+  is_safe_platform "$platform" || fail_inventory "line $line_no: invalid platform for '$id'"
+  is_safe_filename "$filename" || fail_inventory "line $line_no: invalid OCI layout name for '$id'"
+  [[ "$size_bytes" == "-" ]] \
+    || fail_inventory "line $line_no: OCI entry '$id' must use '-' for size (the digest is the anchor)"
+  is_safe_oci_digest "$sha256" \
+    || fail_inventory "line $line_no: invalid manifest-list digest for '$id'"
+  is_approved_oci_ready_ref "$source_url" \
+    || fail_inventory "line $line_no: unapproved or non-tag-qualified OCI reference for '$id': $source_url"
+  [[ "$checksum_url" == "-" && "$checksum_size" == "-" && "$checksum_sha" == "-" \
+      && "$signature_url" == "-" && "$signature_size" == "-" && "$signature_sha" == "-" \
+      && "$key_file" == "-" && "$fingerprint" == "-" ]] \
+    || fail_inventory "line $line_no: OCI entry '$id' must use '-' for checksum/signature/key columns"
+}
+
+validate_ready_file_row() {
+  local line_no=$1 id=$2 kind=$3 platform=$4 filename=$5 size_bytes=$6 sha256=$7
+  local source_url=$8 checksum_url=$9 checksum_size=${10} checksum_sha=${11}
+  local signature_url=${12} signature_size=${13} signature_sha=${14} key_file=${15} fingerprint=${16}
+
   is_safe_platform "$platform" || fail_inventory "line $line_no: invalid platform for '$id'"
   is_safe_filename "$filename" || fail_inventory "line $line_no: invalid filename for '$id'"
   [[ "$size_bytes" =~ ^[1-9][0-9]*$ ]] || fail_inventory "line $line_no: invalid artifact size for '$id'"
@@ -348,12 +409,73 @@ verify_openpgp() {
   fi
 }
 
+# Offline integrity check for an OCI-layout directory. The pinned manifest-list
+# (image index) digest is the trust anchor: it must be present as a
+# content-addressed blob whose bytes hash back to the digest, it must be the
+# entry referenced by index.json, and every blob in the layout must self-address
+# (its filename equals the SHA-256 of its bytes). No network access and no trust
+# in the tag or registry hostname is involved. Returns 3 for a missing layout,
+# 4 for any integrity failure.
+verify_oci_layout() {
+  local id=$1 dir=$2 pinned=$3 blob got f name
+  [[ -d "$dir" ]] || { printf 'missing: %s\n' "$dir" >&2; return 3; }
+  [[ -f "$dir/oci-layout" ]] || { printf 'missing: %s\n' "$dir/oci-layout" >&2; return 3; }
+  [[ -f "$dir/index.json" ]] || { printf 'missing: %s\n' "$dir/index.json" >&2; return 3; }
+  [[ -d "$dir/blobs/sha256" ]] || { printf 'missing: %s\n' "$dir/blobs/sha256" >&2; return 3; }
+
+  blob="$dir/blobs/sha256/$pinned"
+  [[ -f "$blob" ]] || { printf 'missing: %s\n' "$blob" >&2; return 3; }
+
+  if ! jq -e --arg d "sha256:$pinned" 'any((.manifests // [])[]; .digest == $d)' \
+      "$dir/index.json" >/dev/null 2>&1; then
+    printf 'verification error: %s index.json does not reference pinned digest sha256:%s\n' \
+      "$id" "$pinned" >&2
+    return 4
+  fi
+
+  got=$(sha256sum -- "$blob") || return 4
+  got=${got%% *}
+  if [[ "$got" != "$pinned" ]]; then
+    printf 'verification error: manifest-list digest mismatch for %s\n  expected: %s\n  actual:   %s\n' \
+      "$id" "$pinned" "$got" >&2
+    return 4
+  fi
+
+  while IFS= read -r f; do
+    name=${f##*/}
+    if [[ ! "$name" =~ ^[0-9a-f]{64}$ ]]; then
+      printf 'verification error: non-digest blob name in %s layout: %s\n' "$id" "$name" >&2
+      return 4
+    fi
+    got=$(sha256sum -- "$f") || return 4
+    got=${got%% *}
+    if [[ "$got" != "$name" ]]; then
+      printf 'verification error: blob content does not match its digest in %s: %s\n' "$id" "$name" >&2
+      return 4
+    fi
+  done < <(find "$dir/blobs/sha256" -type f)
+}
+
+verify_oci() {
+  local id=$1
+  need_command sha256sum || return 2
+  need_command jq || return 2
+  need_command find || return 2
+  verify_oci_layout "$id" "$(artifact_path "$id")" "${SHA256[$id]}" || return $?
+  printf 'verified\t%s\t%s\n' "$id" "$(artifact_path "$id")"
+}
+
 verify_one() {
   local id=$1
   require_id "$id" || return $?
   if [[ "${STATUS[$id]}" != "ready" ]]; then
     printf 'blocked: %s is %s: %s\n' "$id" "${STATUS[$id]}" "${NOTE[$id]}" >&2
     return 3
+  fi
+
+  if [[ "${KIND[$id]}" == "oci-image" ]]; then
+    verify_oci "$id"
+    return $?
   fi
 
   need_command sha256sum || return 2
@@ -426,12 +548,84 @@ download_to_temp() {
   printf -v "$output_var" '%s' "$tmp"
 }
 
+fetch_oci() {
+  local id=$1 pinned ref repo dir final
+  need_command skopeo || return 2
+  need_command jq || return 2
+  need_command sha256sum || return 2
+  need_command find || return 2
+  need_command mktemp || return 2
+  need_command install || return 2
+  need_command timeout || return 2
+  [[ "$DOWNLOAD_TIMEOUT_SECONDS" =~ ^[0-9]+$ && "$DOWNLOAD_TIMEOUT_SECONDS" -gt 30 ]] || {
+    printf 'error: BASIL_COMPOSE_ARTIFACT_DOWNLOAD_TIMEOUT must be an integer greater than 30\n' >&2
+    return 2
+  }
+
+  if verify_oci "$id" >/dev/null 2>&1; then
+    printf 'already-verified\t%s\t%s\n' "$id" "$(artifact_path "$id")"
+    return 0
+  fi
+
+  pinned=${SHA256[$id]}
+  ref=${SOURCE_URL[$id]}
+  repo=${ref%:*}
+  dir=$(artifact_dir "$id")
+  final=$(artifact_path "$id")
+  install -d -m 0700 -- "$CACHE_ROOT" "$dir"
+
+  (
+    set -e
+    local tmp='' policy=''
+    # shellcheck disable=SC2329  # invoked indirectly by the EXIT trap
+    cleanup_oci() {
+      [[ -z "$tmp" ]] || rm -rf -- "$tmp"
+      [[ -z "$policy" ]] || rm -f -- "$policy"
+    }
+    trap cleanup_oci EXIT
+
+    tmp=$(mktemp -d "$dir/.image.part.XXXXXX")
+    policy=$(mktemp "$dir/.policy.XXXXXX.json")
+    # The pinned manifest-list digest is the sole trust anchor and is re-verified
+    # locally below, so skopeo's own signature policy is deliberately permissive.
+    # This keeps acquisition portable across hosts that ship no default policy.
+    printf '{"default":[{"type":"insecureAcceptAnything"}]}\n' >"$policy"
+
+    # Digest-pinned pull of the full multi-arch index: skopeo validates the
+    # requested manifest digest during transfer, and --all retains every
+    # platform manifest so the arm64 lane can select its architecture offline.
+    printf 'fetching\t%s\t%s@sha256:%s\n' "$id" "$repo" "$pinned"
+    timeout "$DOWNLOAD_TIMEOUT_SECONDS" skopeo copy --all --quiet \
+      --policy "$policy" \
+      "docker://${repo}@sha256:${pinned}" "oci:${tmp}" || exit 5
+    rm -f -- "$policy"
+    policy=''
+
+    # Never publish the cache entry until the freshly pulled layout verifies
+    # against the pinned digest fully offline.
+    verify_oci_layout "$id" "$tmp" "$pinned" || exit 4
+
+    rm -rf -- "$final"
+    mv -T -- "$tmp" "$final"
+    tmp=''
+    chmod -R go-rwx -- "$final" 2>/dev/null || true
+    sync -f "$final" 2>/dev/null || true
+  ) || return $?
+
+  verify_oci "$id"
+}
+
 fetch_one() {
   local id=$1
   require_id "$id" || return $?
   if [[ "${STATUS[$id]}" != "ready" ]]; then
     printf 'blocked: %s is %s: %s\n' "$id" "${STATUS[$id]}" "${NOTE[$id]}" >&2
     return 3
+  fi
+
+  if [[ "${KIND[$id]}" == "oci-image" ]]; then
+    fetch_oci "$id"
+    return $?
   fi
 
   need_command curl || return 2
@@ -552,6 +746,9 @@ explain_one() {
   printf 'size bytes: %s\n' "${SIZE_BYTES[$id]}"
   printf 'sha256: %s\n' "${SHA256[$id]}"
   printf 'source: %s\n' "${SOURCE_URL[$id]}"
+  if [[ "${KIND[$id]}" == "oci-image" && "${STATUS[$id]}" == "ready" ]]; then
+    printf 'pinned reference: %s@sha256:%s\n' "${SOURCE_URL[$id]}" "${SHA256[$id]}"
+  fi
   printf 'checksums: %s\n' "${CHECKSUM_URL[$id]}"
   printf 'checksums size bytes: %s\n' "${CHECKSUM_SIZE_BYTES[$id]}"
   printf 'checksums sha256: %s\n' "${CHECKSUM_SHA256[$id]}"
@@ -600,6 +797,17 @@ report_missing() {
       missing=$((missing + 1))
       continue
     fi
+    if [[ "${KIND[$id]}" == "oci-image" ]]; then
+      local layout
+      layout=$(artifact_path "$id")
+      for path in "$layout/oci-layout" "$layout/index.json" "$layout/blobs/sha256/${SHA256[$id]}"; do
+        if [[ ! -f "$path" ]]; then
+          printf 'MISSING\t%s\t%s\n' "$id" "$path"
+          missing=$((missing + 1))
+        fi
+      done
+      continue
+    fi
     for path in "$(artifact_path "$id")" "$(checksum_path "$id")"; do
       if [[ ! -f "$path" ]]; then
         printf 'MISSING\t%s\t%s\n' "$id" "$path"
@@ -622,6 +830,7 @@ recovery() {
   printf 'Cache root:\n  %s\n\n' "$CACHE_ROOT"
   printf 'Prerequisites:\n'
   printf '  bash curl timeout sha256sum gpgv mktemp install mv sync\n'
+  printf '  skopeo, jq, and find are additionally required for oci-image rows\n'
   printf '  jq is additionally required for list --json\n\n'
   printf 'Fresh-checkout commands (run from the repository root):\n'
   printf '  BASIL_COMPOSE_ARTIFACT_CACHE=%q ./scripts/compose-phase1-artifacts.sh fetch-all\n' "$CACHE_ROOT"
@@ -636,17 +845,24 @@ recovery() {
     printf '\n  %s\n' "$id"
     printf '    platform: %s\n' "${PLATFORM[$id]}"
     printf '    output: %s\n' "$(artifact_path "$id")"
-    printf '    source: %s\n' "${SOURCE_URL[$id]}"
-    printf '    expected bytes: %s\n' "${SIZE_BYTES[$id]}"
-    printf '    expected sha256: %s\n' "${SHA256[$id]}"
-    printf '    signed checksums: %s\n' "${CHECKSUM_URL[$id]}"
-    printf '    checksums bytes: %s\n' "${CHECKSUM_SIZE_BYTES[$id]}"
-    printf '    checksums sha256: %s\n' "${CHECKSUM_SHA256[$id]}"
-    printf '    detached signature: %s\n' "${SIGNATURE_URL[$id]}"
-    printf '    signature bytes: %s\n' "${SIGNATURE_SIZE_BYTES[$id]}"
-    printf '    signature sha256: %s\n' "${SIGNATURE_SHA256[$id]}"
-    printf '    checked-in key: ./interop-tests/compose-phase1/keys/%s\n' "${KEY_FILE[$id]}"
-    printf '    pinned signer: %s\n' "${SIGNER_FINGERPRINT[$id]}"
+    if [[ "${KIND[$id]}" == "oci-image" ]]; then
+      printf '    tag reference: %s\n' "${SOURCE_URL[$id]}"
+      printf '    pinned reference: %s@sha256:%s\n' "${SOURCE_URL[$id]}" "${SHA256[$id]}"
+      printf '    manifest-list digest: sha256:%s\n' "${SHA256[$id]}"
+      printf '    acquisition: skopeo copy --all by digest into an OCI layout, re-verified offline\n'
+    else
+      printf '    source: %s\n' "${SOURCE_URL[$id]}"
+      printf '    expected bytes: %s\n' "${SIZE_BYTES[$id]}"
+      printf '    expected sha256: %s\n' "${SHA256[$id]}"
+      printf '    signed checksums: %s\n' "${CHECKSUM_URL[$id]}"
+      printf '    checksums bytes: %s\n' "${CHECKSUM_SIZE_BYTES[$id]}"
+      printf '    checksums sha256: %s\n' "${CHECKSUM_SHA256[$id]}"
+      printf '    detached signature: %s\n' "${SIGNATURE_URL[$id]}"
+      printf '    signature bytes: %s\n' "${SIGNATURE_SIZE_BYTES[$id]}"
+      printf '    signature sha256: %s\n' "${SIGNATURE_SHA256[$id]}"
+      printf '    checked-in key: ./interop-tests/compose-phase1/keys/%s\n' "${KEY_FILE[$id]}"
+      printf '    pinned signer: %s\n' "${SIGNER_FINGERPRINT[$id]}"
+    fi
     printf '    command: BASIL_COMPOSE_ARTIFACT_CACHE=%q ./scripts/compose-phase1-artifacts.sh fetch %q\n' "$CACHE_ROOT" "$id"
   done
 
@@ -747,6 +963,113 @@ EOF
     return 1
   fi
   printf 'ok: failed fetch preserves prior cache atomically\n'
+
+  need_command jq
+  need_command find
+  # Build a synthetic, self-addressing OCI layout. The pinned manifest-list
+  # digest is computed from the blob bytes, so the verifier's trust anchor is
+  # exercised without any network access or a real container tool.
+  build_test_oci_layout() {
+    local d=$1 idx dg extra ex
+    rm -rf -- "$d"
+    mkdir -p "$d/blobs/sha256"
+    printf '{"imageLayoutVersion":"1.0.0"}' >"$d/oci-layout"
+    idx='{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":1,"platform":{"os":"linux","architecture":"amd64"}}]}'
+    printf '%s' "$idx" >"$d/.ml"
+    dg=$(sha256sum "$d/.ml"); dg=${dg%% *}
+    mv -- "$d/.ml" "$d/blobs/sha256/$dg"
+    extra='self-test-layer-bytes'
+    printf '%s' "$extra" >"$d/.ex"
+    ex=$(sha256sum "$d/.ex"); ex=${ex%% *}
+    mv -- "$d/.ex" "$d/blobs/sha256/$ex"
+    printf '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.index.v1+json","digest":"sha256:%s","size":%d}]}' \
+      "$dg" "${#idx}" >"$d/index.json"
+    printf '%s' "$dg"
+  }
+
+  local oci_dir oci_dg oci_row
+  oci_dir="$tmp/cache/test-oci/image"
+  oci_dg=$(build_test_oci_layout "$oci_dir")
+  oci_row=$(printf '1\ttest-oci\tready\toci-image\tlinux/multiarch\timage\t-\t%s\tdocker.io/library/alpine:3.22\t-\t-\t-\t-\t-\t-\t-\t-\tSynthetic self-test OCI layout.' "$oci_dg")
+  printf '%s\n%s\n' "$header" "$oci_row" >"$tmp/oci.tsv"
+
+  env \
+    BASIL_COMPOSE_ARTIFACT_LOCK="$tmp/oci.tsv" \
+    BASIL_COMPOSE_ARTIFACT_KEY_ROOT="$tmp/keys" \
+    BASIL_COMPOSE_ARTIFACT_CACHE="$tmp/cache" \
+    "$SCRIPT_PATH" verify test-oci >/dev/null \
+    || { printf 'self-test failure: valid oci layout did not verify\n' >&2; return 1; }
+  printf 'ok: valid oci layout verifies offline\n'
+
+  env \
+    BASIL_COMPOSE_ARTIFACT_LOCK="$tmp/oci.tsv" \
+    BASIL_COMPOSE_ARTIFACT_KEY_ROOT="$tmp/keys" \
+    BASIL_COMPOSE_ARTIFACT_CACHE="$tmp/cache" \
+    "$SCRIPT_PATH" offline >/dev/null \
+    || { printf 'self-test failure: oci offline verification failed for a fully populated inventory\n' >&2; return 1; }
+  printf 'ok: oci offline verification passes when every row is populated\n'
+
+  # Negative: tampering the pinned manifest-list blob must fail (digest mismatch).
+  printf 'tampered' >>"$oci_dir/blobs/sha256/$oci_dg"
+  expect_failure 'oci manifest-list digest mismatch rejected' env \
+    BASIL_COMPOSE_ARTIFACT_LOCK="$tmp/oci.tsv" \
+    BASIL_COMPOSE_ARTIFACT_KEY_ROOT="$tmp/keys" \
+    BASIL_COMPOSE_ARTIFACT_CACHE="$tmp/cache" \
+    "$SCRIPT_PATH" verify test-oci
+
+  # Negative: tampering any non-anchor blob must also fail (full-layout integrity).
+  oci_dg=$(build_test_oci_layout "$oci_dir")
+  local b
+  for b in "$oci_dir"/blobs/sha256/*; do
+    [[ "${b##*/}" == "$oci_dg" ]] && continue
+    printf 'tampered' >>"$b"
+  done
+  expect_failure 'oci non-anchor blob tamper rejected' env \
+    BASIL_COMPOSE_ARTIFACT_LOCK="$tmp/oci.tsv" \
+    BASIL_COMPOSE_ARTIFACT_KEY_ROOT="$tmp/keys" \
+    BASIL_COMPOSE_ARTIFACT_CACHE="$tmp/cache" \
+    "$SCRIPT_PATH" verify test-oci
+
+  # Negative: a fetch whose transport substitutes the manifest bytes must be
+  # rejected by the local re-verification and must not replace the prior cache.
+  cat >"$tmp/bin/skopeo" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+dest= ; src=
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    oci:*) dest=${1#oci:} ;;
+    docker://*) src=$1 ;;
+  esac
+  shift
+done
+dg=${src##*@sha256:}
+mkdir -p "$dest/blobs/sha256"
+printf '{"imageLayoutVersion":"1.0.0"}' >"$dest/oci-layout"
+printf 'attacker-substituted-manifest-bytes' >"$dest/blobs/sha256/$dg"
+printf '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.index.v1+json","digest":"sha256:%s","size":1}]}' "$dg" >"$dest/index.json"
+EOF
+  chmod +x "$tmp/bin/skopeo"
+  oci_dg=$(build_test_oci_layout "$oci_dir")
+  printf 'stale' >>"$oci_dir/blobs/sha256/$oci_dg"
+  local before_hash after_hash
+  before_hash=$(sha256sum "$oci_dir/blobs/sha256/$oci_dg"); before_hash=${before_hash%% *}
+  expect_failure 'oci fetch rejects a substituted manifest' env \
+    PATH="$tmp/bin:$PATH" \
+    BASIL_COMPOSE_ARTIFACT_LOCK="$tmp/oci.tsv" \
+    BASIL_COMPOSE_ARTIFACT_KEY_ROOT="$tmp/keys" \
+    BASIL_COMPOSE_ARTIFACT_CACHE="$tmp/cache" \
+    "$SCRIPT_PATH" fetch test-oci
+  after_hash=$(sha256sum "$oci_dir/blobs/sha256/$oci_dg"); after_hash=${after_hash%% *}
+  [[ "$before_hash" == "$after_hash" ]] \
+    || { printf 'self-test failure: rejected oci fetch mutated the cache\n' >&2; return 1; }
+  if compgen -G "$tmp/cache/test-oci/.image.part.*" >/dev/null \
+    || compgen -G "$tmp/cache/test-oci/.policy.*" >/dev/null; then
+    printf 'self-test failure: rejected oci fetch left temporary files\n' >&2
+    return 1
+  fi
+  printf 'ok: oci fetch rejects a substituted manifest and preserves the cache atomically\n'
+
   printf 'self-test: all checks passed\n'
 }
 
