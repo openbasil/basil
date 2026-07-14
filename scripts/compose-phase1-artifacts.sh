@@ -85,6 +85,25 @@ is_approved_unpopulated_source() {
   esac
 }
 
+# Approved download hosts for package-set members and their signed-index anchors.
+# Trust flows from the pinned hashes, never the hostname; the host allow-list only
+# bounds where bytes may be pulled from.
+is_approved_pkg_url() {
+  case "$1" in
+    https://download.docker.com/* | https://download.fedoraproject.org/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# A cache-relative location for a `staged` package-set member: never absolute,
+# never traverses upward, no empty or doubled separators, no control characters.
+is_safe_cache_relpath() {
+  local p=$1
+  [[ -n "$p" && "$p" != /* && "$p" != *//* && "$p" != *$'\n'* && "$p" != *$'\r'* ]] || return 1
+  [[ "$p" == ".." || "$p" == ../* || "$p" == */.. || "$p" == */../* ]] && return 1
+  return 0
+}
+
 # Canonical registry/repository allow-list for populated OCI workload rows. Each
 # project's own registry is pinned; the tag is only how a digest was resolved,
 # never a trust anchor (see is_safe_oci_digest / verify_oci_layout).
@@ -133,14 +152,63 @@ declare -A KEY_FILE=()
 declare -A SIGNER_FINGERPRINT=()
 declare -A NOTE=()
 
+# Transient parse buffers for the current package-set member manifest, populated
+# by read_pkgset_entries and consumed by the package-set verify/fetch/report paths.
+declare -a PKG_RELPATH=()
+declare -a PKG_METHOD=()
+declare -a PKG_SIZE=()
+declare -a PKG_SHA=()
+declare -a PKG_SOURCE=()
+declare -a PKG_RECOVERY=()
+
 validate_ready_row() {
   local line_no=$1 id=$2 kind=$3
 
   case "$kind" in
     file-openpgp-clearsigned | file-openpgp-detached) validate_ready_file_row "$@" ;;
     oci-image) validate_ready_oci_row "$@" ;;
+    package-set) validate_ready_pkgset_row "$@" ;;
     *) fail_inventory "line $line_no: ready entry '$id' has unsupported kind '$kind'" ;;
   esac
+}
+
+# A populated package-set row pins its per-set member manifest (the sidecar
+# compose-phase1-artifacts.<id>.packages.tsv) by sha256 in the sha256 column,
+# which is the anchor over the member list; each member is in turn pinned by its
+# own sha256 in that manifest. filename is the cache subdirectory name; size and
+# every detached-signature column are '-'. source_url is the approved download
+# scope for `url` members; checksum_url / checksum_sha256 record the signed
+# repository index the member hashes were derived from; key_file /
+# signer_fingerprint name the signing key (key_file may be '-' when that key is
+# not checked in, as for the Docker CE key).
+validate_ready_pkgset_row() {
+  local line_no=$1 id=$2 kind=$3 platform=$4 filename=$5 size_bytes=$6 sha256=$7
+  local source_url=$8 checksum_url=$9 checksum_size=${10} checksum_sha=${11}
+  local signature_url=${12} signature_size=${13} signature_sha=${14} key_file=${15} fingerprint=${16}
+
+  is_safe_platform "$platform" || fail_inventory "line $line_no: invalid platform for '$id'"
+  is_safe_filename "$filename" || fail_inventory "line $line_no: invalid cache directory name for '$id'"
+  [[ "$size_bytes" == "-" ]] \
+    || fail_inventory "line $line_no: package-set entry '$id' must use '-' for size (each member is pinned in its manifest)"
+  [[ "$sha256" =~ ^[0-9a-f]{64}$ ]] \
+    || fail_inventory "line $line_no: invalid member-manifest sha256 for '$id'"
+
+  local url
+  for url in "$source_url" "$checksum_url"; do
+    is_release_specific_url "$url" || fail_inventory "line $line_no: non-release-specific URL for '$id': $url"
+    is_approved_pkg_url "$url" || fail_inventory "line $line_no: unapproved URL for '$id': $url"
+  done
+  [[ "$checksum_size" == "-" ]] \
+    || fail_inventory "line $line_no: package-set entry '$id' must use '-' for checksum size"
+  [[ "$checksum_sha" =~ ^[0-9a-f]{64}$ ]] \
+    || fail_inventory "line $line_no: invalid signed-index sha256 for '$id'"
+  [[ "$signature_url" == "-" && "$signature_size" == "-" && "$signature_sha" == "-" ]] \
+    || fail_inventory "line $line_no: package-set entry '$id' must use '-' for detached-signature fields"
+  { [[ "$key_file" == "-" ]] \
+    || [[ "$key_file" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*\.gpg$ && "$key_file" != /* && "$key_file" != *'../'* ]]; } \
+    || fail_inventory "line $line_no: invalid key_file for '$id'"
+  { [[ "$fingerprint" =~ ^[0-9A-F]{40}$ ]] || [[ "$fingerprint" =~ ^[0-9A-F]{64}$ ]]; } \
+    || fail_inventory "line $line_no: invalid signer fingerprint for '$id'"
 }
 
 # A populated OCI row pins a multi-arch manifest-list (image index) digest in the
@@ -465,6 +533,109 @@ verify_oci() {
   printf 'verified\t%s\t%s\n' "$id" "$(artifact_path "$id")"
 }
 
+pkgset_manifest_path() {
+  local dir
+  dir=$(dirname -- "$LOCK_FILE")
+  printf '%s/compose-phase1-artifacts.%s.packages.tsv' "$dir" "$1"
+}
+
+pkgset_cache_dir() {
+  printf '%s/%s' "$CACHE_ROOT" "$1"
+}
+
+# Resolve the on-disk path of member index $2 of package-set $1. A `url` member
+# lives under the row's own cache directory; a `staged` member lives at its
+# cache-relative source path (where a prep script places it).
+pkgset_entry_path() {
+  local id=$1 i=$2
+  if [[ "${PKG_METHOD[$i]}" == "url" ]]; then
+    printf '%s/%s/%s' "$CACHE_ROOT" "$id" "${PKG_RELPATH[$i]}"
+  else
+    printf '%s/%s' "$CACHE_ROOT" "${PKG_SOURCE[$i]}"
+  fi
+}
+
+# Parse and validate the per-set member manifest into the PKG_* arrays. The
+# manifest's own sha256 must equal the row's pinned anchor before any member is
+# trusted, so the chain is lock row -> member manifest -> member bytes. Returns 2
+# for a missing tool, 4 for any manifest or anchor problem.
+read_pkgset_entries() {
+  local id=$1 manifest got line ln=0
+  need_command sha256sum || return 2
+  manifest=$(pkgset_manifest_path "$id")
+  [[ -f "$manifest" ]] || {
+    printf 'verification error: package manifest missing for %s: %s\n' "$id" "$manifest" >&2
+    return 4
+  }
+  got=$(sha256sum -- "$manifest") || return 4
+  got=${got%% *}
+  if [[ "$got" != "${SHA256[$id]}" ]]; then
+    printf 'verification error: package manifest digest mismatch for %s\n  expected: %s\n  actual:   %s\n' \
+      "$id" "${SHA256[$id]}" "$got" >&2
+    return 4
+  fi
+
+  PKG_RELPATH=(); PKG_METHOD=(); PKG_SIZE=(); PKG_SHA=(); PKG_SOURCE=(); PKG_RECOVERY=()
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    ln=$((ln + 1))
+    line=${line%$'\r'}
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    local -a fields=()
+    IFS=$'\t' read -r -a fields <<<"$line"
+    [[ ${#fields[@]} -eq 6 ]] \
+      || { printf 'verification error: %s manifest line %d has %d fields; expected 6\n' "$id" "$ln" "${#fields[@]}" >&2; return 4; }
+    local relpath=${fields[0]} method=${fields[1]} size=${fields[2]}
+    local sha=${fields[3]} source=${fields[4]} recovery=${fields[5]}
+    is_safe_filename "$relpath" \
+      || { printf 'verification error: %s manifest line %d has an unsafe member name\n' "$id" "$ln" >&2; return 4; }
+    [[ "$size" =~ ^[1-9][0-9]*$ ]] \
+      || { printf 'verification error: %s manifest line %d has an invalid size\n' "$id" "$ln" >&2; return 4; }
+    [[ "$sha" =~ ^[0-9a-f]{64}$ ]] \
+      || { printf 'verification error: %s manifest line %d has an invalid sha256\n' "$id" "$ln" >&2; return 4; }
+    case "$method" in
+      url)
+        is_release_specific_url "$source" \
+          || { printf 'verification error: %s manifest line %d URL is not release-specific\n' "$id" "$ln" >&2; return 4; }
+        is_approved_pkg_url "$source" \
+          || { printf 'verification error: %s manifest line %d URL is not approved\n' "$id" "$ln" >&2; return 4; }
+        [[ "$source" == "${SOURCE_URL[$id]}"* ]] \
+          || { printf 'verification error: %s manifest line %d URL is outside the row source scope\n' "$id" "$ln" >&2; return 4; }
+        [[ "$recovery" == "-" ]] \
+          || { printf 'verification error: %s manifest line %d url member must use - for recovery\n' "$id" "$ln" >&2; return 4; }
+        ;;
+      staged)
+        is_safe_cache_relpath "$source" \
+          || { printf 'verification error: %s manifest line %d has an unsafe staged path\n' "$id" "$ln" >&2; return 4; }
+        { [[ -n "$recovery" && "$recovery" != "-" && "$recovery" != *$'\n'* ]]; } \
+          || { printf 'verification error: %s manifest line %d staged member needs a recovery command\n' "$id" "$ln" >&2; return 4; }
+        ;;
+      *)
+        printf 'verification error: %s manifest line %d has an unknown method %s\n' "$id" "$ln" "$method" >&2
+        return 4
+        ;;
+    esac
+    PKG_RELPATH+=("$relpath"); PKG_METHOD+=("$method"); PKG_SIZE+=("$size")
+    PKG_SHA+=("$sha"); PKG_SOURCE+=("$source"); PKG_RECOVERY+=("$recovery")
+  done <"$manifest"
+
+  [[ ${#PKG_RELPATH[@]} -gt 0 ]] \
+    || { printf 'verification error: %s manifest has no members\n' "$id" >&2; return 4; }
+}
+
+# Offline integrity check for a package-set: the member manifest must match the
+# row anchor, and every listed member must be present and hash to its pin.
+# Returns 3 for a missing member, 4 for a manifest or hash failure.
+verify_pkgset() {
+  local id=$1 i path
+  read_pkgset_entries "$id" || return $?
+  for i in "${!PKG_RELPATH[@]}"; do
+    path=$(pkgset_entry_path "$id" "$i")
+    [[ -f "$path" ]] || { printf 'missing: %s\n' "$path" >&2; return 3; }
+    check_file "$path" "${PKG_SIZE[$i]}" "${PKG_SHA[$i]}" || return $?
+  done
+  printf 'verified\t%s\t%s (%d members)\n' "$id" "$(pkgset_cache_dir "$id")" "${#PKG_RELPATH[@]}"
+}
+
 verify_one() {
   local id=$1
   require_id "$id" || return $?
@@ -475,6 +646,11 @@ verify_one() {
 
   if [[ "${KIND[$id]}" == "oci-image" ]]; then
     verify_oci "$id"
+    return $?
+  fi
+
+  if [[ "${KIND[$id]}" == "package-set" ]]; then
+    verify_pkgset "$id"
     return $?
   fi
 
@@ -615,6 +791,71 @@ fetch_oci() {
   verify_oci "$id"
 }
 
+# Acquire a package-set's members into the cache. `url` members are downloaded
+# from their approved immutable source and each verified against its pinned
+# sha256 before an atomic rename into place, so no unverified bytes ever land
+# under a verified name. `staged` members are produced out of band by a prep
+# script and only verified in place; a missing or failing staged member fails
+# closed (exit 3) with its recovery command, never a download.
+fetch_pkgset() {
+  local id=$1 i path dir rc
+  need_command sha256sum || return 2
+  need_command curl || return 2
+  need_command timeout || return 2
+  need_command mktemp || return 2
+  need_command stat || return 2
+  need_command install || return 2
+  [[ "$DOWNLOAD_TIMEOUT_SECONDS" =~ ^[0-9]+$ && "$DOWNLOAD_TIMEOUT_SECONDS" -gt 30 ]] || {
+    printf 'error: BASIL_COMPOSE_ARTIFACT_DOWNLOAD_TIMEOUT must be an integer greater than 30\n' >&2
+    return 2
+  }
+
+  if verify_pkgset "$id" >/dev/null 2>&1; then
+    printf 'already-verified\t%s\t%s\n' "$id" "$(pkgset_cache_dir "$id")"
+    return 0
+  fi
+
+  read_pkgset_entries "$id" || return $?
+  dir=$(pkgset_cache_dir "$id")
+  for i in "${!PKG_RELPATH[@]}"; do
+    path=$(pkgset_entry_path "$id" "$i")
+    if [[ -f "$path" ]] && check_file "$path" "${PKG_SIZE[$i]}" "${PKG_SHA[$i]}" >/dev/null 2>&1; then
+      continue
+    fi
+    if [[ "${PKG_METHOD[$i]}" == "staged" ]]; then
+      printf 'blocked: %s member %s is staged out of band and is absent or fails verification\n  expected: %s\n  recover it by running: %s\n' \
+        "$id" "${PKG_RELPATH[$i]}" "$path" "${PKG_RECOVERY[$i]}" >&2
+      return 3
+    fi
+    install -d -m 0700 -- "$CACHE_ROOT" "$dir"
+    # Run the acquire+verify+place as a standalone subshell (NOT `( ... ) ||`),
+    # then test its status separately: bash ignores an inner `set -e` when a
+    # subshell is the left operand of `||`, which would let a hash-mismatched
+    # download slip past check_file into the mv. Every step is also guarded with
+    # an explicit `|| exit` so no unverified bytes can land under a verified name.
+    (
+      set -e
+      # Not named `tmp`: download_to_temp has its own local `tmp`, and a matching
+      # output-var name would make its `printf -v` target its own local instead.
+      local pkg_tmp=''
+      # shellcheck disable=SC2329  # invoked indirectly by the EXIT trap
+      cleanup_pkg() { [[ -z "$pkg_tmp" ]] || rm -f -- "$pkg_tmp"; }
+      trap cleanup_pkg EXIT
+      printf 'fetching\t%s\t%s\n' "$id" "${PKG_SOURCE[$i]}"
+      download_to_temp "${PKG_SOURCE[$i]}" "$dir" pkg "${PKG_SIZE[$i]}" pkg_tmp || exit $?
+      check_file "$pkg_tmp" "${PKG_SIZE[$i]}" "${PKG_SHA[$i]}" || exit $?
+      chmod 0600 -- "$pkg_tmp" || exit $?
+      mv -f -- "$pkg_tmp" "$path" || exit $?
+      pkg_tmp=''
+      sync -f "$path" 2>/dev/null || true
+    )
+    rc=$?
+    [[ $rc -eq 0 ]] || return "$rc"
+  done
+
+  verify_pkgset "$id"
+}
+
 fetch_one() {
   local id=$1
   require_id "$id" || return $?
@@ -625,6 +866,11 @@ fetch_one() {
 
   if [[ "${KIND[$id]}" == "oci-image" ]]; then
     fetch_oci "$id"
+    return $?
+  fi
+
+  if [[ "${KIND[$id]}" == "package-set" ]]; then
+    fetch_pkgset "$id"
     return $?
   fi
 
@@ -645,7 +891,7 @@ fetch_one() {
     return 0
   fi
 
-  local directory artifact_final manifest_final signature_final
+  local directory artifact_final manifest_final signature_final rc
   directory=$(artifact_dir "$id")
   artifact_final=$(artifact_path "$id")
   manifest_final=$(checksum_path "$id")
@@ -693,7 +939,12 @@ fetch_one() {
       rm -f -- "$signature_final"
     fi
     sync -f "$artifact_final" "$manifest_final" "$directory" 2>/dev/null || true
-  ) || return $?
+  )
+  # Standalone subshell + separate status test: as a `( ... ) || return` operand
+  # the inner `set -e` is ignored, which would let a size-matched but hash-wrong
+  # download reach the mv. Kept standalone so set -e aborts before any placement.
+  rc=$?
+  [[ $rc -eq 0 ]] || return "$rc"
 
   verify_one "$id"
 }
@@ -748,6 +999,9 @@ explain_one() {
   printf 'source: %s\n' "${SOURCE_URL[$id]}"
   if [[ "${KIND[$id]}" == "oci-image" && "${STATUS[$id]}" == "ready" ]]; then
     printf 'pinned reference: %s@sha256:%s\n' "${SOURCE_URL[$id]}" "${SHA256[$id]}"
+  fi
+  if [[ "${KIND[$id]}" == "package-set" && "${STATUS[$id]}" == "ready" ]]; then
+    printf 'member manifest: %s\n' "$(pkgset_manifest_path "$id")"
   fi
   printf 'checksums: %s\n' "${CHECKSUM_URL[$id]}"
   printf 'checksums size bytes: %s\n' "${CHECKSUM_SIZE_BYTES[$id]}"
@@ -808,6 +1062,22 @@ report_missing() {
       done
       continue
     fi
+    if [[ "${KIND[$id]}" == "package-set" ]]; then
+      if ! read_pkgset_entries "$id" 2>/dev/null; then
+        printf 'MISSING\t%s\t%s\n' "$id" "$(pkgset_manifest_path "$id")"
+        missing=$((missing + 1))
+        continue
+      fi
+      local pi
+      for pi in "${!PKG_RELPATH[@]}"; do
+        path=$(pkgset_entry_path "$id" "$pi")
+        if [[ ! -f "$path" ]]; then
+          printf 'MISSING\t%s\t%s\n' "$id" "$path"
+          missing=$((missing + 1))
+        fi
+      done
+      continue
+    fi
     for path in "$(artifact_path "$id")" "$(checksum_path "$id")"; do
       if [[ ! -f "$path" ]]; then
         printf 'MISSING\t%s\t%s\n' "$id" "$path"
@@ -850,6 +1120,23 @@ recovery() {
       printf '    pinned reference: %s@sha256:%s\n' "${SOURCE_URL[$id]}" "${SHA256[$id]}"
       printf '    manifest-list digest: sha256:%s\n' "${SHA256[$id]}"
       printf '    acquisition: skopeo copy --all by digest into an OCI layout, re-verified offline\n'
+    elif [[ "${KIND[$id]}" == "package-set" ]]; then
+      printf '    member manifest: %s\n' "$(pkgset_manifest_path "$id")"
+      printf '    manifest sha256: %s\n' "${SHA256[$id]}"
+      printf '    signed index: %s (sha256 %s)\n' "${CHECKSUM_URL[$id]}" "${CHECKSUM_SHA256[$id]}"
+      printf '    signer fingerprint: %s\n' "${SIGNER_FINGERPRINT[$id]}"
+      if read_pkgset_entries "$id" 2>/dev/null; then
+        local mi
+        for mi in "${!PKG_RELPATH[@]}"; do
+          if [[ "${PKG_METHOD[$mi]}" == "url" ]]; then
+            printf '    member (url): %s\n      from: %s\n      sha256: %s\n' \
+              "${PKG_RELPATH[$mi]}" "${PKG_SOURCE[$mi]}" "${PKG_SHA[$mi]}"
+          else
+            printf '    member (staged): %s\n      at: %s\n      sha256: %s\n      recover: %s\n' \
+              "${PKG_RELPATH[$mi]}" "$(pkgset_entry_path "$id" "$mi")" "${PKG_SHA[$mi]}" "${PKG_RECOVERY[$mi]}"
+          fi
+        done
+      fi
     else
       printf '    source: %s\n' "${SOURCE_URL[$id]}"
       printf '    expected bytes: %s\n' "${SIZE_BYTES[$id]}"
@@ -1069,6 +1356,116 @@ EOF
     return 1
   fi
   printf 'ok: oci fetch rejects a substituted manifest and preserves the cache atomically\n'
+
+  # -- package-set coverage -------------------------------------------------
+  # Build a synthetic package-set with one `url` member and one `staged` member,
+  # plus its checked-in-style sidecar manifest whose sha256 the row pins. Hashes
+  # are computed from the bytes, so the verifier's anchor chain (lock row ->
+  # member manifest -> member bytes) is exercised without any network access.
+  local pkgset_id=test-pkgset
+  local pkgset_sidecar="$tmp/compose-phase1-artifacts.$pkgset_id.packages.tsv"
+  local pkgset_row=
+  build_pkgset_fixture() {
+    mkdir -p "$tmp/cache/$pkgset_id" "$tmp/cache/staged"
+    printf 'aaaaaaaaaaaaaaaa' >"$tmp/cache/$pkgset_id/thing.deb"
+    printf 'staged-member-bytes' >"$tmp/cache/staged/thing.bin"
+    local usz uh ssz sh anchor
+    usz=$(stat -c '%s' -- "$tmp/cache/$pkgset_id/thing.deb")
+    uh=$(sha256sum -- "$tmp/cache/$pkgset_id/thing.deb"); uh=${uh%% *}
+    ssz=$(stat -c '%s' -- "$tmp/cache/staged/thing.bin")
+    sh=$(sha256sum -- "$tmp/cache/staged/thing.bin"); sh=${sh%% *}
+    {
+      printf '# test package-set member manifest\n'
+      printf 'thing.deb\turl\t%s\t%s\thttps://download.docker.com/linux/ubuntu/dists/noble/pool/stable/amd64/thing.deb\t-\n' "$usz" "$uh"
+      printf 'thing.bin\tstaged\t%s\t%s\tstaged/thing.bin\trun-the-prep\n' "$ssz" "$sh"
+    } >"$pkgset_sidecar"
+    anchor=$(sha256sum -- "$pkgset_sidecar"); anchor=${anchor%% *}
+    pkgset_row=$(printf '1\t%s\tready\tpackage-set\tlinux/x86_64\tpackages\t-\t%s\thttps://download.docker.com/linux/ubuntu/dists/noble/pool/stable/amd64/\thttps://download.docker.com/linux/ubuntu/dists/noble/stable/binary-amd64/Packages\t-\t0000000000000000000000000000000000000000000000000000000000000000\t-\t-\t-\t-\t0000000000000000000000000000000000000000\tSynthetic self-test package set.' "$pkgset_id" "$anchor")
+    printf '%s\n%s\n' "$header" "$pkgset_row" >"$tmp/pkgset.tsv"
+  }
+  build_pkgset_fixture
+
+  env \
+    BASIL_COMPOSE_ARTIFACT_LOCK="$tmp/pkgset.tsv" \
+    BASIL_COMPOSE_ARTIFACT_KEY_ROOT="$tmp/keys" \
+    BASIL_COMPOSE_ARTIFACT_CACHE="$tmp/cache" \
+    "$SCRIPT_PATH" verify "$pkgset_id" >/dev/null \
+    || { printf 'self-test failure: valid package-set did not verify\n' >&2; return 1; }
+  printf 'ok: package-set verifies offline (url + staged members)\n'
+
+  # A fully-populated inventory (every row ready and cached, across oci and
+  # package-set kinds) must verify with exit 0 both offline and via verify-all --
+  # the explicit "whole inventory verifies" assertion for the completed lock.
+  oci_dg=$(build_test_oci_layout "$oci_dir")
+  oci_row=$(printf '1\ttest-oci\tready\toci-image\tlinux/multiarch\timage\t-\t%s\tdocker.io/library/alpine:3.22\t-\t-\t-\t-\t-\t-\t-\t-\tSynthetic self-test OCI layout.' "$oci_dg")
+  printf '%s\n%s\n%s\n' "$header" "$oci_row" "$pkgset_row" >"$tmp/full.tsv"
+  env \
+    BASIL_COMPOSE_ARTIFACT_LOCK="$tmp/full.tsv" \
+    BASIL_COMPOSE_ARTIFACT_KEY_ROOT="$tmp/keys" \
+    BASIL_COMPOSE_ARTIFACT_CACHE="$tmp/cache" \
+    "$SCRIPT_PATH" offline >/dev/null \
+    || { printf 'self-test failure: full inventory offline did not exit 0\n' >&2; return 1; }
+  env \
+    BASIL_COMPOSE_ARTIFACT_LOCK="$tmp/full.tsv" \
+    BASIL_COMPOSE_ARTIFACT_KEY_ROOT="$tmp/keys" \
+    BASIL_COMPOSE_ARTIFACT_CACHE="$tmp/cache" \
+    "$SCRIPT_PATH" verify-all >/dev/null \
+    || { printf 'self-test failure: full inventory verify-all did not exit 0\n' >&2; return 1; }
+  printf 'ok: full inventory (oci + package-set) verifies offline with exit 0\n'
+
+  # Negative: tampering a cached member must fail verification.
+  printf 'x' >>"$tmp/cache/$pkgset_id/thing.deb"
+  expect_failure 'package-set cached member tamper rejected' env \
+    BASIL_COMPOSE_ARTIFACT_LOCK="$tmp/pkgset.tsv" \
+    BASIL_COMPOSE_ARTIFACT_KEY_ROOT="$tmp/keys" \
+    BASIL_COMPOSE_ARTIFACT_CACHE="$tmp/cache" \
+    "$SCRIPT_PATH" verify "$pkgset_id"
+  build_pkgset_fixture
+
+  # Negative: editing the member manifest without re-pinning the row anchor fails.
+  printf '# drift\n' >>"$pkgset_sidecar"
+  expect_failure 'package-set manifest anchor mismatch rejected' env \
+    BASIL_COMPOSE_ARTIFACT_LOCK="$tmp/pkgset.tsv" \
+    BASIL_COMPOSE_ARTIFACT_KEY_ROOT="$tmp/keys" \
+    BASIL_COMPOSE_ARTIFACT_CACHE="$tmp/cache" \
+    "$SCRIPT_PATH" verify "$pkgset_id"
+  build_pkgset_fixture
+
+  # Negative: a missing staged member fails closed (exit 3) and never downloads.
+  mv -- "$tmp/cache/staged/thing.bin" "$tmp/cache/staged/thing.bin.away"
+  expect_failure 'package-set missing staged member rejected' env \
+    BASIL_COMPOSE_ARTIFACT_LOCK="$tmp/pkgset.tsv" \
+    BASIL_COMPOSE_ARTIFACT_KEY_ROOT="$tmp/keys" \
+    BASIL_COMPOSE_ARTIFACT_CACHE="$tmp/cache" \
+    "$SCRIPT_PATH" fetch "$pkgset_id"
+  mv -- "$tmp/cache/staged/thing.bin.away" "$tmp/cache/staged/thing.bin"
+
+  # Negative: a download whose bytes do not match the pinned sha256 must fail,
+  # must not land in the cache, and must not leave temporaries.
+  rm -f -- "$tmp/cache/$pkgset_id/thing.deb"
+  cat >"$tmp/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+output=
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == "--output" ]]; then output=$2; shift 2; else shift; fi
+done
+printf 'bbbbbbbbbbbbbbbb' >"$output"
+EOF
+  chmod +x "$tmp/bin/curl"
+  expect_failure 'package-set fetch rejects a wrong-hash download' env \
+    PATH="$tmp/bin:$PATH" \
+    BASIL_COMPOSE_ARTIFACT_LOCK="$tmp/pkgset.tsv" \
+    BASIL_COMPOSE_ARTIFACT_KEY_ROOT="$tmp/keys" \
+    BASIL_COMPOSE_ARTIFACT_CACHE="$tmp/cache" \
+    "$SCRIPT_PATH" fetch "$pkgset_id"
+  [[ ! -f "$tmp/cache/$pkgset_id/thing.deb" ]] \
+    || { printf 'self-test failure: wrong-hash download landed in cache\n' >&2; return 1; }
+  if compgen -G "$tmp/cache/$pkgset_id/.pkg.part.*" >/dev/null; then
+    printf 'self-test failure: rejected package-set fetch left temporary files\n' >&2
+    return 1
+  fi
+  printf 'ok: package-set fetch rejects a wrong-hash download and preserves the cache atomically\n'
 
   printf 'self-test: all checks passed\n'
 }

@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Package-set member manifest for lock row `ubuntu-24.04-docker-packages-x86_64`.
+# Consumed only by scripts/compose-phase1-artifacts.sh (package-set kind). The
+# lock row pins THIS file's sha256 as the anchor; each data row below pins one
+# member artifact by size + sha256. Tab-separated; '#'/blank lines are ignored.
+# Columns:
+#   relpath   member name (a label; for `url` also the cache filename)
+#   method    `url` (download from source) | `staged` (produced out of band)
+#   size_bytes
+#   sha256    lowercase hex; the member's sole operational trust anchor
+#   source    `url`: absolute approved download URL; `staged`: cache-relative path
+#   recovery  `url`: '-'; `staged`: the prep script that produces the file
+#
+# Provenance (how the pins were derived; basil-y0f): download.docker.com/linux/ubuntu
+# suite noble, component stable, amd64. The clearsigned dists/noble/InRelease
+# (Docker Release (CE deb) key fpr 9DC858229FC7DD38854AE2D88D81803C0EBFCD88)
+# authenticates stable/binary-amd64/Packages (sha256
+# ee23b23badda70914fb90302d4abd6c55a20dd2646ac93df65aa68e16a8c74ad), from which
+# each .deb sha256 below was taken. The versioned pool URLs are immutable, so
+# every member re-downloads and re-verifies by its pinned sha256. All hard Depends
+# (iptables, nftables, libseccomp2, libsystemd0, libc6) are already present in the
+# verified ubuntu-24.04 cloud image, so dpkg -i installs the set fully offline.
+containerd.io_2.2.6-1~ubuntu.24.04~noble_amd64.deb	url	23626712	ad9d5ed46615d5adf0fab492101996a395776f0f15fdc37ff425c59d5c4dca02	https://download.docker.com/linux/ubuntu/dists/noble/pool/stable/amd64/containerd.io_2.2.6-1~ubuntu.24.04~noble_amd64.deb	-
+docker-ce_29.6.1-1~ubuntu.24.04~noble_amd64.deb	url	23298076	b71c54e01bf05489384b01c97621293a2803a3c38c754a655456f6c1821a6b55	https://download.docker.com/linux/ubuntu/dists/noble/pool/stable/amd64/docker-ce_29.6.1-1~ubuntu.24.04~noble_amd64.deb	-
+docker-ce-cli_29.6.1-1~ubuntu.24.04~noble_amd64.deb	url	16891052	bab40fb817b8b541a2eb1c33ac3285b06439de06cf05c2cd0cb47a3f87c193c4	https://download.docker.com/linux/ubuntu/dists/noble/pool/stable/amd64/docker-ce-cli_29.6.1-1~ubuntu.24.04~noble_amd64.deb	-
+docker-compose-plugin_5.3.1-1~ubuntu.24.04~noble_amd64.deb	url	8099948	19d9473c2f011f94e1e54b035dcac170dab0c19671799db6f015e29eb9f23357	https://download.docker.com/linux/ubuntu/dists/noble/pool/stable/amd64/docker-compose-plugin_5.3.1-1~ubuntu.24.04~noble_amd64.deb	-
+docker-buildx-plugin_0.35.0-1~ubuntu.24.04~noble_amd64.deb	url	17205460	ddcd67d3e9a8b4cda74326ebebe4ebdc3879210d2d0093274d19f5e1bbaf24f4	https://download.docker.com/linux/ubuntu/dists/noble/pool/stable/amd64/docker-buildx-plugin_0.35.0-1~ubuntu.24.04~noble_amd64.deb	-

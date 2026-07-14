@@ -28,21 +28,36 @@
 #       with 'skopeo inspect --raw <ref> | sha256sum' (skopeo 1.23.0) on
 #       2026-07-14; each index carries linux/amd64 and linux/arm64.
 #   package-set
-#       A set of distribution packages (NEVRAs / versions plus signed repo or
-#       package hashes) installed inside a guest. Populated later by the lane
-#       provisioning issues, NOT here:
+#       A set of distribution packages installed inside a guest. The sha256 column
+#       pins the per-set member manifest (a sidecar TSV named
+#       compose-phase1-artifacts.<id>.packages.tsv beside this lock file); that
+#       manifest lists each member by size + sha256, which is the sole operational
+#       trust anchor, re-verified locally exactly as an oci-image digest is. Each
+#       member is either 'url' (downloaded from an approved source into the cache
+#       under <cache>/<id>/) or 'staged' (produced out of band by a named prep
+#       script and verified in place at a cache-relative path). checksum_url /
+#       checksum_sha256 pin the signed repository index the member hashes were
+#       derived from -- Fedora repomd.xml (signed under the Fedora key named by
+#       key_file / signer_fingerprint), or the Ubuntu Packages index that the
+#       clearsigned InRelease authenticates (signer_fingerprint = Docker CE key;
+#       key_file '-' because that key is not checked in) -- as recorded provenance,
+#       never a live hostname trust. filename is the cache subdirectory name; size
+#       and the signature columns are '-'. The two rows are:
 #         fedora-44-runtime-packages-x86_64  -> basil-3kx (Fedora Podman/Compose)
 #         ubuntu-24.04-docker-packages-x86_64 -> basil-y0f (Ubuntu Docker/Compose)
-#       These rows stay 'not-yet-populated' by design. While ANY row is
-#       unpopulated, fetch-all / verify-all / offline finalize honestly with
-#       exit 3 instead of claiming completeness; per-artifact fetch/verify of the
-#       populated rows still succeed.
+#
+# Final inventory semantics. Every row is now 'ready', so a full fetch followed by
+# verify-all / offline exits 0 when every member is cached and verifies. Any
+# genuinely missing or corrupt artifact (an un-fetched image or package, a hash
+# mismatch, a missing staged payload) still finalizes fail-closed with exit 3 (or
+# 4 on a verification failure); no unverified bytes ever land under a verified
+# name. Per-artifact fetch / verify of any single row also still work.
 schema_version	id	status	kind	platform	filename	size_bytes	sha256	source_url	checksum_url	checksum_size_bytes	checksum_sha256	signature_url	signature_size_bytes	signature_sha256	key_file	signer_fingerprint	note
 1	fedora-44-cloud-x86_64	ready	file-openpgp-clearsigned	linux/x86_64	Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2	583729152	28680fe5b371a5a82ebf43a31926e086a168e59949d03969c5093e7071f90b7f	https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2	https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-44-1.7-x86_64-CHECKSUM	2301	a436186ff0e930d77637d03e6f357206b686c4ef3fcde234b6f1da63041d4b32	-	-	-	fedora-44-signing-key.gpg	36F612DCF27F7D1A48A835E4DBFCF71C6D9F90A6	Fedora 44 Cloud Base Generic release 1.7; exact signed checksum verified with the Fedora 44 release key.
 1	ubuntu-24.04-cloud-x86_64	ready	file-openpgp-detached	linux/x86_64	ubuntu-24.04-server-cloudimg-amd64.img	621673984	ffe6203da54deeb6db5d2a98a83f9ec8e55f149d3f7ba622e1abe5fa966ee3d6	https://cloud-images.ubuntu.com/releases/24.04/release-20260705/ubuntu-24.04-server-cloudimg-amd64.img	https://cloud-images.ubuntu.com/releases/24.04/release-20260705/SHA256SUMS	7843	2c330110cd0df963b073b3a82f3136c82290b4a156a67e568560696036a32340	https://cloud-images.ubuntu.com/releases/24.04/release-20260705/SHA256SUMS.gpg	833	2bdb3623dc8f30a81a9845f4535aa54e57087632ecc2a0256bd267675a1bd20b	ubuntu-cloudimage-signing-key.gpg	D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81	Ubuntu 24.04 LTS amd64 dated release 20260705; exact detached signature and checksum verified.
 1	ubuntu-24.04-cloud-aarch64	ready	file-openpgp-detached	linux/aarch64	ubuntu-24.04-server-cloudimg-arm64.img	615630848	7df0201546f75b8bcc1044594c806c35749421ad3c9bc1be2a3ab806cfae39cc	https://cloud-images.ubuntu.com/releases/24.04/release-20260705/ubuntu-24.04-server-cloudimg-arm64.img	https://cloud-images.ubuntu.com/releases/24.04/release-20260705/SHA256SUMS	7843	2c330110cd0df963b073b3a82f3136c82290b4a156a67e568560696036a32340	https://cloud-images.ubuntu.com/releases/24.04/release-20260705/SHA256SUMS.gpg	833	2bdb3623dc8f30a81a9845f4535aa54e57087632ecc2a0256bd267675a1bd20b	ubuntu-cloudimage-signing-key.gpg	D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81	Ubuntu 24.04 LTS arm64 dated release 20260705; exact detached signature and checksum verified for the functional TCG lane.
-1	fedora-44-runtime-packages-x86_64	not-yet-populated	package-set	linux/x86_64	-	-	-	https://download.fedoraproject.org/pub/fedora/linux/releases/44/Everything/x86_64/os/	-	-	-	-	-	-	-	-	Exact Podman and Compose package NEVRAs plus signed repository metadata hashes are populated later by lane issue basil-3kx, not here.
-1	ubuntu-24.04-docker-packages-x86_64	not-yet-populated	package-set	linux/x86_64	-	-	-	https://download.docker.com/linux/ubuntu/dists/noble/pool/stable/amd64/	-	-	-	-	-	-	-	-	Exact Docker Engine and Compose package versions plus package hashes are populated later by lane issue basil-y0f, not here.
+1	fedora-44-runtime-packages-x86_64	ready	package-set	linux/x86_64	packages	-	f7f431d864cae31816eacf00fff9756dfe683bec89bab0857b155447fad0d98c	https://download.fedoraproject.org/pub/fedora/linux/releases/44/Everything/x86_64/os/	https://download.fedoraproject.org/pub/fedora/linux/releases/44/Everything/x86_64/os/repodata/repomd.xml	-	da3845427d188097f6fd71b417a039bdfb8efefc4f38ca44b5cbb94f95a18991	-	-	-	fedora-44-signing-key.gpg	36F612DCF27F7D1A48A835E4DBFCF71C6D9F90A6	Fedora 44 offline runtime delta (basil-3kx): podman-compose-1.6.0-1.fc44 + jq-1.8.1-3.fc44 over preinstalled podman-5:5.8.1-1.fc44, bundled by fedora-44-prep.sh as a sha256-pinned payload; members listed in the sidecar package manifest, release repomd.xml digest recorded as the signing anchor.
+1	ubuntu-24.04-docker-packages-x86_64	ready	package-set	linux/x86_64	packages	-	d4289aee5187fd78d692f96f7dadaf2f28242552498a65fb4de782b0c1682ce2	https://download.docker.com/linux/ubuntu/dists/noble/pool/stable/amd64/	https://download.docker.com/linux/ubuntu/dists/noble/stable/binary-amd64/Packages	-	ee23b23badda70914fb90302d4abd6c55a20dd2646ac93df65aa68e16a8c74ad	-	-	-	-	9DC858229FC7DD38854AE2D88D81803C0EBFCD88	Docker CE noble stable amd64 packages (basil-y0f): docker-ce/-cli 29.6.1, containerd.io 2.2.6, docker-compose-plugin 5.3.1, docker-buildx-plugin 0.35.0, each .deb pinned by sha256 in the sidecar package manifest; clearsigned InRelease and Packages digest recorded as the signing anchor.
 1	workload-fedora	ready	oci-image	linux/multiarch	image	-	daa24c5598b5313906863c4448685d34cd172871c5f79a1258bd8493f7572798	registry.fedoraproject.org/fedora:44	-	-	-	-	-	-	-	-	Official Fedora 44 workload image. Manifest-list digest resolved with skopeo inspect --raw (skopeo 1.23.0) on 2026-07-14; index covers linux/amd64,arm64,ppc64le,s390x.
 1	workload-alpine	ready	oci-image	linux/multiarch	image	-	14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce	docker.io/library/alpine:3.22	-	-	-	-	-	-	-	-	Official Alpine 3.22 workload image. Manifest-list digest resolved with skopeo inspect --raw (skopeo 1.23.0) on 2026-07-14; index covers linux/amd64 and linux/arm64 among eight platforms.
 1	workload-debian	ready	oci-image	linux/multiarch	image	-	fac46bff2e02f51425b6e33b0e1169f55dfb053d83511ca28aa50c09fd5ed7a4	docker.io/library/debian:13	-	-	-	-	-	-	-	-	Official Debian 13 (trixie) workload image. Manifest-list digest resolved with skopeo inspect --raw (skopeo 1.23.0) on 2026-07-14; index covers linux/amd64 and linux/arm64 among eight platforms.

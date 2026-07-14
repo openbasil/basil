@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Package-set member manifest for lock row `fedora-44-runtime-packages-x86_64`.
+# Consumed only by scripts/compose-phase1-artifacts.sh (package-set kind). The
+# lock row pins THIS file's sha256 as the anchor; each data row below pins one
+# member artifact by size + sha256. Tab-separated; '#'/blank lines are ignored.
+# Columns:
+#   relpath   member name (a label; for `url` also the cache filename)
+#   method    `url` (download from source) | `staged` (produced out of band)
+#   size_bytes
+#   sha256    lowercase hex; the member's sole operational trust anchor
+#   source    `url`: absolute approved download URL; `staged`: cache-relative path
+#   recovery  `url`: '-'; `staged`: the prep script that produces the file
+#
+# Provenance (how the pins were derived; basil-3kx): Podman 5:5.8.1-1.fc44 is
+# preinstalled in the verified Fedora-Cloud-Base-Generic-44-1.7 image, so the
+# offline delta is podman-compose-1.6.0-1.fc44.noarch + jq-1.8.1-3.fc44.x86_64
+# with their dependencies (6 RPMs total) plus the alpine workload, bundled by
+# fedora-44-prep.sh into one sha256-pinned payload.tar. The RPMs come from
+# download.fedoraproject.org authenticated by the Fedora 44 signing key
+# (36F612DCF27F7D1A48A835E4DBFCF71C6D9F90A6): release repodata repomd.xml sha256
+# da3845427d188097f6fd71b417a039bdfb8efefc4f38ca44b5cbb94f95a18991, updates
+# repomd.xml sha256 c5216de7d214ed6b51526f5a872e08606c2fb4d70cf8ed8aea0e715d923c069c.
+# NEVRAs: podman-5:5.8.1-1.fc44.x86_64, podman-compose-1.6.0-1.fc44.noarch,
+# jq-1.8.1-3.fc44.x86_64 (deps oniguruma, python3-click, python3-dotenv,
+# python3-dotenv+cli). payload.tar is not a single upstream download; recover an
+# empty cache by re-running the prep script, which re-resolves the delta via dnf.
+payload.tar	staged	9574400	43c574240b105e5b4967f4922fc2a53f7dba503a51096fab12370704c841d98a	fedora-selinux-rootless-payload/payload.tar	interop-tests/compose-phase1/fedora-44-prep.sh

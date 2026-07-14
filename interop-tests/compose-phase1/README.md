@@ -300,22 +300,38 @@ kinds:
   every other blob must self-address, and `index.json` must reference the pinned
   digest. Neither the tag nor the registry hostname is ever trusted. Skopeo, jq,
   and find are required for these rows.
-- **`package-set`** — the in-guest runtime packages. These rows
-  (`fedora-44-runtime-packages-x86_64`, `ubuntu-24.04-docker-packages-x86_64`)
-  stay `not-yet-populated` by design and are filled in later, with exact NEVRAs
-  or package versions plus signed repository or package hashes, by the lane
-  provisioning issues — Fedora Podman/Compose by `basil-3kx`, Ubuntu
-  Docker/Compose by `basil-y0f`.
+- **`package-set`** — the in-guest runtime packages (`fedora-44-runtime-packages-x86_64`
+  from `basil-3kx`, `ubuntu-24.04-docker-packages-x86_64` from `basil-y0f`). The
+  `sha256` column pins a per-set **member manifest** — a sidecar TSV
+  `scripts/compose-phase1-artifacts.<id>.packages.tsv` beside the lock — which
+  lists each member by size and sha256; that member hash is the sole operational
+  trust anchor, re-verified locally exactly as an `oci-image` digest is. Each
+  member is either **`url`** (downloaded from an approved immutable source into
+  `<cache>/<id>/` and atomically placed only after its hash matches) or
+  **`staged`** (produced out of band by a named prep script and verified in place;
+  a missing staged member fails closed with its recovery command, never a blind
+  download). `checksum_url`/`checksum_sha256` and `signer_fingerprint` record the
+  signed repository index the member hashes were derived from — Fedora
+  `repomd.xml` (Fedora key), or the Ubuntu `Packages` index that the clearsigned
+  `InRelease` authenticates (Docker CE key; `key_file` `-` because that key is not
+  checked in) — as provenance, never a live hostname trust. Fedora ships one
+  `staged` member (the `fedora-44-prep.sh` `payload.tar`, sha256
+  `43c574240b105e5b…`); Ubuntu ships five `url` members (the noble/stable/amd64
+  `docker-ce`/`-cli` 29.6.1, `containerd.io` 2.2.6, `docker-compose-plugin` 5.3.1,
+  `docker-buildx-plugin` 0.35.0 `.deb`s), each pinned by sha256.
 
 Fail-closed is the whole point: no unverified bytes ever land in the cache under
-a verified name, and while **any** row is `not-yet-populated` (or any populated
-row is absent from the cache) `fetch-all`, `verify-all`, and `offline` finalize
-honestly with exit `3` instead of claiming completeness. Per-artifact `fetch`
-and `verify` of the populated rows still succeed. `verify ARTIFACT...` is the
-approved interface the runner uses to gate every lane artifact; `recovery` prints
-exact reacquisition instructions for an empty cache, and `self-test` exercises
-the inventory parser and both the file and OCI verification paths, including
-digest-mismatch and substituted-manifest rejection.
+a verified name. Every row is now `ready`, so once every member is cached and
+verifies, `fetch-all` → `verify-all` and `offline` exit `0`. Any genuinely
+missing or corrupt artifact — an un-fetched image or package, a hash mismatch, a
+missing staged payload — still finalizes fail-closed with exit `3` (or `4` on a
+verification failure); per-artifact `fetch`/`verify` of any single row also still
+work. `verify ARTIFACT...` is the approved interface the runner uses to gate every
+lane artifact; `recovery` prints exact reacquisition instructions for an empty
+cache; and `self-test` exercises the inventory parser and the file, OCI, and
+package-set verification paths, including digest/hash-mismatch, substituted-manifest,
+and wrong-hash-download rejection, and asserts a fully-populated inventory verifies
+with exit `0`.
 
 ## Cleanup identity
 

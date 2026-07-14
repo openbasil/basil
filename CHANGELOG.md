@@ -50,6 +50,16 @@ SPDX-License-Identifier: Apache-2.0
   degrade to TCG), drivers are no longer charged coverage for the runner-owned
   `lane.artifacts` test (a real-driver `lane-smoke` run can now PASS), and the
   guest podman fact uses the correctly-cased `SELinuxEnabled` template field.
+- 2026-07-14: Compose Phase 1 artifact inventory completed (test-only): the two
+  reserved `package-set` rows are populated from the qualified lanes' pins and
+  the artifacts tool gained `package-set` fetch/verify/offline support. Each
+  row pins a checked-in sidecar member manifest
+  (`compose-phase1-artifacts.<id>.packages.tsv`) by sha256; per-member sha256
+  is re-verified locally with the signed repository index recorded as
+  provenance (Fedora repomd + key, Docker clearsigned InRelease), mirroring
+  the OCI digest discipline. Self-tests cover member tamper, anchor mismatch,
+  missing staged member, wrong-hash download (cache preserved), and the
+  full-inventory exit-0 aggregate path.
 
 ### `basil demo`: a zero-dependency guided tour
 
