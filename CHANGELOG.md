@@ -10,6 +10,15 @@ SPDX-License-Identifier: Apache-2.0
 
 ### Added
 
+- 2026-07-14: NixOS module: new `services.basil.raiseRootlessKeyringQuotas`
+  option (default `true`) raises the per-user kernel keyring quotas
+  (`kernel.keys.maxkeys` → 2000, `kernel.keys.maxbytes` → 2000000, both
+  `mkDefault`-overridable) when the agent is enabled. The kernel default of
+  200 keys per non-root user caps rootless-Podman container density at ~196
+  (`crun: join keyctl: Disk quota exceeded`), measured as the binding
+  ceiling in the Compose Phase 1 capacity ladder; set the option to `false`
+  on hosts that never run rootless container workloads.
+
 - 2026-07-14: Compose Phase 1 feasibility-evidence infrastructure (test-only,
   no runtime changes): `scripts/compose-phase1-artifacts.sh` pins and
   OpenPGP-verifies the qualified VM lane images (Fedora 44 Cloud x86_64,

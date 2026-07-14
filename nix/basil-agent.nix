@@ -246,6 +246,19 @@ in
   ];
 
   config = lib.mkIf cfg.enable {
+    # Rootless container density is keyring-quota-bound: crun joins one
+    # session keyring per container, and the kernel default
+    # kernel.keys.maxkeys=200 (per non-root user) caps a rootless realm at
+    # ~196 containers before "crun: join keyctl: Disk quota exceeded"
+    # (measured, Compose Phase 1 capacity ladder, basil-9tj.4). maxbytes must
+    # scale with maxkeys because keyring payloads charge the per-user byte
+    # quota. mkDefault so operators can override either value; the
+    # raiseRootlessKeyringQuotas option disables the pair entirely.
+    boot.kernel.sysctl = lib.mkIf cfg.raiseRootlessKeyringQuotas {
+      "kernel.keys.maxkeys" = lib.mkDefault 2000;
+      "kernel.keys.maxbytes" = lib.mkDefault 2000000;
+    };
+
     assertions = [
       {
         assertion = settings.package != null;

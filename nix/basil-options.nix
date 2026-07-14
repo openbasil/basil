@@ -750,6 +750,25 @@ in
       '';
     };
 
+    raiseRootlessKeyringQuotas = mkOption {
+      type = types.bool;
+      default = true;
+      description = ''
+        Raise the kernel's per-user keyring quotas (`kernel.keys.maxkeys` and
+        `kernel.keys.maxbytes`) on this host. `crun` joins one session keyring
+        per container, so the kernel default of 200 keys per non-root user
+        caps a rootless-Podman realm at roughly 196 containers, failing as
+        "crun: join keyctl: Disk quota exceeded" — measured as the binding
+        density ceiling in the Compose Phase 1 capacity ladder (basil-9tj.4);
+        file descriptors, memory, and pids all had headroom left. The raised
+        values (2000 keys / 2000000 bytes, applied with `lib.mkDefault` so an
+        operator can override or `mkForce` them) budget for 1,000+ rootless
+        workloads per owner; `maxbytes` scales with `maxkeys` because keyring
+        payloads charge the per-user byte quota. Set false on hosts that never
+        run rootless container workloads.
+      '';
+    };
+
     settings = mkOption {
       type = types.submodule {
         options = {
