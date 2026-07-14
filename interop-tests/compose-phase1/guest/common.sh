@@ -82,7 +82,7 @@ check_fedora() {
     failed=1
   fi
   rootless=$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null || true)
-  selinux=$(podman info --format '{{.Host.Security.SelinuxEnabled}}' 2>/dev/null || true)
+  selinux=$(podman info --format '{{.Host.Security.SELinuxEnabled}}' 2>/dev/null || true)
   runtime_version=$(podman version --format '{{.Client.Version}}' 2>/dev/null || true)
   if [[ $rootless == true && $selinux == true && -n $runtime_version ]]; then
     emit_event test.end PASS PODMAN_ROOTLESS_SELINUX lane.runtime-mode \

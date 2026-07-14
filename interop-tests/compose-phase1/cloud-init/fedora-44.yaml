@@ -1,6 +1,15 @@
 #cloud-config
 # SPDX-FileCopyrightText: 2026 OpenBasil Contributors
 # SPDX-License-Identifier: Apache-2.0
+#
+# Fedora 44 SELinux rootless-Podman lane foundation. This provisions the guest
+# for the network-isolated retained lane driver
+# (drivers/fedora-selinux-rootless.sh): it creates the harness SSH user and two
+# distinct rootless Podman owners with lingering user managers, installs ONLY the
+# pinned, pre-verified runtime payload delivered read-only on the seed disk (no
+# network, no unpinned package), and validates cgroup v2 plus SELinux Enforcing
+# WITHOUT ever weakening confinement. The __BASIL_PHASE1_SSH_PUBLIC_KEY__ token is
+# replaced with a fresh per-run public key by the driver before boot.
 
 preserve_hostname: false
 hostname: basil-phase1-fedora44
@@ -20,10 +29,14 @@ users:
     gecos: Rootless Podman realm A
     shell: /bin/bash
     lock_passwd: true
+    ssh_authorized_keys:
+      - __BASIL_PHASE1_SSH_PUBLIC_KEY__
   - name: phase1-b
     gecos: Rootless Podman realm B
     shell: /bin/bash
     lock_passwd: true
+    ssh_authorized_keys:
+      - __BASIL_PHASE1_SSH_PUBLIC_KEY__
 
 write_files:
   - path: /etc/basil-phase1-lane
@@ -56,7 +69,12 @@ runcmd:
   - [usermod, --add-subuids, '200000-265535', --add-subgids, '200000-265535', phase1-b]
   - [loginctl, enable-linger, phase1-a]
   - [loginctl, enable-linger, phase1-b]
+  - [mkdir, -p, /run/basil-payload]
+  - [mount, -o, ro, /dev/disk/by-label/cidata, /run/basil-payload]
+  - "dnf -y install --disablerepo='*' /run/basil-payload/payload/rpms/*.rpm"
   - [systemctl, daemon-reload]
   - [systemctl, enable, --now, basil-phase1-foundation.service]
+  - "echo BASIL_HOSTKEY_ED25519 \"$(cat /etc/ssh/ssh_host_ed25519_key.pub)\" > /dev/console"
+  - "if command -v podman >/dev/null && command -v podman-compose >/dev/null && test \"$(getenforce)\" = Enforcing; then echo BASIL_PROVISION_OK > /dev/console; else echo BASIL_PROVISION_FAIL > /dev/console; fi"
 
-final_message: "Basil Compose Phase 1 Fedora foundation ready; runtime packages remain lane-provisioning inputs"
+final_message: "Basil Compose Phase 1 Fedora foundation ready; pinned runtime payload installed offline under SELinux enforcing"

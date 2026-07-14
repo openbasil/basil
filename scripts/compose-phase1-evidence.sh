@@ -698,6 +698,8 @@ verify_lane_artifacts() {
 driver_is_allowlisted() {
   case "$1" in
     null) return 0 ;;
+    fedora-selinux-rootless) return 0 ;;
+    ubuntu-2404) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -751,6 +753,14 @@ invoke_driver() {
     bwrap
     --ro-bind / /
     --dev /dev
+  )
+  # The fresh --dev tmpfs hides host device nodes; re-expose /dev/kvm when the
+  # host has it so VM lane drivers get hardware acceleration. Drivers request
+  # accel=kvm:tcg and degrade to TCG where KVM is absent.
+  if [[ -e /dev/kvm ]]; then
+    sandbox+=(--dev-bind /dev/kvm /dev/kvm)
+  fi
+  sandbox+=(
     --tmpfs /tmp
     --bind "$scratch" "$scratch"
     --chdir "$scratch"
@@ -853,6 +863,9 @@ execute_driver_lane() {
     return 0
   fi
   required=$(required_tests_json "$(run_metadata_field "$run" '.suite')")
+  # lane.artifacts is runner-owned: run_command emits its terminal after
+  # verify_lane_artifacts, so the driver neither reports it nor owes coverage.
+  required=$(jq -c 'map(select(. != "lane.artifacts"))' <<<"$required")
   if ! validate_driver_result "$result" "$required"; then
     printf '%s %s\n' INFRA_ERROR DRIVER_RESULT_INVALID
     return 0
