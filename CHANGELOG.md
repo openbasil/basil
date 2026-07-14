@@ -75,6 +75,16 @@ SPDX-License-Identifier: Apache-2.0
   conditions are documented with the evidence. All six Phase 1 environment
   subtasks and their parent are closed; the Phase 1 prototype tasks are
   unblocked.
+- 2026-07-14: Compose Phase 1.1 runtime-evidence prototype (test-only): a
+  `runtime-evidence` suite in both x86 lane drivers drives
+  `guest/runtime-evidence.sh` — SO_PEERCRED, PID+start-time pinning,
+  cgroup/namespace evidence, runtime correlation, same-UID owner isolation,
+  realm overlap, and genuine PID-reuse races through a fail-closed
+  `attest_peer` prototype. All five adversarial cases DENY identically on
+  rootless Podman/SELinux and rootful Docker/AppArmor; the per-fact
+  immutability classification (pin-once vs revalidate-at-use vs
+  diagnostic-only) and a pidfd-over-start-time strengthening recommendation
+  are recorded in the Phase 1 findings notes.
 
 ### `basil demo`: a zero-dependency guided tour
 

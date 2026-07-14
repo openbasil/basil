@@ -48,6 +48,18 @@ if [[ $SUITE == capacity-preflight ]]; then
     preflight.evidence-retention
     preflight.stop-conditions
   )
+elif [[ $SUITE == runtime-evidence ]]; then
+  # Runtime-evidence prototype (basil-9tj.2): five fail-closed terminals mapped
+  # from guest/runtime-evidence.sh run in-guest against rootful Docker (root, one
+  # host-wide owner; same-UID isolation is proven intra-owner between two
+  # root-owned containers distinguished by cgroup instance scope).
+  readonly REQUIRED_TESTS=(
+    runtime.peer-correlation
+    runtime.pid-start-time
+    runtime.same-uid-isolation
+    runtime.realm-overlap
+    runtime.stale-and-conflicting
+  )
 else
   # The suite `ubuntu-2404-lane-smoke` must require exactly these test ids.
   readonly REQUIRED_TESTS=(
@@ -317,6 +329,63 @@ run_capacity_preflight() {
   fi
 }
 
+# Guest provisioning wrapper for the runtime-evidence suite: install rootful
+# Docker offline from the staged pinned debs, start it, then exec the injected
+# runtime-evidence prototype against Docker. Its stdout is pure bounded JSONL.
+runtime_evidence_guest_program() {
+  cat <<'GUEST_EOF'
+#!/usr/bin/env bash
+set -u
+IN=/home/basil-ci/in
+if ! command -v docker >/dev/null 2>&1; then
+  dpkg -i "$IN"/debs/*.deb >/tmp/basil-dpkg.log 2>&1 || true
+fi
+systemctl start docker >/dev/null 2>&1 || true
+for _ in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
+exec bash "$IN"/runtime-evidence.sh --runtime docker --lane-id ubuntu-24.04-x86_64 \
+  --run-id runtime-evidence --image basil-smoke/alpine:smoke \
+  --image-tar "$IN"/alpine-amd64.tar
+GUEST_EOF
+}
+
+# Runtime-evidence suite (basil-9tj.2): stage the prototype script and the pinned
+# Alpine workload into the guest, run it as root against rootful Docker, retain
+# its bounded JSONL as raw evidence, and map its end event onto the five
+# runtime.* terminals. Uses main's ssh_base/scp_base (dynamic scope).
+run_runtime_evidence() {
+  local fixture_root=$1 scratch=$2 workload=$3
+  local re="$fixture_root/guest/runtime-evidence.sh"
+  local out="$scratch/runtime-evidence.jsonl" rc=0
+  [[ -f $re ]] || fail_infra RUNTIME_EVIDENCE_SOURCE_MISSING "$re"
+  "${ssh_base[@]}" "$SSH_USER@$SSH_HOST" 'cat >/home/basil-ci/in/runtime-evidence.sh' <"$re" 2>/dev/null \
+    || fail_infra RUNTIME_EVIDENCE_INJECT_FAILED ""
+  "${scp_base[@]}" "$workload" "$SSH_USER@$SSH_HOST:/home/basil-ci/in/alpine-amd64.tar" >/dev/null 2>&1 \
+    || fail_infra RUNTIME_EVIDENCE_WORKLOAD_COPY_FAILED ""
+  runtime_evidence_guest_program | "${ssh_base[@]}" "$SSH_USER@$SSH_HOST" 'cat >/home/basil-ci/in/re.sh' 2>/dev/null \
+    || fail_infra RUNTIME_EVIDENCE_PROGRAM_COPY_FAILED ""
+  "${ssh_base[@]}" "$SSH_USER@$SSH_HOST" 'sudo -n bash /home/basil-ci/in/re.sh' \
+    >"$out" 2>"$scratch/runtime-evidence.stderr.log" || rc=$?
+  if [[ ! -s $out ]] || ! jq -e -s 'length >= 1 and all(.[]; type=="object")' "$out" >/dev/null 2>&1; then
+    fail_infra RUNTIME_EVIDENCE_NO_OUTPUT "rc=$rc"
+  fi
+  cp "$out" "$scratch/guest-events.jsonl" 2>/dev/null || true
+  local end t v reason
+  end=$(jq -s -c '[.[] | select(.event=="end")][0] // empty' "$out" 2>/dev/null) || end=""
+  if [[ -z $end ]]; then
+    fail_infra RUNTIME_EVIDENCE_NO_END "rc=$rc"
+  fi
+  for t in "${REQUIRED_TESTS[@]}"; do
+    v=$(jq -r --arg k "$t" '.data.verdicts[$k].verdict // "MISSING"' <<<"$end" 2>/dev/null) || v=MISSING
+    reason=$(jq -r --arg k "$t" '.data.verdicts[$k].reason // ""' <<<"$end" 2>/dev/null) || reason=""
+    reason=${reason:0:400}
+    case "$v" in
+      PASS) set_verdict "$t" PASS RUNTIME_EVIDENCE_FAIL_CLOSED_OK "$reason" ;;
+      MISSING) set_verdict "$t" INFRA_ERROR RUNTIME_EVIDENCE_VERDICT_MISSING "terminal absent from end event" ;;
+      *) set_verdict "$t" TEST_FAIL RUNTIME_EVIDENCE_NOT_FAIL_CLOSED "$reason" ;;
+    esac
+  done
+}
+
 main() {
   local scratch=${BASIL_DRIVER_SCRATCH:?BASIL_DRIVER_SCRATCH must be set by the runner}
   : "${BASIL_DRIVER_RESULT:?BASIL_DRIVER_RESULT must be set by the runner}"
@@ -462,6 +531,15 @@ main() {
   # in-guest; run the readiness preflight instead of the lane-smoke checks.
   if [[ $SUITE == capacity-preflight ]]; then
     run_capacity_preflight "$fixture_root" "$scratch"
+    "${ssh_base[@]}" "$SSH_USER@$SSH_HOST" 'sudo -n poweroff' 2>/dev/null || true
+    write_result
+    return
+  fi
+
+  # Runtime-evidence suite (basil-9tj.2): needs the pinned debs (already staged
+  # above) plus the Alpine workload; run the prototype instead of lane smoke.
+  if [[ $SUITE == runtime-evidence ]]; then
+    run_runtime_evidence "$fixture_root" "$scratch" "$workload"
     "${ssh_base[@]}" "$SSH_USER@$SSH_HOST" 'sudo -n poweroff' 2>/dev/null || true
     write_result
     return

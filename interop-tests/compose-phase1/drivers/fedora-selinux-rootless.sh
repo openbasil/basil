@@ -69,6 +69,17 @@ if [[ $SUITE == capacity-preflight ]]; then
     preflight.evidence-retention
     preflight.stop-conditions
   )
+elif [[ $SUITE == runtime-evidence ]]; then
+  # Runtime-evidence prototype (basil-9tj.2): five fail-closed terminals mapped
+  # from guest/runtime-evidence.sh (run in-guest as rootless owner phase1-a, with
+  # phase1-b supplying a second same-UID owner fact for cross-owner isolation).
+  readonly TESTS=(
+    runtime.peer-correlation
+    runtime.pid-start-time
+    runtime.same-uid-isolation
+    runtime.realm-overlap
+    runtime.stale-and-conflicting
+  )
 else
   # The 7 lane-smoke tests this driver owns (see [suites.fedora-smoke]).
   readonly TESTS=(
@@ -241,7 +252,7 @@ main() {
   # The structural network-isolation assertion (loopback-only user networking,
   # restrict=on, no host bridge/tap/fs share) is now proven for this boot.
   # Only the lane-smoke suite reports this terminal.
-  if [[ $SUITE != capacity-preflight ]]; then
+  if [[ $SUITE != capacity-preflight && $SUITE != runtime-evidence ]]; then
     set_res lane.network-isolation PASS NETWORK_LOOPBACK_ONLY "restrict=on loopback user-net"
   fi
 
@@ -298,11 +309,79 @@ main() {
 
   if [[ $SUITE == capacity-preflight ]]; then
     run_capacity_preflight
+  elif [[ $SUITE == runtime-evidence ]]; then
+    run_runtime_evidence "$wtag"
   else
     run_checks "$wtag"
   fi
   emit_result
   log "checks complete"
+}
+
+# Runtime-evidence suite (basil-9tj.2): drive guest/runtime-evidence.sh in the
+# booted guest and map its bounded JSONL onto the five runtime.* terminals. The
+# script runs as rootless owner phase1-a; phase1-b first runs it in owner-probe
+# mode so the primary run can prove same-UID / cross-owner isolation against a
+# real second rootless owner. Raw JSONL is retained as raw/guest-events.jsonl.
+run_runtime_evidence() {
+  local wtag=$1
+  local re="$FIXTURE_ROOT/guest/runtime-evidence.sh"
+  local out="$SCRATCH/runtime-evidence.jsonl"
+  local tar=/run/basil-payload/payload/workload-alpine.tar
+  if [[ ! -f $re ]]; then
+    fail_all RUNTIME_EVIDENCE_SOURCE_MISSING "guest/runtime-evidence.sh not found"
+    return 0
+  fi
+  # Inject the script for both owners (umask 077 makes each copy private).
+  if ! ssh_user phase1-a 'cat >/tmp/runtime-evidence.sh' <"$re" 2>/dev/null; then
+    fail_all RUNTIME_EVIDENCE_INJECT_FAILED "could not copy script to phase1-a"
+    return 0
+  fi
+  ssh_user phase1-b 'cat >/tmp/runtime-evidence.sh' <"$re" 2>/dev/null || true
+
+  # Second same-UID owner: capture phase1-b's container fact (best-effort).
+  # shellcheck disable=SC2016  # $(id -u) must expand on the GUEST side.
+  local foreign
+  foreign=$(ssh_user phase1-b "export XDG_RUNTIME_DIR=/run/user/\$(id -u); bash /tmp/runtime-evidence.sh --runtime podman --lane-id fedora-44-x86_64 --run-id owner-b --mode owner-probe --image $wtag --image-tar $tar" 2>/dev/null | tail -1) || foreign=""
+  if [[ -n $foreign ]] && jq -e 'type=="object" and has("owner_uid")' <<<"$foreign" >/dev/null 2>&1; then
+    ssh_user phase1-a 'cat >/tmp/foreign-owner.json' <<<"$foreign" 2>/dev/null || true
+    guest_fact owner-b.fact PASS "$(jq -rc '{owner_uid,container_id}' <<<"$foreign" 2>/dev/null || echo captured)"
+  fi
+
+  # Primary experiments as phase1-a.
+  local rc=0
+  # shellcheck disable=SC2016  # $(id -u) must expand on the GUEST side.
+  ssh_user phase1-a "export XDG_RUNTIME_DIR=/run/user/\$(id -u); bash /tmp/runtime-evidence.sh --runtime podman --lane-id fedora-44-x86_64 --run-id runtime-evidence --image $wtag --image-tar $tar --foreign-owner-fact-file /tmp/foreign-owner.json" \
+    >"$out" 2>"$SCRATCH/runtime-evidence.stderr.log" || rc=$?
+  map_runtime_evidence "$out" "$rc"
+}
+
+# Map the guest runtime-evidence JSONL end event onto the five terminals. rc=1
+# from the guest means one or more terminals failed closed unexpectedly; the
+# end event's per-terminal verdicts remain authoritative.
+map_runtime_evidence() {
+  local out=$1 rc=$2 t v reason
+  if [[ ! -s $out ]] || ! jq -e -s 'length >= 1 and all(.[]; type=="object")' "$out" >/dev/null 2>&1; then
+    fail_all RUNTIME_EVIDENCE_NO_OUTPUT "guest produced no parseable JSONL (rc=$rc)"
+    return 0
+  fi
+  cat "$out" >>"$GUEST_LOG" 2>/dev/null || true
+  local end
+  end=$(jq -s -c '[.[] | select(.event=="end")][0] // empty' "$out" 2>/dev/null) || end=""
+  if [[ -z $end ]]; then
+    fail_all RUNTIME_EVIDENCE_NO_END "guest emitted no end event (rc=$rc)"
+    return 0
+  fi
+  for t in "${TESTS[@]}"; do
+    v=$(jq -r --arg k "$t" '.data.verdicts[$k].verdict // "MISSING"' <<<"$end" 2>/dev/null) || v=MISSING
+    reason=$(jq -r --arg k "$t" '.data.verdicts[$k].reason // ""' <<<"$end" 2>/dev/null) || reason=""
+    reason=${reason:0:400}
+    case "$v" in
+      PASS) set_res "$t" PASS RUNTIME_EVIDENCE_FAIL_CLOSED_OK "$reason" ;;
+      MISSING) set_res "$t" INFRA_ERROR RUNTIME_EVIDENCE_VERDICT_MISSING "terminal absent from end event" ;;
+      *) set_res "$t" TEST_FAIL RUNTIME_EVIDENCE_NOT_FAIL_CLOSED "$reason" ;;
+    esac
+  done
 }
 
 # Capacity-preflight suite (basil-ge9): inject guest/capacity-preflight.sh into
