@@ -51,8 +51,16 @@ readonly DRIVER_NAME="fedora-selinux-rootless"
 # host is shared, so the guest stays modest. accel=kvm:tcg uses KVM when the
 # runner sandbox exposes /dev/kvm and degrades to TCG functional-only emulation
 # when it does not (the stock sandbox's --dev /dev omits /dev/kvm; basil-k78).
-readonly MEMORY_MIB=4096
-readonly VCPUS=4
+# The capacity ladder (basil-9tj.4) needs a bigger guest for 1,000 rootless
+# containers; the host is the exclusive measurement host and guests run serially,
+# so size up for that suite only (every other suite keeps the lock sizing).
+if [[ ${BASIL_DRIVER_SUITE:-} == capacity ]]; then
+  readonly MEMORY_MIB=20480
+  readonly VCPUS=8
+else
+  readonly MEMORY_MIB=4096
+  readonly VCPUS=4
+fi
 readonly MACHINE="q35,accel=kvm:tcg"
 readonly BOOT_MARKER_TIMEOUT=480
 readonly SSH_UP_TIMEOUT=240
@@ -92,6 +100,18 @@ elif [[ $SUITE == wrapper-feasibility ]]; then
     wrapper.tmpfs-and-cleanup
     wrapper.lsm
     wrapper.platform
+  )
+elif [[ $SUITE == capacity ]]; then
+  # Capacity ladder (basil-9tj.4): five terminals mapped from
+  # guest/capacity-ladder.sh, run in-guest as rootless owner phase1-a against
+  # rootless Podman. Measures the attestor resource + latency ceilings across a
+  # serial scale ladder up to 1,000 managed containers with adversarial metadata.
+  readonly TESTS=(
+    capacity.preflight
+    capacity.resources
+    capacity.latency
+    capacity.overload
+    capacity.teardown
   )
 else
   # The 7 lane-smoke tests this driver owns (see [suites.fedora-smoke]).
@@ -239,7 +259,12 @@ main() {
     || { fail_all SEED_BUILD_FAILED "xorriso failed"; emit_result; return 0; }
 
   local overlay="$SCRATCH/overlay.qcow2"
-  qemu-img create -q -f qcow2 -F qcow2 -b "$base" "$overlay" >/dev/null \
+  # The capacity ladder wants disk headroom for 1,000 containers; grow the overlay
+  # virtual size (cloud-init growpart expands the guest root). Other suites keep
+  # the base image's virtual size (no size argument).
+  local overlay_size=()
+  [[ $SUITE == capacity ]] && overlay_size=(40G)
+  qemu-img create -q -f qcow2 -F qcow2 -b "$base" "$overlay" "${overlay_size[@]}" >/dev/null \
     || { fail_all OVERLAY_FAILED "qemu-img create failed"; emit_result; return 0; }
 
   SSH_PORT=$(( (RANDOM % 20000) + 30000 ))
@@ -265,7 +290,7 @@ main() {
   # The structural network-isolation assertion (loopback-only user networking,
   # restrict=on, no host bridge/tap/fs share) is now proven for this boot.
   # Only the lane-smoke suite reports this terminal.
-  if [[ $SUITE != capacity-preflight && $SUITE != runtime-evidence && $SUITE != wrapper-feasibility ]]; then
+  if [[ $SUITE != capacity-preflight && $SUITE != runtime-evidence && $SUITE != wrapper-feasibility && $SUITE != capacity ]]; then
     set_res lane.network-isolation PASS NETWORK_LOOPBACK_ONLY "restrict=on loopback user-net"
   fi
 
@@ -326,6 +351,8 @@ main() {
     run_runtime_evidence "$wtag"
   elif [[ $SUITE == wrapper-feasibility ]]; then
     run_wrapper_feasibility
+  elif [[ $SUITE == capacity ]]; then
+    run_capacity_ladder "$wtag"
   else
     run_checks "$wtag"
   fi
@@ -363,6 +390,35 @@ map_end_terminals() {
 }
 
 # Wrapper / raw secret-delivery feasibility (basil-9tj.6): verify the pinned
+# Capacity ladder (basil-9tj.4): drive guest/capacity-ladder.sh in the booted
+# guest as rootless owner phase1-a against rootless Podman and map its bounded
+# JSONL end event onto the five capacity.* terminals. The rootless user raises
+# its soft file-descriptor limit to its hard cap for the 1,000-container ladder
+# (a non-root user cannot raise the hard cap; if the rootless fd/pid budget is
+# the binding constraint that is itself a reported lower-only bound, basil-ge9).
+# Raw JSONL retained as raw/guest-events.jsonl.
+run_capacity_ladder() {
+  local wtag=$1
+  local helper="$FIXTURE_ROOT/guest/capacity-ladder.sh"
+  local out="$SCRATCH/capacity-ladder.jsonl" rc=0
+  local tar=/run/basil-payload/payload/workload-alpine.tar
+  [[ -f $helper ]] || { fail_all CAPACITY_SOURCE_MISSING "guest/capacity-ladder.sh not found"; return 0; }
+  if ! ssh_user phase1-a 'cat >/tmp/capacity-ladder.sh' <"$helper" 2>/dev/null; then
+    fail_all CAPACITY_INJECT_FAILED "could not copy ladder into guest"
+    return 0
+  fi
+  # Run as rootless owner phase1-a: raise soft nofile to the hard cap, point the
+  # ladder at the pinned Alpine workload. stdout is pure bounded JSONL.
+  # shellcheck disable=SC2016  # $(id -u)/$(ulimit -Hn) must expand on the GUEST side.
+  # Best-effort raise of the rootless density limits (soft nofile -> hard cap;
+  # max user processes; the user slice TasksMax) before the ladder; a non-root
+  # user may be refused some of these, in which case the reached ceiling and the
+  # captured start_error are the reported rootless lower-only bound (basil-ge9).
+  ssh_user phase1-a "export XDG_RUNTIME_DIR=/run/user/\$(id -u); ulimit -n \"\$(ulimit -Hn)\" 2>/dev/null || true; ulimit -u 200000 2>/dev/null || true; systemctl --user set-property user.slice TasksMax=infinity 2>/dev/null || true; bash /tmp/capacity-ladder.sh --runtime podman --lane-id fedora-44-x86_64 --run-id capacity --image $wtag --image-tar $tar --ladder 10,50,100,250,500,750,1000 --budget-secs 360 --attest-samples 60" \
+    >"$out" 2>"$SCRATCH/capacity-ladder.stderr.log" || rc=$?
+  map_end_terminals "$out" "$rc" CAPACITY_LADDER_MEASURED
+}
+
 # staged workload archives + static busybox, deliver them and the guest helper
 # into the booted guest over SSH, run the matrix as rootless owner phase1-a
 # against Podman with SELinux enforcing, and map the end event onto the five

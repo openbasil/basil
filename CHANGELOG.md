@@ -97,6 +97,19 @@ SPDX-License-Identifier: Apache-2.0
   support-claim refinements (exec-form mandatory for signal delivery,
   post-drop uid ownership of delivered secrets, `noswap` tmpfs delivery) are
   recorded in the Phase 1 findings notes for the design review.
+- 2026-07-14: Compose Phase 1.2 capacity ceilings measured (test-only): a
+  `capacity-ladder` suite in both x86 drivers drives
+  `guest/capacity-ladder.sh` through serial scale ladders — rootful Docker
+  reaches 1,000 containers (warm attestation p95 17 ms at 1000, ~38 fds and
+  ~5.3 MiB guest memory per container; the warm 10 ms SLO holds to ~500 with
+  a linear scan, so correlation must become an indexed cgroup→instance map);
+  rootless Podman hits a density ceiling of 196 at the default per-user
+  `kernel.keys.maxkeys=200`. The real broker held 4000+ concurrent
+  connections (1 fd + ~25 KiB each) and degraded without panic at fd
+  exhaustion while continuing to serve an operator RPC — but implements none
+  of Design 0001's mandated admission control yet (recorded as a deviation
+  for the design review, with frozen lower-only bounds in the Phase 1
+  findings notes).
 
 ### `basil demo`: a zero-dependency guided tour
 

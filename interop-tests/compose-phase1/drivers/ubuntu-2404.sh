@@ -76,6 +76,19 @@ elif [[ $SUITE == wrapper-feasibility ]]; then
     wrapper.lsm
     wrapper.platform
   )
+elif [[ $SUITE == capacity ]]; then
+  # Capacity ladder (basil-9tj.4): five terminals mapped from
+  # guest/capacity-ladder.sh, run in-guest against rootful Docker. Measures the
+  # attestor resource + latency ceilings across a serial scale ladder up to
+  # 1,000 managed containers with adversarial metadata. The guest is sized up
+  # for the ladder by the capacity override in main().
+  readonly REQUIRED_TESTS=(
+    capacity.preflight
+    capacity.resources
+    capacity.latency
+    capacity.overload
+    capacity.teardown
+  )
 else
   # The suite `ubuntu-2404-lane-smoke` must require exactly these test ids.
   readonly REQUIRED_TESTS=(
@@ -482,6 +495,68 @@ run_wrapper_feasibility() {
   done
 }
 
+# Guest provisioning wrapper for the capacity ladder suite (basil-9tj.4).
+capacity_ladder_guest_program() {
+  cat <<'GUEST_EOF'
+#!/usr/bin/env bash
+set -u
+IN=/home/basil-ci/in
+if ! command -v docker >/dev/null 2>&1; then
+  dpkg -i "$IN"/debs/*.deb >/tmp/basil-dpkg.log 2>&1 || true
+fi
+# Raise dockerd LimitNOFILE via a systemd drop-in so the daemon can hold the
+# ladder's descriptors, then (re)start Docker.
+mkdir -p /etc/systemd/system/docker.service.d
+printf '[Service]\nLimitNOFILE=1048576\nLimitNPROC=1048576\nTasksMax=infinity\n' \
+  >/etc/systemd/system/docker.service.d/basil-capacity.conf
+systemctl daemon-reload >/dev/null 2>&1 || true
+systemctl restart docker >/dev/null 2>&1 || systemctl start docker >/dev/null 2>&1 || true
+for _ in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
+# Raise this shell's descriptor + process limits for the ladder script itself.
+ulimit -n 1048576 2>/dev/null || ulimit -n 262144 2>/dev/null || true
+ulimit -u 1048576 2>/dev/null || true
+exec bash "$IN"/capacity-ladder.sh --runtime docker --lane-id ubuntu-24.04-x86_64 \
+  --run-id capacity --image basil-smoke/alpine:smoke --image-tar "$IN"/alpine-amd64.tar \
+  --ladder 10,50,100,250,500,750,1000 --budget-secs 360 --attest-samples 60
+GUEST_EOF
+}
+
+# Capacity ladder (basil-9tj.4): stage the ladder helper + the pinned Alpine
+# workload, run it as root against rootful Docker, retain its bounded JSONL as
+# raw evidence, and map its end event onto the five capacity.* terminals. Uses
+# main's ssh_base/scp_base (dynamic scope).
+run_capacity_ladder() {
+  local fixture_root=$1 scratch=$2 workload=$3
+  local helper="$fixture_root/guest/capacity-ladder.sh"
+  local out="$scratch/capacity-ladder.jsonl" rc=0
+  [[ -f $helper ]] || fail_infra CAPACITY_SOURCE_MISSING "$helper"
+  "${ssh_base[@]}" "$SSH_USER@$SSH_HOST" 'cat >/home/basil-ci/in/capacity-ladder.sh' <"$helper" 2>/dev/null \
+    || fail_infra CAPACITY_INJECT_FAILED ""
+  "${scp_base[@]}" "$workload" "$SSH_USER@$SSH_HOST:/home/basil-ci/in/alpine-amd64.tar" >/dev/null 2>&1 \
+    || fail_infra CAPACITY_WORKLOAD_COPY_FAILED ""
+  capacity_ladder_guest_program | "${ssh_base[@]}" "$SSH_USER@$SSH_HOST" 'cat >/home/basil-ci/in/capacity.sh' 2>/dev/null \
+    || fail_infra CAPACITY_PROGRAM_COPY_FAILED ""
+  "${ssh_base[@]}" "$SSH_USER@$SSH_HOST" 'sudo -n bash /home/basil-ci/in/capacity.sh' \
+    >"$out" 2>"$scratch/capacity-ladder.stderr.log" || rc=$?
+  if [[ ! -s $out ]] || ! jq -e -s 'length >= 1 and all(.[]; type=="object")' "$out" >/dev/null 2>&1; then
+    fail_infra CAPACITY_NO_OUTPUT "rc=$rc"
+  fi
+  cp "$out" "$scratch/guest-events.jsonl" 2>/dev/null || true
+  local end t v reason
+  end=$(jq -s -c '[.[] | select(.event=="end")][0] // empty' "$out" 2>/dev/null) || end=""
+  [[ -n $end ]] || fail_infra CAPACITY_NO_END "rc=$rc"
+  for t in "${REQUIRED_TESTS[@]}"; do
+    v=$(jq -r --arg k "$t" '.data.verdicts[$k].verdict // "MISSING"' <<<"$end" 2>/dev/null) || v=MISSING
+    reason=$(jq -r --arg k "$t" '.data.verdicts[$k].reason // ""' <<<"$end" 2>/dev/null) || reason=""
+    reason=${reason:0:400}
+    case "$v" in
+      PASS) set_verdict "$t" PASS CAPACITY_LADDER_MEASURED "$reason" ;;
+      MISSING) set_verdict "$t" INFRA_ERROR CAPACITY_VERDICT_MISSING "terminal absent from end event" ;;
+      *) set_verdict "$t" TEST_FAIL CAPACITY_TERMINAL_FAILED "$reason" ;;
+    esac
+  done
+}
+
 main() {
   local scratch=${BASIL_DRIVER_SCRATCH:?BASIL_DRIVER_SCRATCH must be set by the runner}
   : "${BASIL_DRIVER_RESULT:?BASIL_DRIVER_RESULT must be set by the runner}"
@@ -507,6 +582,15 @@ main() {
   cloud_init_rel=$(jq -er '.lane.cloud_init' "$run/meta/run.json") || fail_infra LANE_CLOUDINIT_UNSET ""
   local cloud_init_template="$fixture_root/$cloud_init_rel"
   [[ -f $cloud_init_template ]] || fail_infra CLOUDINIT_TEMPLATE_MISSING "$cloud_init_rel"
+
+  # Capacity ladder (basil-9tj.4) needs a bigger guest than the lane default:
+  # 1,000 rootful-Docker containers plus the daemon. The host is exclusively the
+  # measurement host (16 cpu / 92 GiB), guests run serially, so size up. This
+  # overrides only the capacity suite; every other suite keeps the lock sizing.
+  if [[ $SUITE == capacity ]]; then
+    memory_mib=24576
+    vcpus=8
+  fi
 
   # The runner's sandbox clears the environment, so recover the invoking user's
   # cache root from the password database (same default artifacts.sh computes).
@@ -646,6 +730,15 @@ main() {
   # this branch verifies and stages itself. Run the matrix instead of lane smoke.
   if [[ $SUITE == wrapper-feasibility ]]; then
     run_wrapper_feasibility "$fixture_root" "$scratch" "$cache"
+    "${ssh_base[@]}" "$SSH_USER@$SSH_HOST" 'sudo -n poweroff' 2>/dev/null || true
+    write_result
+    return
+  fi
+
+  # Capacity ladder (basil-9tj.4): needs the pinned debs (already staged above)
+  # plus the Alpine workload; run the ladder instead of lane smoke.
+  if [[ $SUITE == capacity ]]; then
+    run_capacity_ladder "$fixture_root" "$scratch" "$workload"
     "${ssh_base[@]}" "$SSH_USER@$SSH_HOST" 'sudo -n poweroff' 2>/dev/null || true
     write_result
     return
