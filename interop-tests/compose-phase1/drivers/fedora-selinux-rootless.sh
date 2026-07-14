@@ -80,6 +80,19 @@ elif [[ $SUITE == runtime-evidence ]]; then
     runtime.realm-overlap
     runtime.stale-and-conflicting
   )
+elif [[ $SUITE == wrapper-feasibility ]]; then
+  # Wrapper / raw secret-delivery feasibility prototype (basil-9tj.6): five
+  # terminals mapped from guest/wrapper-feasibility.sh, run in-guest as rootless
+  # owner phase1-a against rootless Podman with SELinux enforcing. Exercises
+  # entrypoint interposition + raw delivery across the alpine/glibc/distroless
+  # image families and the unmodified postgres:18 acceptance target.
+  readonly TESTS=(
+    wrapper.argv
+    wrapper.pid1-signals-exit
+    wrapper.tmpfs-and-cleanup
+    wrapper.lsm
+    wrapper.platform
+  )
 else
   # The 7 lane-smoke tests this driver owns (see [suites.fedora-smoke]).
   readonly TESTS=(
@@ -252,7 +265,7 @@ main() {
   # The structural network-isolation assertion (loopback-only user networking,
   # restrict=on, no host bridge/tap/fs share) is now proven for this boot.
   # Only the lane-smoke suite reports this terminal.
-  if [[ $SUITE != capacity-preflight && $SUITE != runtime-evidence ]]; then
+  if [[ $SUITE != capacity-preflight && $SUITE != runtime-evidence && $SUITE != wrapper-feasibility ]]; then
     set_res lane.network-isolation PASS NETWORK_LOOPBACK_ONLY "restrict=on loopback user-net"
   fi
 
@@ -311,11 +324,93 @@ main() {
     run_capacity_preflight
   elif [[ $SUITE == runtime-evidence ]]; then
     run_runtime_evidence "$wtag"
+  elif [[ $SUITE == wrapper-feasibility ]]; then
+    run_wrapper_feasibility
   else
     run_checks "$wtag"
   fi
   emit_result
   log "checks complete"
+}
+
+readonly WF_PINS_FILE="$DRIVER_DIR/wrapper-feasibility.pins"
+wf_pins_get() { grep -m1 "^$1=" "$WF_PINS_FILE" 2>/dev/null | cut -d= -f2- || true; }
+
+# Map a guest end-event's per-terminal verdicts onto the driver TESTS. Shared by
+# suites whose guest helper emits {data:{verdicts:{<terminal>:{verdict,reason}}}}.
+map_end_terminals() {
+  local out=$1 rc=$2 ok_reason=$3 t v reason end
+  if [[ ! -s $out ]] || ! jq -e -s 'length >= 1 and all(.[]; type=="object")' "$out" >/dev/null 2>&1; then
+    fail_all GUEST_NO_OUTPUT "guest produced no parseable JSONL (rc=$rc)"
+    return 0
+  fi
+  cat "$out" >>"$GUEST_LOG" 2>/dev/null || true
+  end=$(jq -s -c '[.[] | select(.event=="end")][0] // empty' "$out" 2>/dev/null) || end=""
+  if [[ -z $end ]]; then
+    fail_all GUEST_NO_END "guest emitted no end event (rc=$rc)"
+    return 0
+  fi
+  for t in "${TESTS[@]}"; do
+    v=$(jq -r --arg k "$t" '.data.verdicts[$k].verdict // "MISSING"' <<<"$end" 2>/dev/null) || v=MISSING
+    reason=$(jq -r --arg k "$t" '.data.verdicts[$k].reason // ""' <<<"$end" 2>/dev/null) || reason=""
+    reason=${reason:0:400}
+    case "$v" in
+      PASS) set_res "$t" PASS "$ok_reason" "$reason" ;;
+      MISSING) set_res "$t" INFRA_ERROR GUEST_VERDICT_MISSING "terminal absent from end event" ;;
+      *) set_res "$t" TEST_FAIL GUEST_TERMINAL_FAILED "$reason" ;;
+    esac
+  done
+}
+
+# Wrapper / raw secret-delivery feasibility (basil-9tj.6): verify the pinned
+# staged workload archives + static busybox, deliver them and the guest helper
+# into the booted guest over SSH, run the matrix as rootless owner phase1-a
+# against Podman with SELinux enforcing, and map the end event onto the five
+# wrapper.* terminals. Raw JSONL retained as raw/guest-events.jsonl.
+run_wrapper_feasibility() {
+  local helper="$FIXTURE_ROOT/guest/wrapper-feasibility.sh"
+  local out="$SCRATCH/wrapper-feasibility.jsonl" rc=0
+  [[ -f $helper ]] || { fail_all WF_SOURCE_MISSING "guest/wrapper-feasibility.sh not found"; return 0; }
+  [[ -f $WF_PINS_FILE ]] || { fail_all WF_PINS_MISSING "wrapper-feasibility.pins not found"; return 0; }
+
+  local home cache staging bb f fam want got
+  home=$(real_home) || { fail_all ENV_UNRESOLVED "cannot resolve home"; return 0; }
+  cache="$home/.cache/basil/compose-phase1"
+  staging="$cache/wrapper-feasibility-staging"
+  bb="$staging/busybox.amd64"
+  [[ -d $staging/images-amd64 ]] || { fail_all WF_STAGING_MISSING "run wrapper-feasibility-prep.sh"; return 0; }
+
+  # Fail closed unless every staged artifact matches its committed pin.
+  for fam in alpine debian distroless postgres; do
+    f="$staging/images-amd64/$fam.tar.gz"
+    [[ -f $f ]] || { fail_all WF_IMAGE_MISSING "$fam staged archive not found"; return 0; }
+    want=$(wf_pins_get "${fam}_amd64_sha256")
+    got=$(sha256sum "$f" | cut -d' ' -f1)
+    [[ -n $want && $got == "$want" ]] || { fail_all WF_IMAGE_UNVERIFIED "$fam sha256 mismatch"; return 0; }
+  done
+  [[ -f $bb ]] || { fail_all WF_BUSYBOX_MISSING "static busybox not staged"; return 0; }
+  want=$(wf_pins_get busybox_amd64_sha256)
+  got=$(sha256sum "$bb" | cut -d' ' -f1)
+  [[ -n $want && $got == "$want" ]] || { fail_all WF_BUSYBOX_UNVERIFIED "busybox sha256 mismatch"; return 0; }
+  guest_fact wf.artifacts.verified PASS "4 images + busybox"
+
+  # Stage into the guest over SSH stdin (never scp: its port flag differs).
+  ssh_user phase1-a 'rm -rf /tmp/wf && mkdir -p /tmp/wf/images /tmp/wf/work && chmod -R 700 /tmp/wf' 2>/dev/null \
+    || { fail_all WF_GUEST_MKDIR_FAILED ""; return 0; }
+  for fam in alpine debian distroless postgres; do
+    ssh_user phase1-a "cat >/tmp/wf/images/$fam.tar.gz" <"$staging/images-amd64/$fam.tar.gz" 2>/dev/null \
+      || { fail_all WF_GUEST_IMAGE_COPY_FAILED "$fam"; return 0; }
+  done
+  ssh_user phase1-a 'cat >/tmp/wf/busybox && chmod 0755 /tmp/wf/busybox' <"$bb" 2>/dev/null \
+    || { fail_all WF_GUEST_BUSYBOX_COPY_FAILED ""; return 0; }
+  ssh_user phase1-a 'cat >/tmp/wf/wrapper-feasibility.sh' <"$helper" 2>/dev/null \
+    || { fail_all WF_GUEST_HELPER_COPY_FAILED ""; return 0; }
+
+  # Run the matrix as rootless owner phase1-a against Podman under SELinux.
+  # shellcheck disable=SC2016  # $(id -u) must expand on the GUEST side.
+  ssh_user phase1-a 'export XDG_RUNTIME_DIR=/run/user/$(id -u); bash /tmp/wf/wrapper-feasibility.sh --runtime podman --lane-id fedora-44-x86_64 --run-id wrapper-feasibility --images-dir /tmp/wf/images --busybox /tmp/wf/busybox --lsm selinux --workdir /tmp/wf/work --arch-mode full' \
+    >"$out" 2>"$SCRATCH/wrapper-feasibility.stderr.log" || rc=$?
+  map_end_terminals "$out" "$rc" WRAPPER_FEASIBILITY_OK
 }
 
 # Runtime-evidence suite (basil-9tj.2): drive guest/runtime-evidence.sh in the

@@ -36,6 +36,9 @@ umask 077
 readonly SSH_USER=basil-ci
 readonly SSH_HOST=127.0.0.1
 readonly SSH_PORT=2222
+WF_PINS_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/wrapper-feasibility.pins"
+readonly WF_PINS_FILE
+wf_pins_get() { grep -m1 "^$1=" "$WF_PINS_FILE" 2>/dev/null | cut -d= -f2- || true; }
 # Suite selection (exported by the runner as BASIL_DRIVER_SUITE). The
 # capacity-preflight suite (basil-ge9) reports the four preflight.* terminals
 # by running guest/capacity-preflight.sh inside the booted guest; every other
@@ -59,6 +62,19 @@ elif [[ $SUITE == runtime-evidence ]]; then
     runtime.same-uid-isolation
     runtime.realm-overlap
     runtime.stale-and-conflicting
+  )
+elif [[ $SUITE == wrapper-feasibility ]]; then
+  # Wrapper / raw secret-delivery feasibility prototype (basil-9tj.6): five
+  # terminals mapped from guest/wrapper-feasibility.sh run in-guest against
+  # rootful Docker with AppArmor docker-default enforcing. Exercises entrypoint
+  # interposition + raw delivery across the alpine/glibc/distroless image
+  # families and the unmodified postgres:18 acceptance target.
+  readonly REQUIRED_TESTS=(
+    wrapper.argv
+    wrapper.pid1-signals-exit
+    wrapper.tmpfs-and-cleanup
+    wrapper.lsm
+    wrapper.platform
   )
 else
   # The suite `ubuntu-2404-lane-smoke` must require exactly these test ids.
@@ -386,6 +402,86 @@ run_runtime_evidence() {
   done
 }
 
+# Guest provisioning wrapper for the wrapper-feasibility suite: install rootful
+# Docker offline from the staged pinned debs, start it, then exec the injected
+# wrapper-feasibility helper against Docker under AppArmor. Its stdout is pure
+# bounded JSONL; all provisioning output goes to guest-local files.
+wf_guest_program() {
+  cat <<'GUEST_EOF'
+#!/usr/bin/env bash
+set -u
+IN=/home/basil-ci/in
+if ! command -v docker >/dev/null 2>&1; then
+  dpkg -i "$IN"/debs/*.deb >/tmp/basil-dpkg.log 2>&1 || true
+fi
+systemctl start docker >/dev/null 2>&1 || true
+for _ in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
+exec bash "$IN"/wf/wrapper-feasibility.sh --runtime docker --lane-id ubuntu-24.04-x86_64 \
+  --run-id wrapper-feasibility --images-dir "$IN"/wf/images --busybox "$IN"/wf/busybox \
+  --lsm apparmor --workdir "$IN"/wf/work --arch-mode full
+GUEST_EOF
+}
+
+# Wrapper / raw secret-delivery feasibility (basil-9tj.6): verify the pinned
+# staged workload archives + static busybox, deliver them and the guest helper
+# into the booted guest, run the matrix as root against rootful Docker under
+# AppArmor, retain the bounded JSONL, and map the end event onto the five
+# wrapper.* terminals. Uses main's ssh_base/scp_base (dynamic scope).
+run_wrapper_feasibility() {
+  local fixture_root=$1 scratch=$2 cache=$3
+  local helper="$fixture_root/guest/wrapper-feasibility.sh"
+  local wfstaging="$cache/wrapper-feasibility-staging"
+  local bb="$wfstaging/busybox.amd64"
+  local out="$scratch/wrapper-feasibility.jsonl" rc=0 fam f want got
+  [[ -f $helper ]] || fail_infra WF_SOURCE_MISSING "$helper"
+  [[ -f $WF_PINS_FILE ]] || fail_infra WF_PINS_MISSING ""
+  [[ -d $wfstaging/images-amd64 ]] || fail_infra WF_STAGING_MISSING "$wfstaging"
+  for fam in alpine debian distroless postgres; do
+    f="$wfstaging/images-amd64/$fam.tar.gz"
+    [[ -f $f ]] || fail_infra WF_IMAGE_MISSING "$fam"
+    want=$(wf_pins_get "${fam}_amd64_sha256")
+    got=$(sha256sum "$f" | cut -d' ' -f1)
+    [[ -n $want && $got == "$want" ]] || fail_infra WF_IMAGE_UNVERIFIED "$fam"
+  done
+  [[ -f $bb ]] || fail_infra WF_BUSYBOX_MISSING ""
+  want=$(wf_pins_get busybox_amd64_sha256); got=$(sha256sum "$bb" | cut -d' ' -f1)
+  [[ -n $want && $got == "$want" ]] || fail_infra WF_BUSYBOX_UNVERIFIED ""
+
+  "${ssh_base[@]}" "$SSH_USER@$SSH_HOST" \
+    'rm -rf /home/basil-ci/in/wf && mkdir -p /home/basil-ci/in/wf/images /home/basil-ci/in/wf/work' 2>/dev/null \
+    || fail_infra WF_GUEST_MKDIR_FAILED ""
+  for fam in alpine debian distroless postgres; do
+    "${scp_base[@]}" "$wfstaging/images-amd64/$fam.tar.gz" \
+      "$SSH_USER@$SSH_HOST:/home/basil-ci/in/wf/images/$fam.tar.gz" >/dev/null 2>&1 \
+      || fail_infra WF_GUEST_IMAGE_COPY_FAILED "$fam"
+  done
+  "${scp_base[@]}" "$bb" "$SSH_USER@$SSH_HOST:/home/basil-ci/in/wf/busybox" >/dev/null 2>&1 \
+    || fail_infra WF_GUEST_BUSYBOX_COPY_FAILED ""
+  "${ssh_base[@]}" "$SSH_USER@$SSH_HOST" 'cat >/home/basil-ci/in/wf/wrapper-feasibility.sh' <"$helper" 2>/dev/null \
+    || fail_infra WF_GUEST_HELPER_COPY_FAILED ""
+  wf_guest_program | "${ssh_base[@]}" "$SSH_USER@$SSH_HOST" 'cat >/home/basil-ci/in/wf/run.sh' 2>/dev/null \
+    || fail_infra WF_GUEST_PROGRAM_COPY_FAILED ""
+  "${ssh_base[@]}" "$SSH_USER@$SSH_HOST" 'sudo -n bash /home/basil-ci/in/wf/run.sh' \
+    >"$out" 2>"$scratch/wrapper-feasibility.stderr.log" || rc=$?
+  if [[ ! -s $out ]] || ! jq -e -s 'length >= 1 and all(.[]; type=="object")' "$out" >/dev/null 2>&1; then
+    fail_infra WF_NO_OUTPUT "rc=$rc"
+  fi
+  cp "$out" "$scratch/guest-events.jsonl" 2>/dev/null || true
+  local end t v reason
+  end=$(jq -s -c '[.[] | select(.event=="end")][0] // empty' "$out" 2>/dev/null) || end=""
+  [[ -n $end ]] || fail_infra WF_NO_END "rc=$rc"
+  for t in "${REQUIRED_TESTS[@]}"; do
+    v=$(jq -r --arg k "$t" '.data.verdicts[$k].verdict // "MISSING"' <<<"$end" 2>/dev/null) || v=MISSING
+    reason=$(jq -r --arg k "$t" '.data.verdicts[$k].reason // ""' <<<"$end" 2>/dev/null) || reason=""
+    reason=${reason:0:400}
+    case "$v" in
+      PASS) set_verdict "$t" PASS WRAPPER_FEASIBILITY_OK "$reason" ;;
+      MISSING) set_verdict "$t" INFRA_ERROR WRAPPER_FEASIBILITY_VERDICT_MISSING "terminal absent from end event" ;;
+      *) set_verdict "$t" TEST_FAIL WRAPPER_FEASIBILITY_TERMINAL_FAILED "$reason" ;;
+    esac
+  done
+}
+
 main() {
   local scratch=${BASIL_DRIVER_SCRATCH:?BASIL_DRIVER_SCRATCH must be set by the runner}
   : "${BASIL_DRIVER_RESULT:?BASIL_DRIVER_RESULT must be set by the runner}"
@@ -540,6 +636,16 @@ main() {
   # above) plus the Alpine workload; run the prototype instead of lane smoke.
   if [[ $SUITE == runtime-evidence ]]; then
     run_runtime_evidence "$fixture_root" "$scratch" "$workload"
+    "${ssh_base[@]}" "$SSH_USER@$SSH_HOST" 'sudo -n poweroff' 2>/dev/null || true
+    write_result
+    return
+  fi
+
+  # Wrapper-feasibility suite (basil-9tj.6): needs the pinned debs (already staged
+  # above) plus the wrapper-feasibility workload archives + static busybox, which
+  # this branch verifies and stages itself. Run the matrix instead of lane smoke.
+  if [[ $SUITE == wrapper-feasibility ]]; then
+    run_wrapper_feasibility "$fixture_root" "$scratch" "$cache"
     "${ssh_base[@]}" "$SSH_USER@$SSH_HOST" 'sudo -n poweroff' 2>/dev/null || true
     write_result
     return

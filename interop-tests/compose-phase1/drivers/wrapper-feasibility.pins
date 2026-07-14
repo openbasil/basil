@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Pins for the Compose Phase 1 `wrapper-feasibility` suite branch (br basil-9tj.6).
+# The x86_64 lane drivers (fedora-selinux-rootless, ubuntu-2404) re-verify each
+# staged file against these hashes before delivering it into the guest. The
+# operational trust anchor is each sha256 (OCI-digest discipline): a driver
+# refuses to proceed unless the staged artifact matches. The archives are
+# gzip-compressed docker-archives of the linux/amd64 image selected from the
+# already-pinned multi-arch OCI layouts (verified by compose-phase1-artifacts.sh),
+# repacked deterministically and gzip -n so wrapper-feasibility-prep.sh reproduces
+# identical hashes. busybox.amd64 is a static (musl) busybox injected into the
+# shell-free distroless container. The aarch64 FUNCTIONAL-ONLY lane reuses the
+# pinned crun + Alpine arm64 rootfs payload and needs nothing here.
+image_ref_prefix=basil.local/wf
+alpine_amd64_sha256=495a4e9d52d92d3950b6d51814152b60ab96f9e3c879e2e504106b6ec5a15fd0
+debian_amd64_sha256=07c4c5c92a92e95b011d0491fc32a72c4fc94b564cf7f47f31fb1c4b97de4a74
+distroless_amd64_sha256=ffa14b884b976c1f1157fa26a47e06b257baa66313b09091e0604abcb3c0ee7e
+postgres_amd64_sha256=fad52e61892b4536577d5cdbda35d3bee95099ed9122d0244f4b38036d357ec7
+busybox_amd64_sha256=66bd6e55a978992e9a70069063c0f1b1fe912713fce3bdb7ae33c5321f985111

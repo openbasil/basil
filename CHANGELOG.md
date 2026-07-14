@@ -85,6 +85,18 @@ SPDX-License-Identifier: Apache-2.0
   immutability classification (pin-once vs revalidate-at-use vs
   diagnostic-only) and a pidfd-over-start-time strengthening recommendation
   are recorded in the Phase 1 findings notes.
+- 2026-07-14: Compose Phase 1.3 wrapper/delivery feasibility (test-only): a
+  `wrapper-feasibility` suite in all three lane drivers drives
+  `guest/wrapper-feasibility.sh` — wrapper entrypoint-interposition and raw
+  delivery across alpine/debian/distroless/postgres images (staged and pinned
+  by `wrapper-feasibility-prep.sh` + `drivers/wrapper-feasibility.pins`),
+  both LSMs with confinement enabled, and an arm64 functional pass.
+  Unmodified `postgres:18` passes end-to-end (gosu root-drop, delivered
+  `POSTGRES_PASSWORD_FILE` authenticates). Shell interposition on shell-free
+  distroless images is unsupported and fails actionably before start;
+  support-claim refinements (exec-form mandatory for signal delivery,
+  post-drop uid ownership of delivered secrets, `noswap` tmpfs delivery) are
+  recorded in the Phase 1 findings notes for the design review.
 
 ### `basil demo`: a zero-dependency guided tour
 

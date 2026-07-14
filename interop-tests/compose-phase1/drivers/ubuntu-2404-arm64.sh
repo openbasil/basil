@@ -66,14 +66,29 @@ readonly SSH_HOST=127.0.0.1
 readonly BOOT_MARKER_TIMEOUT=600
 readonly SSH_UP_TIMEOUT=240
 
-# The four FUNCTIONAL tests this driver owns (see the arm64 functional-smoke
-# suite). `lane.artifacts` is runner-owned and intentionally absent here.
-readonly TESTS=(
-  lane.boot
-  lane.arch
-  lane.cgroup-v2
-  lane.container-runtime
-)
+# Suite selection (exported by the runner as BASIL_DRIVER_SUITE). The
+# functional-smoke suite reports the four lane.* functional tests; the
+# wrapper-feasibility suite (basil-9tj.6) reports the five wrapper.* terminals,
+# FUNCTIONAL-ONLY on aarch64 (crun OCI bundles, no LSM/perf claim).
+readonly SUITE="${BASIL_DRIVER_SUITE:-ubuntu-2404-arm64-functional-smoke}"
+if [[ $SUITE == wrapper-feasibility ]]; then
+  readonly TESTS=(
+    wrapper.argv
+    wrapper.pid1-signals-exit
+    wrapper.tmpfs-and-cleanup
+    wrapper.lsm
+    wrapper.platform
+  )
+else
+  # The four FUNCTIONAL tests this driver owns (see the arm64 functional-smoke
+  # suite). `lane.artifacts` is runner-owned and intentionally absent here.
+  readonly TESTS=(
+    lane.boot
+    lane.arch
+    lane.cgroup-v2
+    lane.container-runtime
+  )
+fi
 
 declare -A ST RE MS
 for _t in "${TESTS[@]}"; do ST[$_t]=INFRA_ERROR; RE[$_t]=DRIVER_DID_NOT_RUN; MS[$_t]=""; done
@@ -251,6 +266,144 @@ fi
 GUEST_EOF
 }
 
+# FUNCTIONAL-ONLY aarch64 wrapper-feasibility guest program (basil-9tj.6). Runs
+# as root via sudo. It reuses the pinned crun + Alpine arm64 rootfs payload to
+# prove the CORE wrapper shape on aarch64 with daemonless OCI bundles: the
+# entrypoint-interposition wrapper delivers a SYNTHETIC secret to a tmpfs mount
+# then exec's the original argv. It exercises exec-form PID 1 identity + argv
+# preservation, exit-code propagation, tmpfs delivery + fail-before-start, and
+# container mount-namespace isolation. It makes NO LSM-enforcement, performance,
+# or native-host claim; the five wrapper.* terminals here are functional evidence
+# only. The embedded wrapper mirrors guest/wrapper-feasibility.sh write_wrapper().
+wf_guest_program_arm64() {
+  cat <<'GUEST_EOF'
+#!/usr/bin/env bash
+set -u
+IN=/home/basil-ci/in
+emit() { printf 'RESULT %s %s %s\n' "$1" "$2" "$3"; }
+fact() { printf 'FACT %s\n' "$*"; }
+
+command -v jq >/dev/null 2>&1 || { emit wrapper.argv INFRA_ERROR JQ_MISSING
+  emit wrapper.pid1-signals-exit INFRA_ERROR JQ_MISSING
+  emit wrapper.tmpfs-and-cleanup INFRA_ERROR JQ_MISSING
+  emit wrapper.lsm INFRA_ERROR JQ_MISSING
+  emit wrapper.platform INFRA_ERROR JQ_MISSING; exit 0; }
+
+rm -rf "$IN/wf"; mkdir -p "$IN/wf/bundle/rootfs"
+tar -C "$IN/wf/bundle" -xf "$IN/payload.tar" 2>/dev/null   # yields crun + rootfs.tar.gz
+chmod +x "$IN/wf/bundle/crun" 2>/dev/null
+tar -C "$IN/wf/bundle/rootfs" -xzf "$IN/wf/bundle/rootfs.tar.gz" 2>/dev/null
+CRUN="$IN/wf/bundle/crun"
+ROOT="$IN/wf/bundle/rootfs"
+cver=$("$CRUN" --version 2>/dev/null | awk 'NR==1{print $3}')
+fact "container_runtime=crun ${cver} arch=$(uname -m)"
+
+mkdir -p "$ROOT/basil"
+cat >"$ROOT/basil/wrapper" <<'WRAP_EOF'
+#!/bin/sh
+# Basil entrypoint-interposition wrapper prototype (feasibility; SYNTHETIC secret).
+set -eu
+fatal() { c=$1; shift; printf 'basil-wrapper: FATAL %s\n' "$*" >&2; exit "$c"; }
+DEST=${BASIL_SECRET_DEST:-}
+[ -n "$DEST" ] || fatal 97 "BASIL_SECRET_DEST unset; refusing to start workload"
+[ -n "${BASIL_SECRET_VALUE:-}" ] || fatal 97 "no secret material; refusing to start workload"
+DDIR=${DEST%/*}; [ -n "$DDIR" ] || DDIR=/
+_fs=""; _best=-1
+while read -r _dev _mp _t _rest; do
+  case "$DDIR" in "$_mp"|"$_mp"/*) _l=${#_mp}; if [ "$_l" -gt "$_best" ]; then _best=$_l; _fs=$_t; fi ;; esac
+done < /proc/mounts
+case "$_fs" in tmpfs|ramfs) : ;; *) fatal 96 "delivery dir $DDIR is '${_fs:-unknown}', not tmpfs/ramfs" ;; esac
+umask 077
+printf '%s' "$BASIL_SECRET_VALUE" > "$DEST" || fatal 94 "cannot write $DEST"
+if [ -n "${BASIL_BB:-}" ] && [ -x "${BASIL_BB:-}" ]; then "$BASIL_BB" chmod 0400 "$DEST" 2>/dev/null || true
+else chmod 0400 "$DEST" 2>/dev/null || true; fi
+unset BASIL_SECRET_VALUE
+case "${BASIL_WRAP_MODE:-exec}" in
+  exec) exec "$@" ;;
+  noexec) "$@" & _c=$!; wait "$_c"; exit $? ;;
+  *) fatal 93 "unknown BASIL_WRAP_MODE ${BASIL_WRAP_MODE:-}" ;;
+esac
+WRAP_EOF
+chmod 0755 "$ROOT/basil/wrapper"
+
+SECRET="basilsecret-arm64-$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+# Build a JSON string array from arguments via stdin. jq's `--args` still parses
+# a bare `-c` (and other dash-prefixed args) as an OPTION and silently drops it,
+# which would strip the `-c` from `sh -c SCRIPT`; feeding args as raw lines to
+# `jq -Rn '[inputs]'` avoids option parsing entirely. Args must contain no
+# literal newlines (none of ours do).
+mkjson() { printf '%s\n' "$@" | jq -Rnc '[inputs]'; }
+ENVBASE=(PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/
+  BASIL_SECRET_DEST=/s/x BASIL_WRAP_MODE=exec BASIL_BB=/bin/busybox)
+env_secret=$(mkjson "${ENVBASE[@]}" "BASIL_SECRET_VALUE=$SECRET")
+env_nosecret=$(mkjson "${ENVBASE[@]}")
+
+gen_config() { # args_json env_json
+  jq -n --argjson args "$1" --argjson env "$2" '{
+    ociVersion:"1.0.2",
+    process:{terminal:false,user:{uid:0,gid:0},args:$args,env:$env,cwd:"/",
+      capabilities:{bounding:["CAP_KILL"],effective:["CAP_KILL"],permitted:["CAP_KILL"]},
+      noNewPrivileges:true},
+    root:{path:"rootfs",readonly:false},
+    hostname:"basil-wf-arm64",
+    mounts:[
+      {destination:"/proc",type:"proc",source:"proc"},
+      {destination:"/dev",type:"tmpfs",source:"tmpfs",options:["nosuid","mode=755"]},
+      {destination:"/s",type:"tmpfs",source:"tmpfs",options:["nosuid","nodev","mode=700"]}
+    ],
+    linux:{namespaces:[{type:"pid"},{type:"ipc"},{type:"uts"},{type:"mount"}]}
+  }' > "$IN/wf/bundle/config.json"
+}
+run_ctr() { # name args_json env_json
+  gen_config "$2" "$3"
+  OUT=$(cd "$IN/wf/bundle" && "$CRUN" run --no-pivot "$1" 2>>/tmp/crun-wf.err); RC=$?
+  "$CRUN" delete -f "$1" >/dev/null 2>&1 || true
+}
+
+# exp1: exec-form -> workload is PID 1 and argv (incl. a space) is preserved.
+a1=$(mkjson /basil/wrapper /bin/busybox sh -c \
+  'printf "SELFPID=%s ARGC=%s A1=[%s]\n" "$$" "$#" "$1"' x "alpha beta" gamma)
+run_ctr wfa1 "$a1" "$env_secret"; O1=$OUT
+# exp2: exec-form propagates the workload exit code.
+a2=$(mkjson /basil/wrapper /bin/busybox sh -c 'exit 42')
+run_ctr wfa2 "$a2" "$env_secret"; R2=$RC
+# exp3: tmpfs-backed delivery is readable by the workload.
+a3=$(mkjson /basil/wrapper /bin/busybox sh -c \
+  'grep -q " /s tmpfs " /proc/mounts && printf "FT=tmpfs "; printf "V=%s" "$(cat /s/x)"')
+run_ctr wfa3 "$a3" "$env_secret"; O3=$OUT
+# exp4: fail-before-start when no secret is provided (wrapper exits 97).
+a4=$(mkjson /basil/wrapper /bin/busybox echo WORKLOAD_RAN)
+run_ctr wfa4 "$a4" "$env_nosecret"; O4=$OUT; R4=$RC
+
+fact "argv_out=${O1}"
+fact "exit_prop_rc=${R2}"
+fact "tmpfs_out=${O3}"
+fact "failclosed_rc=${R4} failclosed_out=${O4}"
+fact "crun_err=$(tr '\n' '|' </tmp/crun-wf.err 2>/dev/null | tail -c 400)"
+fact "secret=${SECRET}"
+
+case "$O1" in *"SELFPID=1 ARGC=2 A1=[alpha beta]"*)
+  emit wrapper.argv PASS EXEC_FORM_PID1_ARGV ;;
+  *) emit wrapper.argv TEST_FAIL ARGV_OR_PID1_MISMATCH ;;
+esac
+if [ "${R2:-0}" = 42 ]; then emit wrapper.pid1-signals-exit PASS EXIT_CODE_PROPAGATED_FUNCTIONAL
+else emit wrapper.pid1-signals-exit TEST_FAIL EXIT_CODE_NOT_PROPAGATED; fi
+tmpfs_ok=no; [ "$O3" = "FT=tmpfs V=$SECRET" ] && tmpfs_ok=yes
+failclosed_ok=no
+{ [ "${R4:-0}" = 97 ] && ! printf '%s' "$O4" | grep -q WORKLOAD_RAN; } && failclosed_ok=yes
+if [ "$tmpfs_ok" = yes ] && [ "$failclosed_ok" = yes ]; then
+  emit wrapper.tmpfs-and-cleanup PASS TMPFS_DELIVERY_FAILCLOSED_FUNCTIONAL
+else emit wrapper.tmpfs-and-cleanup TEST_FAIL TMPFS_OR_FAILCLOSED_MISMATCH; fi
+# Functional confinement: the delivery tmpfs is private to the container mount
+# namespace and never appears on the guest host. This lane makes NO LSM claim.
+if [ ! -e /s/x ] && [ ! -e /s ]; then emit wrapper.lsm PASS MOUNT_NS_ISOLATION_FUNCTIONAL
+else emit wrapper.lsm TEST_FAIL DELIVERY_LEAKED_TO_HOST; fi
+if [ "$tmpfs_ok" = yes ] && printf '%s' "$O1" | grep -q "SELFPID=1"; then
+  emit wrapper.platform PASS ALPINE_MUSL_AARCH64_FUNCTIONAL
+else emit wrapper.platform TEST_FAIL AARCH64_CORE_SHAPE_FAILED; fi
+GUEST_EOF
+}
+
 main() {
   : >"$GUEST_LOG"
 
@@ -414,7 +567,11 @@ main() {
     || { fail_all SSH_UNAVAILABLE "ssh never came up within ${SSH_UP_TIMEOUT}s"; emit_result; return 0; }
 
   # The aarch64 guest booted from the verified image and is reachable.
-  set_res lane.boot PASS BOOT_FROM_VERIFIED_IMAGE "serial marker + ssh reachable"
+  # lane.boot is a functional-smoke terminal; the wrapper-feasibility suite does
+  # not include it, so only set it outside that suite.
+  if [[ $SUITE != wrapper-feasibility ]]; then
+    set_res lane.boot PASS BOOT_FROM_VERIFIED_IMAGE "serial marker + ssh reachable"
+  fi
   guest_fact boot PASS reachable
 
   # Stage the pinned payload and run the guest checks as root.
@@ -422,12 +579,24 @@ main() {
     || { fail_all GUEST_STAGE_MKDIR_FAILED ""; emit_result; return 0; }
   "${scp_base[@]}" "$payload" "$SSH_USER@$SSH_HOST:/home/basil-ci/in/payload.tar" >/dev/null 2>&1 \
     || { fail_all GUEST_PAYLOAD_COPY_FAILED ""; emit_result; return 0; }
-  guest_program | "${ssh_base[@]}" "$SSH_USER@$SSH_HOST" 'cat >/home/basil-ci/in/checks.sh' 2>/dev/null \
+  local guest_prog=guest_program
+  [[ $SUITE == wrapper-feasibility ]] && guest_prog=wf_guest_program_arm64
+  "$guest_prog" | "${ssh_base[@]}" "$SSH_USER@$SSH_HOST" 'cat >/home/basil-ci/in/checks.sh' 2>/dev/null \
     || { fail_all GUEST_CHECK_COPY_FAILED ""; emit_result; return 0; }
 
   local guest_out
   guest_out=$("${ssh_base[@]}" "$SSH_USER@$SSH_HOST" 'sudo -n bash /home/basil-ci/in/checks.sh' 2>&1) || true
   printf '%s\n' "$guest_out" | grep -E '^(FACT|RESULT) ' >>"$SCRATCH/guest.transcript" 2>/dev/null || true
+  # Retain the wrapper-feasibility diagnostic FACT lines as private raw evidence
+  # (guest.transcript lives in the transient scratch, which is wiped at finalize).
+  # Guarded to the wrapper-feasibility suite so the functional-smoke suite's raw
+  # evidence is bit-for-bit unchanged.
+  if [[ $SUITE == wrapper-feasibility ]]; then
+    local _fl
+    while IFS= read -r _fl; do
+      [[ $_fl == FACT\ * ]] && guest_fact wf-diag INFO "${_fl#FACT }"
+    done < <(printf '%s\n' "$guest_out")
+  fi
 
   local produced=no tag test_id status reason
   while IFS=' ' read -r tag test_id status reason; do
