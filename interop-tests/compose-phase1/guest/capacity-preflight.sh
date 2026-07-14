@@ -17,6 +17,19 @@ readonly MIN_NAMESPACE_LIMIT=4096
 readonly PODMAN_LOCK_RESERVE=128
 readonly MAX_RUNTIME_JSON_BYTES=$((1024 * 1024))
 readonly COMMAND_TIMEOUT_SECONDS=20
+# Readiness-only ladder-sizing estimates. These are conservative planning
+# numbers, NOT measured per-container costs; the real numbers come from the later
+# basil-9tj.4 serial ladder. `TASKS_PER_CONTAINER`/`FDS_PER_CONTAINER` bound the
+# process and descriptor headroom a 1,000-container ladder is expected to draw;
+# the nominal byte constants size a retained run's fixed evidence overhead.
+readonly TASKS_PER_CONTAINER=4
+readonly FDS_PER_CONTAINER=16
+readonly LADDER_STEP_LATENCY_CEILING_MS=$((5 * 60 * 1000))
+readonly MANIFEST_NOMINAL_BYTES=16384
+readonly SNAPSHOT_NOMINAL_BYTES=12288
+# The measurement scale ladder, kept as a bash array so the start event, the
+# evidence-retention projection, and the derived thresholds all agree.
+readonly SCALE_LADDER=(1 10 50 100 250 500 750 1000)
 
 runtime_selection="${BASIL_CAPACITY_RUNTIME:-both}"
 probe_command="${BASIL_COMPOSE_PHASE1_PROBE:-compose_phase1_probe}"
@@ -120,6 +133,18 @@ add_blocker() {
     local detail=$3
     blockers=$(jq -cn \
         --argjson current "$blockers" \
+        --arg code "$code" \
+        --arg scope "$scope" \
+        --arg detail "${detail:0:256}" \
+        '$current + [{code:$code,scope:$scope,detail:$detail}]')
+}
+
+add_warning() {
+    local code=$1
+    local scope=$2
+    local detail=$3
+    warnings=$(jq -cn \
+        --argjson current "$warnings" \
         --arg code "$code" \
         --arg scope "$scope" \
         --arg detail "${detail:0:256}" \
@@ -234,11 +259,13 @@ resolve_probe() {
     command -v "$probe_command"
 }
 
+scale_ladder_json=$(printf '%s\n' "${SCALE_LADDER[@]}" | jq -cs '.')
+
 emit_event "start" "INCOMPLETE" "PREFLIGHT_STARTED" "" "$(jq -cn \
     --arg purpose 'environment readiness only; does not claim a 1,000-container ceiling' \
     --arg selection "$runtime_selection" \
     --argjson target "$TARGET_CONTAINERS" \
-    --argjson ladder '[1,10,50,100,250,500,750,1000]' \
+    --argjson ladder "$scale_ladder_json" \
     '{purpose:$purpose,runtime_selection:$selection,target_containers:$target,creates_containers:false,final_ceiling_evidence:false,scale_ladder:$ladder}')"
 
 probe_path=''
@@ -250,17 +277,21 @@ if probe_path=$(resolve_probe 2>/dev/null); then
         && jq -e '.ok == true and .kind == "capacity-metadata"' >/dev/null 2>&1 <<<"$probe_metadata_raw"; then
         probe_metadata=$probe_metadata_raw
     else
-        add_blocker "PROBE_METADATA_UNAVAILABLE" "probe" "capacity metadata command failed or returned invalid output"
+        add_warning "PROBE_METADATA_UNAVAILABLE" "probe" "capacity metadata command failed or returned invalid output"
     fi
     if probe_host_raw=$(timeout "${COMMAND_TIMEOUT_SECONDS}s" "$probe_path" host-process-snapshot 2>/dev/null) \
         && [[ ${#probe_host_raw} -le MAX_RUNTIME_JSON_BYTES ]] \
         && jq -e '.ok == true and .kind == "host-process-snapshot"' >/dev/null 2>&1 <<<"$probe_host_raw"; then
         probe_host=$probe_host_raw
     else
-        add_blocker "PROBE_HOST_SNAPSHOT_UNAVAILABLE" "probe" "host/process snapshot command failed or returned invalid output"
+        add_warning "PROBE_HOST_SNAPSHOT_UNAVAILABLE" "probe" "host/process snapshot command failed or returned invalid output"
     fi
 else
-    add_blocker "PROBE_NOT_FOUND" "probe" "compose_phase1_probe is not executable on PATH or at --probe"
+    # The probe is a host-side supplement (SO_PEERCRED pinning, projection
+    # sizing). It is dynamically linked against the devshell glibc and is not
+    # expected to execute inside a distro guest, so its absence is a warning, not
+    # a readiness blocker: the script reads the same facts directly from /proc.
+    add_warning "PROBE_NOT_FOUND" "probe" "compose_phase1_probe is not executable on PATH or at --probe; continuing with direct /proc facts"
 fi
 
 architecture=$(uname -m)
@@ -507,6 +538,123 @@ case "$runtime_selection" in
         ;;
 esac
 
+# ---- Evidence-retention sizing (readiness estimate; not measured) -----------
+# Model a retained run's sanitized-evidence bytes as a fixed overhead plus one
+# bounded per-container terminal event, then project the whole scale ladder and
+# check it fits under the evidence filesystem with the readiness disk reserve
+# intact. These are conservative planning numbers, not measured evidence sizes.
+representative_container_event=$(jq -cn \
+    --arg schema "$SCHEMA_VERSION" --arg run_id "$run_id" --arg lane_id "$lane_id" \
+    '{schema_version:$schema,run_id:$run_id,lane_id:$lane_id,seq:1000,event:"container_probe",status:"PASS",reason_code:"CONTAINER_PEERCRED_BOUND",runtime:"podman",test_id:"capacity.container.01000",data:{index:1000,pid:1234567,start_time_ticks:123456789,cgroup:"/user.slice/user-1000.slice/user@1000.service/user.slice/libpod-0000000000000000000000000000000000000000000000000000000000000000.scope",peer:{pid:1234567,uid:1000,gid:1000},create_ms:42,inspect_ms:7,remove_ms:11}}')
+per_container_event_bytes=$((${#representative_container_event} + 1))
+representative_run_terminal=$(jq -cn \
+    --arg schema "$SCHEMA_VERSION" --arg run_id "$run_id" --arg lane_id "$lane_id" \
+    '{schema_version:$schema,run_id:$run_id,lane_id:$lane_id,seq:1,event:"run.start",status:"INCOMPLETE",reason_code:"RUN_PREPARED",test_id:"",data:{}}')
+fixed_overhead_bytes=$(((${#representative_run_terminal} + 1) * 2 + MANIFEST_NOMINAL_BYTES + SNAPSHOT_NOMINAL_BYTES))
+
+ladder_sum=0
+ladder_steps=${#SCALE_LADDER[@]}
+for _n in "${SCALE_LADDER[@]}"; do ladder_sum=$((ladder_sum + _n)); done
+bytes_at_target_run=$((fixed_overhead_bytes + TARGET_CONTAINERS * per_container_event_bytes))
+total_ladder_bytes=$((ladder_steps * fixed_overhead_bytes + ladder_sum * per_container_event_bytes))
+
+evidence_available_bytes=0
+evidence_total_bytes=0
+if [[ $(jq -r '.available' <<<"$host_disk") == true ]]; then
+    evidence_available_bytes=$(jq -r '.bytes_available' <<<"$host_disk")
+    evidence_total_bytes=$(jq -r '.bytes_total' <<<"$host_disk")
+fi
+evidence_fits=true
+evidence_headroom_after_ladder=0
+if ((evidence_available_bytes > 0)); then
+    evidence_headroom_after_ladder=$((evidence_available_bytes - total_ladder_bytes))
+    if ((evidence_headroom_after_ladder < MIN_DISK_BYTES)); then
+        evidence_fits=false
+        add_blocker "EVIDENCE_RETENTION_INSUFFICIENT" "evidence" "projected ladder evidence would leave the evidence filesystem below the readiness disk reserve"
+    fi
+else
+    add_warning "EVIDENCE_SIZING_UNKNOWN" "evidence" "evidence filesystem headroom could not be read; ladder retention not sized"
+fi
+
+evidence_projection=$(jq -cn \
+    --argjson per_container "$per_container_event_bytes" \
+    --argjson fixed "$fixed_overhead_bytes" \
+    --argjson steps "$ladder_steps" \
+    --argjson ladder "$scale_ladder_json" \
+    --argjson at_target "$bytes_at_target_run" \
+    --argjson total "$total_ladder_bytes" \
+    --argjson available "$evidence_available_bytes" \
+    --argjson fs_total "$evidence_total_bytes" \
+    --argjson headroom "$evidence_headroom_after_ladder" \
+    --argjson reserve "$MIN_DISK_BYTES" \
+    --argjson fits "$evidence_fits" \
+    '{model:"readiness estimate; per-run bytes = fixed overhead + containers * per-container terminal; NOT a measured evidence size",per_container_event_bytes:$per_container,fixed_overhead_bytes_per_run:$fixed,scale_ladder:$ladder,ladder_steps:$steps,bytes_at_target_run:$at_target,total_ladder_bytes:$total,evidence_bytes_available:$available,evidence_bytes_total:$fs_total,disk_reserve_bytes:$reserve,headroom_after_ladder_bytes:$headroom,retain_all_steps:true,fits:$fits}')
+
+# ---- Safe scale-ladder stop conditions derived from measured facts ----------
+# Concrete floors/ceilings at which a live 1,000-container ladder must abort.
+memory_floor_bytes=$((mem_total_bytes / 10))
+((memory_floor_bytes < 4 * 1024 * 1024 * 1024)) && memory_floor_bytes=$((4 * 1024 * 1024 * 1024))
+memory_headroom_now=$((mem_available_bytes - memory_floor_bytes))
+
+disk_floor_bytes=$MIN_DISK_BYTES
+((evidence_total_bytes / 20 > disk_floor_bytes)) && disk_floor_bytes=$((evidence_total_bytes / 20))
+disk_headroom_now=$((evidence_available_bytes - disk_floor_bytes))
+
+fd_required=$((TARGET_CONTAINERS * FDS_PER_CONTAINER))
+fd_process_headroom=0
+[[ "$fd_soft" =~ ^[0-9]+$ ]] && fd_process_headroom=$((fd_soft - fd_required))
+
+pid_required=$((TARGET_CONTAINERS * TASKS_PER_CONTAINER))
+pid_headroom=0
+if [[ "$pid_max" =~ ^[0-9]+$ ]]; then
+    if [[ "$pids_current" =~ ^[0-9]+$ ]]; then
+        pid_headroom=$((pid_max - pids_current - pid_required))
+    else
+        pid_headroom=$((pid_max - pid_required))
+    fi
+fi
+if [[ "$pids_max" =~ ^[0-9]+$ && "$pids_current" =~ ^[0-9]+$ ]]; then
+    cgroup_pid_headroom_json=$((pids_max - pids_current - pid_required))
+else
+    cgroup_pid_headroom_json='"unbounded"'
+fi
+
+derived_stop_thresholds=$(jq -cn \
+    --arg classification "derived from measured host facts; abort the serial ladder when a live reading crosses these" \
+    --argjson mem_floor "$memory_floor_bytes" \
+    --argjson mem_headroom "$memory_headroom_now" \
+    --argjson disk_floor "$disk_floor_bytes" \
+    --argjson disk_headroom "$disk_headroom_now" \
+    --argjson inode_floor "$MIN_FREE_INODES" \
+    --argjson fds_per_container "$FDS_PER_CONTAINER" \
+    --argjson fd_required "$fd_required" \
+    --argjson fd_headroom "$fd_process_headroom" \
+    --argjson tasks_per_container "$TASKS_PER_CONTAINER" \
+    --argjson pid_required "$pid_required" \
+    --argjson pid_headroom "$pid_headroom" \
+    --argjson cgroup_pid_headroom "$cgroup_pid_headroom_json" \
+    --argjson latency_ceiling_ms "$LADDER_STEP_LATENCY_CEILING_MS" \
+    --argjson evidence_reserve "$MIN_DISK_BYTES" \
+    '{classification:$classification,
+      memory_floor_bytes:{stop_below:$mem_floor,current_headroom_bytes:$mem_headroom,basis:"max(4 GiB, 10% of MemTotal)",source:"measured"},
+      disk_floor_bytes:{stop_below:$disk_floor,current_headroom_bytes:$disk_headroom,basis:"max(readiness disk reserve, 5% of evidence filesystem)",source:"measured"},
+      inode_floor:{stop_below:$inode_floor,basis:"readiness-only inode reserve",source:"measured"},
+      fd_soft_headroom:{containers_reserve:$fd_required,per_container_estimate:$fds_per_container,current_process_headroom:$fd_headroom,basis:"soft nofile minus containers times per-container estimate",source:"measured+estimate"},
+      pid_headroom:{containers_reserve:$pid_required,per_container_estimate:$tasks_per_container,kernel_pid_headroom:$pid_headroom,effective_cgroup_pid_headroom:$cgroup_pid_headroom,basis:"pid_max and cgroup pids.max minus current minus containers times tasks",source:"measured+estimate"},
+      per_step_latency_ceiling_ms:{stop_above:$latency_ceiling_ms,basis:"runbook stop rule; per-step wall-clock ceiling",source:"runbook-constant",measured:false},
+      evidence_reserve_bytes:{keep_free:$evidence_reserve,basis:"leave the evidence filesystem above the readiness disk reserve after the ladder",source:"measured"}}')
+
+projection_status=PASS
+projection_reason=LADDER_CAPACITY_PROJECTED
+if [[ $evidence_fits != true ]]; then
+    projection_status=INCOMPLETE
+    projection_reason=EVIDENCE_RETENTION_INSUFFICIENT
+fi
+emit_event "capacity_projection" "$projection_status" "$projection_reason" "" "$(jq -cn \
+    --argjson evidence_projection "$evidence_projection" \
+    --argjson derived_stop_thresholds "$derived_stop_thresholds" \
+    '{evidence_projection:$evidence_projection,derived_stop_thresholds:$derived_stop_thresholds}')"
+
 thresholds=$(jq -cn \
     --argjson min_cpus "$MIN_CPUS" \
     --argjson min_memory_bytes "$MIN_MEMORY_BYTES" \
@@ -547,6 +695,8 @@ summary=$(jq -cn \
     --argjson warnings "$warnings" \
     --argjson thresholds "$thresholds" \
     --argjson stop_conditions "$stop_conditions" \
-    '{ready:$ready,target_containers:$target,creates_containers:false,final_ceiling_evidence:false,thresholds:$thresholds,block_reasons:$blockers,warnings:$warnings,scale_ladder_stop_conditions:$stop_conditions,remaining_evidence:["run this preflight in the rootful-Docker AppArmor guest","run this preflight in the rootless-Podman SELinux guest","execute the later serial scale ladder before claiming any numeric ceiling"]}')
+    --argjson evidence_projection "$evidence_projection" \
+    --argjson derived_stop_thresholds "$derived_stop_thresholds" \
+    '{ready:$ready,target_containers:$target,creates_containers:false,final_ceiling_evidence:false,thresholds:$thresholds,block_reasons:$blockers,warnings:$warnings,evidence_projection:$evidence_projection,derived_stop_thresholds:$derived_stop_thresholds,scale_ladder_stop_conditions:$stop_conditions,remaining_evidence:["run this preflight in the rootful-Docker AppArmor guest","run this preflight in the rootless-Podman SELinux guest","execute the later serial scale ladder before claiming any numeric ceiling"]}')
 emit_event "end" "$final_status" "$final_reason" "" "$summary"
 exit "$exit_status"

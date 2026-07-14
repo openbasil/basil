@@ -50,6 +50,33 @@ required_tests = [
   "capacity.teardown",
 ]
 
+# Readiness-only capacity preflight (basil-ge9). Distinct from `[suites.capacity]`
+# above, which is the later basil-9tj.4 measurement suite. This suite qualifies
+# the ENVIRONMENT for a serial 1,000-container ladder — host and both guests — and
+# makes no broker/attestor/protocol ceiling claim. It runs on BOTH qualified
+# lanes (fedora-44-x86_64, ubuntu-24.04-x86_64): the runner exports
+# BASIL_DRIVER_SUITE, and each lane driver, when it reads capacity-preflight,
+# runs guest/capacity-preflight.sh inside the booted guest and maps its bounded
+# JSONL (retained as raw/guest-events.jsonl) onto these four terminals:
+#   preflight.host-baseline     full cpu/mem/disk/fd/pid/namespace/cgroup fact
+#                               set collected (guest verdict in the message)
+#   preflight.runtime-baseline  the lane's required runtime mode observed
+#                               (rootless podman / rootful docker on cgroup v2)
+#   preflight.evidence-retention  ladder evidence sizing projection computed
+#   preflight.stop-conditions   derived safe scale-ladder stop thresholds present
+# These terminals assert complete readiness-evidence COLLECTION; the guest's
+# ready/blocker verdict is never converted into a pass — it travels in the
+# bounded messages and the retained raw JSONL. Host-side readiness (and the
+# host-scale retention fit) is retained as the labeled host-preflight artifact
+# under the evidence root.
+[suites.capacity-preflight]
+required_tests = [
+  "preflight.host-baseline",
+  "preflight.runtime-baseline",
+  "preflight.evidence-retention",
+  "preflight.stop-conditions",
+]
+
 [lanes.fedora-44-x86_64]
 architecture = "x86_64"
 acceleration = "kvm"
@@ -105,14 +132,44 @@ performance = true
 [lanes."ubuntu-24.04-aarch64"]
 architecture = "aarch64"
 acceleration = "tcg"
+# FUNCTIONAL-ONLY architecture-emulation lane (basil-snd). aarch64-on-x86_64 is
+# cross-architecture emulation: QEMU runs it under TCG unconditionally, because
+# KVM cannot accelerate a foreign guest architecture (the sandbox `/dev/kvm` is
+# irrelevant here). Every result is functional evidence only and must never
+# support a performance, capacity, timing, or native-host claim; the lane also
+# makes no LSM-enforcement qualification claim (`lsm = "not-qualified"`).
+tier = "functional-only"
+functional_only = true
 distribution = "Ubuntu 24.04 LTS"
-runtime = "functional-only"
+runtime = "crun-oci"
 lsm = "not-qualified"
-cloud_init = "cloud-init/ubuntu-24.04.yaml"
+cloud_init = "cloud-init/ubuntu-24.04-arm64.yaml"
 artifacts = ["ubuntu-24.04-cloud-aarch64"]
-driver = ""
+machine = "virt,gic-version=max,accel=tcg"
+base_format = "qcow2"
+overlay_format = "qcow2"
+memory_mib = 4096
+vcpus = 4
+network = "user-loopback-only"
+driver = "ubuntu-2404-arm64"
 qualification = false
 performance = false
+
+# Ubuntu 24.04 aarch64 FUNCTIONAL-ONLY smoke (driver `ubuntu-2404-arm64`,
+# basil-snd). TCG cross-architecture emulation: functional evidence only, with
+# no timing, capacity, or native-host claim. `lane.artifacts` is runner-owned
+# (the runner emits its terminal after verify_lane_artifacts); the driver
+# reports the four functional tests: it boots the aarch64 guest from the
+# verified image, confirms `uname -m` is aarch64 and cgroup v2, and runs an
+# architecture-sensitive container with a daemonless OCI runtime (crun).
+[suites.ubuntu-2404-arm64-functional-smoke]
+required_tests = [
+  "lane.artifacts",
+  "lane.boot",
+  "lane.arch",
+  "lane.cgroup-v2",
+  "lane.container-runtime",
+]
 
 # Development-only mock lane. It boots no guest and carries no artifacts; the
 # null driver exercises the driver contract and read-only sandbox so the harness

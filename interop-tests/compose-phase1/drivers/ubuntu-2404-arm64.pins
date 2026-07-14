@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Pins for the Ubuntu 24.04 aarch64 FUNCTIONAL-ONLY (TCG) lane driver
+# `ubuntu-2404-arm64`. The staged offline runtime payload is a daemonless OCI
+# container runtime (crun) plus an aarch64 root filesystem, delivered to the
+# guest over SSH after boot and run to prove an architecture-sensitive container
+# execution. The operational trust anchor is `payload_sha256` (OCI-digest
+# discipline): the driver refuses to proceed unless the staged payload matches.
+# `crun_sha256` and `rootfs_layer_sha256` are provenance for how the payload was
+# assembled by `interop-tests/compose-phase1/ubuntu-2404-arm64-prep.sh`.
+payload_sha256=0a2096114c668f1ea327781af1a3a3cd890b20e0e6386845a94f6cde6daa041a
+crun_version=1.28
+crun_sha256=cc1e8ec89aef1422e0741be196f9ed099e2e09d2f48f30f27cd44a22ef1f0342
+crun_source=https://github.com/containers/crun/releases/download/1.28/crun-1.28-linux-arm64
+rootfs_layer_sha256=738128faa30f570583b0e57efd831e0e6a2a9aacf1be88c8f4c1ef8a5b7033cc
+rootfs_source=workload-alpine pinned OCI layout, arm64/linux layer

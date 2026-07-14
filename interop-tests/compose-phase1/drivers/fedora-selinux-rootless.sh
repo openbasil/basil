@@ -57,16 +57,30 @@ readonly MACHINE="q35,accel=kvm:tcg"
 readonly BOOT_MARKER_TIMEOUT=480
 readonly SSH_UP_TIMEOUT=240
 
-# The 7 lane-smoke tests this driver owns (see [suites.fedora-smoke]).
-readonly TESTS=(
-  lane.cgroup-v2
-  lane.lsm-enforcing
-  lane.runtime-mode
-  lane.rootless-owner-a
-  lane.rootless-owner-b
-  lane.compose-provider
-  lane.network-isolation
-)
+# Suite selection (exported by the runner as BASIL_DRIVER_SUITE). The
+# capacity-preflight suite (basil-ge9) reports the four preflight.* terminals
+# by running guest/capacity-preflight.sh inside the booted guest; every other
+# suite keeps the original fedora-smoke lane test set unchanged.
+readonly SUITE="${BASIL_DRIVER_SUITE:-fedora-smoke}"
+if [[ $SUITE == capacity-preflight ]]; then
+  readonly TESTS=(
+    preflight.host-baseline
+    preflight.runtime-baseline
+    preflight.evidence-retention
+    preflight.stop-conditions
+  )
+else
+  # The 7 lane-smoke tests this driver owns (see [suites.fedora-smoke]).
+  readonly TESTS=(
+    lane.cgroup-v2
+    lane.lsm-enforcing
+    lane.runtime-mode
+    lane.rootless-owner-a
+    lane.rootless-owner-b
+    lane.compose-provider
+    lane.network-isolation
+  )
+fi
 
 declare -A ST RE MS
 for _t in "${TESTS[@]}"; do ST[$_t]=INFRA_ERROR; RE[$_t]=DRIVER_DID_NOT_RUN; MS[$_t]=""; done
@@ -226,7 +240,10 @@ main() {
   fi
   # The structural network-isolation assertion (loopback-only user networking,
   # restrict=on, no host bridge/tap/fs share) is now proven for this boot.
-  set_res lane.network-isolation PASS NETWORK_LOOPBACK_ONLY "restrict=on loopback user-net"
+  # Only the lane-smoke suite reports this terminal.
+  if [[ $SUITE != capacity-preflight ]]; then
+    set_res lane.network-isolation PASS NETWORK_LOOPBACK_ONLY "restrict=on loopback user-net"
+  fi
 
   if [[ -e /dev/kvm ]]; then
     log "booting guest (accel=kvm:tcg; /dev/kvm present in sandbox)"
@@ -279,9 +296,107 @@ main() {
   # Let cloud-init finish the offline install if it hasn't yet.
   ssh_user phase1-a 'cloud-init status --wait >/dev/null 2>&1 || true' 2>/dev/null || true
 
-  run_checks "$wtag"
+  if [[ $SUITE == capacity-preflight ]]; then
+    run_capacity_preflight
+  else
+    run_checks "$wtag"
+  fi
   emit_result
   log "checks complete"
+}
+
+# Capacity-preflight suite (basil-ge9): inject guest/capacity-preflight.sh into
+# the booted guest over ssh stdin, run it as rootless owner A, retain its full
+# bounded JSONL as raw evidence, and map it onto the four preflight.* terminals.
+# This is environment-readiness EVIDENCE COLLECTION, not the basil-9tj.4
+# measurement: each terminal asserts that a readiness fact set was collected
+# completely (and, for the runtime, that the lane's required mode was observed);
+# the guest's ready/blocker verdict is carried in the bounded messages and the
+# retained raw JSONL, never converted into or hidden behind a pass.
+run_capacity_preflight() {
+  local pf="$FIXTURE_ROOT/guest/capacity-preflight.sh"
+  local out="$SCRATCH/preflight.jsonl" rc=0
+  if [[ ! -f $pf ]]; then
+    fail_all PREFLIGHT_SOURCE_MISSING "guest/capacity-preflight.sh not found"
+    return 0
+  fi
+  # Pipe over ssh stdin (never scp: its port flag differs) and run with the
+  # rootless user manager runtime dir so podman info works.
+  if ! ssh_user phase1-a 'cat >/tmp/capacity-preflight.sh' <"$pf" 2>/dev/null; then
+    fail_all PREFLIGHT_INJECT_FAILED "could not copy preflight into guest"
+    return 0
+  fi
+  # shellcheck disable=SC2016  # $(id -u) must expand on the GUEST side.
+  ssh_user phase1-a 'export XDG_RUNTIME_DIR=/run/user/$(id -u); bash /tmp/capacity-preflight.sh --runtime podman --lane-id fedora-44-x86_64 --evidence-root /tmp --run-id capacity-preflight' \
+    >"$out" 2>"$SCRATCH/preflight.stderr.log" || rc=$?
+  # rc 1 = readiness blockers reported (expected in a deliberately small guest);
+  # anything else without parseable output is an infrastructure failure.
+  if [[ ! -s $out ]] || ! jq -e -s 'length >= 3 and all(.[]; type == "object")' "$out" >/dev/null 2>&1; then
+    fail_all GUEST_PREFLIGHT_NO_OUTPUT "preflight produced no parseable JSONL (rc=$rc)"
+    return 0
+  fi
+  cat "$out" >>"$GUEST_LOG" 2>/dev/null || true
+
+  local ready blockers
+  ready=$(jq -r -s '[.[] | select(.event == "end")][0].data.ready // false' "$out" 2>/dev/null) || ready=false
+  blockers=$(jq -r -s '[.[] | select(.event == "end")][0].data.block_reasons // [] | [.[].code] | unique | join(",")' "$out" 2>/dev/null) || blockers=""
+  blockers=${blockers:0:300}
+
+  # preflight.host-baseline: the full host fact set was collected in-guest.
+  if jq -e -s '[.[] | select(.event == "host_snapshot")][0].data
+      | (.cgroup.version_2 == true)
+      and (.logical_cpus | type == "number")
+      and (.memory.available_bytes | type == "number")
+      and (.file_descriptors.soft | test("^[0-9]+$"))
+      and (.processes.pid_max | test("^[0-9]+$"))
+      and (.namespace_limits | type == "object")' "$out" >/dev/null 2>&1; then
+    set_res preflight.host-baseline PASS GUEST_HOST_BASELINE_RECORDED \
+      "readiness verdict ready=$ready blockers=${blockers:-none}"
+  else
+    set_res preflight.host-baseline TEST_FAIL GUEST_HOST_BASELINE_INCOMPLETE \
+      "host snapshot missing or missing required fact groups"
+  fi
+
+  # preflight.runtime-baseline: rootless Podman on cgroup v2 observed PASS.
+  if jq -e -s '[.[] | select(.event == "runtime_snapshot" and .runtime == "podman")][0]
+      | (.status == "PASS") and (.data.mode == "rootless")
+      and (.data.info.host.cgroup_version | tostring | IN("2","v2"))' "$out" >/dev/null 2>&1; then
+    local locks
+    locks=$(jq -r -s '[.[] | select(.event == "runtime_snapshot" and .runtime == "podman")][0].data.lock_readiness.free_locks // "unknown"' "$out" 2>/dev/null) || locks=unknown
+    set_res preflight.runtime-baseline PASS GUEST_RUNTIME_BASELINE_RECORDED \
+      "rootless podman on cgroup v2; free_locks=$locks"
+  else
+    set_res preflight.runtime-baseline TEST_FAIL GUEST_RUNTIME_BASELINE_MISMATCH \
+      "rootless podman snapshot missing or not PASS"
+  fi
+
+  # preflight.evidence-retention: the ladder retention projection was computed.
+  if jq -e -s '[.[] | select(.event == "capacity_projection")][0].data.evidence_projection
+      | (.per_container_event_bytes > 0) and (.bytes_at_target_run > 0)
+      and (.total_ladder_bytes > 0)' "$out" >/dev/null 2>&1; then
+    local total fits
+    total=$(jq -r -s '[.[] | select(.event == "capacity_projection")][0].data.evidence_projection.total_ladder_bytes' "$out" 2>/dev/null) || total=unknown
+    fits=$(jq -r -s '[.[] | select(.event == "capacity_projection")][0].data.evidence_projection.fits' "$out" 2>/dev/null) || fits=unknown
+    set_res preflight.evidence-retention PASS LADDER_RETENTION_PROJECTED \
+      "total_ladder_bytes=$total guest_fs_fits=$fits; host-side retention sized by the host preflight"
+  else
+    set_res preflight.evidence-retention TEST_FAIL LADDER_RETENTION_NOT_PROJECTED \
+      "capacity_projection event missing or incomplete"
+  fi
+
+  # preflight.stop-conditions: measured thresholds + all stop categories derived.
+  if jq -e -s '[.[] | select(.event == "capacity_projection")][0].data.derived_stop_thresholds
+      | has("memory_floor_bytes") and has("disk_floor_bytes")
+      and has("fd_soft_headroom") and has("pid_headroom")
+      and has("per_step_latency_ceiling_ms") and has("evidence_reserve_bytes")' "$out" >/dev/null 2>&1 \
+    && jq -e -s '[.[] | select(.event == "end")][0].data.scale_ladder_stop_conditions
+      | type == "array" and length == 7' "$out" >/dev/null 2>&1; then
+    set_res preflight.stop-conditions PASS STOP_CONDITIONS_DERIVED \
+      "7 stop-condition categories with measured floors/ceilings"
+  else
+    set_res preflight.stop-conditions TEST_FAIL STOP_CONDITIONS_MISSING \
+      "derived stop thresholds or stop-condition categories missing"
+  fi
 }
 
 run_checks() {

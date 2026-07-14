@@ -275,6 +275,68 @@ Development lane-smoke evidence: run `20260714T070109Z-a6eb31d62fe947df`
 sha256 `9573c57ffb4b48c1561959c4def90e79f8f9b5943d2940e9de7cf3c08a0e9147`),
 retained under `~/.local/state/basil/ph1` (`basil-y0f`).
 
+## Ubuntu 24.04 arm64 lane (FUNCTIONAL-ONLY, QEMU TCG emulation)
+
+Lane `ubuntu-24.04-aarch64` (driver `ubuntu-2404-arm64`, suite
+`ubuntu-2404-arm64-functional-smoke`, `basil-snd`) boots the verified, cached
+Ubuntu 24.04 **aarch64** cloud image on an x86_64 host under **QEMU TCG
+full-system emulation** for architecture-sensitive wrapper and platform checks.
+
+**Functional-only tier — read this before citing the evidence.** aarch64 on
+x86_64 is cross-architecture emulation: QEMU uses TCG unconditionally because
+KVM cannot accelerate a foreign guest architecture (`/dev/kvm` is irrelevant to
+this lane). Every result is a *functional* result. TCG evidence from this lane
+must never support a performance, capacity, latency, timing, or native-host
+claim, and the lane makes **no LSM-enforcement qualification claim** (`lsm =
+"not-qualified"`, `qualification = false`, `performance = false`, `tier =
+"functional-only"` in `phase1.lock.toml`). For scale: the same guest shape that
+boots in ~30 s under x86_64 KVM takes ~2 minutes of boot-to-SSH here at 4 vCPU
+TCG — and that number is an emulation observation, not a measurement of
+anything.
+
+The lane keeps every x86 boundary: immutable verified base image as a read-only
+backing file under a per-run qcow2 overlay, `-nodefaults`, loopback-only
+user-mode networking with `restrict=on` and one forwarded SSH port, a per-run
+SSH key with a serial-established host-key pin, and no 9p/tap/bridge/privilege
+re-entry (re-checked by the shared `qemu_unpriv_assert_boundary`; the aarch64
+argv itself is assembled by the driver because the shared builder pins
+`qemu-system-x86_64`). aarch64 additions: `-machine virt,gic-version=max,accel=tcg`,
+`-cpu max`, and the edk2 UEFI pflash pair (read-only `edk2-aarch64-code.fd`
+plus a per-run writable copy of `edk2-arm-vars.fd`). Provisioning is
+`cloud-init/ubuntu-24.04-arm64.yaml` (arm64-owned copy; the x86 file is
+untouched).
+
+The architecture-sensitive container-runtime check deliberately uses a
+**daemonless OCI runtime** rather than a full engine: `crun` 1.28 (official
+static aarch64 release binary, sha256-pinned) runs a container from an aarch64
+rootfs taken verbatim from the already-pinned `workload-alpine` OCI layout's
+arm64 layer (a self-addressing blob, so it inherits the same digest anchor as
+the verified workload artifact). The container reports `uname -m` = `aarch64`
+from inside PID/IPC/UTS/mount namespaces. Both pieces ship as one deterministic
+`payload.tar` staged offline under
+`~/.cache/basil/compose-phase1/ubuntu-24.04-arm64-runtime-payload/` and pinned
+in `drivers/ubuntu-2404-arm64.pins` (operational anchor `payload_sha256`;
+rebuild with `interop-tests/compose-phase1/ubuntu-2404-arm64-prep.sh`, once,
+with network).
+
+The `ubuntu-2404-arm64-functional-smoke` suite requires the runner-owned
+`lane.artifacts` plus four driver-reported functional tests: `lane.boot` (the
+aarch64 guest boots from the verified image: serial final-message marker plus
+pinned-host-key SSH), `lane.arch` (`uname -m` is `aarch64`), `lane.cgroup-v2`
+(cgroup2fs), and `lane.container-runtime` (the pinned `crun` runs an aarch64
+container that itself reports `aarch64`). Reproduce:
+
+```console
+interop-tests/compose-phase1/ubuntu-2404-arm64-prep.sh                          # once, with network
+scripts/compose-phase1-evidence.sh prepare --lane ubuntu-24.04-aarch64 --suite ubuntu-2404-arm64-functional-smoke
+scripts/compose-phase1-evidence.sh run        --run RUN_ID
+scripts/compose-phase1-evidence.sh collect    --run RUN_ID
+scripts/compose-phase1-evidence.sh verify-run --run RUN_ID
+```
+
+`run` requires the runner allowlist to include `ubuntu-2404-arm64` (see the
+`basil-snd` NEEDS-SHARED-CHANGE note for `driver_is_allowlisted`).
+
 ## Artifact inventory
 
 `scripts/compose-phase1-artifacts.lock.tsv` is the checked-in inventory and
@@ -360,6 +422,93 @@ They do not disable SELinux labeling or AppArmor confinement.
 AppArmor enablement and rootful Docker without a reported user-namespace remap.
 It never emits environments or raw runtime responses and does not claim the
 host-side QEMU network or artifact tests.
+
+## Capacity preflight (readiness for a 1,000-container ladder)
+
+`guest/capacity-preflight.sh` is a bounded, sanitized readiness probe for a
+serial 1,000-container measurement ladder. It is **environment readiness only** —
+it creates no containers and is **not** the later `basil-9tj.4` attestor/broker
+resource-ceiling measurement. It emits versioned JSONL
+(`basil.compose.phase1.capacity-preflight/v1`): a host snapshot (cpu, memory,
+disk/inodes, file descriptors, `pid_max`/`threads-max`, per-user process and
+namespace limits, cgroup v2 `pids.max`/`memory.max`), one snapshot per
+container runtime (storage driver, cgroup driver/manager, Podman `freeLocks`,
+rootful/rootless mode), an **evidence-retention projection** (bytes per retained
+run times the ladder length, checked against the evidence filesystem), and
+**derived stop conditions** computed from the measured numbers. The optional
+`compose_phase1_probe` (basil-tests bin) enriches the host run with SO_PEERCRED
+and projection sizing; it is a host-side supplement and its absence in a distro
+guest is a warning, not a blocker.
+
+The `[suites.capacity-preflight]` suite in `phase1.lock.toml` defines the
+runner-based contract (`preflight.host-baseline`, `preflight.runtime-baseline`,
+`preflight.evidence-retention`, `preflight.stop-conditions`) for **both**
+qualified lanes. The runner exports the selected suite as `BASIL_DRIVER_SUITE`;
+when a lane driver reads `capacity-preflight` it injects
+`guest/capacity-preflight.sh` into the booted guest over ssh stdin, runs it
+(rootless owner A with Podman on Fedora; root with the offline-provisioned
+rootful Docker on Ubuntu), retains the full bounded JSONL as
+`raw/guest-events.jsonl`, and maps it onto the four terminals. The terminals
+assert complete readiness-evidence **collection** (plus the lane's required
+runtime mode); the guest's `ready`/blocker verdict is carried in the bounded
+messages and raw JSONL and is never converted into a pass. Any other suite
+leaves the lane-smoke driver behavior unchanged. Reproduce on either lane:
+
+```console
+scripts/compose-phase1-evidence.sh prepare --lane fedora-44-x86_64 --suite capacity-preflight
+scripts/compose-phase1-evidence.sh run        --run RUN_ID
+scripts/compose-phase1-evidence.sh collect    --run RUN_ID
+scripts/compose-phase1-evidence.sh verify-run --run RUN_ID
+```
+
+Retained readiness evidence (under `~/.local/state/basil/ph1`; runner runs
+verify with `verify-run` exit `0`, artifacts carry a `README.md` label and
+`SHA256SUMS`):
+
+| kind | run id | verdict |
+| --- | --- | --- |
+| Fedora 44 runner run (suite `capacity-preflight`) | `20260714T082858Z-4534b95ced67cd8b` | `PASS` (4/4 terminals; guest verdict `ready=false` in messages) |
+| Ubuntu 24.04 runner run (suite `capacity-preflight`) | `20260714T082930Z-7021c7269f810ae0` | `PASS` (4/4 terminals; guest verdict `ready=false` in messages) |
+| host artifact | `host-preflight-20260714T075853Z-49095` | `ready=true` |
+| Fedora 44 guest artifact (pre-runner, host-orchestrated) | `fedora-44-x86_64-20260714T080222Z` | `ready=false` (see below) |
+| Ubuntu 24.04 guest artifact (pre-runner, host-orchestrated) | `ubuntu-24.04-x86_64-20260714T080806Z` | `ready=false` (see below) |
+
+The host preflight stays a labeled artifact (the runner executes only VM lane
+drivers, and host readiness needs no guest); the two host-orchestrated guest
+artifacts predate the runner wiring and are kept as corroborating evidence.
+
+Headline measured numbers:
+
+- **Host** (native x86_64): 16 logical CPUs, `MemTotal` ~92 GiB, `nofile` soft
+  524288, `pid_max` 4194304, cgroup `pids.max` unbounded, evidence filesystem
+  ZFS with ~1.08 TiB and ~2.1 billion inodes free. Rootful Docker (overlayfs,
+  cgroup v2) and rootless Podman (overlay, cgroup v2, `freeLocks` 2048) both
+  `PASS`. Evidence-retention projection: ~0.6 KiB per container terminal, a
+  1,000-container run ~0.6 MiB, the whole 8-step ladder ~1.8 MiB — fits with the
+  40 GiB disk reserve intact.
+- **Both guests** were sized at **4 vcpus / 8 GiB** (capped per shared-host
+  guidance) and ship the cloud-image default **`nofile` soft = 1024** with a
+  small root/home filesystem. Against the host-scale readiness thresholds these
+  small guests honestly report `ready=false`; the confinement dimensions PASS
+  (Fedora: SELinux `Enforcing` + rootless Podman; Ubuntu: AppArmor active).
+
+Safe scale-ladder **stop conditions** (abort the serial ladder when a live
+reading crosses these; derived from the measured host facts):
+
+| condition | threshold | basis |
+| --- | --- | --- |
+| memory floor | stop below `max(4 GiB, 10% of MemTotal)` (~9.9 GiB on this host) | measured |
+| disk floor | stop below `max(40 GiB reserve, 5% of evidence fs)` | measured |
+| inode floor | stop below the readiness inode reserve | measured |
+| fd headroom | keep soft `nofile` above `containers * 16` fds | measured + estimate |
+| pid headroom | keep `pid_max`/cgroup `pids.max` above `containers * 4` tasks | measured + estimate |
+| per-step latency | stop above the runbook per-step wall-clock ceiling (default 5 min) | runbook constant |
+| evidence retention | stop before the projected ladder evidence would breach the disk reserve | measured |
+
+**Readiness prerequisite surfaced by the guest preflights:** the cloud-image
+default `nofile` soft limit of 1024 is far below a 1,000-container ladder's need,
+so the ladder driver must raise `LimitNOFILE`/`ulimit -n` in-guest and run on a
+sufficiently large storage volume before any measurement.
 
 ## Development versus qualification
 

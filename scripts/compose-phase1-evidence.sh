@@ -700,6 +700,7 @@ driver_is_allowlisted() {
     null) return 0 ;;
     fedora-selinux-rootless) return 0 ;;
     ubuntu-2404) return 0 ;;
+    ubuntu-2404-arm64) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -744,9 +745,10 @@ resolve_driver() {
 # scratch directory (which holds the result file) is writable. The sandbox is
 # time-bounded, dies with the runner, and starts from a cleared environment.
 invoke_driver() {
-  local run=$1 driver_path=$2 scratch=$3 run_id lane_id
+  local run=$1 driver_path=$2 scratch=$3 run_id lane_id suite
   run_id=$(run_metadata_field "$run" '.run_id') || return "$EXIT_INFRA_ERROR"
   lane_id=$(run_metadata_field "$run" '.lane_id') || return "$EXIT_INFRA_ERROR"
+  suite=$(run_metadata_field "$run" '.suite') || return "$EXIT_INFRA_ERROR"
   require_tool bwrap >/dev/null || return "$EXIT_INFRA_ERROR"
   require_tool timeout >/dev/null || return "$EXIT_INFRA_ERROR"
   local -a sandbox=(
@@ -773,6 +775,7 @@ invoke_driver() {
     --setenv BASIL_DRIVER_SCRATCH "$scratch"
     --setenv BASIL_RUN_ID "$run_id"
     --setenv BASIL_LANE_ID "$lane_id"
+    --setenv BASIL_DRIVER_SUITE "$suite"
     --setenv BASIL_DRIVER_RESULT_SCHEMA "$DRIVER_RESULT_SCHEMA"
     --setenv BASIL_DRIVER_RESULT_SCHEMA_VERSION "$DRIVER_RESULT_SCHEMA_VERSION"
     --setenv BASIL_MAX_RESULT_BYTES "$MAX_DRIVER_RESULT_BYTES"

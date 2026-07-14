@@ -1,0 +1,66 @@
+#cloud-config
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Ubuntu 24.04 aarch64 FUNCTIONAL-ONLY foundation for the Compose Phase 1
+# arm64 QEMU/TCG lane. This is architecture-emulation (TCG) evidence: it proves
+# an aarch64 guest boots from the verified image and can run architecture-
+# sensitive functional checks. It makes NO performance, capacity, timing, or
+# native-host claim, and it deliberately makes NO LSM-enforcement qualification
+# claim (the lane's `lsm` field is `not-qualified`). It does not weaken any LSM.
+
+preserve_hostname: false
+hostname: basil-phase1-ubuntu2404-arm64
+manage_etc_hosts: true
+ssh_pwauth: false
+disable_root: true
+
+users:
+  - default
+  - name: basil-ci
+    gecos: Basil Phase 1 arm64 harness
+    shell: /bin/bash
+    lock_passwd: true
+    # Password login stays locked and root SSH disabled; the harness user gets
+    # passwordless sudo only so the lane driver can install the pinned, offline
+    # OCI runtime under `/usr/local` and run an architecture-sensitive container
+    # as root. This does not change any LSM mode.
+    sudo:
+      - 'ALL=(ALL) NOPASSWD:ALL'
+    ssh_authorized_keys:
+      - __BASIL_PHASE1_SSH_PUBLIC_KEY__
+
+write_files:
+  - path: /etc/basil-phase1-lane
+    owner: root:root
+    permissions: '0600'
+    content: |
+      lane=ubuntu-24.04-aarch64
+      design=Design 0001 revision 1.1
+      tier=functional-only-tcg
+      purpose=architecture-emulation-evidence-only
+      claims=no-performance,no-capacity,no-timing,no-native-host,no-lsm-qualification
+  - path: /etc/systemd/system/basil-phase1-arm64-foundation.service
+    owner: root:root
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Record Ubuntu Phase 1 aarch64 functional foundation (no LSM claim)
+      After=multi-user.target
+      ConditionPathExists=/etc/basil-phase1-lane
+
+      [Service]
+      Type=oneshot
+      # Functional, architecture-neutral readiness only: cgroup v2 present.
+      # Deliberately asserts NO LSM enforcement (functional-only lane).
+      ExecStart=/bin/sh -c 'test "$(/usr/bin/stat -fc %%T /sys/fs/cgroup)" = cgroup2fs'
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - [systemctl, daemon-reload]
+  - [systemctl, enable, --now, basil-phase1-arm64-foundation.service]
+
+final_message: "Basil Compose Phase 1 Ubuntu arm64 functional foundation ready (TCG emulation; functional-only, no performance or LSM-qualification claim)"

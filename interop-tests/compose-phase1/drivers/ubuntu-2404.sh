@@ -36,14 +36,28 @@ umask 077
 readonly SSH_USER=basil-ci
 readonly SSH_HOST=127.0.0.1
 readonly SSH_PORT=2222
-# The suite `ubuntu-2404-lane-smoke` must require exactly these test ids.
-readonly REQUIRED_TESTS=(
-  lane.cgroup-v2
-  lane.lsm-enforcing
-  lane.runtime-mode
-  lane.container-confinement
-  lane.compose-plugin
-)
+# Suite selection (exported by the runner as BASIL_DRIVER_SUITE). The
+# capacity-preflight suite (basil-ge9) reports the four preflight.* terminals
+# by running guest/capacity-preflight.sh inside the booted guest; every other
+# suite keeps the original ubuntu-2404-lane-smoke test set unchanged.
+readonly SUITE="${BASIL_DRIVER_SUITE:-ubuntu-2404-lane-smoke}"
+if [[ $SUITE == capacity-preflight ]]; then
+  readonly REQUIRED_TESTS=(
+    preflight.host-baseline
+    preflight.runtime-baseline
+    preflight.evidence-retention
+    preflight.stop-conditions
+  )
+else
+  # The suite `ubuntu-2404-lane-smoke` must require exactly these test ids.
+  readonly REQUIRED_TESTS=(
+    lane.cgroup-v2
+    lane.lsm-enforcing
+    lane.runtime-mode
+    lane.container-confinement
+    lane.compose-plugin
+  )
+fi
 
 log() { printf '%s\n' "$*"; }
 err() { printf '%s\n' "$*" >&2; }
@@ -194,6 +208,115 @@ docker rm -f basilsmoke >/dev/null 2>&1 || true
 GUEST_EOF
 }
 
+# Guest program for the capacity-preflight suite: provision rootful Docker
+# offline from the staged pinned debs exactly as the smoke program does, then
+# exec the injected readiness preflight. Its stdout is pure bounded JSONL; all
+# provisioning output goes to guest-local files.
+capacity_guest_program() {
+  cat <<'GUEST_EOF'
+#!/usr/bin/env bash
+set -u
+IN=/home/basil-ci/in
+if ! command -v docker >/dev/null 2>&1; then
+  dpkg -i "$IN"/debs/*.deb >/tmp/basil-dpkg.log 2>&1 || true
+fi
+systemctl start docker >/dev/null 2>&1 || true
+for _ in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
+exec bash "$IN"/capacity-preflight.sh --runtime docker --lane-id ubuntu-24.04-x86_64 --evidence-root /tmp --run-id capacity-preflight
+GUEST_EOF
+}
+
+# Capacity-preflight suite (basil-ge9): inject guest/capacity-preflight.sh,
+# run it as root against rootful Docker, retain its full bounded JSONL as raw
+# evidence, and map it onto the four preflight.* terminals. This is
+# environment-readiness EVIDENCE COLLECTION, not the basil-9tj.4 measurement:
+# each terminal asserts a readiness fact set was collected completely (and, for
+# the runtime, that the lane's required mode was observed); the guest's
+# ready/blocker verdict travels in the bounded messages and raw JSONL, never
+# converted into or hidden behind a pass. Uses main's ssh_base (dynamic scope).
+run_capacity_preflight() {
+  local fixture_root=$1 scratch=$2
+  local pf="$fixture_root/guest/capacity-preflight.sh"
+  local out="$scratch/preflight.jsonl" rc=0
+  [[ -f $pf ]] || fail_infra PREFLIGHT_SOURCE_MISSING "$pf"
+  # Pipe over ssh stdin (never scp for scripts: its port flag differs).
+  "${ssh_base[@]}" "$SSH_USER@$SSH_HOST" 'cat >/home/basil-ci/in/capacity-preflight.sh' <"$pf" 2>/dev/null \
+    || fail_infra PREFLIGHT_INJECT_FAILED ""
+  capacity_guest_program | "${ssh_base[@]}" "$SSH_USER@$SSH_HOST" 'cat >/home/basil-ci/in/capacity.sh' 2>/dev/null \
+    || fail_infra PREFLIGHT_PROGRAM_COPY_FAILED ""
+  "${ssh_base[@]}" "$SSH_USER@$SSH_HOST" 'sudo -n bash /home/basil-ci/in/capacity.sh' \
+    >"$out" 2>"$scratch/preflight.stderr.log" || rc=$?
+  # rc 1 = readiness blockers reported (expected in a deliberately small guest);
+  # anything without parseable JSONL is an infrastructure failure.
+  if [[ ! -s $out ]] || ! jq -e -s 'length >= 3 and all(.[]; type == "object")' "$out" >/dev/null 2>&1; then
+    fail_infra GUEST_PREFLIGHT_NO_OUTPUT "rc=$rc"
+  fi
+  # Retain the full bounded preflight JSONL as raw evidence (collected by the
+  # runner as raw/guest-events.jsonl).
+  cp "$out" "$scratch/guest-events.jsonl" 2>/dev/null || true
+
+  local ready blockers
+  ready=$(jq -r -s '[.[] | select(.event == "end")][0].data.ready // false' "$out" 2>/dev/null) || ready=false
+  blockers=$(jq -r -s '[.[] | select(.event == "end")][0].data.block_reasons // [] | [.[].code] | unique | join(",")' "$out" 2>/dev/null) || blockers=""
+  blockers=${blockers:0:300}
+
+  # preflight.host-baseline: the full host fact set was collected in-guest.
+  if jq -e -s '[.[] | select(.event == "host_snapshot")][0].data
+      | (.cgroup.version_2 == true)
+      and (.logical_cpus | type == "number")
+      and (.memory.available_bytes | type == "number")
+      and (.file_descriptors.soft | test("^[0-9]+$"))
+      and (.processes.pid_max | test("^[0-9]+$"))
+      and (.namespace_limits | type == "object")' "$out" >/dev/null 2>&1; then
+    set_verdict preflight.host-baseline PASS GUEST_HOST_BASELINE_RECORDED \
+      "readiness verdict ready=$ready blockers=${blockers:-none}"
+  else
+    set_verdict preflight.host-baseline TEST_FAIL GUEST_HOST_BASELINE_INCOMPLETE \
+      "host snapshot missing or missing required fact groups"
+  fi
+
+  # preflight.runtime-baseline: rootful Docker on cgroup v2 observed PASS.
+  if jq -e -s '[.[] | select(.event == "runtime_snapshot" and .runtime == "docker")][0]
+      | (.status == "PASS") and (.data.mode == "rootful")
+      and (.data.info.cgroup_version | tostring | IN("2","v2"))' "$out" >/dev/null 2>&1; then
+    local driver_name
+    driver_name=$(jq -r -s '[.[] | select(.event == "runtime_snapshot" and .runtime == "docker")][0].data.info.storage_driver // "unknown"' "$out" 2>/dev/null) || driver_name=unknown
+    set_verdict preflight.runtime-baseline PASS GUEST_RUNTIME_BASELINE_RECORDED \
+      "rootful docker on cgroup v2; storage_driver=$driver_name"
+  else
+    set_verdict preflight.runtime-baseline TEST_FAIL GUEST_RUNTIME_BASELINE_MISMATCH \
+      "rootful docker snapshot missing or not PASS"
+  fi
+
+  # preflight.evidence-retention: the ladder retention projection was computed.
+  if jq -e -s '[.[] | select(.event == "capacity_projection")][0].data.evidence_projection
+      | (.per_container_event_bytes > 0) and (.bytes_at_target_run > 0)
+      and (.total_ladder_bytes > 0)' "$out" >/dev/null 2>&1; then
+    local total fits
+    total=$(jq -r -s '[.[] | select(.event == "capacity_projection")][0].data.evidence_projection.total_ladder_bytes' "$out" 2>/dev/null) || total=unknown
+    fits=$(jq -r -s '[.[] | select(.event == "capacity_projection")][0].data.evidence_projection.fits' "$out" 2>/dev/null) || fits=unknown
+    set_verdict preflight.evidence-retention PASS LADDER_RETENTION_PROJECTED \
+      "total_ladder_bytes=$total guest_fs_fits=$fits; host-side retention sized by the host preflight"
+  else
+    set_verdict preflight.evidence-retention TEST_FAIL LADDER_RETENTION_NOT_PROJECTED \
+      "capacity_projection event missing or incomplete"
+  fi
+
+  # preflight.stop-conditions: measured thresholds + all stop categories derived.
+  if jq -e -s '[.[] | select(.event == "capacity_projection")][0].data.derived_stop_thresholds
+      | has("memory_floor_bytes") and has("disk_floor_bytes")
+      and has("fd_soft_headroom") and has("pid_headroom")
+      and has("per_step_latency_ceiling_ms") and has("evidence_reserve_bytes")' "$out" >/dev/null 2>&1 \
+    && jq -e -s '[.[] | select(.event == "end")][0].data.scale_ladder_stop_conditions
+      | type == "array" and length == 7' "$out" >/dev/null 2>&1; then
+    set_verdict preflight.stop-conditions PASS STOP_CONDITIONS_DERIVED \
+      "7 stop-condition categories with measured floors/ceilings"
+  else
+    set_verdict preflight.stop-conditions TEST_FAIL STOP_CONDITIONS_MISSING \
+      "derived stop thresholds or stop-condition categories missing"
+  fi
+}
+
 main() {
   local scratch=${BASIL_DRIVER_SCRATCH:?BASIL_DRIVER_SCRATCH must be set by the runner}
   : "${BASIL_DRIVER_RESULT:?BASIL_DRIVER_RESULT must be set by the runner}"
@@ -334,6 +457,16 @@ main() {
     2>/dev/null || fail_infra GUEST_STAGE_MKDIR_FAILED ""
   "${scp_base[@]}" "$debs_dir"/*.deb "$SSH_USER@$SSH_HOST:/home/basil-ci/in/debs/" >/dev/null 2>&1 \
     || fail_infra GUEST_DEBS_COPY_FAILED ""
+
+  # Capacity-preflight suite (basil-ge9): only the pinned debs are needed
+  # in-guest; run the readiness preflight instead of the lane-smoke checks.
+  if [[ $SUITE == capacity-preflight ]]; then
+    run_capacity_preflight "$fixture_root" "$scratch"
+    "${ssh_base[@]}" "$SSH_USER@$SSH_HOST" 'sudo -n poweroff' 2>/dev/null || true
+    write_result
+    return
+  fi
+
   "${scp_base[@]}" "$workload" "$SSH_USER@$SSH_HOST:/home/basil-ci/in/alpine-amd64.tar" >/dev/null 2>&1 \
     || fail_infra GUEST_WORKLOAD_COPY_FAILED ""
   "${scp_base[@]}" "$compose_file" "$SSH_USER@$SSH_HOST:/home/basil-ci/in/compose/compose.yaml" >/dev/null 2>&1 \

@@ -60,6 +60,21 @@ SPDX-License-Identifier: Apache-2.0
   the OCI digest discipline. Self-tests cover member tamper, anchor mismatch,
   missing staged member, wrong-hash download (cache preserved), and the
   full-inventory exit-0 aggregate path.
+- 2026-07-14: Compose Phase 1 environment completed (test-only): an Ubuntu
+  24.04 **arm64 functional-emulation lane** (`drivers/ubuntu-2404-arm64.sh`,
+  TCG-only and labeled functional-only everywhere — excluded from
+  performance/capacity/native-host claims; static sha256-pinned crun 1.28 ran
+  an aarch64 container from the pinned `workload-alpine` layer; retained
+  canonical-runner PASS in ~132 s) and a **capacity preflight** for the serial
+  1,000-container ladder: the driver sandbox now exports `BASIL_DRIVER_SUITE`,
+  both x86 lane drivers gained a strictly-additive `capacity-preflight` suite
+  path running `guest/capacity-preflight.sh` in-guest, and retained runs cover
+  the host (ready; ~1.8 MiB evidence per 8-step ladder) and both guests
+  (not-ready as-is: cloud-image `nofile soft=1024` and small disks — the
+  ladder must raise `LimitNOFILE` and mount a volume). Scale-ladder stop
+  conditions are documented with the evidence. All six Phase 1 environment
+  subtasks and their parent are closed; the Phase 1 prototype tasks are
+  unblocked.
 
 ### `basil demo`: a zero-dependency guided tour
 
