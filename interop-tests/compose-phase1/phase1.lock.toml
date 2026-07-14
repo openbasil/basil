@@ -64,9 +64,25 @@ overlay_format = "qcow2"
 memory_mib = 4096
 vcpus = 4
 network = "user-loopback-only"
-driver = ""
+driver = "fedora-selinux-rootless"
 qualification = true
 performance = true
+
+# Fedora lane smoke suite (basil-3kx). The retained lane driver reports exactly
+# these seven confinement tests. lane.artifacts is intentionally excluded: the
+# runner already verifies the lane's artifacts directly (verify_lane_artifacts),
+# and a real driver cannot both report lane.artifacts and let the runner pre-emit
+# it without a duplicate-terminal event-validation failure.
+[suites.fedora-smoke]
+required_tests = [
+  "lane.cgroup-v2",
+  "lane.lsm-enforcing",
+  "lane.runtime-mode",
+  "lane.rootless-owner-a",
+  "lane.rootless-owner-b",
+  "lane.compose-provider",
+  "lane.network-isolation",
+]
 
 [lanes."ubuntu-24.04-x86_64"]
 architecture = "x86_64"
@@ -75,8 +91,14 @@ distribution = "Ubuntu 24.04 LTS"
 runtime = "docker-rootful"
 lsm = "apparmor-enforcing"
 cloud_init = "cloud-init/ubuntu-24.04.yaml"
-artifacts = ["ubuntu-24.04-cloud-x86_64"]
-driver = ""
+artifacts = ["ubuntu-24.04-cloud-x86_64", "workload-alpine"]
+machine = "q35,accel=kvm:tcg"
+base_format = "qcow2"
+overlay_format = "qcow2"
+memory_mib = 4096
+vcpus = 4
+network = "user-loopback-only"
+driver = "ubuntu-2404"
 qualification = true
 performance = true
 
@@ -111,4 +133,18 @@ performance = false
 required_tests = [
   "dev.result-contract",
   "dev.sandbox-readonly",
+]
+
+# Ubuntu 24.04 rootful-Docker lane smoke (driver `ubuntu-2404`).
+# `lane.artifacts` is runner-owned: the runner emits its terminal after
+# verifying the lane's `artifacts` list, drivers owe no coverage for it, and a
+# driver that reports it is rejected. The driver reports every other test here.
+[suites.ubuntu-2404-lane-smoke]
+required_tests = [
+  "lane.artifacts",
+  "lane.cgroup-v2",
+  "lane.lsm-enforcing",
+  "lane.runtime-mode",
+  "lane.container-confinement",
+  "lane.compose-plugin",
 ]

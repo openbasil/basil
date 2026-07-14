@@ -35,6 +35,21 @@ SPDX-License-Identifier: Apache-2.0
   kind-aware `oci-image` fetch/verify/offline support (digest-anchored
   `skopeo copy --all`, offline blob re-verification, atomic cache placement);
   package-set rows stay reserved and keep `verify-all`/`offline` fail-closed.
+- 2026-07-14: Compose Phase 1 qualified evidence lanes (test-only): Fedora 44
+  SELinux rootless-Podman lane (`drivers/fedora-selinux-rootless.sh` +
+  sha256-pinned offline payload staged by `fedora-44-prep.sh`; SELinux
+  Enforcing, two rootless owners with distinct MCS pairs, `podman-compose`
+  up/down — Fedora's `docker-compose` package pulls the moby engine, so the
+  native provider is pinned instead) and Ubuntu 24.04 AppArmor rootful-Docker
+  lane (`drivers/ubuntu-2404.sh`; AppArmor enforcing with `docker-default`
+  applied to running containers, no userns-remap, pinned Docker Engine 29.6.1
+  and Compose plugin 5.3.1 from the clearsigned noble stable pool). Both lanes
+  retained PASS evidence runs through the canonical runner under KVM.
+  Evidence-runner fixes surfaced by the lanes: the driver sandbox re-exposes
+  `/dev/kvm` when present (guarded `--dev-bind`; VM lanes no longer silently
+  degrade to TCG), drivers are no longer charged coverage for the runner-owned
+  `lane.artifacts` test (a real-driver `lane-smoke` run can now PASS), and the
+  guest podman fact uses the correctly-cased `SELinuxEnabled` template field.
 
 ### `basil demo`: a zero-dependency guided tour
 

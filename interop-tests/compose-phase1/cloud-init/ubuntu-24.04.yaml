@@ -14,6 +14,12 @@ users:
     gecos: Basil Phase 1 harness
     shell: /bin/bash
     lock_passwd: true
+    # Password login stays locked and root SSH disabled; the harness user gets
+    # passwordless sudo only so the lane driver can install the pinned Docker
+    # packages, start rootful dockerd, and read aa-status. This does not weaken
+    # AppArmor or change its mode.
+    sudo:
+      - 'ALL=(ALL) NOPASSWD:ALL'
     ssh_authorized_keys:
       - __BASIL_PHASE1_SSH_PUBLIC_KEY__
 
