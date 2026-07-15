@@ -20,6 +20,7 @@ pub mod ml_dsa_sign;
 pub mod ml_kem_envelope;
 pub mod peer;
 pub mod reconcile;
+pub mod release_admission;
 pub mod reload;
 pub mod revocation;
 pub mod seal;

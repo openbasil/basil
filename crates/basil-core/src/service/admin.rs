@@ -1268,7 +1268,7 @@ mod tests {
         std::fs::write(&policy_path, RELOAD_POLICY).expect("write policy");
         std::fs::write(
             &config_path,
-            "schema = \"agent\"\nschemaVersion = 3\n[config]\ncatalog = \"catalog.json\"\npolicy = \"policy.json\"\nbundle = \"bundle.age\"\n",
+            "schema = \"agent\"\nschemaVersion = 3\n[import]\ncatalog = \"catalog.json\"\npolicy = \"policy.json\"\nbundle = \"bundle.age\"\n",
         )
         .expect("write config");
 

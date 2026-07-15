@@ -84,13 +84,13 @@ pkgs.testers.nixosTest {
 
     # --- scaffold fixtures (written via base64 so no shell-quoting/heredoc
     # --- or nix-indentation hazards leak into JSON/TOML content). ---------
-    CATALOG_A = '{"schemaVersion":1,"backends":{"primary":{"kind":"vault","addr":"http://127.0.0.1:8200","engines":["transit"],"capabilities":[],"mintKeyTypes":["ed25519"]}},"keys":{"example.signing_key":{"class":"asymmetric","keyType":"ed25519","backend":"primary","engine":"transit","path":"example-signing-key","writable":true,"missing":"generate","description":"TPM-unlock e2e signer"}}}'
-    POLICY_A = '{"schemaVersion":2,"subjects":{"breakglass.root":{"breakGlass":true,"allOf":[{"kind":"unix","uid":0}]}},"roles":{"signer":["sign","verify","get_public_key"]},"rules":[{"id":"tpm-e2e-signer","subjects":["breakglass.root"],"action":["role:signer"],"target":["example.signing_key"]}],"config":{"names":{"users":{"0":"root"},"groups":{}},"memberships":{"0":[0]}}}'
-    CATALOG_ZERO = '{"schemaVersion":1,"backends":{"primary":{"kind":"vault","addr":"http://127.0.0.1:8200","engines":["transit"],"capabilities":[]}},"keys":{}}'
-    POLICY_ZERO = '{"roles":{},"rules":[],"config":{"names":{"users":{},"groups":{}},"memberships":{}}}'
-    TOML_TPM = 'catalog = "/root/catalog.json"\npolicy = "/root/policy.json"\nbundle = "/root/b-tpm.sealed"\nvault-addr = "http://127.0.0.1:8200"\nsocket = "/root/basil.sock"\n[unlock]\nunlock-tpm = true\n'
-    TOML_TPM_CHECK = 'catalog = "/root/catalog.json"\npolicy = "/root/policy.json"\nbundle = "/root/b-tpm.sealed"\nvault-addr = "http://127.0.0.1:8200"\n[unlock]\nunlock-tpm = true\n'
-    TOML_RECOV = 'catalog = "/root/catalog.json"\npolicy = "/root/policy.json"\nbundle = "/root/b-recov.sealed"\nvault-addr = "http://127.0.0.1:8200"\n[unlock]\nunlock-tpm = true\nunlock-passphrase-file = "/root/pass"\nunlock-passphrase-no-wipe = true\n'
+    CATALOG_A = '{"schema":"catalog","backends":{"primary":{"kind":"vault","addr":"http://127.0.0.1:8200","engines":["transit"],"capabilities":[],"mintKeyTypes":["ed25519"]}},"keys":{"example.signing_key":{"class":"asymmetric","keyType":"ed25519","backend":"primary","engine":"transit","path":"example-signing-key","writable":true,"missing":"generate","description":"TPM-unlock e2e signer"}}}'
+    POLICY_A = '{"schema":"policy","subjects":{"breakglass.root":{"breakGlass":true,"allOf":[{"kind":"unix","uid":0}]}},"roles":{"signer":["sign","verify","get_public_key"]},"rules":[{"id":"tpm-e2e-signer","subjects":["breakglass.root"],"action":["role:signer"],"target":["example.signing_key"]}],"config":{"names":{"users":{"0":"root"},"groups":{}},"memberships":{"0":[0]}}}'
+    CATALOG_ZERO = '{"schema":"catalog","backends":{"primary":{"kind":"vault","addr":"http://127.0.0.1:8200","engines":["transit"],"capabilities":[]}},"keys":{}}'
+    POLICY_ZERO = '{"schema":"policy","roles":{},"rules":[],"config":{"names":{"users":{},"groups":{}},"memberships":{}}}'
+    TOML_TPM = 'schema = "agent"\nschemaVersion = 3\nvault-addr = "http://127.0.0.1:8200"\nsocket = "/root/basil.sock"\n[import]\ncatalog = "/root/catalog.json"\npolicy = "/root/policy.json"\nbundle = "/root/b-tpm.sealed"\n[unlock]\nunlock-tpm = true\n'
+    TOML_TPM_CHECK = 'schema = "agent"\nschemaVersion = 3\nvault-addr = "http://127.0.0.1:8200"\n[import]\ncatalog = "/root/catalog.json"\npolicy = "/root/policy.json"\nbundle = "/root/b-tpm.sealed"\n[unlock]\nunlock-tpm = true\n'
+    TOML_RECOV = 'schema = "agent"\nschemaVersion = 3\nvault-addr = "http://127.0.0.1:8200"\n[import]\ncatalog = "/root/catalog.json"\npolicy = "/root/policy.json"\nbundle = "/root/b-recov.sealed"\n[unlock]\nunlock-tpm = true\nunlock-passphrase-file = "/root/pass"\nunlock-passphrase-no-wipe = true\n'
 
     def put(node, path, content):
         blob = base64.b64encode(content.encode("utf-8")).decode("ascii")

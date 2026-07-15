@@ -120,6 +120,7 @@ basil-cose = { workspace = true, features = ["fixtures"] }
 hyper-util = { workspace = true }
 minicbor = { workspace = true }
 nkeys = { workspace = true }
+proptest = { workspace = true }
 tower = { workspace = true }
 
 [build-dependencies]

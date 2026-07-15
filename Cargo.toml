@@ -103,6 +103,7 @@ p384 = { version = "0.13", features = ["ecdsa"] }
 p521 = { version = "0.13", features = ["ecdsa"] }
 percent-encoding = "2.3"
 pkcs8 = "0.10"
+proptest = "1.11.0"
 prost = "0.14.4"
 prost-types = "0.14.4"
 rand = "0.8"

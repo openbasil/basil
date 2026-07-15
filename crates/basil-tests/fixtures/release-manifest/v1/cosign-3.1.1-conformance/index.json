@@ -1,0 +1,28 @@
+{
+  "schema": "basil.release-manifest.cosign-conformance-fixture",
+  "schemaVersion": 1,
+  "profile": "cosign-3.1.1-bundle-v0.3",
+  "cosign": {
+    "version": "3.1.1",
+    "sourceCommit": "7914231b348c4057891edeb321772aad3ed04fce",
+    "linuxAmd64BinarySha256": "80fe3a80f00420f5f2cb08d70a1b38ac4818b7323aa22f05e931a23ca90d4407"
+  },
+  "signer": {
+    "identity": "https://github.com/sigstore-conformance/extremely-dangerous-public-oidc-beacon/.github/workflows/extremely-dangerous-oidc-beacon.yml@refs/heads/main",
+    "issuer": "https://token.actions.githubusercontent.com",
+    "rekorIntegratedTime": 1710869186
+  },
+  "sources": {
+    "conformanceCommit": "21533cde107c734ebc153c3e3a24d75fc9811a36",
+    "payload": "https://github.com/sigstore/sigstore-conformance/blob/21533cde107c734ebc153c3e3a24d75fc9811a36/test/assets/bundle-verify/a.txt",
+    "bundle": "https://github.com/sigstore/sigstore-conformance/blob/21533cde107c734ebc153c3e3a24d75fc9811a36/test/assets/bundle-verify/happy-path-v0.3-new-mediaType/bundle.sigstore.json",
+    "trustedRootCommit": "8ca80c47ef03d26ebf174db7c296700b075b2c16",
+    "trustedRoot": "https://github.com/sigstore/sigstore-go/blob/8ca80c47ef03d26ebf174db7c296700b075b2c16/pkg/testing/data/trusted-roots/public-good.json"
+  },
+  "files": {
+    "a.txt": "a0cfc71271d6e278e57cd332ff957c3f7043fdda354c4cbb190a30d56efa01bf",
+    "bundle.sigstore.json": "82382358bdf586d1a184820ac0d0ff06eb737f459fe03baebbbd2c76e80b54a9",
+    "trusted-root.json": "4364d7724c04cc912ce2a6c45ed2610e8d8d1c4dc857fb500292738d4d9c8d2c"
+  }
+}
+

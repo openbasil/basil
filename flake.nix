@@ -168,6 +168,10 @@
           rootless-keyring-quota-test = import ./nix/tests/rootless-keyring-quota-test.nix {
             inherit pkgs basil;
           };
+          basil-agent-schema3-test = import ./nix/tests/basil-agent-schema3-test.nix {
+            inherit pkgs basil;
+            nixosSystem = inputs.nixpkgs.lib.nixosSystem;
+          };
 
           # Distribution build for the `.deb`: the two shipped binaries plus the
           # roff man pages the `xtask` crate emits (via `clap_mangen`). Scoped to
@@ -347,6 +351,7 @@
           devShells.nightly = pkgs.mkShell {
             nativeBuildInputs = shellTools ++ [ toolchainNightly ];
           };
+          checks.basil-agent-schema3 = basil-agent-schema3-test;
         }
         # Linux-only: nixosTest builds NixOS guest VMs, which only make sense on
         # Linux systems. Keep them outside `checks` so `nix flake check` remains

@@ -50,8 +50,9 @@ use crate::catalog::loader::LoadError;
 use crate::catalog::schema::{BackendKind, Capability, Class, Engine, KeyAlgorithm};
 use crate::catalog::{Catalog, Config, ResolvedPolicy};
 use crate::configuration::{
-    ConfigOverride, CorpusDocuments, OverrideProvenance, load_bootstrap,
-    load_documents_with_overrides,
+    ConfigOverride, ConfigurationSourceTrace, ConfigurationTraceContext, CorpusDocuments,
+    OverrideProvenance, emit_configuration_source_trace, load_bootstrap_with_trace_collector,
+    load_documents_with_trace_collector,
 };
 use crate::state::{BrokerState, Generation};
 
@@ -314,12 +315,40 @@ fn file_fingerprint(path: &Path) -> std::io::Result<FileFingerprint> {
     })
 }
 
+#[cfg(test)]
 fn read_reload_inputs_with_observer(
     inputs: &ReloadInputs,
     observer: impl FnOnce(),
 ) -> Result<CorpusDocuments, ReloadError> {
+    read_reload_inputs_with_observer_and_context(
+        inputs,
+        observer,
+        ConfigurationTraceContext::Offline,
+    )
+}
+
+#[cfg(test)]
+fn read_reload_inputs_with_observer_and_context(
+    inputs: &ReloadInputs,
+    observer: impl FnOnce(),
+    trace_context: ConfigurationTraceContext,
+) -> Result<CorpusDocuments, ReloadError> {
+    let mut traces = Vec::new();
+    let result = read_reload_inputs_with_observer_and_collector(inputs, observer, &mut traces);
+    for trace in &traces {
+        emit_configuration_source_trace(trace, trace_context, result.is_ok());
+    }
+    result
+}
+
+fn read_reload_inputs_with_observer_and_collector(
+    inputs: &ReloadInputs,
+    observer: impl FnOnce(),
+    traces: &mut Vec<ConfigurationSourceTrace>,
+) -> Result<CorpusDocuments, ReloadError> {
     let config_before = fingerprint(&inputs.config_path)?;
-    let bootstrap = load_bootstrap(Some(&inputs.config_path), &inputs.overrides)?;
+    let bootstrap =
+        load_bootstrap_with_trace_collector(Some(&inputs.config_path), &inputs.overrides, traces)?;
     let mut paths = vec![
         bootstrap.sources.catalog.clone(),
         bootstrap.sources.policy.clone(),
@@ -343,10 +372,11 @@ fn read_reload_inputs_with_observer(
             });
         }
     }
-    let documents = load_documents_with_overrides(
+    let documents = load_documents_with_trace_collector(
         &bootstrap.sources,
         &bootstrap.document_overrides,
         bootstrap.overrides,
+        traces,
     )
     .map_err(|error| match error {
         crate::configuration::ConfigurationError::Catalog(error) => ReloadError::Validate(error),
@@ -375,6 +405,7 @@ fn fingerprint(path: &Path) -> Result<FileFingerprint, ReloadError> {
     })
 }
 
+#[cfg(test)]
 fn read_reload_inputs(inputs: &ReloadInputs) -> Result<CorpusDocuments, ReloadError> {
     read_reload_inputs_with_observer(inputs, || {})
 }
@@ -411,6 +442,20 @@ struct ValidatedCandidate {
 /// validation ([`ReloadError::Validate`]), or it changes a restart-only routing
 /// dimension ([`ReloadError::RoutingShapeChanged`]).
 fn validate_candidate(state: &BrokerState) -> Result<ValidatedCandidate, ReloadError> {
+    let active_generation = state.active_generation_id();
+    let trace_context = ConfigurationTraceContext::Reload { active_generation };
+    let mut traces = Vec::new();
+    let result = validate_candidate_with_trace_collector(state, &mut traces);
+    for trace in &traces {
+        emit_configuration_source_trace(trace, trace_context, result.is_ok());
+    }
+    result
+}
+
+fn validate_candidate_with_trace_collector(
+    state: &BrokerState,
+    traces: &mut Vec<ConfigurationSourceTrace>,
+) -> Result<ValidatedCandidate, ReloadError> {
     let inputs = state.reload_inputs().ok_or(ReloadError::NoInputs)?;
     let CorpusDocuments {
         catalog,
@@ -419,7 +464,7 @@ fn validate_candidate(state: &BrokerState) -> Result<ValidatedCandidate, ReloadE
         warnings,
         compose: _,
         overrides,
-    } = read_reload_inputs(inputs)?;
+    } = read_reload_inputs_with_observer_and_collector(inputs, || {}, traces)?;
     for w in &warnings {
         tracing::warn!(warning = %w, "reload: catalog/policy load warning");
     }
@@ -521,20 +566,112 @@ pub fn reload_generation(state: &BrokerState) -> Result<ReloadOutcome, ReloadErr
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use basil_proto::KeyType;
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Level, Subscriber};
+    use tracing_subscriber::layer::{Context, SubscriberExt as _};
+    use tracing_subscriber::{Layer, Registry};
 
     use super::{
         ReloadError, ReloadInputs, check_reload, read_reload_inputs,
         read_reload_inputs_with_observer, reload_generation,
+        validate_candidate_with_trace_collector,
     };
     use crate::backend::{Backend, BackendError, NewKey};
     use crate::catalog::load;
     use crate::configuration::ConfigOverride;
     use crate::manager::BackendManager;
     use crate::state::{BrokerState, INITIAL_GENERATION_ID};
+
+    #[derive(Clone, Default)]
+    struct EventCapture {
+        events: Arc<Mutex<Vec<CapturedEvent>>>,
+    }
+
+    #[derive(Debug)]
+    struct CapturedEvent {
+        level: Level,
+        fields: BTreeMap<String, CapturedValue>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum CapturedValue {
+        Bool(bool),
+        I64(i64),
+        U64(u64),
+        String(String),
+        Debug(String),
+    }
+
+    impl EventCapture {
+        fn source_events(&self) -> Vec<CapturedEvent> {
+            let mut guard = self.events.lock().expect("capture lock");
+            let events = std::mem::take(&mut *guard);
+            drop(guard);
+            events
+                .into_iter()
+                .filter(|event| {
+                    event.fields.get("event")
+                        == Some(&CapturedValue::String(
+                            "basil.configuration.source".to_string(),
+                        ))
+                })
+                .collect()
+        }
+    }
+
+    impl<S> Layer<S> for EventCapture
+    where
+        S: Subscriber,
+    {
+        fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+            let mut visitor = FieldCapture::default();
+            event.record(&mut visitor);
+            self.events
+                .lock()
+                .expect("capture lock")
+                .push(CapturedEvent {
+                    level: *event.metadata().level(),
+                    fields: visitor.fields,
+                });
+        }
+    }
+
+    #[derive(Default)]
+    struct FieldCapture {
+        fields: BTreeMap<String, CapturedValue>,
+    }
+
+    impl FieldCapture {
+        fn insert(&mut self, field: &Field, value: CapturedValue) {
+            self.fields.insert(field.name().to_string(), value);
+        }
+    }
+
+    impl Visit for FieldCapture {
+        fn record_bool(&mut self, field: &Field, value: bool) {
+            self.insert(field, CapturedValue::Bool(value));
+        }
+
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            self.insert(field, CapturedValue::I64(value));
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.insert(field, CapturedValue::U64(value));
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.insert(field, CapturedValue::String(value.to_string()));
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.insert(field, CapturedValue::Debug(format!("{value:?}")));
+        }
+    }
 
     /// A no-op backend: reload is non-mutating and never calls the backend, so the
     /// required trait methods all fail closed (the manager only needs them present
@@ -630,7 +767,7 @@ mod tests {
         std::fs::write(&policy_path, policy).expect("write policy");
         std::fs::write(
             &config_path,
-            "schema = \"agent\"\nschemaVersion = 3\n[config]\ncatalog = \"catalog.json\"\npolicy = \"policy.json\"\nbundle = \"bundle.age\"\n",
+            "schema = \"agent\"\nschemaVersion = 3\n[import]\ncatalog = \"catalog.json\"\npolicy = \"policy.json\"\nbundle = \"bundle.age\"\n",
         )
         .expect("write config");
 
@@ -724,6 +861,148 @@ mod tests {
         assert_eq!(state.active_generation_id(), INITIAL_GENERATION_ID);
     }
 
+    fn assert_source_event_contract(
+        event: &CapturedEvent,
+        outcome: &str,
+        active_generation: u64,
+        prior_generation_active: bool,
+    ) {
+        assert_eq!(event.level, Level::INFO);
+        assert_eq!(
+            event.fields.get("operation"),
+            Some(&CapturedValue::String("reload".to_string()))
+        );
+        assert_eq!(
+            event.fields.get("outcome"),
+            Some(&CapturedValue::String(outcome.to_string()))
+        );
+        assert_eq!(
+            event.fields.get("active_generation"),
+            Some(&CapturedValue::U64(active_generation))
+        );
+        assert_eq!(
+            event.fields.get("active_generation_present"),
+            Some(&CapturedValue::Bool(true))
+        );
+        assert_eq!(
+            event.fields.get("prior_generation_active"),
+            Some(&CapturedValue::Bool(prior_generation_active))
+        );
+        assert_eq!(
+            event.fields.get("name"),
+            Some(&CapturedValue::String(String::new()))
+        );
+        assert_eq!(
+            event.fields.get("name_present"),
+            Some(&CapturedValue::Bool(false))
+        );
+        assert!(
+            matches!(
+                event.fields.get("slot"),
+                Some(CapturedValue::String(slot))
+                    if matches!(slot.as_str(), "agent" | "catalog" | "policy")
+            ),
+            "source slot is stable"
+        );
+        assert!(
+            matches!(
+                event.fields.get("path"),
+                Some(CapturedValue::String(path)) if !path.is_empty()
+            ),
+            "resolved path is present"
+        );
+        assert!(matches!(
+            event.fields.get("byte_size"),
+            Some(CapturedValue::U64(size)) if *size > 0
+        ));
+        assert!(matches!(
+            event.fields.get("modified_unix_seconds"),
+            Some(CapturedValue::I64(seconds)) if *seconds > 0
+        ));
+        assert!(matches!(
+            event.fields.get("modified_nanoseconds"),
+            Some(CapturedValue::U64(nanoseconds)) if *nanoseconds < 1_000_000_000
+        ));
+        assert_eq!(
+            event.fields.get("hash_algorithm"),
+            Some(&CapturedValue::String("sha256".to_string()))
+        );
+        assert!(matches!(
+            event.fields.get("hash"),
+            Some(CapturedValue::String(hash))
+                if hash.len() == 64
+                    && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        ));
+        assert!(
+            event
+                .fields
+                .values()
+                .filter_map(|value| match value {
+                    CapturedValue::String(value) | CapturedValue::Debug(value) => Some(value),
+                    CapturedValue::Bool(_) | CapturedValue::I64(_) | CapturedValue::U64(_) => None,
+                })
+                .all(|value| !value.contains("source-secret-sentinel"))
+        );
+    }
+
+    #[test]
+    fn reload_source_events_are_typed_complete_and_attempt_scoped() {
+        const CHILD_ENV: &str = "BASIL_RELOAD_TRACE_CAPTURE_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("current test executable"),
+            )
+            .args([
+                "--exact",
+                "core::reload::tests::reload_source_events_are_typed_complete_and_attempt_scoped",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("run isolated trace-capture test");
+            assert!(
+                output.status.success(),
+                "isolated trace capture failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let (state, inputs) = state_with_files(&catalog_json(false), &policy_json(false));
+        let capture = EventCapture::default();
+        let subscriber = Registry::default().with(capture.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            write_files(&inputs, &catalog_json(true), &policy_json(true));
+            reload_generation(&state).expect("accepted reload");
+
+            let rejected_policy = r#"{
+              "schema": "policy",
+              "subjects": { "svc.web": { "allOf": [ { "kind": "unix", "uid": 1000 } ] } },
+              "roles": {},
+              "rules": [ {
+                "id": "bad", "subjects": ["svc.web"],
+                "action": ["role:missing"], "target": ["web.signer"],
+                "comment": "source-secret-sentinel"
+              } ],
+              "config": {}
+            }"#;
+            write_files(&inputs, &catalog_json(true), rejected_policy);
+            reload_generation(&state).expect_err("semantic rejection");
+        });
+
+        let events = capture.source_events();
+        assert_eq!(events.len(), 6, "three sources per reload attempt");
+        for event in &events[..3] {
+            assert_source_event_contract(event, "accepted", INITIAL_GENERATION_ID, false);
+        }
+        for event in &events[3..] {
+            assert_source_event_contract(event, "rejected", INITIAL_GENERATION_ID + 1, true);
+        }
+        assert_eq!(state.active_generation_id(), INITIAL_GENERATION_ID + 1);
+    }
+
     #[test]
     fn reload_input_change_during_read_is_rejected() {
         let (state, inputs) = state_with_files(&catalog_json(true), &policy_json(true));
@@ -790,10 +1069,14 @@ mod tests {
     fn restart_only_routing_change_is_rejected() {
         let (state, inputs) = state_with_files(&catalog_json(true), &policy_json(true));
         write_files(&inputs, &catalog_json_repathed(), &policy_json(true));
+        let mut traces = Vec::new();
 
-        let err = reload_generation(&state).expect_err("repath rejected");
+        let err = validate_candidate_with_trace_collector(&state, &mut traces)
+            .err()
+            .expect("repath rejected");
         assert!(matches!(err, ReloadError::RoutingShapeChanged(_)));
         assert_eq!(err.audit_reason(), "routing_shape_changed");
+        assert_eq!(traces.len(), 3, "all files read remain traceable");
         assert_eq!(state.active_generation_id(), INITIAL_GENERATION_ID);
     }
 

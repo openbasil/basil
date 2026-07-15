@@ -31,11 +31,11 @@ use crate::seal::{BackendCred, CredBundle};
 use crate::service::broker::{BrokerIdentityRuntimeConfig, InvocationRuntimeConfig};
 use crate::{
     AuditLog, Backend, BackendKind, BackendManager, BrokerLimits, BrokerState, CapabilityPolicy,
-    ConfigOverride, DEFAULT_MAX_ENCRYPT_SIZE, DEFAULT_MAX_PAYLOAD_SIZE,
+    ConfigOverride, ConfigurationTraceContext, DEFAULT_MAX_ENCRYPT_SIZE, DEFAULT_MAX_PAYLOAD_SIZE,
     DEFAULT_ROTATION_GRACE_VERSIONS, DEFAULT_SOCKET_MODE, DEFAULT_SVID_TTL_SECS,
     JwtRevocationStore, ReloadActor, ReloadInputs, ServerConfig, SpiffeConfig, SpiffeVaultBackend,
-    VaultBackend, enforce_capabilities, load_bootstrap, load_documents_with_overrides,
-    reload_generation, run_grpc,
+    VaultBackend, enforce_capabilities, load_documents_with_overrides,
+    load_documents_with_overrides_and_context, reload_generation, run_grpc,
 };
 use crate::{bundle_cli, doctor, init, unlock};
 use anyhow::{Context, Result, bail};
@@ -540,7 +540,7 @@ pub(crate) struct AgentConfigFile {
     schema: String,
     #[serde(rename = "schemaVersion")]
     schema_version: i64,
-    pub(crate) config: ConfigSourcesFile,
+    pub(crate) import: ImportFiles,
     pub(crate) socket: Option<String>,
     pub(crate) socket_mode: Option<SocketMode>,
     pub(crate) socket_group: Option<String>,
@@ -575,7 +575,7 @@ pub(crate) struct AgentConfigFile {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub(crate) struct ConfigSourcesFile {
+pub(crate) struct ImportFiles {
     pub(crate) catalog: PathBuf,
     pub(crate) policy: PathBuf,
     pub(crate) bundle: PathBuf,
@@ -587,7 +587,7 @@ impl Default for AgentConfigFile {
         Self {
             schema: "agent".to_string(),
             schema_version: crate::CORPUS_SCHEMA_VERSION,
-            config: ConfigSourcesFile::default(),
+            import: ImportFiles::default(),
             socket: None,
             socket_mode: None,
             socket_group: None,
@@ -972,7 +972,8 @@ fn parse_capability_policy(s: &str) -> Result<CapabilityPolicy, String> {
 }
 
 fn load_run_config(overrides: &ConfigOverrides) -> Result<RunConfig> {
-    let (file, bootstrap) = load_agent_config(overrides)?;
+    let (file, bootstrap) =
+        load_agent_config_with_context(overrides, ConfigurationTraceContext::Startup)?;
     let setup = build_setup(&file, overrides, &bootstrap)?;
     #[cfg(feature = "http")]
     let jwks = resolve_jwks_config(&file.jwks)?;
@@ -1347,6 +1348,7 @@ fn load_key_probe_config(overrides: &ConfigOverrides) -> Result<SetupArgs> {
     Ok(setup)
 }
 
+#[cfg(test)]
 pub(crate) fn load_config_file(overrides: &ConfigOverrides) -> Result<AgentConfigFile> {
     load_agent_config(overrides).map(|(file, _)| file)
 }
@@ -1354,17 +1356,40 @@ pub(crate) fn load_config_file(overrides: &ConfigOverrides) -> Result<AgentConfi
 fn load_agent_config(
     overrides: &ConfigOverrides,
 ) -> Result<(AgentConfigFile, crate::LoadedBootstrap)> {
-    let bootstrap = load_bootstrap(overrides.config.as_deref(), &overrides.values)
-        .context("loading configuration corpus bootstrap")?;
+    load_agent_config_with_context(overrides, ConfigurationTraceContext::Offline)
+}
+
+fn load_agent_config_with_context(
+    overrides: &ConfigOverrides,
+    context: ConfigurationTraceContext,
+) -> Result<(AgentConfigFile, crate::LoadedBootstrap)> {
+    let mut traces = Vec::new();
+    let result = load_agent_config_with_trace_collector(overrides, &mut traces);
+    for trace in &traces {
+        crate::configuration::emit_configuration_source_trace(trace, context, result.is_ok());
+    }
+    result
+}
+
+fn load_agent_config_with_trace_collector(
+    overrides: &ConfigOverrides,
+    traces: &mut Vec<crate::configuration::ConfigurationSourceTrace>,
+) -> Result<(AgentConfigFile, crate::LoadedBootstrap)> {
+    let bootstrap = crate::configuration::load_bootstrap_with_trace_collector(
+        overrides.config.as_deref(),
+        &overrides.values,
+        traces,
+    )
+    .context("loading configuration corpus bootstrap")?;
     let mut file: AgentConfigFile = bootstrap
         .value
         .clone()
         .try_into()
         .with_context(|| format!("parsing config from {}", bootstrap.path.display()))?;
-    file.config.catalog.clone_from(&bootstrap.sources.catalog);
-    file.config.policy.clone_from(&bootstrap.sources.policy);
-    file.config.bundle.clone_from(&bootstrap.sources.bundle);
-    file.config.compose = bootstrap.sources.compose.clone();
+    file.import.catalog.clone_from(&bootstrap.sources.catalog);
+    file.import.policy.clone_from(&bootstrap.sources.policy);
+    file.import.bundle.clone_from(&bootstrap.sources.bundle);
+    file.import.compose = bootstrap.sources.compose.clone();
     let parent = bootstrap.path.parent().unwrap_or_else(|| Path::new("."));
     resolve_optional_path(parent, &mut file.audit_log);
     resolve_optional_path(parent, &mut file.logging.file.dir);
@@ -1623,10 +1648,10 @@ fn build_setup(
         startup_overrides: overrides.values.clone(),
         document_overrides: bootstrap.document_overrides.clone(),
         override_provenance: bootstrap.overrides.clone(),
-        catalog: file.config.catalog.clone(),
-        policy: file.config.policy.clone(),
-        bundle: file.config.bundle.clone(),
-        compose: file.config.compose.clone(),
+        catalog: file.import.catalog.clone(),
+        policy: file.import.policy.clone(),
+        bundle: file.import.bundle.clone(),
+        compose: file.import.compose.clone(),
         vault_addr,
         transit_mount: file
             .transit_mount
@@ -1682,12 +1707,15 @@ struct Prepared {
 /// startup pipeline for `run` and `check`; fails closed (clean non-zero, no
 /// panic) at every step. The plaintext [`CredBundle`] is zeroized before return;
 /// each backend holds only its own cred.
-async fn prepare_manager(setup: &SetupArgs) -> Result<Prepared> {
+async fn prepare_manager(
+    setup: &SetupArgs,
+    trace_context: ConfigurationTraceContext,
+) -> Result<Prepared> {
     if is_plaintext_non_loopback_http(&setup.vault_addr) {
         warn!(addr = %setup.vault_addr, "talking to vault over plaintext HTTP");
     }
 
-    let documents = load_documents_with_overrides(
+    let documents = load_documents_with_overrides_and_context(
         &crate::CorpusSources {
             catalog: setup.catalog.clone(),
             policy: setup.policy.clone(),
@@ -1696,6 +1724,7 @@ async fn prepare_manager(setup: &SetupArgs) -> Result<Prepared> {
         },
         &setup.document_overrides,
         setup.override_provenance.clone(),
+        trace_context,
     )
     .context("loading configuration corpus documents")?;
     let crate::CorpusDocuments {
@@ -1716,8 +1745,9 @@ async fn prepare_manager(setup: &SetupArgs) -> Result<Prepared> {
     );
 
     // Unlock the sealed bundle -> CredBundle (KEK zeroized inside `open`).
-    let creds = unlock::open_bundle_at_startup(&setup.bundle, &setup.unlock)
-        .context("unlocking sealed credential bundle")?;
+    let creds =
+        unlock::open_bundle_at_startup_with_context(&setup.bundle, &setup.unlock, trace_context)
+            .context("unlocking sealed credential bundle")?;
     info!(
         backend_creds = creds.backends.len(),
         "sealed bundle unlocked",
@@ -1779,7 +1809,7 @@ async fn run_daemon(args: RunArgs, version: &'static str) -> Result<()> {
         manager,
         backend_label,
         override_provenance,
-    } = prepare_manager(&run_config.setup).await?;
+    } = prepare_manager(&run_config.setup, ConfigurationTraceContext::Startup).await?;
 
     validate_invocation_catalog_bindings(&run_config.invocation, &catalog)
         .context("validating invocation broker identity and keys")?;
@@ -2099,14 +2129,15 @@ async fn doctor_key_material_rows(overrides: &ConfigOverrides) -> Vec<doctor::Ch
             )));
         }
     };
-    let Prepared { manager, .. } = match prepare_manager(&setup).await {
-        Ok(prepared) => prepared,
-        Err(err) => {
-            return doctor::key_material_rows(Err(format!(
-                "could not build authenticated backend manager: {err:#}"
-            )));
-        }
-    };
+    let Prepared { manager, .. } =
+        match prepare_manager(&setup, ConfigurationTraceContext::Offline).await {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                return doctor::key_material_rows(Err(format!(
+                    "could not build authenticated backend manager: {err:#}"
+                )));
+            }
+        };
     match manager.check().await {
         Ok(report) => doctor::key_material_rows(Ok(&report)),
         Err(err) => doctor::key_material_rows(Err(err.to_string())),
@@ -2411,6 +2442,8 @@ pub async fn run_agent(args: RunArgs, version: &'static str) -> Result<()> {
     // a once-per-process cold path, so the heap indirection is free.
     Box::pin(run_with_config_logging(
         &overrides,
+        ConfigurationTraceContext::Startup,
+        false,
         run_daemon(args, version),
     ))
     .await
@@ -2419,16 +2452,14 @@ pub async fn run_agent(args: RunArgs, version: &'static str) -> Result<()> {
 /// Run the preflight doctor behind `basil doctor`.
 pub async fn run_doctor_command(args: DoctorArgs) -> Result<()> {
     let overrides = args.overrides.clone();
-    if args.json {
-        let mut logging = logging_config_for_overrides(&overrides)?;
-        logging.stdout.enable = Some(false);
-        let logging_guards = init_logging(&logging)?;
-        let result = run_doctor(args).await;
-        logging_guards.shutdown();
-        result
-    } else {
-        Box::pin(run_with_config_logging(&overrides, run_doctor(args))).await
-    }
+    let suppress_stdout_logging = args.json;
+    Box::pin(run_with_config_logging(
+        &overrides,
+        ConfigurationTraceContext::Offline,
+        suppress_stdout_logging,
+        run_doctor(args),
+    ))
+    .await
 }
 
 /// Run first-run config scaffolding behind top-level `basil init`.
@@ -2453,26 +2484,135 @@ pub fn run_bundle(command: bundle_cli::BundleCommand) -> Result<()> {
 
 async fn run_with_config_logging(
     overrides: &ConfigOverrides,
+    trace_context: ConfigurationTraceContext,
+    suppress_stdout_logging: bool,
     fut: impl std::future::Future<Output = Result<()>>,
 ) -> Result<()> {
-    let logging = logging_config_for_overrides(overrides)?;
-    let logging_guards = init_logging(&logging)?;
+    let mut preflight_traces = Vec::new();
+    let mut logging = match load_agent_config_with_trace_collector(overrides, &mut preflight_traces)
+    {
+        Ok((file, _)) => file.logging,
+        Err(error) => {
+            return finish_failed_config_load(error, &preflight_traces, trace_context, || {
+                best_effort_fallback_logging(suppress_stdout_logging)
+            });
+        }
+    };
+    if suppress_stdout_logging {
+        logging.stdout.enable = Some(false);
+    }
+    let logging_guards = match init_logging(&logging) {
+        Ok(guards) => guards,
+        Err(error) => {
+            return finish_failed_config_load(error, &preflight_traces, trace_context, || {
+                best_effort_fallback_logging(suppress_stdout_logging)
+            });
+        }
+    };
     let result = fut.await;
     logging_guards.shutdown();
     result
 }
 
-fn logging_config_for_overrides(overrides: &ConfigOverrides) -> Result<LoggingConfigFile> {
-    Ok(load_config_file(overrides)?.logging)
+fn finish_failed_config_load(
+    error: anyhow::Error,
+    traces: &[crate::configuration::ConfigurationSourceTrace],
+    trace_context: ConfigurationTraceContext,
+    init_fallback: impl FnOnce() -> Option<LoggingGuards>,
+) -> Result<()> {
+    let fallback_guards = init_fallback();
+    for trace in traces {
+        crate::configuration::emit_configuration_source_trace(trace, trace_context, false);
+    }
+    if let Some(guards) = fallback_guards {
+        guards.shutdown();
+    }
+    Err(error)
+}
+
+fn best_effort_fallback_logging(suppress_stdout_logging: bool) -> Option<LoggingGuards> {
+    let result = if suppress_stdout_logging {
+        init_stderr_logging()
+    } else {
+        init_logging(&LoggingConfigFile::default())
+    };
+    match result {
+        Ok(guards) => Some(guards),
+        Err(error) => {
+            eprintln!("fallback logging unavailable; using any existing subscriber: {error}");
+            None
+        }
+    }
+}
+
+fn init_stderr_logging() -> Result<LoggingGuards> {
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let subscriber = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt::layer().with_writer(std::io::stderr));
+    subscriber
+        .try_init()
+        .context("initializing stderr fallback tracing subscriber")?;
+    Ok(LoggingGuards {
+        file_guard: None,
+        #[cfg(feature = "otlp")]
+        otel_provider: None,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
     use crate::catalog::MissingPolicy;
     use clap::Parser as _;
+
+    struct SourceEventLayer {
+        fallback_attempted: Arc<AtomicBool>,
+        event_count: Arc<AtomicUsize>,
+        observed_after_fallback: Arc<AtomicBool>,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for SourceEventLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = SourceEventVisitor {
+                fallback_attempted: &self.fallback_attempted,
+                event_count: &self.event_count,
+                observed_after_fallback: &self.observed_after_fallback,
+            };
+            event.record(&mut visitor);
+        }
+    }
+
+    struct SourceEventVisitor<'a> {
+        fallback_attempted: &'a AtomicBool,
+        event_count: &'a AtomicUsize,
+        observed_after_fallback: &'a AtomicBool,
+    }
+
+    impl tracing::field::Visit for SourceEventVisitor<'_> {
+        fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "event" && value == "basil.configuration.source" {
+                self.event_count.fetch_add(1, Ordering::Relaxed);
+                self.observed_after_fallback.store(
+                    self.fallback_attempted.load(Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
+            }
+        }
+    }
 
     fn temp_config(contents: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -2496,13 +2636,51 @@ mod tests {
             contents.to_string()
         } else {
             format!(
-                "schema = \"agent\"\nschemaVersion = 3\n{}\n[config]\n{}\n",
+                "schema = \"agent\"\nschemaVersion = 3\n{}\n[import]\n{}\n",
                 settings.join("\n"),
                 sources.join("\n")
             )
         };
         std::fs::write(&path, body).expect("write temp config");
         path
+    }
+
+    #[test]
+    fn failed_fallback_preserves_original_error_and_emits_once_after_attempt() {
+        let path = temp_config("jwt-role = \"test\"");
+        let (_, trace) = crate::configuration::read_configuration_source("agent", None, &path)
+            .expect("read configuration source trace");
+        let fallback_attempted = Arc::new(AtomicBool::new(false));
+        let event_count = Arc::new(AtomicUsize::new(0));
+        let observed_after_fallback = Arc::new(AtomicBool::new(false));
+        let subscriber = tracing_subscriber::registry().with(SourceEventLayer {
+            fallback_attempted: Arc::clone(&fallback_attempted),
+            event_count: Arc::clone(&event_count),
+            observed_after_fallback: Arc::clone(&observed_after_fallback),
+        });
+
+        tracing::subscriber::with_default(subscriber, || {
+            let result = finish_failed_config_load(
+                anyhow::anyhow!("original configuration error"),
+                std::slice::from_ref(&trace),
+                ConfigurationTraceContext::Offline,
+                || {
+                    fallback_attempted.store(true, Ordering::Relaxed);
+                    None
+                },
+            );
+
+            assert_eq!(
+                result
+                    .expect_err("configuration load must fail")
+                    .to_string(),
+                "original configuration error"
+            );
+        });
+
+        assert_eq!(event_count.load(Ordering::Relaxed), 1);
+        assert!(observed_after_fallback.load(Ordering::Relaxed));
+        std::fs::remove_file(path).ok();
     }
 
     #[test]
@@ -3397,9 +3575,9 @@ vault-addr = "http://cfg-vault:8200"
         let args = ConfigOverrides {
             config: Some(config.clone()),
             values: [
-                "config.catalog=/cli/catalog.json",
-                "config.policy=/cli/policy.json",
-                "config.bundle=/cli/bundle.sealed",
+                "import.catalog=/cli/catalog.json",
+                "import.policy=/cli/policy.json",
+                "import.bundle=/cli/bundle.sealed",
                 "socket=/cli/basil.sock",
                 "vault-addr=http://cli-vault:8200",
             ]
@@ -3673,7 +3851,7 @@ vault-addr = "http://cfg-vault:8200"
             std::fs::write(
                 &config_path,
                 format!(
-                    "schema = \"agent\"\nschemaVersion = 3\n[config]\ncatalog = {:?}\npolicy = {:?}\nbundle = \"unused.age\"\n",
+                    "schema = \"agent\"\nschemaVersion = 3\n[import]\ncatalog = {:?}\npolicy = {:?}\nbundle = \"unused.age\"\n",
                     catalog_path.display().to_string(),
                     policy_path.display().to_string()
                 ),

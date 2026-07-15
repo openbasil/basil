@@ -59,8 +59,8 @@ pub use core::identity;
 pub use core::ml_dsa_sign;
 pub use core::{
     actor, audit, backend, capability, catalog, configuration, decision, ed25519_sign, event,
-    manager, minter, ml_kem_envelope, peer, reconcile, reload, revocation, seal, state,
-    x25519_seal,
+    manager, minter, ml_kem_envelope, peer, reconcile, release_admission, reload, revocation, seal,
+    state, x25519_seal,
 };
 pub use service::broker as grpc;
 #[cfg(feature = "http")]
@@ -84,8 +84,10 @@ pub use catalog::{
 };
 pub use configuration::{
     CORPUS_SCHEMA_VERSION, ComposeInstallOutcome, ConfigOverride, ConfigurationError,
-    CorpusDocuments, CorpusSources, DEFAULT_CONFIG_PATH, LoadedBootstrap, OverrideProvenance,
-    install_compose_document, load_bootstrap, load_documents, load_documents_with_overrides,
+    ConfigurationTraceContext, CorpusDocuments, CorpusSources, DEFAULT_CONFIG_PATH,
+    LoadedBootstrap, OverrideProvenance, install_compose_document, load_bootstrap,
+    load_bootstrap_with_context, load_documents, load_documents_with_overrides,
+    load_documents_with_overrides_and_context,
 };
 pub use decision::{DecisionRecord, Outcome};
 pub use event::{BrokerEvent, BrokerEventKind, EventSource};

@@ -904,7 +904,7 @@ fn build_config_toml(layout: &Layout) -> String {
     out.push_str("db-keystore-cipher = \"aegis256\"\n");
     out.push_str("# One structured JSON event per authorization decision, allow and deny.\n");
     let _ = writeln!(out, "audit-log = {}", toml_str(&layout.audit));
-    out.push_str("\n[config]\n");
+    out.push_str("\n[import]\n");
     let _ = writeln!(out, "catalog = {}", toml_str(&layout.catalog));
     let _ = writeln!(out, "policy = {}", toml_str(&layout.policy));
     let _ = writeln!(out, "bundle = {}", toml_str(&layout.bundle));
@@ -1039,9 +1039,9 @@ mod tests {
         };
         let file =
             crate::agent_cli::load_config_file(&overrides).expect("agent parses demo config");
-        assert_eq!(file.config.catalog, layout.catalog);
-        assert_eq!(file.config.policy, layout.policy);
-        assert_eq!(file.config.bundle, layout.bundle);
+        assert_eq!(file.import.catalog, layout.catalog);
+        assert_eq!(file.import.policy, layout.policy);
+        assert_eq!(file.import.bundle, layout.bundle);
         assert_eq!(file.audit_log.as_deref(), Some(layout.audit.as_path()));
 
         std::fs::remove_dir_all(&dir).ok();

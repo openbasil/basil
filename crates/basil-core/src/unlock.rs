@@ -61,11 +61,35 @@ pub struct UnlockArgs {
 /// The master KEK is recovered and zeroized inside `seal::open_bundle`; only the
 /// decrypted [`CredBundle`] is returned. Fails closed if no slot opens.
 pub fn open_bundle_at_startup(bundle_path: &Path, args: &UnlockArgs) -> Result<CredBundle> {
+    open_bundle_at_startup_with_context(
+        bundle_path,
+        args,
+        crate::ConfigurationTraceContext::Offline,
+    )
+}
+
+/// Read and unlock the sealed bundle with configuration-source traceability.
+///
+/// # Errors
+///
+/// Returns an error when the bundle or an enabled unlock method is invalid.
+pub fn open_bundle_at_startup_with_context(
+    bundle_path: &Path,
+    args: &UnlockArgs,
+    context: crate::ConfigurationTraceContext,
+) -> Result<CredBundle> {
     check_bundle_perms(bundle_path, args.strict_bundle_perms)?;
 
-    let bytes = std::fs::read(bundle_path)
-        .with_context(|| format!("reading sealed bundle from {}", bundle_path.display()))?;
-    let parsed = format::decode(&bytes).context("parsing sealed bundle")?;
+    let (bytes, trace) =
+        crate::configuration::read_configuration_source("bundle", None, bundle_path)
+            .with_context(|| format!("reading sealed bundle from {}", bundle_path.display()))?;
+    let result = open_bundle_bytes(bundle_path, args, &bytes);
+    crate::configuration::emit_configuration_source_trace(&trace, context, result.is_ok());
+    result
+}
+
+fn open_bundle_bytes(bundle_path: &Path, args: &UnlockArgs, bytes: &[u8]) -> Result<CredBundle> {
+    let parsed = format::decode(bytes).context("parsing sealed bundle")?;
 
     // Best-effort logical anti-rollback, checked BEFORE any unlock slot is
     // tried: a stale bundle is refused without decrypting its payload or

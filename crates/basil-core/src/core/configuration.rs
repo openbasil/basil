@@ -10,10 +10,11 @@
 //! into separate discovery or compatibility paths.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value as JsonValue;
+use sha2::{Digest as _, Sha256};
 
 const MAX_STARTUP_OVERRIDES: usize = 64;
 const MAX_OVERRIDE_PATH_LEN: usize = 256;
@@ -24,6 +25,49 @@ pub const CORPUS_SCHEMA_VERSION: i64 = 3;
 
 /// The system bootstrap selected when `--config` is omitted.
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/basil/config.toml";
+
+/// The command path responsible for reading a configuration source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigurationTraceContext {
+    /// Agent startup is assembling its initial serving generation.
+    Startup,
+    /// An offline command is validating configuration without serving it.
+    Offline,
+    /// A reload is assembling a candidate while the named generation remains
+    /// active until validation and the atomic swap complete.
+    Reload {
+        /// Generation serving when the reload attempt began.
+        active_generation: u64,
+    },
+}
+
+impl ConfigurationTraceContext {
+    const fn operation(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Offline => "offline",
+            Self::Reload { .. } => "reload",
+        }
+    }
+
+    const fn active_generation(self) -> Option<u64> {
+        match self {
+            Self::Startup | Self::Offline => None,
+            Self::Reload { active_generation } => Some(active_generation),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfigurationSourceTrace {
+    slot: String,
+    name: Option<String>,
+    path: PathBuf,
+    modified_unix_seconds: i64,
+    modified_nanoseconds: u32,
+    byte_size: u64,
+    sha256: String,
+}
 
 /// One validated startup override supplied as `-o PATH=VALUE`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,8 +121,8 @@ impl ConfigOverride {
     fn is_source_path(&self) -> bool {
         matches!(
             self.path.as_str(),
-            "config.catalog" | "config.policy" | "config.bundle"
-        ) || self.path.starts_with("config.compose.")
+            "import.catalog" | "import.policy" | "import.bundle"
+        ) || self.path.starts_with("import.compose.")
     }
 
     fn is_document_path(&self) -> bool {
@@ -142,7 +186,7 @@ pub struct LoadedBootstrap {
     pub path: PathBuf,
     /// Mutated TOML value ready for typed deserialization.
     pub value: toml::Value,
-    /// Explicit, config-parent-resolved document sources.
+    /// Explicit, bootstrap-parent-resolved document sources.
     pub sources: CorpusSources,
     /// Non-secret override provenance.
     pub overrides: Vec<OverrideProvenance>,
@@ -187,6 +231,14 @@ pub enum ConfigurationError {
         /// TOML parser error.
         source: toml::de::Error,
     },
+    /// The selected bootstrap is not valid UTF-8.
+    #[error("decoding bootstrap from {path} as UTF-8: {source}")]
+    DecodeBootstrap {
+        /// Selected path.
+        path: PathBuf,
+        /// UTF-8 decoder error.
+        source: std::str::Utf8Error,
+    },
     /// The bootstrap or referenced document violates corpus schema `3`.
     #[error("invalid configuration corpus: {0}")]
     InvalidCorpus(String),
@@ -213,12 +265,157 @@ pub enum ConfigurationError {
         /// Bounded parser diagnostic.
         reason: String,
     },
+    /// A referenced structured document is not valid UTF-8.
+    #[error("decoding {slot} document from {path} as UTF-8: {source}")]
+    DecodeDocument {
+        /// Referencing slot.
+        slot: String,
+        /// Referenced path.
+        path: PathBuf,
+        /// UTF-8 decoder error.
+        source: std::str::Utf8Error,
+    },
     /// Catalog or policy semantic validation failed.
     #[error(transparent)]
     Catalog(#[from] crate::catalog::LoadError),
     /// A reviewed Compose document could not be installed safely.
     #[error("installing Compose document: {0}")]
     Install(String),
+}
+
+pub(crate) fn read_configuration_source(
+    slot: &str,
+    name: Option<&str>,
+    path: &Path,
+) -> std::io::Result<(Vec<u8>, ConfigurationSourceTrace)> {
+    read_configuration_source_with_observer(slot, name, path, || {})
+}
+
+fn read_configuration_source_with_observer(
+    slot: &str,
+    name: Option<&str>,
+    path: &Path,
+    observer: impl FnOnce(),
+) -> std::io::Result<(Vec<u8>, ConfigurationSourceTrace)> {
+    let mut file = std::fs::File::open(path)?;
+    let before = SourceFileState::from_metadata(&file.metadata()?)?;
+    observer();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let after = SourceFileState::from_metadata(&file.metadata()?)?;
+    let path_after = SourceFileState::from_metadata(&std::fs::metadata(path)?)?;
+    let byte_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if before != after || after != path_after || byte_size != after.len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "configuration source changed while being read",
+        ));
+    }
+    let (modified_unix_seconds, modified_nanoseconds) = system_time_parts(after.modified);
+    let digest = Sha256::digest(&bytes);
+    let mut sha256 = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(sha256, "{byte:02x}");
+    }
+    let trace = ConfigurationSourceTrace {
+        slot: slot.to_string(),
+        name: name.map(str::to_string),
+        path: path.to_path_buf(),
+        modified_unix_seconds,
+        modified_nanoseconds,
+        byte_size,
+        sha256,
+    };
+    Ok((bytes, trace))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceFileState {
+    len: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(unix)]
+    ctime_seconds: i64,
+    #[cfg(unix)]
+    ctime_nanoseconds: i64,
+}
+
+impl SourceFileState {
+    fn from_metadata(metadata: &std::fs::Metadata) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt as _;
+
+        Ok(Self {
+            len: metadata.len(),
+            modified: metadata.modified()?,
+            #[cfg(unix)]
+            dev: metadata.dev(),
+            #[cfg(unix)]
+            ino: metadata.ino(),
+            #[cfg(unix)]
+            ctime_seconds: metadata.ctime(),
+            #[cfg(unix)]
+            ctime_nanoseconds: metadata.ctime_nsec(),
+        })
+    }
+}
+
+fn system_time_parts(time: std::time::SystemTime) -> (i64, u32) {
+    match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => (
+            i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
+            duration.subsec_nanos(),
+        ),
+        Err(error) => {
+            let duration = error.duration();
+            let seconds = i64::try_from(duration.as_secs()).unwrap_or(i64::MAX);
+            if duration.subsec_nanos() == 0 {
+                (-seconds, 0)
+            } else {
+                (
+                    -seconds.saturating_add(1),
+                    1_000_000_000 - duration.subsec_nanos(),
+                )
+            }
+        }
+    }
+}
+
+pub(crate) fn emit_configuration_source_trace(
+    trace: &ConfigurationSourceTrace,
+    context: ConfigurationTraceContext,
+    accepted: bool,
+) {
+    let outcome = if accepted { "accepted" } else { "rejected" };
+    let name = trace.name.as_deref().unwrap_or("");
+    let name_present = trace.name.is_some();
+    let active_generation = context.active_generation().unwrap_or(0);
+    let active_generation_present = context.active_generation().is_some();
+    let prior_generation_active =
+        matches!(context, ConfigurationTraceContext::Reload { .. }) && !accepted;
+    let path = trace.path.to_string_lossy();
+    tracing::info!(
+        event = "basil.configuration.source",
+        operation = context.operation(),
+        slot = trace.slot.as_str(),
+        name,
+        name_present,
+        path = path.as_ref(),
+        modified_unix_seconds = trace.modified_unix_seconds,
+        modified_nanoseconds = trace.modified_nanoseconds,
+        byte_size = trace.byte_size,
+        hash_algorithm = "sha256",
+        hash = trace.sha256.as_str(),
+        outcome,
+        active_generation,
+        active_generation_present,
+        prior_generation_active,
+        "configuration source validation",
+    );
 }
 
 /// Load and validate the selected bootstrap, applying immutable startup
@@ -232,15 +429,48 @@ pub fn load_bootstrap(
     selected: Option<&Path>,
     overrides: &[ConfigOverride],
 ) -> Result<LoadedBootstrap, ConfigurationError> {
+    load_bootstrap_with_context(selected, overrides, ConfigurationTraceContext::Offline)
+}
+
+/// Load a bootstrap and emit byte-exact source traceability for `context`.
+///
+/// # Errors
+///
+/// Returns the same failures as [`load_bootstrap`].
+pub fn load_bootstrap_with_context(
+    selected: Option<&Path>,
+    overrides: &[ConfigOverride],
+    context: ConfigurationTraceContext,
+) -> Result<LoadedBootstrap, ConfigurationError> {
+    let mut traces = Vec::new();
+    let result = load_bootstrap_with_trace_collector(selected, overrides, &mut traces);
+    for trace in &traces {
+        emit_configuration_source_trace(trace, context, result.is_ok());
+    }
+    result
+}
+
+pub(crate) fn load_bootstrap_with_trace_collector(
+    selected: Option<&Path>,
+    overrides: &[ConfigOverride],
+    traces: &mut Vec<ConfigurationSourceTrace>,
+) -> Result<LoadedBootstrap, ConfigurationError> {
     validate_override_set(overrides)?;
     let path = selected.map_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH), Path::to_path_buf);
+    let (bytes, trace) = read_configuration_source("agent", None, &path).map_err(|source| {
+        ConfigurationError::ReadBootstrap {
+            path: path.clone(),
+            source,
+        }
+    })?;
+    traces.push(trace);
     let raw =
-        std::fs::read_to_string(&path).map_err(|source| ConfigurationError::ReadBootstrap {
+        std::str::from_utf8(&bytes).map_err(|source| ConfigurationError::DecodeBootstrap {
             path: path.clone(),
             source,
         })?;
     let mut value: toml::Value =
-        toml::from_str(&raw).map_err(|source| ConfigurationError::ParseBootstrap {
+        toml::from_str(raw).map_err(|source| ConfigurationError::ParseBootstrap {
             path: path.clone(),
             source,
         })?;
@@ -322,11 +552,44 @@ pub fn load_documents(sources: &CorpusSources) -> Result<CorpusDocuments, Config
 pub fn load_documents_with_overrides(
     sources: &CorpusSources,
     overrides: &[ConfigOverride],
-    mut provenance: Vec<OverrideProvenance>,
+    provenance: Vec<OverrideProvenance>,
 ) -> Result<CorpusDocuments, ConfigurationError> {
-    let mut catalog_value = read_structured("catalog", &sources.catalog)?;
+    load_documents_with_overrides_and_context(
+        sources,
+        overrides,
+        provenance,
+        ConfigurationTraceContext::Offline,
+    )
+}
+
+/// Load referenced documents and emit byte-exact source traceability.
+///
+/// # Errors
+///
+/// Returns the same failures as [`load_documents_with_overrides`].
+pub fn load_documents_with_overrides_and_context(
+    sources: &CorpusSources,
+    overrides: &[ConfigOverride],
+    provenance: Vec<OverrideProvenance>,
+    context: ConfigurationTraceContext,
+) -> Result<CorpusDocuments, ConfigurationError> {
+    let mut traces = Vec::new();
+    let result = load_documents_with_trace_collector(sources, overrides, provenance, &mut traces);
+    for trace in &traces {
+        emit_configuration_source_trace(trace, context, result.is_ok());
+    }
+    result
+}
+
+pub(crate) fn load_documents_with_trace_collector(
+    sources: &CorpusSources,
+    overrides: &[ConfigOverride],
+    mut provenance: Vec<OverrideProvenance>,
+    traces: &mut Vec<ConfigurationSourceTrace>,
+) -> Result<CorpusDocuments, ConfigurationError> {
+    let mut catalog_value = read_structured("catalog", None, &sources.catalog, traces)?;
     require_schema(&catalog_value, "catalog", &sources.catalog)?;
-    let policy_value = read_structured("policy", &sources.policy)?;
+    let policy_value = read_structured("policy", None, &sources.policy, traces)?;
     require_schema(&policy_value, "policy", &sources.policy)?;
 
     for config_override in overrides {
@@ -359,7 +622,7 @@ pub fn load_documents_with_overrides(
 
     let mut compose = BTreeMap::new();
     for (name, path) in &sources.compose {
-        let document = read_structured(&format!("compose `{name}`"), path)?;
+        let document = read_structured("compose", Some(name), path, traces)?;
         require_schema(&document, "compose", path)?;
         let actual_name = document
             .as_object()
@@ -529,26 +792,33 @@ pub fn install_compose_document(
 }
 
 fn validate_compose_source(name: &str, path: &Path) -> Result<(), ConfigurationError> {
-    let document = read_structured(&format!("compose `{name}`"), path)?;
-    require_schema(&document, "compose", path)?;
-    let actual = document
-        .as_object()
-        .and_then(|object| object.get("name"))
-        .and_then(JsonValue::as_str)
-        .ok_or_else(|| {
-            ConfigurationError::InvalidCorpus(format!(
-                "Compose document {} must contain a string `name`",
+    let mut traces = Vec::new();
+    let result = (|| {
+        let document = read_structured("compose", Some(name), path, &mut traces)?;
+        require_schema(&document, "compose", path)?;
+        let actual = document
+            .as_object()
+            .and_then(|object| object.get("name"))
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                ConfigurationError::InvalidCorpus(format!(
+                    "Compose document {} must contain a string `name`",
+                    path.display()
+                ))
+            })?;
+        if actual == name {
+            Ok(())
+        } else {
+            Err(ConfigurationError::InvalidCorpus(format!(
+                "Compose document {} has name `{actual}`, expected `{name}`",
                 path.display()
-            ))
-        })?;
-    if actual == name {
-        Ok(())
-    } else {
-        Err(ConfigurationError::InvalidCorpus(format!(
-            "Compose document {} has name `{actual}`, expected `{name}`",
-            path.display()
-        )))
+            )))
+        }
+    })();
+    for trace in &traces {
+        emit_configuration_source_trace(trace, ConfigurationTraceContext::Offline, result.is_ok());
     }
+    result
 }
 
 fn ensure_protected_destination(
@@ -634,21 +904,21 @@ fn update_bootstrap_compose(
     let mut document = raw
         .parse::<toml_edit::DocumentMut>()
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    let config = document
-        .get_mut("config")
+    let imports = document
+        .get_mut("import")
         .and_then(toml_edit::Item::as_table_mut)
-        .ok_or_else(|| std::io::Error::other("bootstrap lacks `[config]` table"))?;
-    if !config.contains_key("compose") {
-        config.insert("compose", toml_edit::Item::Table(toml_edit::Table::new()));
+        .ok_or_else(|| std::io::Error::other("bootstrap lacks `[import]` table"))?;
+    if !imports.contains_key("compose") {
+        imports.insert("compose", toml_edit::Item::Table(toml_edit::Table::new()));
     }
-    let compose = config
+    let compose = imports
         .get_mut("compose")
         .and_then(toml_edit::Item::as_table_mut)
-        .ok_or_else(|| std::io::Error::other("`config.compose` is not a table"))?;
+        .ok_or_else(|| std::io::Error::other("`import.compose` is not a table"))?;
     if compose.contains_key(name) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
-            format!("`config.compose.{name}` already exists"),
+            format!("`import.compose.{name}` already exists"),
         ));
     }
     let parent = config_path.parent().unwrap_or_else(|| Path::new("."));
@@ -727,6 +997,11 @@ fn validate_bootstrap_header(value: &toml::Value) -> Result<(), ConfigurationErr
     let table = value.as_table().ok_or_else(|| {
         ConfigurationError::InvalidCorpus("bootstrap must be a TOML table".to_string())
     })?;
+    if table.contains_key("config") {
+        return Err(ConfigurationError::InvalidCorpus(
+            "bootstrap field `[config]` is unsupported; use `[import]`".to_string(),
+        ));
+    }
     match table.get("schema").and_then(toml::Value::as_str) {
         Some("agent") => {}
         Some(other) => {
@@ -758,24 +1033,24 @@ fn extract_sources(
     value: &toml::Value,
     parent: &Path,
 ) -> Result<CorpusSources, ConfigurationError> {
-    let config = value
-        .get("config")
+    let imports = value
+        .get("import")
         .and_then(toml::Value::as_table)
         .ok_or_else(|| {
-            ConfigurationError::InvalidCorpus("bootstrap requires a `[config]` table".to_string())
+            ConfigurationError::InvalidCorpus("bootstrap requires an `[import]` table".to_string())
         })?;
     let required = |name: &str| -> Result<PathBuf, ConfigurationError> {
-        let raw = config
+        let raw = imports
             .get(name)
             .and_then(toml::Value::as_str)
             .ok_or_else(|| {
-                ConfigurationError::InvalidCorpus(format!("`config.{name}` must be a string path"))
+                ConfigurationError::InvalidCorpus(format!("`import.{name}` must be a string path"))
             })?;
         Ok(resolve_path(parent, raw))
     };
-    let compose_table = match config.get("compose") {
+    let compose_table = match imports.get("compose") {
         Some(value) => value.as_table().ok_or_else(|| {
-            ConfigurationError::InvalidCorpus("`config.compose` must be a table".to_string())
+            ConfigurationError::InvalidCorpus("`import.compose` must be a table".to_string())
         })?,
         None => &toml::map::Map::new(),
     };
@@ -784,7 +1059,7 @@ fn extract_sources(
         validate_compose_name(name)?;
         let raw = value.as_str().ok_or_else(|| {
             ConfigurationError::InvalidCorpus(format!(
-                "`config.compose.{name}` must be a string path"
+                "`import.compose.{name}` must be a string path"
             ))
         })?;
         compose.insert(name.clone(), resolve_path(parent, raw));
@@ -842,6 +1117,7 @@ fn apply_scalar_override(
 ) -> Result<(), ConfigurationError> {
     let path = config_override.path.as_str();
     if matches!(path, "schema" | "schemaVersion")
+        || path.starts_with("import.")
         || path.starts_with("config.")
         || path.starts_with("unlock.")
         || path.starts_with("broker-identity.")
@@ -913,44 +1189,58 @@ fn parse_string_value(raw: &str) -> String {
     parsed.unwrap_or_else(|| raw.to_string())
 }
 
-fn read_structured(slot: &str, path: &Path) -> Result<JsonValue, ConfigurationError> {
-    let raw = std::fs::read_to_string(path).map_err(|source| ConfigurationError::ReadDocument {
-        slot: slot.to_string(),
+fn read_structured(
+    slot: &str,
+    name: Option<&str>,
+    path: &Path,
+    traces: &mut Vec<ConfigurationSourceTrace>,
+) -> Result<JsonValue, ConfigurationError> {
+    let label = name.map_or_else(|| slot.to_string(), |name| format!("{slot} `{name}`"));
+    let (bytes, trace) = read_configuration_source(slot, name, path).map_err(|source| {
+        ConfigurationError::ReadDocument {
+            slot: label.clone(),
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    traces.push(trace);
+    let raw = std::str::from_utf8(&bytes).map_err(|source| ConfigurationError::DecodeDocument {
+        slot: label.clone(),
         path: path.to_path_buf(),
         source,
     })?;
     let extension = path.extension().and_then(std::ffi::OsStr::to_str);
     match extension {
         Some("json") => {
-            serde_json::from_str(&raw).map_err(|error| ConfigurationError::ParseDocument {
-                slot: slot.to_string(),
+            serde_json::from_str(raw).map_err(|error| ConfigurationError::ParseDocument {
+                slot: label.clone(),
                 path: path.to_path_buf(),
                 reason: error.to_string(),
             })
         }
         Some("toml") => {
-            let value = toml::from_str::<toml::Value>(&raw).map_err(|error| {
+            let value = toml::from_str::<toml::Value>(raw).map_err(|error| {
                 ConfigurationError::ParseDocument {
-                    slot: slot.to_string(),
+                    slot: label.clone(),
                     path: path.to_path_buf(),
                     reason: error.to_string(),
                 }
             })?;
             serde_json::to_value(value).map_err(|error| ConfigurationError::ParseDocument {
-                slot: slot.to_string(),
+                slot: label.clone(),
                 path: path.to_path_buf(),
                 reason: error.to_string(),
             })
         }
         Some("yaml" | "yml") => {
-            serde_yaml::from_str(&raw).map_err(|error| ConfigurationError::ParseDocument {
-                slot: slot.to_string(),
+            serde_yaml::from_str(raw).map_err(|error| ConfigurationError::ParseDocument {
+                slot: label.clone(),
                 path: path.to_path_buf(),
                 reason: error.to_string(),
             })
         }
         _ => Err(ConfigurationError::ParseDocument {
-            slot: slot.to_string(),
+            slot: label,
             path: path.to_path_buf(),
             reason: "structured document path must end in .json, .toml, .yaml, or .yml".to_string(),
         }),
@@ -998,6 +1288,67 @@ mod tests {
     }
 
     #[test]
+    fn source_trace_hashes_the_exact_bytes_read() {
+        let dir = temp_dir();
+        let path = dir.join("source.toml");
+        write(&path, "abc");
+
+        let (bytes, trace) =
+            read_configuration_source("compose", Some("web"), &path).expect("read source");
+
+        assert_eq!(bytes, b"abc");
+        assert_eq!(trace.slot, "compose");
+        assert_eq!(trace.name.as_deref(), Some("web"));
+        assert_eq!(trace.path, path);
+        assert_eq!(trace.byte_size, 3);
+        assert_eq!(
+            trace.sha256,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert!(trace.modified_unix_seconds > 0);
+        assert!(trace.modified_nanoseconds < 1_000_000_000);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn source_change_during_read_is_rejected_without_a_trace() {
+        let dir = temp_dir();
+        let path = dir.join("source.toml");
+        write(&path, "first");
+
+        let error = read_configuration_source_with_observer("agent", None, &path, || {
+            write(&path, "replacement with a different length");
+        })
+        .expect_err("in-place mutation rejects");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("changed while being read"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn invalid_utf8_still_retains_rejected_source_trace() {
+        let dir = temp_dir();
+        let path = dir.join("catalog.json");
+        std::fs::write(&path, [0xff, 0xfe]).expect("write invalid UTF-8");
+        let sources = CorpusSources {
+            catalog: path,
+            policy: dir.join("policy.json"),
+            bundle: dir.join("bundle.age"),
+            compose: BTreeMap::new(),
+        };
+        let mut traces = Vec::new();
+
+        let error = load_documents_with_trace_collector(&sources, &[], Vec::new(), &mut traces)
+            .expect_err("invalid UTF-8 rejects");
+
+        assert!(matches!(error, ConfigurationError::DecodeDocument { .. }));
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].byte_size, 2);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn exact_version_and_relative_sources_are_required() {
         let dir = temp_dir();
         let config = dir.join("config.toml");
@@ -1006,11 +1357,11 @@ mod tests {
             r#"schema = "agent"
 schemaVersion = 3
 socket = "/run/basil.sock"
-[config]
+[import]
 catalog = "catalog.json"
 policy = "policy.json"
 bundle = "bundle.age"
-[config.compose]
+[import.compose]
 web = "web.yaml"
 "#,
         );
@@ -1023,10 +1374,65 @@ web = "web.yaml"
 
         write(
             &config,
-            "schema = \"agent\"\nschemaVersion = 2\n[config]\ncatalog = \"a\"\npolicy = \"b\"\nbundle = \"c\"\n",
+            "schema = \"agent\"\nschemaVersion = 2\n[import]\ncatalog = \"a\"\npolicy = \"b\"\nbundle = \"c\"\n",
         );
         let error = load_bootstrap(Some(&config), &[]).expect_err("version 2 rejects");
         assert!(error.to_string().contains("reserved pre-unification"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn legacy_config_table_is_rejected() {
+        let dir = temp_dir();
+        let config = dir.join("config.toml");
+        write(
+            &config,
+            r#"schema = "agent"
+schemaVersion = 3
+[config]
+catalog = "catalog.json"
+policy = "policy.json"
+bundle = "bundle.age"
+"#,
+        );
+
+        let error = load_bootstrap(Some(&config), &[]).expect_err("legacy table rejects");
+        assert!(error.to_string().contains("`[config]` is unsupported"));
+
+        write(
+            &config,
+            r#"schema = "agent"
+schemaVersion = 3
+[import]
+catalog = "catalog.json"
+policy = "policy.json"
+bundle = "bundle.age"
+[config]
+catalog = "legacy-catalog.json"
+"#,
+        );
+        let error = load_bootstrap(Some(&config), &[]).expect_err("dual spelling rejects");
+        assert!(error.to_string().contains("`[config]` is unsupported"));
+
+        write(
+            &config,
+            r#"schema = "agent"
+schemaVersion = 3
+[import]
+catalog = "catalog.json"
+policy = "policy.json"
+bundle = "bundle.age"
+"#,
+        );
+        let legacy_override =
+            [ConfigOverride::parse("config.catalog=legacy.json").expect("parse override")];
+        let error = load_bootstrap(Some(&config), &legacy_override)
+            .expect_err("legacy source override rejects");
+        assert!(
+            error
+                .to_string()
+                .contains("target `config.catalog` is secret-bearing")
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -1039,14 +1445,14 @@ web = "web.yaml"
             r#"schema = "agent"
 schemaVersion = 3
 max-payload-size = 42
-[config]
+[import]
 catalog = "catalog.json"
 policy = "policy.json"
 bundle = "bundle.age"
 "#,
         );
         let overrides = [
-            ConfigOverride::parse("config.catalog=other.json").expect("source override"),
+            ConfigOverride::parse("import.catalog=other.json").expect("source override"),
             ConfigOverride::parse("max-payload-size=64").expect("scalar override"),
         ];
         let loaded = load_bootstrap(Some(&config), &overrides).expect("load overrides");
@@ -1061,7 +1467,7 @@ bundle = "bundle.age"
 
         let forbidden = [ConfigOverride::parse("schemaVersion=4").expect("parse")];
         assert!(load_bootstrap(Some(&config), &forbidden).is_err());
-        let structural = [ConfigOverride::parse("config.compose=x").expect("parse")];
+        let structural = [ConfigOverride::parse("import.compose=x").expect("parse")];
         assert!(load_bootstrap(Some(&config), &structural).is_err());
         let duplicate = [
             ConfigOverride::parse("max-payload-size=64").expect("parse"),
@@ -1145,7 +1551,7 @@ bundle = "bundle.age"
         let destination = dir.join("compose.d/web.yaml");
         write(
             &config,
-            "# operator comment\nschema = \"agent\"\nschemaVersion = 3\n[config]\ncatalog = \"catalog.json\"\npolicy = \"policy.json\"\nbundle = \"bundle.age\"\n",
+            "# operator comment\nschema = \"agent\"\nschemaVersion = 3\n[import]\ncatalog = \"catalog.json\"\npolicy = \"policy.json\"\nbundle = \"bundle.age\"\n",
         );
         write(&source, "schema: compose\nname: web\n");
 

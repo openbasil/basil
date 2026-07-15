@@ -97,7 +97,6 @@ in
     enable = true;
 
     catalog = {
-      schemaVersion = 1;
       backends.bao = {
         implementation = caps.OPENBAO_2_5;
         addr = "http://127.0.0.1:8200";

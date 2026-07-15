@@ -408,7 +408,7 @@ fn build_config_toml(args: &InitArgs, layout: &Layout) -> String {
         );
     }
 
-    out.push_str("\n[config]\n");
+    out.push_str("\n[import]\n");
     let _ = writeln!(out, "catalog = {}", toml_str(&layout.catalog));
     let _ = writeln!(out, "policy = {}", toml_str(&layout.policy));
     out.push_str("# The sealed bundle is NOT created by init. Create it with `bundle create`.\n");
@@ -923,7 +923,7 @@ mod tests {
         let parsed: toml::Value = toml::from_str(&config).expect("config is valid TOML");
         assert_eq!(
             parsed
-                .get("config")
+                .get("import")
                 .and_then(|value| value.get("catalog"))
                 .and_then(toml::Value::as_str),
             Some(layout.catalog.display().to_string().as_str())
@@ -955,9 +955,9 @@ mod tests {
         };
         let file =
             crate::agent_cli::load_config_file(&overrides).expect("agent parses generated config");
-        assert_eq!(file.config.catalog, layout.catalog);
-        assert_eq!(file.config.policy, layout.policy);
-        assert_eq!(file.config.bundle, layout.bundle);
+        assert_eq!(file.import.catalog, layout.catalog);
+        assert_eq!(file.import.policy, layout.policy);
+        assert_eq!(file.import.bundle, layout.bundle);
         assert_eq!(
             file.socket.as_deref(),
             Some(layout.socket.display().to_string().as_str())

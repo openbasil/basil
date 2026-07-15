@@ -25,6 +25,7 @@ a structured audit record.
 | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
 | `core::catalog`                                                               | The key inventory and authorization policy loaded at startup: what exists, who may do what to it.                               |
 | `core::state`                                                                 | The loaded policy + backend manager bundle shared across services; reload swaps it atomically (`core::reload`).                 |
+| `core::release_admission`                                                     | Bounded verified release-artifact indexing, exact admission, and guarded current/previous lifecycle transitions.               |
 | `core::backend`                                                               | Backend adapters (table below).                                                                                                 |
 | `core::audit`, `core::decision`                                               | Decision records: subject, action, target, outcome, policy generation.                                                          |
 | `core::seal`, `x25519_seal`, `ed25519_sign`, `ml_dsa_sign`, `ml_kem_envelope` | Local crypto used for sealed invocations and materialize-to-use operations.                                                     |

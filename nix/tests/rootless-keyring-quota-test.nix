@@ -13,10 +13,14 @@ let
       virtualisation.memorySize = 1024;
       environment.systemPackages = [ basil ];
       environment.etc."basil/doctor-quota.toml".text = ''
+        schema = "agent"
+        schemaVersion = 3
+        socket = "/run/basil-doctor.sock"
+
+        [import]
         catalog = "/root/missing-catalog.json"
         policy = "/root/missing-policy.json"
         bundle = "/root/missing-bundle.sealed"
-        socket = "/run/basil-doctor.sock"
 
         [logging.journald]
         enable = false

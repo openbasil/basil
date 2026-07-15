@@ -25,6 +25,25 @@ precedence = "override"
 SPDX-FileCopyrightText = "The SPIFFE Project & Scytale, Inc"
 SPDX-License-Identifier = "Apache-2.0"
 
+# Exact upstream Sigstore conformance evidence. Licensing is declared here so
+# the signed payload, bundle, and trust snapshot remain byte-identical to their
+# pinned upstream sources.
+[[annotations]]
+path = [
+  "crates/basil-tests/fixtures/release-manifest/v1/cosign-3.1.1-conformance/a.txt",
+  "crates/basil-tests/fixtures/release-manifest/v1/cosign-3.1.1-conformance/bundle.sigstore.json",
+  "crates/basil-tests/fixtures/release-manifest/v1/cosign-3.1.1-conformance/trusted-root.json",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "The Sigstore Authors"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = "crates/basil-tests/fixtures/release-manifest/v1/cosign-3.1.1-conformance/index.json"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 OpenBasil Contributors"
+SPDX-License-Identifier = "Apache-2.0"
+
 # Code and other first-party project files.
 [[annotations]]
 path = [
