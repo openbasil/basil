@@ -1071,7 +1071,7 @@ mod tests {
     const POLICY: &str = r#"{
       "schema": "policy",
       "subjects": {
-        "svc.api": { "allOf": [ { "kind": "unix", "uid": 9100 } ] }
+        "svc.api": { "domain": "host-process", "match": { "all": [ { "process.uid": 9100 } ] } }
       },
       "roles": { "minter": ["mint"], "validator": ["validate"] },
       "rules": [
@@ -1524,7 +1524,7 @@ mod tests {
         const RENAMED_POLICY: &str = r#"{
           "schema": "policy",
           "subjects": {
-            "svc.api": { "allOf": [ { "kind": "unix", "uid": 9100 } ] }
+            "svc.api": { "domain": "host-process", "match": { "all": [ { "process.uid": 9100 } ] } }
           },
           "roles": { "minter": ["mint"], "validator": ["validate"] },
           "rules": [

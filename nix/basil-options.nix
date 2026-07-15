@@ -456,16 +456,24 @@ let
         example = lib.literalExpression ''{ "9001" = [ 9001 10 ]; }'';
         description = ''
           uid-to-full-group-set table. Each uid maps to all declared primary and
-          supplementary gids used by the PDP for group principal checks.
+          supplementary gids used by process group-evidence checks.
         '';
       };
     };
   };
 
-  principalSpecType = types.attrs;
-
   subjectType = types.submodule {
     options = {
+      domain = mkOption {
+        type = types.enum [
+          "host-process"
+          "systemd-unit"
+          "container"
+        ];
+        example = "host-process";
+        description = "Mandatory disjoint local workload authorization domain.";
+      };
+
       breakGlass = mkOption {
         type = types.bool;
         default = false;
@@ -475,23 +483,14 @@ let
         '';
       };
 
-      allOf = mkOption {
-        type = types.listOf principalSpecType;
-        default = [ ];
-        description = ''
-          Principal specs that must all match. Specs may be runtime-shaped
-          `{ kind = "unix"; uid = 9001; }` values or source-shaped
-          `{ unix.uid = 9001; }` / `{ signature = { algorithm = "ed25519"; public = "..."; }; }`
-          values. Use `{ kind = "unauthenticated"; }` to match the explicit
-          unauthenticated actor (see policy.unauthenticatedSubject).
+      match = mkOption {
+        type = types.attrs;
+        example = lib.literalExpression ''
+          { all = [ { "process.uid" = 9001; } ]; }
         '';
-      };
-
-      anyOf = mkOption {
-        type = types.listOf principalSpecType;
-        default = [ ];
         description = ''
-          Principal specs where any one may match. Leave empty when using allOf.
+          Recursive monotonic evidence expression. Each node contains exactly
+          one `all`, `any`, or typed namespaced leaf key.
         '';
       };
     };
@@ -600,25 +599,13 @@ let
         default = { };
         example = lib.literalExpression ''
           {
-            "svc.web".allOf = [
-              { unix.uid = 9001; }
-            ];
+            "svc.web" = {
+              domain = "host-process";
+              match.all = [ { "process.uid" = 9001; } ];
+            };
           }
         '';
         description = "Subject registry exported to policy.json.";
-      };
-
-      unauthenticatedSubject = mkOption {
-        type = types.nullOr types.str;
-        default = null;
-        example = "guest";
-        description = ''
-          Name of the subject resolved for explicitly unauthenticated requests.
-          Must name a subject (in `subjects` or generated from `unixSubjects`)
-          whose principals include the `unauthenticated` kind. When null, an
-          unauthenticated request resolves to no subject and is default-denied
-          rather than falling through to public reads.
-        '';
       };
 
       unixSubjects = mkOption {
@@ -632,7 +619,7 @@ let
         '';
         description = ''
           Convenience source form for generated Unix subjects. The exporter
-          resolves user/group names to numeric uid/gid principals and writes
+          resolves user/group names to numeric process evidence leaves and writes
           audit name mappings into policy.config.names.
         '';
       };

@@ -42,9 +42,15 @@ fn admin_resolution_status(op: &'static str, err: &SubjectResolutionError) -> to
             op,
             "missing peer credentials",
         ),
+        SubjectResolutionError::DomainUnavailable
+        | SubjectResolutionError::EvidenceUnavailable { .. } => broker_status(
+            Code::Unavailable,
+            "ATTESTATION_UNAVAILABLE",
+            op,
+            "attestation unavailable",
+        ),
         SubjectResolutionError::NoSubject { .. }
-        | SubjectResolutionError::AmbiguousSubject { .. }
-        | SubjectResolutionError::InvalidUnauthenticatedSubject { .. } => {
+        | SubjectResolutionError::AmbiguousSubject { .. } => {
             broker_status(Code::PermissionDenied, "UNAUTHORIZED", op, "not authorized")
         }
     }
@@ -1229,10 +1235,10 @@ mod tests {
     const RELOAD_POLICY: &str = r#"{
       "schema": "policy",
       "subjects": {
-        "svc.admin": { "allOf": [ { "kind": "unix", "uid": 4242 } ] },
-        "svc.explain": { "allOf": [ { "kind": "unix", "uid": 4243 } ] },
-        "svc.revoke": { "allOf": [ { "kind": "unix", "uid": 4244 } ] },
-        "svc.app": { "allOf": [ { "kind": "unix", "uid": 7 } ] }
+        "svc.admin": { "domain": "host-process", "match": { "all": [ { "process.uid": 4242 } ] } },
+        "svc.explain": { "domain": "host-process", "match": { "all": [ { "process.uid": 4243 } ] } },
+        "svc.revoke": { "domain": "host-process", "match": { "all": [ { "process.uid": 4244 } ] } },
+        "svc.app": { "domain": "host-process", "match": { "all": [ { "process.uid": 7 } ] } }
       },
       "roles": { "signer": ["sign", "verify", "get_public_key"] },
       "rules": [
@@ -1316,7 +1322,7 @@ mod tests {
         let policy_json = r#"{
           "schema": "policy",
           "subjects": {
-            "svc.revoke": { "allOf": [ { "kind": "unix", "uid": 4244 } ] }
+            "svc.revoke": { "domain": "host-process", "match": { "all": [ { "process.uid": 4244 } ] } }
           },
           "roles": {},
           "rules": [

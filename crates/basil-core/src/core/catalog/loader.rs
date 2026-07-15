@@ -9,17 +9,26 @@
 //! up front so a bad export fails fast at startup rather than at request time.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
+use std::io::Read as _;
 use std::marker::PhantomData;
+use std::os::unix::fs::MetadataExt as _;
+use std::path::Path;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use serde::de::{self, MapAccess, Visitor};
+use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
+use super::evidence::{
+    AuthorizationDomain, ComposeProjectSelector, ComposeServiceSelector, ContainerRuntimeKind,
+    CredentialSlot, EvidenceExpression, EvidencePredicate, IdentitySelector, LocalAccountSource,
+    MAX_EXPRESSION_DEPTH, MAX_EXPRESSION_LEAVES, SystemdSelector,
+};
 use super::glob::{GlobError, KeyGlob};
 use super::policy::{
-    ALL_OPS, ActionTerm, ActionTermError, Config, Grant, Op, PrincipalSpec, ResolvedPolicy,
-    ResolvedRule, Rule, SignatureKeyAlgorithm, SubjectDefinition, SubjectMatch, SubjectName,
+    ALL_OPS, ActionTerm, ActionTermError, Config, Grant, Op, ResolvedPolicy, ResolvedRule, Rule,
+    SignatureKeyAlgorithm, SubjectDefinition, SubjectName,
 };
 use super::schema::{Catalog, Class, Engine, GenerateSpec, KeyAlgorithm, KeyEntry, MissingPolicy};
 
@@ -32,6 +41,15 @@ pub enum LoadWarning {
         /// The offending key name.
         key: String,
     },
+    /// A valid subject expression exceeds the human-auditability warning threshold.
+    ComplexSubjectExpression {
+        /// Subject name.
+        subject: SubjectName,
+        /// Recursive group nesting depth.
+        depth: usize,
+        /// Leaf predicate count.
+        leaves: usize,
+    },
 }
 
 impl std::fmt::Display for LoadWarning {
@@ -40,6 +58,14 @@ impl std::fmt::Display for LoadWarning {
             Self::MissingNatsType { key } => write!(
                 f,
                 "ed25519-nkey key `{key}` has no nats_type label; mint will fail for it"
+            ),
+            Self::ComplexSubjectExpression {
+                subject,
+                depth,
+                leaves,
+            } => write!(
+                f,
+                "subject `{subject}` expression has depth {depth} and {leaves} leaves; review policies above depth 4 or 16 leaves"
             ),
         }
     }
@@ -91,37 +117,91 @@ pub enum LoadError {
     #[error("subject name must not be empty")]
     EmptySubjectName,
 
-    /// A subject definition did not contain exactly one expression shape.
-    #[error("subject `{subject}` must define exactly one of allOf or anyOf")]
+    /// A subject name exceeds the audit-safe byte ceiling.
+    #[error("subject name exceeds the 128-byte limit ({bytes} bytes)")]
+    SubjectNameTooLong {
+        /// Observed UTF-8 byte length.
+        bytes: usize,
+    },
+
+    /// A subject definition did not contain a valid recursive expression.
+    #[error("subject `{subject}` has invalid evidence expression: {reason}")]
     InvalidSubjectShape {
         /// The offending subject name.
         subject: String,
+        /// Bounded, disclosure-safe structural reason.
+        reason: String,
     },
 
-    /// A subject expression list was empty.
-    #[error("subject `{subject}` has an empty {field}")]
-    EmptySubjectMatch {
-        /// The offending subject name.
+    /// A recursive expression exceeded a hard complexity limit.
+    #[error(
+        "subject `{subject}` evidence expression exceeds limits: depth {depth}/{max_depth}, leaves {leaves}/{max_leaves}"
+    )]
+    SubjectExpressionTooComplex {
+        /// Subject name.
         subject: String,
-        /// The empty field (`allOf` or `anyOf`).
-        field: &'static str,
+        /// Observed recursive group depth.
+        depth: usize,
+        /// Maximum permitted recursive group depth.
+        max_depth: usize,
+        /// Observed leaf count.
+        leaves: usize,
+        /// Maximum permitted leaf count.
+        max_leaves: usize,
     },
 
-    /// A Unix principal named neither uid nor gid.
-    #[error("subject `{subject}` has a unix principal without uid or gid")]
-    EmptyUnixPrincipal {
-        /// The offending subject name.
+    /// A predicate is invalid in the subject's declared domain.
+    #[error("subject `{subject}` predicate `{predicate}` is not valid in domain `{domain}`")]
+    PredicateDomainMismatch {
+        /// Subject name.
         subject: String,
+        /// Namespaced predicate token.
+        predicate: &'static str,
+        /// Domain token.
+        domain: &'static str,
     },
 
-    /// A signature principal has empty public key material.
-    #[error("subject `{subject}` has a signature-key principal with empty public key material")]
+    /// A symbolic process identity was used outside the host-process domain.
+    #[error(
+        "subject `{subject}` uses symbolic `{predicate}` in domain `{domain}`; use the observed numeric process credential"
+    )]
+    SymbolicProcessIdentity {
+        /// Subject name.
+        subject: String,
+        /// Namespaced predicate token.
+        predicate: &'static str,
+        /// Declared authorization domain.
+        domain: &'static str,
+    },
+
+    /// A symbolic local account could not be resolved strictly.
+    #[error("subject `{subject}` cannot resolve local account `{account}`: {reason}")]
+    LocalAccountResolution {
+        /// Subject name.
+        subject: String,
+        /// Escaped symbolic account name.
+        account: String,
+        /// Bounded resolution failure.
+        reason: &'static str,
+    },
+
+    /// A local account database could not be loaded atomically.
+    #[error("cannot load local account database `{path}`: {reason}")]
+    LocalAccountDatabase {
+        /// Fixed local database path.
+        path: &'static str,
+        /// Bounded failure reason.
+        reason: &'static str,
+    },
+
+    /// A signature predicate has empty public key material.
+    #[error("subject `{subject}` has a signature-key predicate with empty public key material")]
     EmptySignaturePublic {
         /// The offending subject name.
         subject: String,
     },
 
-    /// A signature principal has malformed public key material.
+    /// A signature predicate has malformed public key material.
     #[error(
         "subject `{subject}` has malformed {algorithm} signature-key public material: {reason}"
     )]
@@ -132,22 +212,6 @@ pub enum LoadError {
         algorithm: &'static str,
         /// Secret-free validation reason.
         reason: &'static str,
-    },
-
-    /// An unauthenticated principal appears outside the configured unauthenticated subject.
-    #[error(
-        "subject `{subject}` uses unauthenticated principal but `unauthenticatedSubject` does not name it"
-    )]
-    InvalidUnauthenticatedPrincipal {
-        /// The offending subject name.
-        subject: String,
-    },
-
-    /// `unauthenticatedSubject` names no configured subject.
-    #[error("`unauthenticatedSubject` references undefined subject `{subject}`")]
-    UnknownUnauthenticatedSubject {
-        /// The unknown subject name.
-        subject: String,
     },
 
     /// A rule did not name any subjects.
@@ -413,13 +477,6 @@ pub struct RawPolicy {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub subjects: BTreeMap<SubjectName, RawSubjectDefinition>,
-    /// Subject used for explicitly unauthenticated access, when configured.
-    #[serde(
-        rename = "unauthenticatedSubject",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub unauthenticated_subject: Option<SubjectName>,
     /// Named role → op-set table; an action `role:<name>` expands to its ops.
     #[serde(
         default,
@@ -487,7 +544,7 @@ where
     deserializer.deserialize_map(UniqueMapVisitor(PhantomData))
 }
 
-/// One raw subject definition. Exactly one of `allOf` or `anyOf` must be set.
+/// One raw domain-scoped subject definition.
 ///
 /// Unknown fields fail closed: a typo'd `breakGlass` silently defaulting to
 /// `false` would be caught by the any-target gate, but the same class of typo
@@ -495,15 +552,121 @@ where
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawSubjectDefinition {
+    /// Mandatory disjoint workload domain.
+    pub domain: AuthorizationDomain,
     /// Whether this subject is eligible for rules targeting global `*`.
     #[serde(rename = "breakGlass", default, skip_serializing_if = "is_false")]
     pub break_glass: bool,
-    /// All principal specs must match.
-    #[serde(rename = "allOf", default, skip_serializing_if = "Option::is_none")]
-    pub all_of: Option<Vec<PrincipalSpec>>,
-    /// At least one principal spec must match.
-    #[serde(rename = "anyOf", default, skip_serializing_if = "Option::is_none")]
-    pub any_of: Option<Vec<PrincipalSpec>>,
+    /// Recursive monotonic evidence expression.
+    #[serde(rename = "match")]
+    pub match_: RawEvidenceExpression,
+}
+
+/// Raw recursive expression retained as JSON until strict semantic compilation.
+#[derive(Debug, Serialize)]
+#[serde(transparent)]
+pub struct RawEvidenceExpression(pub serde_json::Value);
+
+impl<'de> Deserialize<'de> for RawEvidenceExpression {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueValueVisitor).map(Self)
+    }
+}
+
+struct UniqueValueVisitor;
+
+impl<'de> Visitor<'de> for UniqueValueVisitor {
+    type Value = serde_json::Value;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| de::Error::custom("non-finite evidence number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(Self)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+        while let Some(value) = sequence.next_element_seed(UniqueValueSeed)? {
+            values.push(value);
+        }
+        Ok(serde_json::Value::Array(values))
+    }
+
+    fn visit_map<A>(self, mut object: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = serde_json::Map::with_capacity(object.size_hint().unwrap_or(0));
+        while let Some(key) = object.next_key::<String>()? {
+            if values.contains_key(&key) {
+                return Err(de::Error::custom(format!("duplicate evidence key `{key}`")));
+            }
+            let value = object.next_value_seed(UniqueValueSeed)?;
+            values.insert(key, value);
+        }
+        Ok(serde_json::Value::Object(values))
+    }
+}
+
+struct UniqueValueSeed;
+
+impl<'de> DeserializeSeed<'de> for UniqueValueSeed {
+    type Value = serde_json::Value;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueValueVisitor)
+    }
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -548,20 +711,12 @@ pub fn load(
     let raw_policy: RawPolicy = serde_json::from_str(policy_json)
         .map_err(|source| classify_policy_parse_error(policy_json, source))?;
 
-    let warnings = validate_catalog(&catalog)?;
-    let subjects = parse_subjects(
-        raw_policy.subjects,
-        raw_policy.unauthenticated_subject.as_ref(),
-    )?;
-    validate_unauthenticated_subject(raw_policy.unauthenticated_subject.as_ref(), &subjects)?;
+    let mut warnings = validate_catalog(&catalog)?;
+    let (subjects, subject_warnings) = parse_subjects(raw_policy.subjects)?;
+    warnings.extend(subject_warnings);
     let rules = parse_rules(raw_policy.rules, &subjects)?;
     validate_rule_roles(&rules, &raw_policy.roles)?;
-    let resolved = build_resolved(
-        subjects,
-        raw_policy.unauthenticated_subject,
-        &rules,
-        &raw_policy.roles,
-    );
+    let resolved = build_resolved(subjects, &rules, &raw_policy.roles);
 
     Ok((catalog, resolved, raw_policy.config, warnings))
 }
@@ -1021,21 +1176,39 @@ const fn class_str(class: Class) -> &'static str {
 
 fn parse_subjects(
     raw: BTreeMap<SubjectName, RawSubjectDefinition>,
-    unauthenticated_subject: Option<&SubjectName>,
-) -> Result<BTreeMap<SubjectName, SubjectDefinition>, LoadError> {
-    raw.into_iter()
-        .map(|(name, subject)| parse_subject(&name, subject, unauthenticated_subject))
-        .collect()
+) -> Result<(BTreeMap<SubjectName, SubjectDefinition>, Vec<LoadWarning>), LoadError> {
+    let mut accounts = None;
+    let mut subjects = BTreeMap::new();
+    let mut warnings = Vec::new();
+    for (name, subject) in raw {
+        let (name, subject) = parse_subject(&name, &subject, &mut accounts)?;
+        let depth = subject.match_.depth();
+        let leaves = subject.match_.leaf_count();
+        if depth > 4 || leaves > 16 {
+            warnings.push(LoadWarning::ComplexSubjectExpression {
+                subject: name.clone(),
+                depth,
+                leaves,
+            });
+        }
+        subjects.insert(name, subject);
+    }
+    Ok((subjects, warnings))
 }
 
 fn parse_subject(
     name: &str,
-    raw: RawSubjectDefinition,
-    unauthenticated_subject: Option<&SubjectName>,
+    raw: &RawSubjectDefinition,
+    accounts: &mut Option<LocalAccounts>,
 ) -> Result<(SubjectName, SubjectDefinition), LoadError> {
     let normalized = name.trim();
     if normalized.is_empty() {
         return Err(LoadError::EmptySubjectName);
+    }
+    if normalized.len() > 128 {
+        return Err(LoadError::SubjectNameTooLong {
+            bytes: normalized.len(),
+        });
     }
     // Subject names are logged on every decision record; a control character
     // (newline, ESC) could forge lines in the text tracing sinks.
@@ -1044,98 +1217,751 @@ fn parse_subject(
             subject: normalized.chars().flat_map(char::escape_default).collect(),
         });
     }
-    let match_ = match (raw.all_of, raw.any_of) {
-        (Some(specs), None) => {
-            validate_principal_specs(normalized, &specs, "allOf", unauthenticated_subject)?;
-            SubjectMatch::AllOf(specs)
-        }
-        (None, Some(specs)) => {
-            validate_principal_specs(normalized, &specs, "anyOf", unauthenticated_subject)?;
-            SubjectMatch::AnyOf(specs)
-        }
-        (Some(_), Some(_)) | (None, None) => {
-            return Err(LoadError::InvalidSubjectShape {
-                subject: normalized.to_string(),
-            });
-        }
-    };
+    let match_ = compile_expression(normalized, raw.domain, &raw.match_.0, accounts)?;
+    let depth = match_.depth();
+    let leaves = match_.leaf_count();
+    if depth > MAX_EXPRESSION_DEPTH || leaves > MAX_EXPRESSION_LEAVES {
+        return Err(LoadError::SubjectExpressionTooComplex {
+            subject: normalized.to_string(),
+            depth,
+            max_depth: MAX_EXPRESSION_DEPTH,
+            leaves,
+            max_leaves: MAX_EXPRESSION_LEAVES,
+        });
+    }
     Ok((
         normalized.to_string(),
         SubjectDefinition {
+            domain: raw.domain,
             break_glass: raw.break_glass,
             match_,
         },
     ))
 }
 
-fn validate_unauthenticated_subject(
-    unauthenticated_subject: Option<&SubjectName>,
-    subjects: &BTreeMap<SubjectName, SubjectDefinition>,
-) -> Result<(), LoadError> {
-    let Some(subject) = unauthenticated_subject else {
-        return Ok(());
+fn compile_expression(
+    subject: &str,
+    domain: AuthorizationDomain,
+    value: &serde_json::Value,
+    accounts: &mut Option<LocalAccounts>,
+) -> Result<EvidenceExpression, LoadError> {
+    let mut leaves = 0;
+    compile_expression_node(subject, domain, value, accounts, 0, &mut leaves)
+}
+
+fn compile_expression_node(
+    subject: &str,
+    domain: AuthorizationDomain,
+    value: &serde_json::Value,
+    accounts: &mut Option<LocalAccounts>,
+    group_depth: usize,
+    leaves: &mut usize,
+) -> Result<EvidenceExpression, LoadError> {
+    let Some(object) = value.as_object() else {
+        return invalid_expression(
+            subject,
+            "expected an object with exactly one operator or leaf",
+        );
     };
-    if subjects.contains_key(subject) {
+    if object.len() != 1 {
+        return invalid_expression(subject, "each expression node must contain exactly one key");
+    }
+    let Some((key, value)) = object.iter().next() else {
+        return invalid_expression(subject, "expression node must not be empty");
+    };
+    match key.as_str() {
+        "all" | "any" => {
+            let next_depth = group_depth.saturating_add(1);
+            if next_depth > MAX_EXPRESSION_DEPTH {
+                return Err(LoadError::SubjectExpressionTooComplex {
+                    subject: subject.to_string(),
+                    depth: next_depth,
+                    max_depth: MAX_EXPRESSION_DEPTH,
+                    leaves: *leaves,
+                    max_leaves: MAX_EXPRESSION_LEAVES,
+                });
+            }
+            let Some(children) = value.as_array() else {
+                return invalid_expression(subject, "`all` and `any` values must be arrays");
+            };
+            if children.is_empty() {
+                return invalid_expression(subject, "`all` and `any` groups must not be empty");
+            }
+            let compiled = children
+                .iter()
+                .map(|child| {
+                    compile_expression_node(subject, domain, child, accounts, next_depth, leaves)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if key == "all" {
+                Ok(EvidenceExpression::All(compiled))
+            } else {
+                Ok(EvidenceExpression::Any(compiled))
+            }
+        }
+        _ => {
+            *leaves = leaves.saturating_add(1);
+            if *leaves > MAX_EXPRESSION_LEAVES {
+                return Err(LoadError::SubjectExpressionTooComplex {
+                    subject: subject.to_string(),
+                    depth: group_depth,
+                    max_depth: MAX_EXPRESSION_DEPTH,
+                    leaves: *leaves,
+                    max_leaves: MAX_EXPRESSION_LEAVES,
+                });
+            }
+            let predicate = compile_predicate(subject, domain, key, value, accounts)?;
+            Ok(EvidenceExpression::Leaf(predicate))
+        }
+    }
+}
+
+fn invalid_expression<T>(subject: &str, reason: &str) -> Result<T, LoadError> {
+    Err(LoadError::InvalidSubjectShape {
+        subject: subject.to_string(),
+        reason: reason.to_string(),
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the strict one-key predicate decoder keeps the accepted namespace in one exhaustive match"
+)]
+fn compile_predicate(
+    subject: &str,
+    domain: AuthorizationDomain,
+    key: &str,
+    value: &serde_json::Value,
+    accounts: &mut Option<LocalAccounts>,
+) -> Result<EvidencePredicate, LoadError> {
+    let predicate = match key {
+        "process.uid" => EvidencePredicate::ProcessUid(compile_identity(
+            subject,
+            domain,
+            "process.uid",
+            value,
+            LocalAccountSource::Passwd,
+            accounts,
+        )?),
+        "process.uid.real" => process_uid_slot(
+            subject,
+            domain,
+            "process.uid.real",
+            value,
+            CredentialSlot::Real,
+            accounts,
+        )?,
+        "process.uid.effective" => process_uid_slot(
+            subject,
+            domain,
+            "process.uid.effective",
+            value,
+            CredentialSlot::Effective,
+            accounts,
+        )?,
+        "process.uid.saved" => process_uid_slot(
+            subject,
+            domain,
+            "process.uid.saved",
+            value,
+            CredentialSlot::Saved,
+            accounts,
+        )?,
+        "process.uid.filesystem" => process_uid_slot(
+            subject,
+            domain,
+            "process.uid.filesystem",
+            value,
+            CredentialSlot::Filesystem,
+            accounts,
+        )?,
+        "process.gid" => EvidencePredicate::ProcessGid(compile_identity(
+            subject,
+            domain,
+            "process.gid",
+            value,
+            LocalAccountSource::Group,
+            accounts,
+        )?),
+        "process.gid.real" => process_gid_slot(
+            subject,
+            domain,
+            "process.gid.real",
+            value,
+            CredentialSlot::Real,
+            accounts,
+        )?,
+        "process.gid.effective" => process_gid_slot(
+            subject,
+            domain,
+            "process.gid.effective",
+            value,
+            CredentialSlot::Effective,
+            accounts,
+        )?,
+        "process.gid.saved" => process_gid_slot(
+            subject,
+            domain,
+            "process.gid.saved",
+            value,
+            CredentialSlot::Saved,
+            accounts,
+        )?,
+        "process.gid.filesystem" => process_gid_slot(
+            subject,
+            domain,
+            "process.gid.filesystem",
+            value,
+            CredentialSlot::Filesystem,
+            accounts,
+        )?,
+        "process.gid.supplementary" => {
+            EvidencePredicate::ProcessGidSupplementary(compile_identity(
+                subject,
+                domain,
+                "process.gid.supplementary",
+                value,
+                LocalAccountSource::Group,
+                accounts,
+            )?)
+        }
+        "process.executable.digest" => {
+            let digest = required_string(subject, value, "executable digest")?;
+            if !valid_sha256_digest(&digest) {
+                return invalid_expression(
+                    subject,
+                    "`process.executable.digest` must be `sha256:` plus 64 lowercase hex digits",
+                );
+            }
+            EvidencePredicate::ProcessExecutableDigest(digest)
+        }
+        "systemd.unit" => EvidencePredicate::SystemdUnit(compile_systemd_selector(
+            subject, value, false, accounts,
+        )?),
+        "systemd.template" => EvidencePredicate::SystemdTemplate(compile_systemd_selector(
+            subject, value, true, accounts,
+        )?),
+        "compose.service" => {
+            EvidencePredicate::ComposeService(compile_compose_service(subject, value)?)
+        }
+        "compose.project" => {
+            EvidencePredicate::ComposeProject(compile_compose_project(subject, value)?)
+        }
+        "runtime.kind" => {
+            let runtime = required_string(subject, value, "runtime kind")?;
+            let runtime = match runtime.as_str() {
+                "docker" => ContainerRuntimeKind::Docker,
+                "podman" => ContainerRuntimeKind::Podman,
+                _ => return invalid_expression(subject, "unknown `runtime.kind` value"),
+            };
+            EvidencePredicate::RuntimeKind(runtime)
+        }
+        "oci.signer" => EvidencePredicate::OciSigner(required_bounded_string(
+            subject,
+            value,
+            "OCI signer policy",
+        )?),
+        "invocation.signature-key" => compile_signature_key(subject, value)?,
+        _ => return invalid_expression(subject, "unknown evidence predicate"),
+    };
+    validate_predicate_domain(subject, domain, key, &predicate)?;
+    Ok(predicate)
+}
+
+fn process_uid_slot(
+    subject: &str,
+    domain: AuthorizationDomain,
+    key: &'static str,
+    value: &serde_json::Value,
+    slot: CredentialSlot,
+    accounts: &mut Option<LocalAccounts>,
+) -> Result<EvidencePredicate, LoadError> {
+    Ok(EvidencePredicate::ProcessUidSlot(
+        slot,
+        compile_identity(
+            subject,
+            domain,
+            key,
+            value,
+            LocalAccountSource::Passwd,
+            accounts,
+        )?,
+    ))
+}
+
+fn process_gid_slot(
+    subject: &str,
+    domain: AuthorizationDomain,
+    key: &'static str,
+    value: &serde_json::Value,
+    slot: CredentialSlot,
+    accounts: &mut Option<LocalAccounts>,
+) -> Result<EvidencePredicate, LoadError> {
+    Ok(EvidencePredicate::ProcessGidSlot(
+        slot,
+        compile_identity(
+            subject,
+            domain,
+            key,
+            value,
+            LocalAccountSource::Group,
+            accounts,
+        )?,
+    ))
+}
+
+fn compile_identity(
+    subject: &str,
+    domain: AuthorizationDomain,
+    predicate: &'static str,
+    value: &serde_json::Value,
+    source: LocalAccountSource,
+    accounts: &mut Option<LocalAccounts>,
+) -> Result<IdentitySelector, LoadError> {
+    if let Some(id) = value.as_u64() {
+        return u32::try_from(id)
+            .map(IdentitySelector::Numeric)
+            .map_err(|_| LoadError::LocalAccountResolution {
+                subject: subject.to_string(),
+                account: "numeric-id".to_string(),
+                reason: "numeric identifier is out of range",
+            });
+    }
+    let Some(name) = value.as_str() else {
+        return invalid_expression(
+            subject,
+            "process identities must be integers or local names",
+        );
+    };
+    if name.is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
+        return invalid_expression(subject, "local account name is empty, too long, or unsafe");
+    }
+    if name.parse::<i128>().is_ok() {
+        return invalid_expression(subject, "numeric-looking identity strings are invalid");
+    }
+    if domain != AuthorizationDomain::HostProcess && predicate != "systemd.managerUser" {
+        return Err(LoadError::SymbolicProcessIdentity {
+            subject: subject.to_string(),
+            predicate,
+            domain: domain_token(domain),
+        });
+    }
+    if accounts.is_none() {
+        *accounts = Some(LocalAccounts::load()?);
+    }
+    let Some(local) = accounts.as_ref() else {
+        return Err(LoadError::LocalAccountDatabase {
+            path: "/etc/passwd",
+            reason: "account database state unavailable",
+        });
+    };
+    let id = match source {
+        LocalAccountSource::Passwd => local.users.get(name),
+        LocalAccountSource::Group => local.groups.get(name),
+    }
+    .copied()
+    .ok_or_else(|| LoadError::LocalAccountResolution {
+        subject: subject.to_string(),
+        account: name.chars().flat_map(char::escape_default).collect(),
+        reason: "name is missing from the local account database",
+    })?;
+    Ok(IdentitySelector::LocalName {
+        name: name.to_string(),
+        id,
+        source,
+    })
+}
+
+fn compile_systemd_selector(
+    subject: &str,
+    value: &serde_json::Value,
+    template: bool,
+    accounts: &mut Option<LocalAccounts>,
+) -> Result<SystemdSelector, LoadError> {
+    let Some(object) = value.as_object() else {
+        return invalid_expression(subject, "systemd predicate must be an object");
+    };
+    if object
+        .keys()
+        .any(|key| key != "name" && key != "managerUser")
+        || object.len() > 2
+    {
+        return invalid_expression(subject, "systemd predicate contains unknown fields");
+    }
+    let Some(name) = object.get("name").and_then(serde_json::Value::as_str) else {
+        return invalid_expression(subject, "systemd predicate requires string `name`");
+    };
+    if !valid_systemd_service_name(name, template) {
+        return invalid_expression(subject, "systemd name must be a canonical `.service` unit");
+    }
+    let manager_user = object
+        .get("managerUser")
+        .map(|value| {
+            compile_identity(
+                subject,
+                AuthorizationDomain::SystemdUnit,
+                "systemd.managerUser",
+                value,
+                LocalAccountSource::Passwd,
+                accounts,
+            )
+        })
+        .transpose()?;
+    Ok(SystemdSelector {
+        name: name.to_string(),
+        manager_user,
+    })
+}
+
+fn valid_systemd_service_name(name: &str, template: bool) -> bool {
+    if name.is_empty() || name.len() > 255 || name.chars().any(char::is_control) {
+        return false;
+    }
+    let Some(stem) = name.strip_suffix(".service") else {
+        return false;
+    };
+    let mut parts = stem.split('@');
+    let Some(base) = parts.next() else {
+        return false;
+    };
+    let instance = parts.next();
+    if parts.next().is_some() || !valid_systemd_name_component(base) {
+        return false;
+    }
+    if template {
+        instance == Some("")
+    } else {
+        instance.is_none_or(valid_systemd_name_component)
+    }
+}
+
+fn valid_systemd_name_component(component: &str) -> bool {
+    if component.is_empty() {
+        return false;
+    }
+    let bytes = component.as_bytes();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let Some(byte) = bytes.get(offset).copied() else {
+            break;
+        };
+        if byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'_' | b'.' | b'-') {
+            offset += 1;
+            continue;
+        }
+        if !matches!(
+            bytes.get(offset..offset.saturating_add(4)),
+            Some([b'\\', b'x', high, low]) if is_lower_hex(*high) && is_lower_hex(*low)
+        ) {
+            return false;
+        }
+        offset += 4;
+    }
+    true
+}
+
+const fn is_lower_hex(byte: u8) -> bool {
+    byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
+}
+
+fn compile_compose_service(
+    subject: &str,
+    value: &serde_json::Value,
+) -> Result<ComposeServiceSelector, LoadError> {
+    let object = exact_object(subject, value, &["realm", "project", "name"])?;
+    Ok(ComposeServiceSelector {
+        realm: required_object_string(subject, object, "realm")?,
+        project: required_object_string(subject, object, "project")?,
+        name: required_object_string(subject, object, "name")?,
+    })
+}
+
+fn compile_compose_project(
+    subject: &str,
+    value: &serde_json::Value,
+) -> Result<ComposeProjectSelector, LoadError> {
+    let object = exact_object(subject, value, &["realm", "project"])?;
+    Ok(ComposeProjectSelector {
+        realm: required_object_string(subject, object, "realm")?,
+        project: required_object_string(subject, object, "project")?,
+    })
+}
+
+fn exact_object<'a>(
+    subject: &str,
+    value: &'a serde_json::Value,
+    fields: &[&str],
+) -> Result<&'a serde_json::Map<String, serde_json::Value>, LoadError> {
+    let Some(object) = value.as_object() else {
+        return invalid_expression(subject, "compound predicate must be an object");
+    };
+    if object.len() != fields.len() || fields.iter().any(|field| !object.contains_key(*field)) {
+        return invalid_expression(
+            subject,
+            "compound predicate fields are incomplete or unknown",
+        );
+    }
+    Ok(object)
+}
+
+fn required_object_string(
+    subject: &str,
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<String, LoadError> {
+    let Some(value) = object.get(field).and_then(serde_json::Value::as_str) else {
+        return invalid_expression(subject, "compound predicate fields must be strings");
+    };
+    if !valid_bounded_text(value) {
+        return invalid_expression(
+            subject,
+            "compound predicate string is empty, too long, or unsafe",
+        );
+    }
+    Ok(value.to_string())
+}
+
+fn required_string(
+    subject: &str,
+    value: &serde_json::Value,
+    _field: &str,
+) -> Result<String, LoadError> {
+    value
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| LoadError::InvalidSubjectShape {
+            subject: subject.to_string(),
+            reason: "predicate value must be a string".to_string(),
+        })
+}
+
+fn required_bounded_string(
+    subject: &str,
+    value: &serde_json::Value,
+    field: &str,
+) -> Result<String, LoadError> {
+    let value = required_string(subject, value, field)?;
+    if !valid_bounded_text(&value) {
+        return invalid_expression(subject, "predicate string is empty, too long, or unsafe");
+    }
+    Ok(value)
+}
+
+fn valid_bounded_text(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+}
+
+fn valid_sha256_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    })
+}
+
+fn compile_signature_key(
+    subject: &str,
+    value: &serde_json::Value,
+) -> Result<EvidencePredicate, LoadError> {
+    let object = exact_object(subject, value, &["algorithm", "public"])?;
+    let algorithm = match object.get("algorithm").and_then(serde_json::Value::as_str) {
+        Some("ed25519") => SignatureKeyAlgorithm::Ed25519,
+        Some("nats-nkey") => SignatureKeyAlgorithm::NatsNkey,
+        _ => return invalid_expression(subject, "unknown signature-key algorithm"),
+    };
+    let Some(public) = object.get("public").and_then(serde_json::Value::as_str) else {
+        return invalid_expression(subject, "signature-key `public` must be a string");
+    };
+    if public.trim().is_empty() {
+        return Err(LoadError::EmptySignaturePublic {
+            subject: subject.to_string(),
+        });
+    }
+    validate_signature_public(subject, algorithm, public)?;
+    Ok(EvidencePredicate::InvocationSignatureKey {
+        algorithm,
+        public: public.to_string(),
+    })
+}
+
+fn validate_predicate_domain(
+    subject: &str,
+    domain: AuthorizationDomain,
+    key: &str,
+    predicate: &EvidencePredicate,
+) -> Result<(), LoadError> {
+    let valid = match predicate {
+        EvidencePredicate::ComposeService(_)
+        | EvidencePredicate::ComposeProject(_)
+        | EvidencePredicate::RuntimeKind(_)
+        | EvidencePredicate::OciSigner(_) => domain == AuthorizationDomain::Container,
+        EvidencePredicate::SystemdUnit(_) | EvidencePredicate::SystemdTemplate(_) => {
+            domain != AuthorizationDomain::HostProcess
+        }
+        EvidencePredicate::ProcessUid(_)
+        | EvidencePredicate::ProcessUidSlot(_, _)
+        | EvidencePredicate::ProcessGid(_)
+        | EvidencePredicate::ProcessGidSlot(_, _)
+        | EvidencePredicate::ProcessGidSupplementary(_)
+        | EvidencePredicate::ProcessExecutableDigest(_)
+        | EvidencePredicate::InvocationSignatureKey { .. } => true,
+    };
+    if valid {
         Ok(())
     } else {
-        Err(LoadError::UnknownUnauthenticatedSubject {
-            subject: subject.clone(),
+        Err(LoadError::PredicateDomainMismatch {
+            subject: subject.to_string(),
+            predicate: predicate_token(key),
+            domain: domain_token(domain),
         })
     }
 }
 
-fn validate_principal_specs(
-    subject: &str,
-    specs: &[PrincipalSpec],
-    field: &'static str,
-    unauthenticated_subject: Option<&SubjectName>,
-) -> Result<(), LoadError> {
-    if specs.is_empty() {
-        return Err(LoadError::EmptySubjectMatch {
-            subject: subject.to_string(),
-            field,
-        });
+const fn domain_token(domain: AuthorizationDomain) -> &'static str {
+    match domain {
+        AuthorizationDomain::HostProcess => "host-process",
+        AuthorizationDomain::SystemdUnit => "systemd-unit",
+        AuthorizationDomain::Container => "container",
     }
-    for spec in specs {
-        validate_principal_spec(subject, spec, unauthenticated_subject)?;
-    }
-    Ok(())
 }
 
-fn validate_principal_spec(
-    subject: &str,
-    spec: &PrincipalSpec,
-    unauthenticated_subject: Option<&SubjectName>,
-) -> Result<(), LoadError> {
-    match spec {
-        PrincipalSpec::Unix { uid, gid } => {
-            if uid.is_some() || gid.is_some() {
-                Ok(())
-            } else {
-                Err(LoadError::EmptyUnixPrincipal {
-                    subject: subject.to_string(),
-                })
-            }
+fn predicate_token(key: &str) -> &'static str {
+    match key {
+        "compose.service" => "compose.service",
+        "compose.project" => "compose.project",
+        "runtime.kind" => "runtime.kind",
+        "oci.signer" => "oci.signer",
+        "systemd.unit" => "systemd.unit",
+        "systemd.template" => "systemd.template",
+        _ => "evidence",
+    }
+}
+
+#[derive(Debug)]
+struct LocalAccounts {
+    users: BTreeMap<String, u32>,
+    groups: BTreeMap<String, u32>,
+}
+
+impl LocalAccounts {
+    fn load() -> Result<Self, LoadError> {
+        let passwd = read_stable_account_file("/etc/passwd")?;
+        let group = read_stable_account_file("/etc/group")?;
+        Ok(Self {
+            users: parse_account_file(&passwd, 7, 2, "/etc/passwd")?,
+            groups: parse_account_file(&group, 4, 2, "/etc/group")?,
+        })
+    }
+}
+
+const MAX_ACCOUNT_FILE_BYTES: u64 = 1024 * 1024;
+
+fn read_stable_account_file(path: &'static str) -> Result<String, LoadError> {
+    let mut file = File::open(Path::new(path)).map_err(|_| LoadError::LocalAccountDatabase {
+        path,
+        reason: "file is unavailable",
+    })?;
+    let before = file
+        .metadata()
+        .map_err(|_| LoadError::LocalAccountDatabase {
+            path,
+            reason: "metadata is unavailable",
+        })?;
+    if before.len() > MAX_ACCOUNT_FILE_BYTES {
+        return Err(LoadError::LocalAccountDatabase {
+            path,
+            reason: "file exceeds the 1 MiB limit",
+        });
+    }
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(MAX_ACCOUNT_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| LoadError::LocalAccountDatabase {
+            path,
+            reason: "file read failed",
+        })?;
+    let after = file
+        .metadata()
+        .map_err(|_| LoadError::LocalAccountDatabase {
+            path,
+            reason: "post-read metadata is unavailable",
+        })?;
+    let path_after =
+        std::fs::metadata(Path::new(path)).map_err(|_| LoadError::LocalAccountDatabase {
+            path,
+            reason: "post-read path metadata is unavailable",
+        })?;
+    let stable_time = before
+        .modified()
+        .ok()
+        .zip(after.modified().ok())
+        .zip(path_after.modified().ok())
+        .is_some_and(|((before_time, after_time), path_time)| {
+            before_time == after_time && after_time == path_time
+        });
+    let stable_identity = before.dev() == after.dev()
+        && after.dev() == path_after.dev()
+        && before.ino() == after.ino()
+        && after.ino() == path_after.ino();
+    if bytes.len() as u64 != before.len()
+        || before.len() != after.len()
+        || after.len() != path_after.len()
+        || !stable_identity
+        || !stable_time
+    {
+        return Err(LoadError::LocalAccountDatabase {
+            path,
+            reason: "file changed while it was read",
+        });
+    }
+    String::from_utf8(bytes).map_err(|_| LoadError::LocalAccountDatabase {
+        path,
+        reason: "file is not valid UTF-8",
+    })
+}
+
+fn parse_account_file(
+    contents: &str,
+    field_count: usize,
+    id_index: usize,
+    path: &'static str,
+) -> Result<BTreeMap<String, u32>, LoadError> {
+    let mut entries = BTreeMap::new();
+    for line in contents.lines() {
+        if line.is_empty() {
+            continue;
         }
-        PrincipalSpec::Unauthenticated => {
-            if unauthenticated_subject.is_some_and(|configured| configured == subject) {
-                Ok(())
-            } else {
-                Err(LoadError::InvalidUnauthenticatedPrincipal {
-                    subject: subject.to_string(),
-                })
-            }
-        }
-        PrincipalSpec::SignatureKey { algorithm, public } => {
-            if public.trim().is_empty() {
-                Err(LoadError::EmptySignaturePublic {
-                    subject: subject.to_string(),
-                })
-            } else {
-                validate_signature_public(subject, *algorithm, public)
-            }
+        let fields = line.split(':').collect::<Vec<_>>();
+        let Some(name) = fields.first().copied() else {
+            return Err(LoadError::LocalAccountDatabase {
+                path,
+                reason: "file contains a malformed entry",
+            });
+        };
+        let Some(id) = fields
+            .get(id_index)
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            return Err(LoadError::LocalAccountDatabase {
+                path,
+                reason: "file contains a malformed or out-of-range identifier",
+            });
+        };
+        if fields.len() != field_count
+            || name.is_empty()
+            || name.len() > 128
+            || name.chars().any(char::is_control)
+            || entries.insert(name.to_string(), id).is_some()
+        {
+            return Err(LoadError::LocalAccountDatabase {
+                path,
+                reason: "file contains a malformed or duplicate account name",
+            });
         }
     }
+    Ok(entries)
 }
 
 fn validate_signature_public(
@@ -1304,7 +2130,6 @@ fn expand_ops(
 
 fn build_resolved(
     subjects: BTreeMap<SubjectName, SubjectDefinition>,
-    unauthenticated_subject: Option<SubjectName>,
     rules: &[Rule],
     defined_roles: &BTreeMap<String, BTreeSet<Op>>,
 ) -> ResolvedPolicy {
@@ -1332,11 +2157,7 @@ fn build_resolved(
             }
         })
         .collect();
-    ResolvedPolicy {
-        subjects,
-        unauthenticated_subject,
-        rules,
-    }
+    ResolvedPolicy { subjects, rules }
 }
 
 #[cfg(test)]
@@ -1367,11 +2188,11 @@ mod tests {
             r#"{{
               "schema": "policy",
               "subjects": {{
-                "svc.nats": {{ "allOf": [ {{ "kind": "unix", "uid": 9002 }} ] }},
-                "ops.wheel": {{ "allOf": [ {{ "kind": "unix", "gid": 10 }} ] }},
-                "breakglass.root": {{ "breakGlass": true, "allOf": [ {{ "kind": "unix", "uid": 0 }} ] }},
-                "root.group": {{ "allOf": [ {{ "kind": "unix", "gid": 0 }} ] }},
-                "public.subject": {{ "allOf": [ {{ "kind": "unix", "uid": 42 }} ] }}
+                "svc.nats": {{ "domain": "host-process", "match": {{ "all": [ {{ "process.uid": 9002 }} ] }} }},
+                "ops.wheel": {{ "domain": "host-process", "match": {{ "all": [ {{ "process.gid.supplementary": 10 }} ] }} }},
+                "breakglass.root": {{ "domain": "host-process", "breakGlass": true, "match": {{ "all": [ {{ "process.uid": 0 }} ] }} }},
+                "root.group": {{ "domain": "host-process", "match": {{ "all": [ {{ "process.gid.supplementary": 0 }} ] }} }},
+                "public.subject": {{ "domain": "host-process", "match": {{ "all": [ {{ "process.uid": 42 }} ] }} }}
               }},
               "roles": {{ {roles_body} }},
               "rules": [ {rules_array} ],
@@ -1465,7 +2286,7 @@ mod tests {
         let cat = catalog_json(ASYM_KEY);
         let pol = r#"{
           "schema": "policy",
-          "subjects": { "svc.\nnats": { "allOf": [ { "kind": "unix", "uid": 9002 } ] } },
+          "subjects": { "svc.\nnats": { "domain": "host-process", "match": { "all": [ { "process.uid": 9002 } ] } } },
           "roles": {},
           "rules": [],
           "config": {}
@@ -2003,8 +2824,8 @@ mod tests {
         let pol = r#"{
           "schema": "policy",
           "subjects": {
-            "svc.nats": { "allOf": [ { "kind": "unix", "uid": 9002 } ] },
-            "svc.nats": { "allOf": [ { "kind": "unix", "uid": 9003 } ] }
+            "svc.nats": { "domain": "host-process", "match": { "all": [ { "process.uid": 9002 } ] } },
+            "svc.nats": { "domain": "host-process", "match": { "all": [ { "process.uid": 9003 } ] } }
           },
           "roles": {},
           "rules": [],
@@ -2027,7 +2848,7 @@ mod tests {
         let pol = r#"{
           "schema": "policy",
           "subjects": {
-            "svc.nats": { "allOf": [ { "kind": "unix", "uid": 9002 } ] }
+            "svc.nats": { "domain": "host-process", "match": { "all": [ { "process.uid": 9002 } ] } }
           },
           "roles": {
             "reader": ["get"],
@@ -2044,6 +2865,33 @@ mod tests {
         assert!(
             err.to_string().contains("duplicate policy key `reader`"),
             "error names the duplicate role: {err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_evidence_key_is_fatal_at_decode() {
+        let cat = catalog_json(ASYM_KEY);
+        let pol = r#"{
+          "schema": "policy",
+          "subjects": {
+            "svc.nats": {
+              "domain": "host-process",
+              "match": { "process.uid": 9002, "process.uid": 9003 }
+            }
+          },
+          "roles": {},
+          "rules": [],
+          "config": {}
+        }"#;
+        let err = load(&cat, pol).expect_err("duplicate evidence key rejected");
+        assert!(
+            matches!(err, LoadError::Json { what: "policy", .. }),
+            "duplicate evidence keys fail during policy JSON decode: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("duplicate evidence key `process.uid`"),
+            "error names the duplicate predicate: {err}"
         );
     }
 
@@ -2187,25 +3035,25 @@ mod tests {
     #[test]
     fn empty_subject_expressions_are_fatal() {
         let cat = catalog_json(ASYM_KEY);
-        for field in ["allOf", "anyOf"] {
+        for field in ["all", "any"] {
             let pol = format!(
                 r#"{{
                   "schema": "policy",
-                  "subjects": {{ "svc.empty": {{ "{field}": [] }} }},
+                  "subjects": {{ "svc.empty": {{ "domain": "host-process", "match": {{ "{field}": [] }} }} }},
                   "roles": {{ }},
                   "rules": [],
                   "config": {{ }}
                 }}"#
             );
             assert!(
-                matches!(load(&cat, &pol), Err(LoadError::EmptySubjectMatch { .. })),
+                matches!(load(&cat, &pol), Err(LoadError::InvalidSubjectShape { .. })),
                 "{field} must reject empty lists"
             );
         }
     }
 
     #[test]
-    fn unix_principal_requires_uid_or_gid() {
+    fn provisional_unix_principal_is_rejected() {
         let cat = catalog_json(ASYM_KEY);
         let pol = r#"{
           "schema": "policy",
@@ -2214,14 +3062,11 @@ mod tests {
           "rules": [],
           "config": {}
         }"#;
-        assert!(matches!(
-            load(&cat, pol),
-            Err(LoadError::EmptyUnixPrincipal { .. })
-        ));
+        assert!(matches!(load(&cat, pol), Err(LoadError::Json { .. })));
     }
 
     #[test]
-    fn unauthenticated_principal_must_match_configured_subject() {
+    fn provisional_unauthenticated_principal_is_rejected() {
         let cat = catalog_json(ASYM_KEY);
         let pol = r#"{
           "schema": "policy",
@@ -2231,14 +3076,11 @@ mod tests {
           "rules": [],
           "config": {}
         }"#;
-        assert!(matches!(
-            load(&cat, pol),
-            Err(LoadError::InvalidUnauthenticatedPrincipal { .. })
-        ));
+        assert!(matches!(load(&cat, pol), Err(LoadError::Json { .. })));
     }
 
     #[test]
-    fn unauthenticated_subject_must_be_defined() {
+    fn unauthenticated_subject_field_is_rejected() {
         let cat = catalog_json(ASYM_KEY);
         let pol = r#"{
           "schema": "policy",
@@ -2248,10 +3090,7 @@ mod tests {
           "rules": [],
           "config": {}
         }"#;
-        assert!(matches!(
-            load(&cat, pol),
-            Err(LoadError::UnknownUnauthenticatedSubject { .. })
-        ));
+        assert!(matches!(load(&cat, pol), Err(LoadError::Json { .. })));
     }
 
     #[test]
@@ -2259,25 +3098,32 @@ mod tests {
         let cat = catalog_json(ASYM_KEY);
         let bad_kind = r#"{
           "schema": "policy",
-          "subjects": { "svc.bad": { "allOf": [ { "kind": "process", "sha256": "00" } ] } },
+          "subjects": { "svc.bad": { "domain": "host-process", "match": { "process.sha256": "00" } } },
           "roles": {},
           "rules": [],
           "config": {}
         }"#;
-        assert!(matches!(load(&cat, bad_kind), Err(LoadError::Json { .. })));
+        assert!(matches!(
+            load(&cat, bad_kind),
+            Err(LoadError::InvalidSubjectShape { .. })
+        ));
 
         let bad_alg = r#"{
           "schema": "policy",
           "subjects": {
             "svc.bad": {
-              "allOf": [ { "kind": "signature-key", "algorithm": "ssh-ed25519", "public": "x" } ]
+              "domain": "host-process",
+              "match": { "invocation.signature-key": { "algorithm": "ssh-ed25519", "public": "x" } }
             }
           },
           "roles": {},
           "rules": [],
           "config": {}
         }"#;
-        assert!(matches!(load(&cat, bad_alg), Err(LoadError::Json { .. })));
+        assert!(matches!(
+            load(&cat, bad_alg),
+            Err(LoadError::InvalidSubjectShape { .. })
+        ));
     }
 
     #[test]
@@ -2287,7 +3133,8 @@ mod tests {
           "schema": "policy",
           "subjects": {
             "svc.bad": {
-              "allOf": [ { "kind": "signature-key", "algorithm": "ed25519", "public": "not-base64url" } ]
+              "domain": "host-process",
+              "match": { "invocation.signature-key": { "algorithm": "ed25519", "public": "not-base64url" } }
             }
           },
           "roles": {},
@@ -2306,7 +3153,8 @@ mod tests {
           "schema": "policy",
           "subjects": {
             "svc.bad": {
-              "allOf": [ { "kind": "signature-key", "algorithm": "nats-nkey", "public": "not-an-nkey" } ]
+              "domain": "host-process",
+              "match": { "invocation.signature-key": { "algorithm": "nats-nkey", "public": "not-an-nkey" } }
             }
           },
           "roles": {},
@@ -2325,7 +3173,7 @@ mod tests {
     // ---- ResolvedPolicy index building --------------------------------------
 
     #[test]
-    fn resolved_index_buckets_by_principal_kind() {
+    fn resolved_index_preserves_subject_rules() {
         let cat = catalog_json(ASYM_KEY);
         let pol = policy_json(
             r#""signer": ["sign", "verify", "get_public_key"]"#,
@@ -2438,5 +3286,240 @@ mod tests {
             Err(LoadError::Json { what, .. }) => assert_eq!(what, "policy"),
             other => panic!("expected policy JSON error, got {other:?}"),
         }
+    }
+
+    fn raw_subject(domain: AuthorizationDomain, match_: serde_json::Value) -> RawSubjectDefinition {
+        RawSubjectDefinition {
+            domain,
+            break_glass: false,
+            match_: RawEvidenceExpression(match_),
+        }
+    }
+
+    #[test]
+    fn recursive_expression_depth_and_leaf_limits_are_hard() {
+        let mut too_deep = serde_json::json!({ "process.uid": 7 });
+        for _ in 0..=MAX_EXPRESSION_DEPTH {
+            too_deep = serde_json::json!({ "all": [too_deep] });
+        }
+        let mut accounts = None;
+        assert!(matches!(
+            parse_subject(
+                "too.deep",
+                &raw_subject(AuthorizationDomain::HostProcess, too_deep),
+                &mut accounts,
+            ),
+            Err(LoadError::SubjectExpressionTooComplex { .. })
+        ));
+
+        let too_many = serde_json::json!({
+            "all": (0..=MAX_EXPRESSION_LEAVES)
+                .map(|id| serde_json::json!({ "process.uid": id }))
+                .collect::<Vec<_>>()
+        });
+        assert!(matches!(
+            parse_subject(
+                "too.many",
+                &raw_subject(AuthorizationDomain::HostProcess, too_many),
+                &mut accounts,
+            ),
+            Err(LoadError::SubjectExpressionTooComplex { .. })
+        ));
+    }
+
+    #[test]
+    fn complex_but_valid_expression_emits_review_warning() {
+        let mut expression = serde_json::json!({ "process.uid": 7 });
+        for _ in 0..5 {
+            expression = serde_json::json!({ "all": [expression] });
+        }
+        let (_, warnings) = parse_subjects(BTreeMap::from([(
+            "deep.valid".to_string(),
+            raw_subject(AuthorizationDomain::HostProcess, expression),
+        )]))
+        .expect("expression within hard limits loads");
+        assert_eq!(
+            warnings,
+            [LoadWarning::ComplexSubjectExpression {
+                subject: "deep.valid".to_string(),
+                depth: 5,
+                leaves: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn typed_compose_predicates_require_container_domain_and_exact_fields() {
+        let expression = serde_json::json!({
+            "all": [
+                { "compose.service": { "realm": "ci", "project": "build", "name": "worker" } },
+                { "compose.project": { "realm": "ci", "project": "build" } },
+                { "runtime.kind": "podman" },
+                { "oci.signer": "release" },
+                { "process.uid": 7 },
+                { "process.executable.digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+            ]
+        });
+        let mut accounts = None;
+        let (_, subject) = parse_subject(
+            "container.worker",
+            &raw_subject(AuthorizationDomain::Container, expression.clone()),
+            &mut accounts,
+        )
+        .expect("typed container expression loads");
+        assert_eq!(subject.match_.leaf_count(), 6);
+
+        assert!(matches!(
+            parse_subject(
+                "host.worker",
+                &raw_subject(AuthorizationDomain::HostProcess, expression),
+                &mut accounts,
+            ),
+            Err(LoadError::PredicateDomainMismatch { .. })
+        ));
+        assert!(matches!(
+            parse_subject(
+                "bad.compose",
+                &raw_subject(
+                    AuthorizationDomain::Container,
+                    serde_json::json!({
+                        "compose.service": { "project": "build", "name": "worker" }
+                    }),
+                ),
+                &mut accounts,
+            ),
+            Err(LoadError::InvalidSubjectShape { .. })
+        ));
+    }
+
+    #[test]
+    fn symbolic_accounts_compile_only_for_host_processes_and_manager_owners() {
+        let mut accounts = Some(LocalAccounts {
+            users: BTreeMap::from([("svc-web".to_string(), 9001)]),
+            groups: BTreeMap::from([("wheel".to_string(), 10)]),
+        });
+        let (_, subject) = parse_subject(
+            "host.web",
+            &raw_subject(
+                AuthorizationDomain::HostProcess,
+                serde_json::json!({
+                    "all": [
+                        { "process.uid": "svc-web" },
+                        { "process.gid.supplementary": "wheel" }
+                    ]
+                }),
+            ),
+            &mut accounts,
+        )
+        .expect("strict local names compile");
+        let mut symbolic = 0;
+        subject
+            .match_
+            .visit_leaves(&mut |predicate| match predicate {
+                EvidencePredicate::ProcessUid(selector)
+                | EvidencePredicate::ProcessGidSupplementary(selector)
+                    if selector.is_symbolic() =>
+                {
+                    symbolic += 1;
+                }
+                _ => {}
+            });
+        assert_eq!(symbolic, 2);
+
+        assert!(matches!(
+            parse_subject(
+                "container.web",
+                &raw_subject(
+                    AuthorizationDomain::Container,
+                    serde_json::json!({ "process.uid": "svc-web" }),
+                ),
+                &mut accounts,
+            ),
+            Err(LoadError::SymbolicProcessIdentity { .. })
+        ));
+        assert!(matches!(
+            parse_subject(
+                "systemd.web",
+                &raw_subject(
+                    AuthorizationDomain::SystemdUnit,
+                    serde_json::json!({ "process.uid": "svc-web" }),
+                ),
+                &mut accounts,
+            ),
+            Err(LoadError::SymbolicProcessIdentity { .. })
+        ));
+        parse_subject(
+            "systemd.manager",
+            &raw_subject(
+                AuthorizationDomain::SystemdUnit,
+                serde_json::json!({
+                    "systemd.unit": { "name": "web.service", "managerUser": "svc-web" }
+                }),
+            ),
+            &mut accounts,
+        )
+        .expect("symbolic user-manager ownership compiles");
+        assert!(matches!(
+            parse_subject(
+                "numeric.string",
+                &raw_subject(
+                    AuthorizationDomain::HostProcess,
+                    serde_json::json!({ "process.uid": "001" }),
+                ),
+                &mut accounts,
+            ),
+            Err(LoadError::InvalidSubjectShape { .. })
+        ));
+    }
+
+    #[test]
+    fn systemd_names_require_exact_canonical_service_or_template_shape() {
+        for (name, template) in [
+            ("payments.service", false),
+            ("worker@george.service", false),
+            (r"worker@george\x20smith.service", false),
+            ("worker@.service", true),
+        ] {
+            assert!(
+                valid_systemd_service_name(name, template),
+                "valid systemd name: {name}"
+            );
+        }
+        for (name, template) in [
+            ("payments.timer", false),
+            ("bad name.service", false),
+            ("worker@one@two.service", false),
+            ("worker@.service", false),
+            ("worker@george.service", true),
+            (r"worker@bad\x2G.service", false),
+        ] {
+            assert!(
+                !valid_systemd_service_name(name, template),
+                "invalid systemd name: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_account_files_reject_duplicate_and_malformed_entries() {
+        assert_eq!(
+            parse_account_file("svc:x:7:7::/:/bin/false\n", 7, 2, "/etc/passwd")
+                .expect("valid entry")
+                .get("svc"),
+            Some(&7)
+        );
+        assert!(matches!(
+            parse_account_file(
+                "svc:x:7:7::/:/bin/false\nsvc:x:8:8::/:/bin/false\n",
+                7,
+                2,
+                "/etc/passwd",
+            ),
+            Err(LoadError::LocalAccountDatabase { .. })
+        ));
+        assert!(matches!(
+            parse_account_file("svc:x:not-a-number:7::/:/bin/false\n", 7, 2, "/etc/passwd"),
+            Err(LoadError::LocalAccountDatabase { .. })
+        ));
     }
 }

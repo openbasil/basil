@@ -2222,6 +2222,7 @@ fn render_effective_with_overrides(
     json: bool,
 ) -> Result<()> {
     let grants = pdp.effective(subject);
+    let domain = pdp.subject_domain(subject);
     if json {
         let rows: Vec<serde_json::Value> = grants
             .iter()
@@ -2231,11 +2232,16 @@ fn render_effective_with_overrides(
                     "op": g.op.token(),
                     "via": allow_via_json(&g.via),
                     "rule": g.rule_id,
+                    "status": "conditional",
                 })
             })
             .collect();
         let doc = serde_json::json!({
             "subject": subject,
+            "subjectState": if domain.is_some() { "configured" } else { "unknown" },
+            "domain": domain.map(crate::catalog::AuthorizationDomain::token),
+            "servingDecision": false,
+            "evidenceState": "not-evaluated",
             "effective": rows,
             "overrides": overrides,
         });
@@ -2244,7 +2250,7 @@ fn render_effective_with_overrides(
     }
     writeln!(
         out,
-        "effective permissions for subject {subject}: {} grant(s)",
+        "conditional permissions for subject {subject}: {} grant(s)",
         grants.len()
     )?;
     render_override_provenance(out, overrides)?;
@@ -2252,7 +2258,7 @@ fn render_effective_with_overrides(
         let rule = g.rule_id.as_deref().unwrap_or("<public-class>");
         writeln!(
             out,
-            "  ALLOW  {}  {}  via {} [{rule}]",
+            "  CONDITIONAL  {}  {}  via {} [{rule}]",
             g.op.token(),
             g.key,
             allow_via_json(&g.via),
@@ -2261,6 +2267,10 @@ fn render_effective_with_overrides(
     if grants.is_empty() {
         writeln!(out, "  (none: default-deny)")?;
     }
+    writeln!(
+        out,
+        "  serving requires unique subject resolution from observed evidence"
+    )?;
     Ok(())
 }
 
@@ -2280,8 +2290,9 @@ fn print_explanation(
 
 /// Render a single-tuple explanation into `out`.
 ///
-/// The render seam (separate from [`print_explanation`]) so the stable `--json`
-/// allow/deny shape can be asserted without the process's real stdout.
+/// The render seam (separate from [`print_explanation`]) lets the stable
+/// `--json` conditional/deny shape be asserted without the process's real
+/// stdout.
 #[cfg(test)]
 fn render_explanation(
     out: &mut impl std::io::Write,
@@ -2309,12 +2320,23 @@ fn render_explanation_with_overrides(
     if json {
         let mut obj = serde_json::Map::new();
         obj.insert("subject".into(), subject.into());
+        obj.insert(
+            "domain".into(),
+            serde_json::to_value(
+                pdp.subject_domain(subject)
+                    .map(crate::catalog::AuthorizationDomain::token),
+            )?,
+        );
+        obj.insert("evidenceProvenance".into(), "operator-supplied".into());
+        obj.insert("evidenceState".into(), "not-evaluated".into());
+        obj.insert("servingDecision".into(), false.into());
         obj.insert("op".into(), op.token().into());
         obj.insert("key".into(), key.into());
         obj.insert("overrides".into(), serde_json::to_value(overrides)?);
         match &ex.decision {
             Decision::Allow { via } => {
-                obj.insert("decision".into(), "allow".into());
+                obj.insert("decision".into(), "conditional".into());
+                obj.insert("potentialDecision".into(), "allow".into());
                 obj.insert("via".into(), allow_via_json(via).into());
                 let matched = ex.matched.as_ref().map_or(serde_json::Value::Null, |m| {
                     serde_json::json!({
@@ -2344,7 +2366,7 @@ fn render_explanation_with_overrides(
         Decision::Allow { via } => {
             writeln!(
                 out,
-                "ALLOW  subject {subject}  {}  {key}  (via {})",
+                "CONDITIONAL  subject {subject}  {}  {key}  (via {})",
                 op.token(),
                 allow_via_json(via)
             )?;
@@ -2361,6 +2383,10 @@ fn render_explanation_with_overrides(
                     )?;
                 }
             }
+            writeln!(
+                out,
+                "  serving requires unique subject resolution from observed evidence"
+            )?;
         }
         Decision::Deny { reason } => {
             writeln!(
@@ -3646,8 +3672,8 @@ vault-addr = "http://cfg-vault:8200"
         const POLICY: &str = r#"{
           "schema": "policy",
           "subjects": {
-            "svc.grafana": { "allOf": [ { "kind": "unix", "uid": 9002 } ] },
-            "ops.wheel": { "allOf": [ { "kind": "unix", "gid": 10 } ] }
+            "svc.grafana": { "domain": "host-process", "match": { "all": [ { "process.uid": 9002 } ] } },
+            "ops.wheel": { "domain": "host-process", "match": { "all": [ { "process.gid.supplementary": 10 } ] } }
           },
           "roles": { "reader": ["get", "list"], "operator": ["set", "rotate"] },
           "rules": [
@@ -3695,7 +3721,12 @@ vault-addr = "http://cfg-vault:8200"
                 true,
             );
             let doc: serde_json::Value = serde_json::from_str(&out).expect("json");
-            assert_eq!(doc["decision"], "allow");
+            assert_eq!(doc["decision"], "conditional");
+            assert_eq!(doc["potentialDecision"], "allow");
+            assert_eq!(doc["domain"], "host-process");
+            assert_eq!(doc["evidenceProvenance"], "operator-supplied");
+            assert_eq!(doc["evidenceState"], "not-evaluated");
+            assert_eq!(doc["servingDecision"], false);
             assert_eq!(doc["subject"], "svc.grafana");
             assert_eq!(doc["op"], "get");
             assert_eq!(doc["key"], "grafana.admin_password");
@@ -3793,7 +3824,11 @@ vault-addr = "http://cfg-vault:8200"
                 true,
             );
             let doc: serde_json::Value = serde_json::from_str(&allowed).expect("json");
-            assert_eq!(doc["decision"], "allow", "operator subject can set");
+            assert_eq!(
+                doc["decision"], "conditional",
+                "operator subject can potentially set"
+            );
+            assert_eq!(doc["potentialDecision"], "allow");
             assert_eq!(doc["via"], "subject:ops.wheel");
             assert_eq!(doc["matched_rule"]["rule"], "wheel-operator");
         }
@@ -3806,6 +3841,10 @@ vault-addr = "http://cfg-vault:8200"
             render_effective(&mut buf, &pdp, "ops.wheel", true).expect("render effective");
             let doc: serde_json::Value = serde_json::from_slice(&buf).expect("effective json");
             assert_eq!(doc["subject"], "ops.wheel");
+            assert_eq!(doc["subjectState"], "configured");
+            assert_eq!(doc["domain"], "host-process");
+            assert_eq!(doc["servingDecision"], false);
+            assert_eq!(doc["evidenceState"], "not-evaluated");
             let rows = doc["effective"].as_array().expect("effective rows");
             let pairs: Vec<(&str, &str)> = rows
                 .iter()
@@ -3823,12 +3862,18 @@ vault-addr = "http://cfg-vault:8200"
                 rows.iter().all(|r| r["via"] == "subject:ops.wheel"),
                 "every grant is via the wheel subject"
             );
+            assert!(
+                rows.iter().all(|r| r["status"] == "conditional"),
+                "every static grant is conditional"
+            );
 
             // An unknown subject renders an empty effective set (default-deny),
             // not an error and not a spurious allow.
             let mut buf = Vec::new();
             render_effective(&mut buf, &pdp, "missing.subject", true).expect("render effective");
             let doc: serde_json::Value = serde_json::from_slice(&buf).expect("json");
+            assert_eq!(doc["subjectState"], "unknown");
+            assert!(doc["domain"].is_null());
             assert!(
                 doc["effective"].as_array().expect("rows").is_empty(),
                 "no grants -> empty effective set"

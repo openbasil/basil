@@ -29,9 +29,9 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::catalog::{
-    BackendKind, BackendRef, Catalog, CatalogSchema, Class, Config, Engine, KeyAlgorithm, KeyEntry,
-    Labels, MissingPolicy, NameTable, Op, PolicySchema, PrincipalSpec, RawPolicy, RawRule,
-    RawSubjectDefinition,
+    AuthorizationDomain, BackendKind, BackendRef, Catalog, CatalogSchema, Class, Config, Engine,
+    KeyAlgorithm, KeyEntry, Labels, MissingPolicy, NameTable, Op, PolicySchema,
+    RawEvidenceExpression, RawPolicy, RawRule, RawSubjectDefinition,
 };
 use anyhow::{Context, Result, bail};
 use clap::{Args, ValueEnum};
@@ -360,19 +360,17 @@ fn build_policy(uid: u32) -> RawPolicy {
     subjects.insert(
         "init.user".to_string(),
         RawSubjectDefinition {
+            domain: AuthorizationDomain::HostProcess,
             break_glass: false,
-            all_of: Some(vec![PrincipalSpec::Unix {
-                uid: Some(uid),
-                gid: None,
-            }]),
-            any_of: None,
+            match_: RawEvidenceExpression(serde_json::json!({
+                "all": [{ "process.uid": uid }]
+            })),
         },
     );
 
     RawPolicy {
         schema: PolicySchema::Policy,
         subjects,
-        unauthenticated_subject: None,
         roles,
         rules: vec![rule],
         config: Config { names, memberships },

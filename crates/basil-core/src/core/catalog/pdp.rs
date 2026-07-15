@@ -6,17 +6,15 @@
 //! `AuthenticatedActor` authorization. This is `vault-1l8`.
 //!
 //! The broker **is** the `PDP`. Local transports first resolve the connecting
-//! peer's kernel-trustworthy `SO_PEERCRED` identity into an
-//! [`AuthenticatedActor`]. The actor carries the configured subject that matched
-//! the peer's `uid`, primary `gid`, or supplementary group set. Ambiguous or
-//! missing subject resolution fails closed before operation-level policy is
-//! evaluated.
+//! peer's trusted evidence snapshot into an [`AuthenticatedActor`]. The actor
+//! carries the one domain-scoped subject selected by the recursive evidence
+//! evaluator. Ambiguous, unavailable, or missing subject resolution fails
+//! closed before operation-level policy is evaluated.
 //!
 //! The decision is **default-deny**: a request is allowed only if the resolved
 //! actor's subject has a matching grant, or a public-read rule applies to a
-//! resolved actor. Truly unauthenticated access is represented by the configured
-//! `unauthenticatedSubject`, not by falling through to all public reads. Denial is
-//! the absence of an allow; there are no explicit deny rules.
+//! resolved actor. Missing observed evidence never falls through to public
+//! reads. Denial is the absence of an allow; there are no explicit deny rules.
 //!
 //! # Decision algorithm
 //!
@@ -75,10 +73,12 @@
 //! a privilege-escalation gap. (See the canonical `sealer` role below: it grants
 //! `decrypt` + `encrypt` + `get_public_key`.)
 
+use super::evidence::EvidenceSnapshot;
 use super::policy::{ALL_OPS, Config, Grant, Op, ResolvedPolicy, SubjectName};
 use super::schema::{Catalog, Class};
 use crate::actor::{
-    AuthenticatedActor, PresenterInfo, SubjectResolutionError, TransportInfo, resolve_local_actor,
+    AuthenticatedActor, PresenterInfo, SubjectResolutionError, TransportInfo,
+    resolve_evidence_actor, resolve_local_actor,
     resolve_unix_actor as resolve_unix_authenticated_actor,
 };
 use crate::peer::PeerInfo;
@@ -98,7 +98,7 @@ pub struct Pdp<'a> {
 /// The outcome of a [`Pdp::decide`] call.
 ///
 /// Both variants carry enough context for the audit log (`vault-vq5`): an allow
-/// records *which* principal matched (so a denied-then-allowed key can be
+/// records *which* subject matched (so a denied-then-allowed key can be
 /// distinguished from a public read), and a deny records *which* check failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -253,6 +253,15 @@ impl<'a> Pdp<'a> {
         resolve_local_actor(self.policy, self.config, peer)
     }
 
+    /// Resolve a live actor from one immutable provider-independent evidence snapshot.
+    pub fn resolve_evidence_actor(
+        &self,
+        evidence: &EvidenceSnapshot,
+        peer: &PeerInfo,
+    ) -> Result<AuthenticatedActor, SubjectResolutionError> {
+        resolve_evidence_actor(self.policy, evidence, peer)
+    }
+
     /// Resolve an offline Unix actor for policy inspection.
     pub fn resolve_unix_actor(
         &self,
@@ -274,8 +283,9 @@ impl<'a> Pdp<'a> {
     pub fn resolve_subject_actor(&self, subject: &str) -> Option<AuthenticatedActor> {
         self.policy
             .subjects
-            .contains_key(subject)
-            .then(|| AuthenticatedActor {
+            .get(subject)
+            .map(|definition| AuthenticatedActor {
+                domain: definition.domain,
                 subject: subject.to_string(),
                 authenticated_by: Vec::new(),
                 presenter: PresenterInfo {
@@ -287,6 +297,15 @@ impl<'a> Pdp<'a> {
                 },
                 transport: TransportInfo::default(),
             })
+    }
+
+    /// Declared domain for a configured subject.
+    #[must_use]
+    pub fn subject_domain(&self, subject: &str) -> Option<super::AuthorizationDomain> {
+        self.policy
+            .subjects
+            .get(subject)
+            .map(|definition| definition.domain)
     }
 
     /// Decide whether `actor` may perform `op` on `key` (§3, §4.1).
@@ -312,7 +331,7 @@ impl<'a> Pdp<'a> {
     /// membership, the `writable` hard cap, the §3.5 world-readable rule), an admin
     /// op has **no key**, so none of those apply. The decision is pure
     /// **default-deny grant matching**: allow iff some `(op, glob)` grant (under
-    /// the caller's resolved principal scope) matches that op's reserved admin
+    /// the caller's resolved subject) matches that op's reserved admin
     /// target, else deny [`DenyReason::NotPermitted`].
     ///
     /// Because [`Op::Reload`] is excluded from `ALL_OPS`, a `*` (any-op) action
@@ -327,6 +346,11 @@ impl<'a> Pdp<'a> {
                 reason: DenyReason::NotPermitted,
             };
         };
+        if !self.actor_is_registered(actor) {
+            return Decision::Deny {
+                reason: DenyReason::NotPermitted,
+            };
+        }
         for rule in &self.policy.rules {
             if let Some(subject) = matching_rule_subject(&rule.subjects, actor.subject.as_str())
                 && rule
@@ -390,6 +414,14 @@ impl<'a> Pdp<'a> {
             return Explanation::deny(DenyReason::IssuerRawSign);
         }
 
+        // Actor construction and policy evaluation are separate boundaries.
+        // Reject a stale or manually constructed actor whose subject/domain pair
+        // is not present in this exact policy generation before grants or the
+        // public-class rule are considered.
+        if !self.actor_is_registered(actor) {
+            return Explanation::deny(DenyReason::NotPermitted);
+        }
+
         // Step 4: iterate rules in declaration order; first matching predicate + grant wins.
         for rule in &self.policy.rules {
             if let Some(subject) = matching_rule_subject(&rule.subjects, actor.subject.as_str())
@@ -415,6 +447,13 @@ impl<'a> Pdp<'a> {
 
         // Step 5: default-deny.
         Explanation::deny(DenyReason::NotPermitted)
+    }
+
+    fn actor_is_registered(&self, actor: &AuthenticatedActor) -> bool {
+        self.policy
+            .subjects
+            .get(&actor.subject)
+            .is_some_and(|definition| definition.domain == actor.domain)
     }
 
     fn evaluate_without_actor(&self, op: Op, key: &str) -> Explanation {
@@ -546,7 +585,7 @@ fn matching_rule_subject<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::load;
+    use crate::catalog::{AuthorizationDomain, load};
 
     // ---- Fixtures: build the real types via the loader from JSON literals ----
 
@@ -597,7 +636,7 @@ mod tests {
       "operator": ["set", "rotate", "import", "new_key"]
     "#;
 
-    // The principal/op/target matrix.
+    // The subject/op/target matrix.
     //
     //  uid 9002          : reader over grafana.admin_password (user: rule)
     //  uid 9003          : signer over nats.account           (user: rule; NO mint)
@@ -609,15 +648,15 @@ mod tests {
     //  uid 9008          : watch over broker.watch            (admin op)
     //  uid 0 (root)      : * over * (root any-target)
     const SUBJECTS: &str = r#"
-      "svc.grafana":     { "allOf": [ { "kind": "unix", "uid": 9002 } ] },
-      "svc.nats":        { "allOf": [ { "kind": "unix", "uid": 9003 } ] },
-      "svc.minter":      { "allOf": [ { "kind": "unix", "uid": 9004 } ] },
-      "svc.enroll":      { "allOf": [ { "kind": "unix", "uid": 9005 } ] },
-      "svc.reload":      { "allOf": [ { "kind": "unix", "uid": 9006 } ] },
-      "svc.revoke":      { "allOf": [ { "kind": "unix", "uid": 9007 } ] },
-      "svc.watch":       { "allOf": [ { "kind": "unix", "uid": 9008 } ] },
-      "ops.wheel":       { "allOf": [ { "kind": "unix", "gid": 10 } ] },
-      "breakglass.root": { "breakGlass": true, "allOf": [ { "kind": "unix", "uid": 0 } ] }
+      "svc.grafana":     { "domain": "host-process", "match": { "all": [ { "process.uid": 9002 } ] } },
+      "svc.nats":        { "domain": "host-process", "match": { "all": [ { "process.uid": 9003 } ] } },
+      "svc.minter":      { "domain": "host-process", "match": { "all": [ { "process.uid": 9004 } ] } },
+      "svc.enroll":      { "domain": "host-process", "match": { "all": [ { "process.uid": 9005 } ] } },
+      "svc.reload":      { "domain": "host-process", "match": { "all": [ { "process.uid": 9006 } ] } },
+      "svc.revoke":      { "domain": "host-process", "match": { "all": [ { "process.uid": 9007 } ] } },
+      "svc.watch":       { "domain": "host-process", "match": { "all": [ { "process.uid": 9008 } ] } },
+      "ops.wheel":       { "domain": "host-process", "match": { "all": [ { "process.gid.supplementary": 10 } ] } },
+      "breakglass.root": { "domain": "host-process", "breakGlass": true, "match": { "all": [ { "process.uid": 0 } ] } }
     "#;
 
     const RULES: &str = r#"
@@ -735,10 +774,10 @@ mod tests {
         const POL: &str = r#"{
           "schema": "policy",
           "subjects": {
-            "svc.compound": { "allOf": [
-              { "kind": "unix", "uid": 333 },
-              { "kind": "unix", "gid": 10 }
-            ] }
+            "svc.compound": { "domain": "host-process", "match": { "all": [
+              { "process.uid": 333 },
+              { "process.gid.supplementary": 10 }
+            ] } }
           },
           "roles": { "reader": ["get"] },
           "rules": [
@@ -760,7 +799,7 @@ mod tests {
         assert_eq!(matched.via, via("svc.compound"));
         assert_eq!(matched.subject, "svc.compound");
 
-        // The allOf subject denies a uid missing the group half.
+        // The `all` subject denies a uid missing the group half.
         assert!(explain(&pdp, 333, Op::Get, "grafana.admin_password").is_allow());
         assert!(decide(&pdp, 334, Op::Get, "grafana.admin_password").is_deny());
     }
@@ -795,6 +834,35 @@ mod tests {
             decide(&pdp, 9002, Op::GetPublicKey, "web.tls.ca_cert"),
             Decision::Allow {
                 via: AllowVia::PublicClass
+            }
+        );
+    }
+
+    #[test]
+    fn stale_or_inconsistent_actor_never_reaches_grants_or_public_class() {
+        let (c, r, cfg) = fixture();
+        let pdp = Pdp::new(&c, &r, &cfg);
+        let mut actor = pdp
+            .resolve_subject_actor("svc.grafana")
+            .expect("configured subject");
+        actor.domain = AuthorizationDomain::Container;
+
+        assert_eq!(
+            pdp.decide(&actor, Op::Get, "grafana.admin_password"),
+            Decision::Deny {
+                reason: DenyReason::NotPermitted
+            }
+        );
+        assert_eq!(
+            pdp.decide(&actor, Op::Get, "web.tls.ca_cert"),
+            Decision::Deny {
+                reason: DenyReason::NotPermitted
+            }
+        );
+        assert_eq!(
+            pdp.decide_admin(&actor, Op::Reload),
+            Decision::Deny {
+                reason: DenyReason::NotPermitted
             }
         );
     }
@@ -1340,7 +1408,7 @@ mod tests {
     fn explain_deny_is_default_deny_with_no_rule() {
         let (c, r, cfg) = fixture();
         let pdp = Pdp::new(&c, &r, &cfg);
-        // unmatched principal -> default-deny.
+        // Unmatched subject -> default-deny.
         let ex = explain(&pdp, 7777, Op::Get, "grafana.admin_password");
         assert_eq!(
             ex.decision,

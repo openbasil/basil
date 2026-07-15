@@ -545,7 +545,7 @@ mod tests {
         let policy = r#"{
           "schema": "policy",
           "subjects": {
-            "svc.mint": { "allOf": [ { "kind": "unix", "uid": 42 } ] }
+            "svc.mint": { "domain": "host-process", "match": { "all": [ { "process.uid": 42 } ] } }
           },
           "roles": {
             "minter": ["mint", "sign_nats_jwt", "validate_nats_jwt"],

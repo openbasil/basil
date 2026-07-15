@@ -143,9 +143,12 @@ fn sds_resolution_status(err: &SubjectResolutionError) -> Status {
             Code::Unauthenticated,
             "missing peer credentials for Envoy SDS",
         ),
+        SubjectResolutionError::DomainUnavailable
+        | SubjectResolutionError::EvidenceUnavailable { .. } => {
+            Status::new(Code::Unavailable, "attestation unavailable for Envoy SDS")
+        }
         SubjectResolutionError::NoSubject { .. }
-        | SubjectResolutionError::AmbiguousSubject { .. }
-        | SubjectResolutionError::InvalidUnauthenticatedSubject { .. } => {
+        | SubjectResolutionError::AmbiguousSubject { .. } => {
             Status::new(Code::PermissionDenied, "not authorized for Envoy SDS")
         }
     }
@@ -468,7 +471,7 @@ mod tests {
     const POLICY: &str = r#"{
       "schema": "policy",
       "subjects": {
-        "test.runner": { "allOf": [ { "kind": "unix", "uid": 42 } ] }
+        "test.runner": { "domain": "host-process", "match": { "all": [ { "process.uid": 42 } ] } }
       },
       "roles": { "mint": ["mint"] },
       "rules": [

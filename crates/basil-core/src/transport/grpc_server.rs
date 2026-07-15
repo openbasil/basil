@@ -274,7 +274,7 @@ mod tests {
         let policy = format!(
             r#"{{
               "schema": "policy",
-              "subjects": {{ "test.peer": {{ "allOf": [ {{ "kind": "unix", "uid": {uid} }} ] }} }},
+              "subjects": {{ "test.peer": {{ "domain": "host-process", "match": {{ "all": [ {{ "process.uid": {uid} }} ] }} }} }},
               "roles": {{}},
               "rules": [],
               "config": {{

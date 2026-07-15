@@ -5,15 +5,15 @@
 //! Policy schema: the authorization allow-list and the export-resolved config
 //! tables.
 //!
-//! Rules grant to named subjects. Subject definitions hold typed principal specs
-//! such as numeric Unix uid/gid selectors, while rules carry only subject names,
-//! action terms, and target globs. The export tool has already resolved symbolic
-//! user/group names to numeric uid/gid values before this module sees them.
+//! Rules grant to named subjects. Each subject declares a disjoint workload
+//! domain and a monotonic recursive evidence expression. Rules carry only
+//! subject names, action terms, and target globs.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use super::evidence::{AuthorizationDomain, EvidenceExpression};
 use super::glob::KeyGlob;
 
 /// A stable subject name from the policy subject registry.
@@ -200,7 +200,7 @@ impl Op {
     }
 }
 
-/// The supported public-key families for first-cut signature principals.
+/// The supported public-key families for invocation-signature evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SignatureKeyAlgorithm {
@@ -210,95 +210,15 @@ pub enum SignatureKeyAlgorithm {
     NatsNkey,
 }
 
-/// A typed principal selector inside a subject definition.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum PrincipalSpec {
-    /// Unix peer-credential selector. At least one of `uid` or `gid` must be set.
-    Unix {
-        /// Numeric uid to match.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        uid: Option<u32>,
-        /// Numeric gid to match against the full configured group set.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        gid: Option<u32>,
-    },
-    /// Explicit unauthenticated actor selector.
-    Unauthenticated,
-    /// Signed invocation key selector.
-    SignatureKey {
-        /// Signature algorithm family.
-        algorithm: SignatureKeyAlgorithm,
-        /// Public key material in the algorithm's canonical policy encoding.
-        public: String,
-    },
-}
-
-impl PrincipalSpec {
-    /// Whether this principal matches an authenticated Unix actor.
-    #[must_use]
-    pub fn matches_unix(&self, uid: u32, gids: &[u32]) -> bool {
-        match self {
-            Self::Unix { uid: want_uid, gid } => {
-                let uid_matches = want_uid.is_none_or(|want| want == uid);
-                let gid_matches = gid.is_none_or(|want| gids.contains(&want));
-                uid_matches && gid_matches
-            }
-            Self::Unauthenticated | Self::SignatureKey { .. } => false,
-        }
-    }
-
-    /// Whether this principal matches the explicit unauthenticated actor.
-    #[must_use]
-    pub const fn matches_unauthenticated(&self) -> bool {
-        matches!(self, Self::Unauthenticated)
-    }
-}
-
-/// The boolean shape of a subject definition.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SubjectMatch {
-    /// Every listed principal spec must match.
-    AllOf(Vec<PrincipalSpec>),
-    /// At least one listed principal spec must match.
-    AnyOf(Vec<PrincipalSpec>),
-}
-
-impl SubjectMatch {
-    /// Whether this subject expression matches an authenticated Unix actor.
-    #[must_use]
-    pub fn matches_unix(&self, uid: u32, gids: &[u32]) -> bool {
-        match self {
-            Self::AllOf(specs) => specs.iter().all(|spec| spec.matches_unix(uid, gids)),
-            Self::AnyOf(specs) => specs.iter().any(|spec| spec.matches_unix(uid, gids)),
-        }
-    }
-
-    /// Whether this expression matches the explicit unauthenticated actor.
-    #[must_use]
-    pub fn matches_unauthenticated(&self) -> bool {
-        match self {
-            Self::AllOf(specs) => specs.iter().all(PrincipalSpec::matches_unauthenticated),
-            Self::AnyOf(specs) => specs.iter().any(PrincipalSpec::matches_unauthenticated),
-        }
-    }
-
-    /// Principal specs carried by this subject expression.
-    #[must_use]
-    pub fn specs(&self) -> &[PrincipalSpec] {
-        match self {
-            Self::AllOf(specs) | Self::AnyOf(specs) => specs,
-        }
-    }
-}
-
 /// A named subject definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubjectDefinition {
+    /// Mandatory disjoint local workload domain.
+    pub domain: AuthorizationDomain,
     /// Whether this subject may appear on a global `*` target rule.
     pub break_glass: bool,
-    /// The typed principal selectors for this subject.
-    pub match_: SubjectMatch,
+    /// Monotonic recursive evidence expression.
+    pub match_: EvidenceExpression,
 }
 
 /// A rule action term (§3.3): a role reference, an inline op, or `*`.
@@ -453,8 +373,6 @@ pub struct ResolvedRule {
 pub struct ResolvedPolicy {
     /// Validated subject registry.
     pub subjects: BTreeMap<SubjectName, SubjectDefinition>,
-    /// Explicit subject used for unauthenticated requests, when configured.
-    pub unauthenticated_subject: Option<SubjectName>,
     /// Resolved rules in declaration order.
     pub rules: Vec<ResolvedRule>,
 }
@@ -557,13 +475,6 @@ mod tests {
             ActionTerm::parse("op:bogus"),
             Err(ActionTermError::UnknownOp(_))
         ));
-    }
-
-    #[test]
-    fn unauthenticated_principal_matches_only_unauthenticated_actor() {
-        let subject = SubjectMatch::AnyOf(vec![PrincipalSpec::Unauthenticated]);
-        assert!(subject.matches_unauthenticated());
-        assert!(!subject.matches_unix(42, &[42]));
     }
 
     #[test]

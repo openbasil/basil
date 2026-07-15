@@ -90,7 +90,7 @@ write_policy() {
     "signer": ["sign", "verify", "get_public_key"]
   },
   "subjects": {
-    "local": { "allOf": [ { "kind": "unix", "uid": $uid } ] }
+    "local": { "domain": "host-process", "match": { "all": [ { "process.uid": $uid } ] } }
   },
   "rules": [
     { "id": "local-signs-demo-key", "subjects": ["local"], "action": ["role:signer"], "target": ["$KEY_ID"] }

@@ -26,11 +26,12 @@ use basil_proto::invocation::{
 use tonic::{Code, Request, Response, Status};
 use zeroize::Zeroizing;
 
-use crate::actor::{AuthenticatedActor, PresenterInfo, ProofKind, ProofSummary, TransportInfo};
+use crate::actor::{AuthenticatedActor, host_process_snapshot, resolve_evidence_actor};
 use crate::catalog::Class;
-use crate::catalog::policy::{
-    Op, PrincipalSpec, ResolvedPolicy, SignatureKeyAlgorithm, SubjectMatch,
+use crate::catalog::evidence::{
+    EvidencePredicate, EvidenceState, EvidenceValue, SignatureKeyEvidence,
 };
+use crate::catalog::policy::{Op, ResolvedPolicy, SignatureKeyAlgorithm};
 use crate::decision::DecisionRecord;
 use crate::service::broker::{BrokerGrpc, GrpcResult};
 use crate::service::shared::{invalid_request, manager_status};
@@ -120,6 +121,7 @@ impl BrokerGrpc {
         let generation = self.state.load_generation();
         let generation_id = generation.id();
         let policy = generation.policy().clone();
+        let config = generation.config().clone();
         drop(generation);
 
         let policy_verifier = PolicyVerifier::new(&policy);
@@ -142,30 +144,59 @@ impl BrokerGrpc {
                         &peer,
                         Op::Decrypt,
                         "unknown",
-                        format!("invalid_actor_proof: {error}"),
+                        None,
+                        EvidenceState::NoMatch,
+                        &format!("invalid_actor_proof: {error}"),
                     ));
                 return Err(verify_status(&error));
             }
         };
 
-        let actor = match resolve_signature_actor(
-            &policy_verifier.verified_subjects()?,
-            sealed.claims.issuer.as_ref().map(Subject::as_str),
-            PresenterInfo::from(&peer),
-        ) {
-            Ok(actor) => actor,
-            Err(status) => {
-                self.state
-                    .record_decision(&DecisionRecord::from_resolution_error(
-                        generation_id,
-                        &peer,
-                        Op::Decrypt,
-                        key_id_for_audit(&sealed.recipient_key_id),
-                        "invalid_actor_proof".to_string(),
-                    ));
-                return Err(status);
-            }
+        let Some(uid) = peer.uid else {
+            self.state
+                .record_decision(&DecisionRecord::from_resolution_error(
+                    generation_id,
+                    &peer,
+                    Op::Decrypt,
+                    key_id_for_audit(&sealed.recipient_key_id),
+                    None,
+                    EvidenceState::Unavailable,
+                    "invalid_actor_proof",
+                ));
+            return Err(unauthorized_invocation());
         };
+        let mut evidence = host_process_snapshot(&config, &peer, uid);
+        evidence.invocation_signature_key =
+            EvidenceValue::Available(policy_verifier.verified_key()?);
+        let actor = resolve_evidence_actor(&policy, &evidence, &peer).map_err(|error| {
+            self.state
+                .record_decision(&DecisionRecord::from_subject_resolution_error(
+                    generation_id,
+                    &peer,
+                    Op::Decrypt,
+                    key_id_for_audit(&sealed.recipient_key_id),
+                    &error,
+                    "invalid_actor_proof",
+                ));
+            unauthorized_invocation()
+        })?;
+        if sealed
+            .claims
+            .issuer
+            .as_ref()
+            .is_some_and(|issuer| issuer.as_str() != actor.subject)
+        {
+            self.state
+                .record_decision(&DecisionRecord::from_actor_evidence_denial(
+                    generation_id,
+                    &actor,
+                    Op::Decrypt,
+                    key_id_for_audit(&sealed.recipient_key_id),
+                    EvidenceState::NoMatch,
+                    "actor_claim_mismatch",
+                ));
+            return Err(unauthorized_invocation());
+        }
 
         let recipient_key_id = catalog_key_id(&sealed.recipient_key_id, "recipient key id")?;
         self.validate_request_recipient_key(recipient_key_id)?;
@@ -533,22 +564,26 @@ fn effective_expires_at_unix(claims: &Claims) -> Result<u32, Status> {
 
 struct PolicyVerifier<'a> {
     policy: &'a ResolvedPolicy,
-    verified_subjects: Mutex<Vec<String>>,
+    verified_key: Mutex<Option<SignatureKeyEvidence>>,
 }
 
 impl<'a> PolicyVerifier<'a> {
     const fn new(policy: &'a ResolvedPolicy) -> Self {
         Self {
             policy,
-            verified_subjects: Mutex::new(Vec::new()),
+            verified_key: Mutex::new(None),
         }
     }
 
-    fn verified_subjects(&self) -> Result<Vec<String>, Status> {
-        self.verified_subjects
+    fn verified_key(&self) -> Result<SignatureKeyEvidence, Status> {
+        self.verified_key
             .lock()
-            .map(|subjects| subjects.clone())
             .map_err(|_| invalid_request(INVOKE_OP, "signature verifier state unavailable"))
+            .and_then(|verified| {
+                verified
+                    .clone()
+                    .ok_or_else(|| invalid_request(INVOKE_OP, "signature was not verified"))
+            })
     }
 }
 
@@ -566,22 +601,25 @@ impl Verifier for PolicyVerifier<'_> {
         if algorithm != SignatureAlgorithm::EdDsa {
             return Err(VerifyError::AlgorithmMismatch);
         }
-        let mut subjects = Vec::new();
-        for (name, definition) in &self.policy.subjects {
-            if subject_match_verifies(&definition.match_, key_id, sig_structure, signature) {
-                subjects.push(name.clone());
+        let mut verified_key = None;
+        for definition in self.policy.subjects.values() {
+            if let Some(key) =
+                expression_signature_verifies(&definition.match_, key_id, sig_structure, signature)
+            {
+                verified_key = Some(key);
+                break;
             }
         }
-        if subjects.is_empty() {
+        let Some(verified_key) = verified_key else {
             return Err(VerifyError::SignatureInvalid);
-        }
+        };
         let mut verified = self
-            .verified_subjects
+            .verified_key
             .lock()
             .map_err(|_| VerifyError::Provider {
                 message: "signature verifier state unavailable".to_string(),
             })?;
-        *verified = subjects;
+        *verified = Some(verified_key);
         drop(verified);
         Ok(())
     }
@@ -704,56 +742,31 @@ enum ReplayError {
     ReplayedMessageId,
 }
 
-fn resolve_signature_actor(
-    subjects: &[String],
-    explicit_subject: Option<&str>,
-    presenter: PresenterInfo,
-) -> Result<AuthenticatedActor, Status> {
-    let subject = match explicit_subject {
-        Some(subject) if subjects.iter().any(|s| s == subject) => subject.to_string(),
-        Some(_) => return Err(unauthorized_invocation()),
-        None => match subjects {
-            [subject] => subject.clone(),
-            [] | [_, ..] => return Err(unauthorized_invocation()),
-        },
-    };
-    Ok(AuthenticatedActor {
-        subject: subject.clone(),
-        authenticated_by: vec![ProofSummary {
-            kind: ProofKind::SignatureKey,
-            subject,
-        }],
-        presenter,
-        transport: TransportInfo::default(),
-    })
-}
-
-fn subject_match_verifies(
-    match_: &SubjectMatch,
+fn expression_signature_verifies(
+    expression: &crate::catalog::EvidenceExpression,
     key_id: &KeyId,
     sig_structure: &[u8],
     signature: &Signature,
-) -> bool {
-    match match_ {
-        SubjectMatch::AllOf(specs) => specs
-            .iter()
-            .all(|spec| principal_verifies(spec, key_id, sig_structure, signature)),
-        SubjectMatch::AnyOf(specs) => specs
-            .iter()
-            .any(|spec| principal_verifies(spec, key_id, sig_structure, signature)),
-    }
+) -> Option<SignatureKeyEvidence> {
+    let mut verified = None;
+    expression.visit_leaves(&mut |predicate| {
+        if verified.is_none() {
+            verified = predicate_signature_verifies(predicate, key_id, sig_structure, signature);
+        }
+    });
+    verified
 }
 
-fn principal_verifies(
-    spec: &PrincipalSpec,
+fn predicate_signature_verifies(
+    predicate: &EvidencePredicate,
     key_id: &KeyId,
     sig_structure: &[u8],
     signature: &Signature,
-) -> bool {
-    let PrincipalSpec::SignatureKey { algorithm, public } = spec else {
-        return false;
+) -> Option<SignatureKeyEvidence> {
+    let EvidencePredicate::InvocationSignatureKey { algorithm, public } = predicate else {
+        return None;
     };
-    match algorithm {
+    let valid = match algorithm {
         SignatureKeyAlgorithm::Ed25519 => decode_ed25519_public(public).is_some_and(|public| {
             let _ = key_id;
             crate::ed25519_sign::verify(&public, sig_structure, signature.as_bytes())
@@ -764,7 +777,11 @@ fn principal_verifies(
                 && basil_nats::verify_public_signature(public, sig_structure, signature.as_bytes())
                     .unwrap_or(false)
         }
-    }
+    };
+    valid.then(|| SignatureKeyEvidence {
+        algorithm: *algorithm,
+        public: public.clone(),
+    })
 }
 
 fn decode_ed25519_public(public: &str) -> Option<[u8; crate::ed25519_sign::PUBLIC_KEY_LEN]> {
@@ -1089,14 +1106,18 @@ mod tests {
               "schema": "policy",
               "subjects": {{
                 "{CLIENT_SUBJECT}": {{
-                  "allOf": [
-                    {{ "kind": "signature-key", "algorithm": "ed25519", "public": "{client_public}" }}
-                  ]
+                  "domain": "host-process",
+                  "match": {{ "all": [
+                    {{ "process.uid": 42 }},
+                    {{ "invocation.signature-key": {{ "algorithm": "ed25519", "public": "{client_public}" }} }}
+                  ] }}
                 }},
                 "mallory": {{
-                  "allOf": [
-                    {{ "kind": "signature-key", "algorithm": "ed25519", "public": "{mallory_public}" }}
-                  ]
+                  "domain": "host-process",
+                  "match": {{ "all": [
+                    {{ "process.uid": 42 }},
+                    {{ "invocation.signature-key": {{ "algorithm": "ed25519", "public": "{mallory_public}" }} }}
+                  ] }}
                 }}
               }},
               "roles": {{
@@ -1211,7 +1232,13 @@ mod tests {
     }
 
     fn request(message: Vec<u8>) -> Request<pb::SealedRequest> {
-        Request::new(pb::SealedRequest { message })
+        let mut request = Request::new(pb::SealedRequest { message });
+        request.extensions_mut().insert(crate::peer::PeerInfo {
+            uid: Some(42),
+            gid: Some(42),
+            ..crate::peer::PeerInfo::default()
+        });
+        request
     }
 
     async fn prepare_err(fixture: &Fixture, message: Vec<u8>) -> Status {

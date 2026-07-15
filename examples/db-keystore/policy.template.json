@@ -5,7 +5,7 @@
     "demo-operator": ["new_key", "import", "rotate", "set"]
   },
   "subjects": {
-    "current-user": { "allOf": [ { "kind": "unix", "uid": __UID__ } ] }
+    "current-user": { "domain": "host-process", "match": { "all": [ { "process.uid": __UID__ } ] } }
   },
   "rules": [
     {

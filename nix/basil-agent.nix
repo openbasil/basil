@@ -38,31 +38,12 @@ let
     schema = "catalog";
     backends = lib.mapAttrs (_: projectBackend) cfg.catalog.backends;
   };
-  normalizePrincipal =
-    spec:
-    if spec ? kind then
-      spec
-    else if spec ? unix then
-      { kind = "unix"; } // spec.unix
-    else if spec ? signature then
-      {
-        kind = "signature-key";
-      }
-      // spec.signature
-    else
-      spec;
   normalizeSubject =
     subject:
-    let
-      normalized =
-        if subject.allOf != [ ] then { allOf = map normalizePrincipal subject.allOf; } else { };
-      normalizedAny =
-        if subject.anyOf != [ ] then
-          normalized // { anyOf = map normalizePrincipal subject.anyOf; }
-        else
-          normalized;
-    in
-    normalizedAny // lib.optionalAttrs (subject.breakGlass or false) { breakGlass = true; };
+    {
+      inherit (subject) domain match;
+    }
+    // lib.optionalAttrs (subject.breakGlass or false) { breakGlass = true; };
 
   userSubject =
     subjectName: spec:
@@ -73,12 +54,8 @@ let
     {
       name = subjectName;
       value = {
-        allOf = [
-          {
-            kind = "unix";
-            inherit uid;
-          }
-        ];
+        domain = "host-process";
+        match.all = [ { "process.uid" = uid; } ];
       }
       // lib.optionalAttrs spec.breakGlass { breakGlass = true; };
     };
@@ -91,12 +68,8 @@ let
     {
       name = subjectName;
       value = {
-        allOf = [
-          {
-            kind = "unix";
-            inherit gid;
-          }
-        ];
+        domain = "host-process";
+        match.all = [ { "process.gid.supplementary" = gid; } ];
       }
       // lib.optionalAttrs spec.breakGlass { breakGlass = true; };
     };

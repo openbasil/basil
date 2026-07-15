@@ -90,42 +90,26 @@ let
   };
 
   policy = {
-    # Named subjects: each maps a stable name to a typed principal selector, here
+    # Named subjects: each maps a stable name to a typed evidence expression, here
     # a Unix uid proven by `SO_PEERCRED`. Rules below grant to these names.
     subjects = {
       # `breakGlass` lets a subject appear on a global `*`-target rule (below).
       root = {
+        domain = "host-process";
         breakGlass = true;
-        allOf = [
-          {
-            kind = "unix";
-            uid = 0;
-          }
-        ];
+        match.all = [ { "process.uid" = 0; } ];
       };
       svc-web = {
-        allOf = [
-          {
-            kind = "unix";
-            uid = 9001;
-          }
-        ];
+        domain = "host-process";
+        match.all = [ { "process.uid" = 9001; } ];
       };
       svc-backup = {
-        allOf = [
-          {
-            kind = "unix";
-            uid = 9002;
-          }
-        ];
+        domain = "host-process";
+        match.all = [ { "process.uid" = 9002; } ];
       };
       svc-grafana = {
-        allOf = [
-          {
-            kind = "unix";
-            uid = 9003;
-          }
-        ];
+        domain = "host-process";
+        match.all = [ { "process.uid" = 9003; } ];
       };
     };
 

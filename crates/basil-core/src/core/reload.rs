@@ -743,7 +743,7 @@ mod tests {
         format!(
             r#"{{
               "schema": "policy",
-              "subjects": {{ "svc.web": {{ "allOf": [ {{ "kind": "unix", "uid": 1000 }} ] }} }},
+              "subjects": {{ "svc.web": {{ "domain": "host-process", "match": {{ "all": [ {{ "process.uid": 1000 }} ] }} }} }},
               "roles": {{}},
               "rules": {rules},
               "config": {{}}
@@ -851,7 +851,7 @@ mod tests {
         write_files(
             &inputs,
             &catalog_json(true),
-            r#"{ "schema": "policy", "subjects": { "svc.web": { "allOf": [ { "kind": "unix", "uid": 1000 } ] } }, "roles": {}, "rules": [ { "id": "bad", "subjects": ["svc.web"], "action": ["role:nonexistent"], "target": ["web.signer"] } ], "config": {} }"#,
+            r#"{ "schema": "policy", "subjects": { "svc.web": { "domain": "host-process", "match": { "all": [ { "process.uid": 1000 } ] } } }, "roles": {}, "rules": [ { "id": "bad", "subjects": ["svc.web"], "action": ["role:nonexistent"], "target": ["web.signer"] } ], "config": {} }"#,
         );
 
         let err = reload_generation(&state).expect_err("malformed policy rejected");
@@ -979,7 +979,7 @@ mod tests {
 
             let rejected_policy = r#"{
               "schema": "policy",
-              "subjects": { "svc.web": { "allOf": [ { "kind": "unix", "uid": 1000 } ] } },
+              "subjects": { "svc.web": { "domain": "host-process", "match": { "all": [ { "process.uid": 1000 } ] } } },
               "roles": {},
               "rules": [ {
                 "id": "bad", "subjects": ["svc.web"],

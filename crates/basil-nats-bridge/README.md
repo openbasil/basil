@@ -42,10 +42,10 @@ max-message-bytes = 1048576
 
 The bridge process needs no policy grant of its own. There is no transport-level
 `op:invoke` action in the policy language (a policy naming one fails to load);
-the broker authorizes the *actor* inside the sealed message, never the process
-that delivered it:
+the broker authorizes the compound local ingress and verified signer:
 
-- the sealed request's actor proof (its `signature-key` subject) must verify;
+- the local bridge process must resolve in its observed workload domain;
+- the sealed request's `invocation.signature-key` evidence must verify;
 - the actor needs `op:decrypt` on the request-encryption key the message is
   sealed to;
 - the actor needs the operation-specific grant for the inner request (for
@@ -55,13 +55,14 @@ that delivered it:
 {
 	"subjects": {
 		"content.publisher": {
-			"allOf": [
-				{
-					"kind": "signature-key",
+			"domain": "host-process",
+			"match": { "all": [
+				{ "process.uid": 991 },
+				{ "invocation.signature-key": {
 					"algorithm": "nats-nkey",
 					"public": "UANATS_PUBLIC_NKEY"
-				}
-			]
+				} }
+			] }
 		}
 	},
 	"rules": [

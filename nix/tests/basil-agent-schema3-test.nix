@@ -95,12 +95,10 @@ let
   expectedPolicy = pkgs.writeText "expected-basil-policy.json" (
     builtins.toJSON {
       schema = "policy";
-      subjects.operator-root.allOf = [
-        {
-          kind = "unix";
-          uid = 0;
-        }
-      ];
+      subjects.operator-root = {
+        domain = "host-process";
+        match.all = [ { "process.uid" = 0; } ];
+      };
       roles = { };
       rules = [
         {

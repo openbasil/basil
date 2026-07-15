@@ -4,15 +4,23 @@
 
 //! Authenticated authorization actor resolution.
 
-use std::collections::BTreeSet;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use sha2::{Digest as _, Sha256};
 
+use crate::catalog::evidence::{
+    AuthorizationDomain, CredentialSlots, EvidenceResolutionError, EvidenceSnapshot, EvidenceState,
+    EvidenceValue, ProcessEvidence, SignatureKeyEvidence, SubjectResolution, resolve_subject,
+};
 use crate::catalog::policy::{Config, ResolvedPolicy, SubjectName};
 use crate::peer::PeerInfo;
 
 /// A resolved actor that the `PDP` can authorize.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedActor {
-    /// The subject selected for authorization.
+    /// Independently resolved local workload domain.
+    pub domain: AuthorizationDomain,
+    /// The uniquely selected policy subject.
     pub subject: SubjectName,
     /// Evidence summaries that established the subject.
     pub authenticated_by: Vec<ProofSummary>,
@@ -23,7 +31,7 @@ pub struct AuthenticatedActor {
 }
 
 impl AuthenticatedActor {
-    /// The presenter's `SO_PEERCRED` uid, when the actor came over a Unix socket.
+    /// The presenter's `SO_PEERCRED` UID, when the actor came over a Unix socket.
     #[must_use]
     pub const fn unix_uid(&self) -> Option<u32> {
         self.presenter.uid
@@ -37,27 +45,31 @@ pub struct ProofSummary {
     pub kind: ProofKind,
     /// The subject established by this proof.
     pub subject: SubjectName,
+    /// Disclosure-safe fingerprint for key evidence, when applicable.
+    pub fingerprint: Option<String>,
 }
 
-/// Supported first-cut proof kinds.
+/// Bounded proof kinds suitable for trusted audit output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProofKind {
-    /// Local Unix peer credentials from `SO_PEERCRED`.
-    UnixPeerCredentials,
-    /// Explicit configured anonymous subject.
-    Unauthenticated,
-    /// Signed sealed-invocation envelope with a configured public key.
+    /// Fresh process credentials correlated to the pinned presenter.
+    ProcessCredentials,
+    /// Trusted systemd unit evidence.
+    SystemdUnit,
+    /// Trusted container/runtime evidence.
+    Container,
+    /// Verified sealed-invocation signature key.
     SignatureKey,
 }
 
 /// Information about the process or bridge that presented the request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PresenterInfo {
-    /// `SO_PEERCRED` process id.
+    /// `SO_PEERCRED` process ID.
     pub pid: Option<u32>,
-    /// `SO_PEERCRED` uid.
+    /// `SO_PEERCRED` UID.
     pub uid: Option<u32>,
-    /// `SO_PEERCRED` primary gid.
+    /// `SO_PEERCRED` primary GID.
     pub gid: Option<u32>,
     /// Best-effort executable path from `/proc`.
     pub executable_path: Option<String>,
@@ -99,214 +111,351 @@ impl Default for TransportInfo {
     }
 }
 
-/// Why actor resolution failed.
+/// Why fail-closed subject resolution stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubjectResolutionError {
-    /// No Unix credentials were present and no explicit unauthenticated subject applies.
+    /// No kernel peer credentials were captured.
     MissingPeerCredentials,
-    /// Unix credentials were present but matched no subject.
+    /// The local workload domain could not be established safely.
+    DomainUnavailable,
+    /// Every eligible subject conclusively failed to match.
     NoSubject {
-        /// The presenter's uid.
-        uid: u32,
+        /// Independently resolved domain.
+        domain: AuthorizationDomain,
+        /// Number of conclusively non-matching eligible subjects.
+        no_match_count: usize,
     },
-    /// Unix credentials matched more than one subject and no request-level subject disambiguated it.
+    /// More than one eligible subject matched.
     AmbiguousSubject {
-        /// The presenter's uid.
-        uid: u32,
-        /// Matching subjects.
+        /// Independently resolved domain.
+        domain: AuthorizationDomain,
+        /// Bounded matching-subject prefix for trusted diagnostics.
         subjects: Vec<SubjectName>,
+        /// Total matching-subject count.
+        total: usize,
+        /// Whether `subjects` was truncated.
+        truncated: bool,
+        /// Number of conclusively non-matching eligible subjects.
+        no_match_count: usize,
+        /// Number of eligible subjects with unavailable evidence.
+        unavailable_count: usize,
     },
-    /// The configured unauthenticated subject is absent or not an unauthenticated subject.
-    InvalidUnauthenticatedSubject {
-        /// The configured subject name.
-        subject: SubjectName,
+    /// An eligible subject required evidence that was unavailable.
+    EvidenceUnavailable {
+        /// Independently resolved domain.
+        domain: AuthorizationDomain,
+        /// Bounded matching-subject prefix for trusted diagnostics.
+        subjects: Vec<SubjectName>,
+        /// Whether `subjects` was truncated.
+        truncated: bool,
+        /// Number of matching eligible subjects.
+        matching_count: usize,
+        /// Number of conclusively non-matching eligible subjects.
+        no_match_count: usize,
+        /// Number of eligible subjects with unavailable evidence.
+        unavailable_count: usize,
     },
 }
 
+impl SubjectResolutionError {
+    /// Independently resolved domain retained for trusted diagnostics.
+    #[must_use]
+    pub const fn domain(&self) -> Option<AuthorizationDomain> {
+        match self {
+            Self::MissingPeerCredentials | Self::DomainUnavailable => None,
+            Self::NoSubject { domain, .. }
+            | Self::AmbiguousSubject { domain, .. }
+            | Self::EvidenceUnavailable { domain, .. } => Some(*domain),
+        }
+    }
+
+    /// Three-state evidence outcome retained for audit and diagnostics.
+    #[must_use]
+    pub const fn evidence_state(&self) -> EvidenceState {
+        match self {
+            Self::NoSubject { .. } => EvidenceState::NoMatch,
+            Self::AmbiguousSubject { .. } => EvidenceState::Match,
+            Self::MissingPeerCredentials
+            | Self::DomainUnavailable
+            | Self::EvidenceUnavailable { .. } => EvidenceState::Unavailable,
+        }
+    }
+
+    /// Bounded matching-subject names for trusted diagnostics.
+    #[must_use]
+    pub fn matching_subjects(&self) -> &[SubjectName] {
+        match self {
+            Self::AmbiguousSubject { subjects, .. }
+            | Self::EvidenceUnavailable { subjects, .. } => subjects,
+            Self::MissingPeerCredentials | Self::DomainUnavailable | Self::NoSubject { .. } => &[],
+        }
+    }
+
+    /// Aggregate `(match, no-match, unavailable)` eligible-subject counts.
+    #[must_use]
+    pub const fn subject_counts(&self) -> (usize, usize, usize) {
+        match self {
+            Self::MissingPeerCredentials | Self::DomainUnavailable => (0, 0, 0),
+            Self::NoSubject { no_match_count, .. } => (0, *no_match_count, 0),
+            Self::AmbiguousSubject {
+                total,
+                no_match_count,
+                unavailable_count,
+                ..
+            } => (*total, *no_match_count, *unavailable_count),
+            Self::EvidenceUnavailable {
+                matching_count,
+                no_match_count,
+                unavailable_count,
+                ..
+            } => (*matching_count, *no_match_count, *unavailable_count),
+        }
+    }
+
+    /// Whether the matching-subject diagnostic prefix was truncated.
+    #[must_use]
+    pub const fn matching_subjects_truncated(&self) -> bool {
+        matches!(
+            self,
+            Self::AmbiguousSubject {
+                truncated: true,
+                ..
+            } | Self::EvidenceUnavailable {
+                truncated: true,
+                ..
+            }
+        )
+    }
+}
+
 /// Resolve a local request actor from captured peer information.
+///
+/// This compatibility adapter treats its caller as an explicitly selected
+/// `host-process` input. The pinned classifier introduced by `basil-9tj.10`
+/// supplies a complete [`EvidenceSnapshot`] through [`resolve_evidence_actor`].
 pub fn resolve_local_actor(
     policy: &ResolvedPolicy,
     config: &Config,
     peer: &PeerInfo,
 ) -> Result<AuthenticatedActor, SubjectResolutionError> {
-    if let Some(uid) = peer.uid {
-        return resolve_unix_actor(policy, config, peer, uid);
-    }
-    resolve_unauthenticated_actor(policy, peer)
+    let Some(uid) = peer.uid else {
+        return Err(SubjectResolutionError::MissingPeerCredentials);
+    };
+    resolve_unix_actor(policy, config, peer, uid)
 }
 
-/// Resolve a Unix actor by uid with optional presenter context.
+/// Resolve an offline host-process actor from an explicitly supplied UID.
 pub fn resolve_unix_actor(
     policy: &ResolvedPolicy,
     config: &Config,
     peer: &PeerInfo,
     uid: u32,
 ) -> Result<AuthenticatedActor, SubjectResolutionError> {
-    let gids: Vec<u32> = config
+    let evidence = host_process_snapshot(config, peer, uid);
+    let mut actor = resolve_evidence_actor(policy, &evidence, peer)?;
+    actor.presenter.display_label = Some(config.user_name_num(uid));
+    Ok(actor)
+}
+
+/// Build the compatibility host-process snapshot from current peer credentials.
+#[must_use]
+pub fn host_process_snapshot(config: &Config, peer: &PeerInfo, uid: u32) -> EvidenceSnapshot {
+    let supplementary = config
         .groups_of(uid)
-        .map(|s| s.iter().copied().collect())
+        .map(|groups| groups.iter().copied().collect())
         .unwrap_or_default();
-    let subjects: Vec<SubjectName> = matching_unix_subjects(policy, uid, &gids)
-        .into_iter()
-        .cloned()
-        .collect();
-    match subjects.as_slice() {
-        [] => Err(SubjectResolutionError::NoSubject { uid }),
-        [subject] => {
-            let mut actor = actor(subject.clone(), ProofKind::UnixPeerCredentials, peer);
-            actor.presenter.display_label = Some(config.user_name_num(uid));
-            Ok(actor)
-        }
-        _ => Err(SubjectResolutionError::AmbiguousSubject { uid, subjects }),
+    EvidenceSnapshot {
+        domain: EvidenceValue::Available(AuthorizationDomain::HostProcess),
+        process: ProcessEvidence {
+            uids: EvidenceValue::Available(CredentialSlots::uniform(uid)),
+            gids: peer.gid.map_or(EvidenceValue::Unavailable, |gid| {
+                EvidenceValue::Available(CredentialSlots::uniform(gid))
+            }),
+            supplementary_gids: EvidenceValue::Available(supplementary),
+            executable_digest: EvidenceValue::Unavailable,
+        },
+        ..EvidenceSnapshot::default()
     }
 }
 
-/// Resolve the configured unauthenticated actor, if enabled.
-pub fn resolve_unauthenticated_actor(
+/// Resolve exactly one actor from a provider-independent immutable snapshot.
+pub fn resolve_evidence_actor(
     policy: &ResolvedPolicy,
+    evidence: &EvidenceSnapshot,
     peer: &PeerInfo,
 ) -> Result<AuthenticatedActor, SubjectResolutionError> {
-    let Some(subject) = policy.unauthenticated_subject.as_ref() else {
-        return Err(SubjectResolutionError::MissingPeerCredentials);
+    let resolution = resolve_subject(&policy.subjects, evidence).map_err(map_resolution_error)?;
+    let Some(subject) = resolution.subject else {
+        return Err(SubjectResolutionError::DomainUnavailable);
     };
-    if !policy
-        .subjects
-        .get(subject)
-        .is_some_and(|definition| definition.match_.matches_unauthenticated())
-    {
-        return Err(SubjectResolutionError::InvalidUnauthenticatedSubject {
+    let mut authenticated_by = vec![ProofSummary {
+        kind: domain_proof(resolution.domain),
+        subject: subject.clone(),
+        fingerprint: None,
+    }];
+    if let EvidenceValue::Available(signature_key) = &evidence.invocation_signature_key {
+        authenticated_by.push(ProofSummary {
+            kind: ProofKind::SignatureKey,
             subject: subject.clone(),
+            fingerprint: Some(signature_key_fingerprint(signature_key)),
         });
     }
-    Ok(actor(subject.clone(), ProofKind::Unauthenticated, peer))
-}
-
-fn matching_unix_subjects<'a>(
-    policy: &'a ResolvedPolicy,
-    uid: u32,
-    gids: &[u32],
-) -> BTreeSet<&'a SubjectName> {
-    policy
-        .subjects
-        .iter()
-        .filter_map(|(name, subject)| subject.match_.matches_unix(uid, gids).then_some(name))
-        .collect()
-}
-
-fn actor(subject: SubjectName, kind: ProofKind, peer: &PeerInfo) -> AuthenticatedActor {
-    AuthenticatedActor {
-        authenticated_by: vec![ProofSummary {
-            kind,
-            subject: subject.clone(),
-        }],
+    Ok(AuthenticatedActor {
+        domain: resolution.domain,
         subject,
+        authenticated_by,
         presenter: PresenterInfo::from(peer),
         transport: TransportInfo::default(),
+    })
+}
+
+fn signature_key_fingerprint(key: &SignatureKeyEvidence) -> String {
+    let algorithm = match key.algorithm {
+        crate::catalog::policy::SignatureKeyAlgorithm::Ed25519 => "ed25519",
+        crate::catalog::policy::SignatureKeyAlgorithm::NatsNkey => "nats-nkey",
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(algorithm.as_bytes());
+    hasher.update(b":");
+    hasher.update(key.public.as_bytes());
+    format!("sha256:{}", URL_SAFE_NO_PAD.encode(hasher.finalize()))
+}
+
+const fn domain_proof(domain: AuthorizationDomain) -> ProofKind {
+    match domain {
+        AuthorizationDomain::HostProcess => ProofKind::ProcessCredentials,
+        AuthorizationDomain::SystemdUnit => ProofKind::SystemdUnit,
+        AuthorizationDomain::Container => ProofKind::Container,
+    }
+}
+
+fn map_resolution_error(error: EvidenceResolutionError) -> SubjectResolutionError {
+    match error {
+        EvidenceResolutionError::DomainUnavailable => SubjectResolutionError::DomainUnavailable,
+        EvidenceResolutionError::NoSubject(SubjectResolution {
+            domain,
+            no_match_count,
+            ..
+        }) => SubjectResolutionError::NoSubject {
+            domain,
+            no_match_count,
+        },
+        EvidenceResolutionError::AmbiguousSubject(resolution) => {
+            SubjectResolutionError::AmbiguousSubject {
+                domain: resolution.domain,
+                subjects: resolution.matching_subjects,
+                total: resolution.matching_count,
+                truncated: resolution.matching_subjects_truncated,
+                no_match_count: resolution.no_match_count,
+                unavailable_count: resolution.unavailable_count,
+            }
+        }
+        EvidenceResolutionError::EvidenceUnavailable(SubjectResolution {
+            domain,
+            matching_count,
+            matching_subjects,
+            matching_subjects_truncated,
+            no_match_count,
+            unavailable_count,
+            ..
+        }) => SubjectResolutionError::EvidenceUnavailable {
+            domain,
+            subjects: matching_subjects,
+            truncated: matching_subjects_truncated,
+            matching_count,
+            no_match_count,
+            unavailable_count,
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
 
     use super::*;
-    use crate::catalog::policy::{PrincipalSpec, ResolvedPolicy, SubjectDefinition, SubjectMatch};
+    use crate::catalog::evidence::{EvidenceExpression, EvidencePredicate, IdentitySelector};
+    use crate::catalog::policy::SignatureKeyAlgorithm;
+    use crate::catalog::policy::SubjectDefinition;
 
-    fn unix_subject(uid: Option<u32>, gid: Option<u32>) -> SubjectDefinition {
+    fn host_subject(uid: u32) -> SubjectDefinition {
         SubjectDefinition {
+            domain: AuthorizationDomain::HostProcess,
             break_glass: false,
-            match_: SubjectMatch::AllOf(vec![PrincipalSpec::Unix { uid, gid }]),
+            match_: EvidenceExpression::All(vec![EvidenceExpression::Leaf(
+                EvidencePredicate::ProcessUid(IdentitySelector::Numeric(uid)),
+            )]),
         }
     }
 
-    fn unauthenticated_subject() -> SubjectDefinition {
-        SubjectDefinition {
-            break_glass: false,
-            match_: SubjectMatch::AnyOf(vec![PrincipalSpec::Unauthenticated]),
-        }
-    }
-
-    fn peer(uid: Option<u32>, gid: Option<u32>) -> PeerInfo {
+    fn peer(uid: Option<u32>) -> PeerInfo {
         PeerInfo {
             uid,
-            gid,
+            gid: uid,
             ..PeerInfo::default()
         }
     }
 
     #[test]
-    fn local_unix_actor_resolves_exactly_one_subject() {
+    fn local_actor_resolves_exactly_one_subject() {
         let policy = ResolvedPolicy {
-            subjects: BTreeMap::from([("svc.web".to_string(), unix_subject(Some(9001), None))]),
-            unauthenticated_subject: None,
+            subjects: BTreeMap::from([("svc.web".to_string(), host_subject(9001))]),
             rules: Vec::new(),
         };
-        let actor =
-            resolve_local_actor(&policy, &Config::default(), &peer(Some(9001), Some(1))).unwrap();
+        let actor = resolve_local_actor(&policy, &Config::default(), &peer(Some(9001)))
+            .expect("one subject resolves");
         assert_eq!(actor.subject, "svc.web");
+        assert_eq!(actor.domain, AuthorizationDomain::HostProcess);
         assert_eq!(actor.unix_uid(), Some(9001));
+    }
+
+    #[test]
+    fn overlapping_subjects_are_bounded_and_rejected() {
+        let subjects = (0..12)
+            .map(|index| (format!("svc.{index:02}"), host_subject(42)))
+            .collect();
+        let policy = ResolvedPolicy {
+            subjects,
+            rules: Vec::new(),
+        };
+        let error = resolve_local_actor(&policy, &Config::default(), &peer(Some(42)))
+            .expect_err("overlap must deny");
+        let SubjectResolutionError::AmbiguousSubject {
+            subjects,
+            total,
+            truncated,
+            ..
+        } = error
+        else {
+            panic!("expected ambiguity");
+        };
+        assert_eq!(subjects.len(), 8);
+        assert_eq!(total, 12);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn missing_peer_credentials_never_resolve() {
+        let policy = ResolvedPolicy {
+            subjects: BTreeMap::from([("svc.web".to_string(), host_subject(9001))]),
+            rules: Vec::new(),
+        };
         assert_eq!(
-            actor.authenticated_by[0].kind,
-            ProofKind::UnixPeerCredentials
+            resolve_local_actor(&policy, &Config::default(), &peer(None)),
+            Err(SubjectResolutionError::MissingPeerCredentials)
         );
     }
 
     #[test]
-    fn group_subject_uses_configured_memberships_not_primary_gid() {
-        let policy = ResolvedPolicy {
-            subjects: BTreeMap::from([("ops.wheel".to_string(), unix_subject(None, Some(10)))]),
-            unauthenticated_subject: None,
-            rules: Vec::new(),
+    fn signature_fingerprint_is_stable_and_does_not_disclose_public_material() {
+        let key = SignatureKeyEvidence {
+            algorithm: SignatureKeyAlgorithm::Ed25519,
+            public: "sensitive-public-material".to_string(),
         };
-        let mut config = Config::default();
-        config.memberships.insert(5000, BTreeSet::from([5000, 10]));
-        let actor = resolve_local_actor(&policy, &config, &peer(Some(5000), Some(5000))).unwrap();
-        assert_eq!(actor.subject, "ops.wheel");
-
-        let no_membership =
-            resolve_local_actor(&policy, &Config::default(), &peer(Some(5000), Some(10)));
-        assert!(matches!(
-            no_membership,
-            Err(SubjectResolutionError::NoSubject { uid: 5000 })
-        ));
-    }
-
-    #[test]
-    fn ambiguous_unix_actor_is_rejected() {
-        let policy = ResolvedPolicy {
-            subjects: BTreeMap::from([
-                ("svc.one".to_string(), unix_subject(Some(42), None)),
-                ("svc.two".to_string(), unix_subject(Some(42), None)),
-            ]),
-            unauthenticated_subject: None,
-            rules: Vec::new(),
-        };
-        let err = resolve_local_actor(&policy, &Config::default(), &peer(Some(42), None))
-            .expect_err("two subjects must be ambiguous");
-        assert!(matches!(
-            err,
-            SubjectResolutionError::AmbiguousSubject { uid: 42, .. }
-        ));
-    }
-
-    #[test]
-    fn unauthenticated_subject_resolves_only_when_configured() {
-        let policy = ResolvedPolicy {
-            subjects: BTreeMap::from([("guest".to_string(), unauthenticated_subject())]),
-            unauthenticated_subject: Some("guest".to_string()),
-            rules: Vec::new(),
-        };
-        let actor = resolve_local_actor(&policy, &Config::default(), &PeerInfo::default()).unwrap();
-        assert_eq!(actor.subject, "guest");
-        assert_eq!(actor.authenticated_by[0].kind, ProofKind::Unauthenticated);
-
-        let disabled = ResolvedPolicy {
-            unauthenticated_subject: None,
-            ..policy
-        };
-        assert!(matches!(
-            resolve_local_actor(&disabled, &Config::default(), &PeerInfo::default()),
-            Err(SubjectResolutionError::MissingPeerCredentials)
-        ));
+        let first = signature_key_fingerprint(&key);
+        let second = signature_key_fingerprint(&key);
+        assert_eq!(first, second);
+        assert!(first.starts_with("sha256:"));
+        assert!(!first.contains(&key.public));
     }
 }

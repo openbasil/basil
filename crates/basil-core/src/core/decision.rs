@@ -17,9 +17,10 @@
 
 use tracing::{info, warn};
 
-use crate::actor::{AuthenticatedActor, ProofKind};
+use crate::actor::{AuthenticatedActor, ProofKind, SubjectResolutionError};
 use crate::catalog::policy::Op;
 use crate::catalog::{AllowVia, Decision, DenyReason};
+use crate::catalog::{AuthorizationDomain, EvidenceState};
 use crate::peer::PeerInfo;
 
 /// The outcome of a gated request, in audit-friendly form.
@@ -62,8 +63,22 @@ pub struct DecisionRecord {
     pub actor_kind: String,
     /// The policy subject being authorized.
     pub actor_id: String,
+    /// Independently resolved local workload domain, when available.
+    pub authorization_domain: Option<String>,
+    /// Three-state result of the evidence evaluation that reached this record.
+    pub evidence_state: String,
     /// Evidence summaries that established the actor.
     pub authenticated_by: Vec<String>,
+    /// Bounded matching-subject prefix for overlap diagnostics.
+    pub matching_subjects: Vec<String>,
+    /// Total eligible subjects whose evidence matched.
+    pub matching_subject_count: usize,
+    /// Total eligible subjects whose evidence conclusively did not match.
+    pub no_match_subject_count: usize,
+    /// Total eligible subjects whose evidence was unavailable.
+    pub unavailable_subject_count: usize,
+    /// Whether `matching_subjects` omits additional matches.
+    pub matching_subjects_truncated: bool,
     /// Presenter kind, e.g. `unix_peercred`.
     pub presenter_kind: String,
     /// Presenter id, preferably the configured `name(uid)` label.
@@ -96,7 +111,14 @@ impl DecisionRecord {
             key: sanitize_log_value(key),
             actor_kind: "subject".to_string(),
             actor_id: sanitize_log_value(&actor.subject),
+            authorization_domain: Some(actor.domain.token().to_string()),
+            evidence_state: EvidenceState::Match.token().to_string(),
             authenticated_by: authenticated_by(actor),
+            matching_subjects: Vec::new(),
+            matching_subject_count: 1,
+            no_match_subject_count: 0,
+            unavailable_subject_count: 0,
+            matching_subjects_truncated: false,
             presenter_kind: presenter_kind(actor),
             presenter_id: presenter_id(actor),
             outcome,
@@ -112,7 +134,9 @@ impl DecisionRecord {
         peer: &PeerInfo,
         op: Op,
         key: &str,
-        reason: String,
+        authorization_domain: Option<AuthorizationDomain>,
+        evidence_state: EvidenceState,
+        reason: &str,
     ) -> Self {
         let (presenter_kind, presenter_id) = presenter_from_peer(peer);
         Self {
@@ -121,12 +145,76 @@ impl DecisionRecord {
             key: sanitize_log_value(key),
             actor_kind: "subject".to_string(),
             actor_id: "unresolved".to_string(),
+            authorization_domain: authorization_domain.map(|domain| domain.token().to_string()),
+            evidence_state: evidence_state.token().to_string(),
             authenticated_by: Vec::new(),
+            matching_subjects: Vec::new(),
+            matching_subject_count: 0,
+            no_match_subject_count: 0,
+            unavailable_subject_count: 0,
+            matching_subjects_truncated: false,
             presenter_kind,
             presenter_id,
             outcome: Outcome::Deny,
-            reason,
+            reason: sanitize_log_value(reason),
         }
+    }
+
+    /// Build a denied record with bounded subject-resolution diagnostics.
+    #[must_use]
+    pub fn from_subject_resolution_error(
+        generation: u64,
+        peer: &PeerInfo,
+        op: Op,
+        key: &str,
+        error: &SubjectResolutionError,
+        reason: &str,
+    ) -> Self {
+        let mut record = Self::from_resolution_error(
+            generation,
+            peer,
+            op,
+            key,
+            error.domain(),
+            error.evidence_state(),
+            reason,
+        );
+        let (matching, no_match, unavailable) = error.subject_counts();
+        record.matching_subjects = error
+            .matching_subjects()
+            .iter()
+            .map(|subject| sanitize_log_value(subject))
+            .collect();
+        record.matching_subject_count = matching;
+        record.no_match_subject_count = no_match;
+        record.unavailable_subject_count = unavailable;
+        record.matching_subjects_truncated = error.matching_subjects_truncated();
+        record
+    }
+
+    /// Build a denied record after an actor resolved but a secondary evidence
+    /// equality check failed.
+    #[must_use]
+    pub fn from_actor_evidence_denial(
+        generation: u64,
+        actor: &AuthenticatedActor,
+        op: Op,
+        key: &str,
+        evidence_state: EvidenceState,
+        reason: &str,
+    ) -> Self {
+        let mut record = Self::from_actor_decision(
+            generation,
+            actor,
+            op,
+            key,
+            &Decision::Deny {
+                reason: DenyReason::NotPermitted,
+            },
+        );
+        record.evidence_state = evidence_state.token().to_string();
+        record.reason = sanitize_log_value(reason);
+        record
     }
 
     /// Emit this record to the tracing log (the in-handler audit hook).
@@ -136,8 +224,14 @@ impl DecisionRecord {
     /// only side effect today.
     pub fn record(&self) {
         let event_kind = "basil.audit.authz";
-        let event_version = 2_u16;
+        let event_version = 3_u16;
         let op = op_token(self.op);
+        let authorization_domain = self.authorization_domain.as_deref().unwrap_or("unresolved");
+        let evidence_state = self.evidence_state.as_str();
+        let matching_subject_count = self.matching_subject_count;
+        let no_match_subject_count = self.no_match_subject_count;
+        let unavailable_subject_count = self.unavailable_subject_count;
+        let matching_subjects_truncated = self.matching_subjects_truncated;
         match self.outcome {
             Outcome::Allow => info!(
                 name: "basil.audit.authz",
@@ -149,7 +243,14 @@ impl DecisionRecord {
                 target_id = %self.key,
                 actor_kind = %self.actor_kind,
                 actor_id = %self.actor_id,
+                authorization_domain = authorization_domain,
+                evidence_state = evidence_state,
+                matching_subject_count = matching_subject_count,
+                no_match_subject_count = no_match_subject_count,
+                unavailable_subject_count = unavailable_subject_count,
+                matching_subjects_truncated = matching_subjects_truncated,
                 authenticated_by = ?self.authenticated_by,
+                matching_subjects = ?self.matching_subjects,
                 presenter_kind = %self.presenter_kind,
                 presenter_id = %self.presenter_id,
                 decision = self.outcome.as_str(),
@@ -167,7 +268,14 @@ impl DecisionRecord {
                 target_id = %self.key,
                 actor_kind = %self.actor_kind,
                 actor_id = %self.actor_id,
+                authorization_domain = authorization_domain,
+                evidence_state = evidence_state,
+                matching_subject_count = matching_subject_count,
+                no_match_subject_count = no_match_subject_count,
+                unavailable_subject_count = unavailable_subject_count,
+                matching_subjects_truncated = matching_subjects_truncated,
                 authenticated_by = ?self.authenticated_by,
+                matching_subjects = ?self.matching_subjects,
                 presenter_kind = %self.presenter_kind,
                 presenter_id = %self.presenter_id,
                 decision = self.outcome.as_str(),
@@ -188,31 +296,41 @@ impl DecisionRecord {
 /// record. The JSONL audit sink escapes independently via serde; sanitized
 /// values contain only printables, so it is unaffected.
 fn sanitize_log_value(value: &str) -> String {
-    if value.chars().any(char::is_control) {
-        value
-            .chars()
-            .flat_map(|c| {
-                let escaped: Box<dyn Iterator<Item = char>> = if c.is_control() {
-                    Box::new(c.escape_default())
-                } else {
-                    Box::new(std::iter::once(c))
-                };
-                escaped
-            })
-            .collect()
-    } else {
-        value.to_string()
+    const MAX_CHARS: usize = 256;
+    let mut sanitized = String::new();
+    let mut truncated = false;
+    for (index, character) in value.chars().enumerate() {
+        if index >= MAX_CHARS {
+            truncated = true;
+            break;
+        }
+        if character.is_control() {
+            sanitized.extend(character.escape_default());
+        } else {
+            sanitized.push(character);
+        }
     }
+    if truncated {
+        sanitized.push_str("...[truncated]");
+    }
+    sanitized
 }
 
 fn authenticated_by(actor: &AuthenticatedActor) -> Vec<String> {
     actor
         .authenticated_by
         .iter()
-        .map(|proof| match proof.kind {
-            ProofKind::UnixPeerCredentials => format!("unix_peercred:{}", proof.subject),
-            ProofKind::Unauthenticated => format!("unauthenticated:{}", proof.subject),
-            ProofKind::SignatureKey => format!("signature-key:{}", proof.subject),
+        .map(|proof| {
+            let kind = match proof.kind {
+                ProofKind::ProcessCredentials => "process-credentials",
+                ProofKind::SystemdUnit => "systemd-unit",
+                ProofKind::Container => "container",
+                ProofKind::SignatureKey => "signature-key",
+            };
+            proof.fingerprint.as_ref().map_or_else(
+                || format!("{kind}:{}", proof.subject),
+                |fingerprint| format!("{kind}:{}:{fingerprint}", proof.subject),
+            )
         })
         .collect()
 }
@@ -279,10 +397,12 @@ mod tests {
 
     fn actor() -> AuthenticatedActor {
         AuthenticatedActor {
+            domain: AuthorizationDomain::HostProcess,
             subject: "svc.nats".to_string(),
             authenticated_by: vec![ProofSummary {
-                kind: ProofKind::UnixPeerCredentials,
+                kind: ProofKind::ProcessCredentials,
                 subject: "svc.nats".to_string(),
+                fingerprint: None,
             }],
             presenter: PresenterInfo {
                 pid: Some(123),
@@ -307,7 +427,8 @@ mod tests {
         assert_eq!(rec.key, "nats.account");
         assert_eq!(rec.actor_kind, "subject");
         assert_eq!(rec.actor_id, "svc.nats");
-        assert_eq!(rec.authenticated_by, ["unix_peercred:svc.nats"]);
+        assert_eq!(rec.authorization_domain.as_deref(), Some("host-process"));
+        assert_eq!(rec.authenticated_by, ["process-credentials:svc.nats"]);
         assert_eq!(rec.presenter_kind, "unix_peercred");
         assert_eq!(rec.presenter_id, "svc-nats(9002)");
         assert_eq!(rec.outcome, Outcome::Allow);
@@ -345,6 +466,10 @@ mod tests {
             rec.key
         );
         assert!(rec.key.contains("\\n"), "newline is visibly escaped");
+        let oversized = "x".repeat(1_000);
+        let rec = DecisionRecord::from_actor_decision(1, &actor(), Op::Get, &oversized, &decision);
+        assert!(rec.key.len() < 300);
+        assert!(rec.key.ends_with("...[truncated]"));
         // A benign dotted-lowercase key is unchanged.
         let rec =
             DecisionRecord::from_actor_decision(1, &actor(), Op::Get, "web.tls.key", &decision);
@@ -369,5 +494,49 @@ mod tests {
             );
             assert_eq!(rec.reason, token);
         }
+    }
+
+    #[test]
+    fn resolution_error_retains_domain_and_bounds_reason() {
+        let reason = format!("bad\n{}", "x".repeat(1_000));
+        let record = DecisionRecord::from_resolution_error(
+            4,
+            &PeerInfo::default(),
+            Op::Get,
+            "app.secret",
+            Some(AuthorizationDomain::Container),
+            EvidenceState::Unavailable,
+            &reason,
+        );
+        assert_eq!(record.authorization_domain.as_deref(), Some("container"));
+        assert_eq!(record.evidence_state, "unavailable");
+        assert!(!record.reason.contains('\n'));
+        assert!(record.reason.ends_with("...[truncated]"));
+        assert!(record.reason.len() < 300);
+    }
+
+    #[test]
+    fn subject_resolution_record_retains_bounded_overlap_diagnostics() {
+        let error = SubjectResolutionError::AmbiguousSubject {
+            domain: AuthorizationDomain::Container,
+            subjects: vec!["svc.a".to_string(), "svc.b".to_string()],
+            total: 12,
+            truncated: true,
+            no_match_count: 3,
+            unavailable_count: 1,
+        };
+        let record = DecisionRecord::from_subject_resolution_error(
+            5,
+            &PeerInfo::default(),
+            Op::Get,
+            "app.secret",
+            &error,
+            "ambiguous_actor_subject",
+        );
+        assert_eq!(record.matching_subjects, ["svc.a", "svc.b"]);
+        assert_eq!(record.matching_subject_count, 12);
+        assert_eq!(record.no_match_subject_count, 3);
+        assert_eq!(record.unavailable_subject_count, 1);
+        assert!(record.matching_subjects_truncated);
     }
 }

@@ -4,7 +4,7 @@
     "token-minter": ["mint", "get_public_key"]
   },
   "subjects": {
-    "web-service": { "allOf": [ { "kind": "unix", "uid": __UID__ } ] }
+    "web-service": { "domain": "host-process", "match": { "all": [ { "process.uid": __UID__ } ] } }
   },
   "rules": [
     {

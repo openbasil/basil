@@ -121,19 +121,14 @@ fn record_resolution_error(
     err: &SubjectResolutionError,
 ) {
     let reason = match err {
-        SubjectResolutionError::MissingPeerCredentials => "no_actor_subject".to_string(),
-        SubjectResolutionError::NoSubject { uid } => {
-            format!("no_actor_subject:{uid}")
-        }
-        SubjectResolutionError::AmbiguousSubject { uid, .. } => {
-            format!("ambiguous_actor_subject:{uid}")
-        }
-        SubjectResolutionError::InvalidUnauthenticatedSubject { subject } => {
-            format!("invalid_unauthenticated_subject:{subject}")
-        }
+        SubjectResolutionError::MissingPeerCredentials
+        | SubjectResolutionError::NoSubject { .. } => "no_actor_subject".to_string(),
+        SubjectResolutionError::DomainUnavailable => "workload_domain_unavailable".to_string(),
+        SubjectResolutionError::AmbiguousSubject { .. } => "ambiguous_actor_subject".to_string(),
+        SubjectResolutionError::EvidenceUnavailable { .. } => "attestation_unavailable".to_string(),
     };
-    state.record_decision(&DecisionRecord::from_resolution_error(
-        generation, peer, op, key, reason,
+    state.record_decision(&DecisionRecord::from_subject_resolution_error(
+        generation, peer, op, key, err, &reason,
     ));
 }
 
@@ -145,9 +140,15 @@ fn resolution_status(op: Op, err: &SubjectResolutionError) -> Status {
             op_token(op),
             "missing peer credentials",
         ),
+        SubjectResolutionError::DomainUnavailable
+        | SubjectResolutionError::EvidenceUnavailable { .. } => broker_status(
+            Code::Unavailable,
+            "ATTESTATION_UNAVAILABLE",
+            op_token(op),
+            "attestation unavailable",
+        ),
         SubjectResolutionError::NoSubject { .. }
-        | SubjectResolutionError::AmbiguousSubject { .. }
-        | SubjectResolutionError::InvalidUnauthenticatedSubject { .. } => broker_status(
+        | SubjectResolutionError::AmbiguousSubject { .. } => broker_status(
             Code::PermissionDenied,
             "UNAUTHORIZED",
             op_token(op),
@@ -216,7 +217,7 @@ mod tests {
     const POLICY: &str = r#"{
       "schema": "policy",
       "subjects": {
-        "svc.app": { "allOf": [ { "kind": "unix", "uid": 42 } ] }
+        "svc.app": { "domain": "host-process", "match": { "all": [ { "process.uid": 42 } ] } }
       },
       "roles": { "reader": ["get"] },
       "rules": [
@@ -231,7 +232,7 @@ mod tests {
     const DENY_POLICY: &str = r#"{
       "schema": "policy",
       "subjects": {
-        "svc.app": { "allOf": [ { "kind": "unix", "uid": 42 } ] }
+        "svc.app": { "domain": "host-process", "match": { "all": [ { "process.uid": 42 } ] } }
       },
       "roles": {},
       "rules": [],

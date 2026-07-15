@@ -728,7 +728,7 @@ fn apply_policy_override(
     let top_level = relative.split('.').next().unwrap_or_default();
     let known_section = matches!(
         top_level,
-        "schema" | "subjects" | "unauthenticatedSubject" | "roles" | "rules" | "config"
+        "schema" | "subjects" | "roles" | "rules" | "config"
     );
     if known_section
         && policy
@@ -1622,7 +1622,7 @@ bundle = "bundle.age"
             &policy,
             r#"{
   "schema": "policy",
-  "subjects": {"svc.web": {"allOf": [{"kind": "unix", "uid": 1000}]}},
+  "subjects": {"svc.web": {"domain": "host-process", "match": {"all": [{"process.uid": 1000}]}}},
   "roles": {}, "rules": [], "config": {}
 }"#,
         );
@@ -1657,7 +1657,7 @@ bundle = "bundle.age"
         assert!(error.to_string().contains("identity-bearing"));
 
         let subject =
-            [ConfigOverride::parse("policy.subjects.svc.web.allOf=false").expect("parse")];
+            [ConfigOverride::parse("policy.subjects.svc.web.match=false").expect("parse")];
         let error = load_documents_with_overrides(&sources, &subject, Vec::new())
             .expect_err("subject mutation rejects");
         assert!(error.to_string().contains("policy-bearing"));

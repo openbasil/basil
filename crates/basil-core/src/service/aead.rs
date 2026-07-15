@@ -545,8 +545,8 @@ mod tests {
     const POLICY: &str = r#"{
       "schema": "policy",
       "subjects": {
-        "svc.granted": { "allOf": [ { "kind": "unix", "uid": 42 } ] },
-        "svc.ungranted": { "allOf": [ { "kind": "unix", "uid": 43 } ] }
+        "svc.granted": { "domain": "host-process", "match": { "all": [ { "process.uid": 42 } ] } },
+        "svc.ungranted": { "domain": "host-process", "match": { "all": [ { "process.uid": 43 } ] } }
       },
       "roles": {},
       "rules": [

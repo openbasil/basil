@@ -173,7 +173,7 @@ mod tests {
         let policy = r#"{
           "schema": "policy",
           "subjects": {
-            "svc.ops": { "allOf": [ { "kind": "unix", "uid": 42 } ] }
+            "svc.ops": { "domain": "host-process", "match": { "all": [ { "process.uid": 42 } ] } }
           },
           "roles": { "rotator": ["rotate"] },
           "rules": [

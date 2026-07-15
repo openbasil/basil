@@ -19,23 +19,33 @@
 //! Glob matching ([`glob`]) is the load-bearing §3.4 semantics: wildcards are
 //! last-position only, `*` matches exactly one segment, `**` matches one-or-more.
 
+pub mod evidence;
 pub mod glob;
 pub mod loader;
 pub mod pdp;
 pub mod policy;
 pub mod schema;
 
+pub use evidence::{
+    AuthorizationDomain, ComposeEvidence, ComposeProjectSelector, ComposeServiceSelector,
+    ContainerRuntimeKind, CredentialSlot, CredentialSlots, EvidenceExpression, EvidencePredicate,
+    EvidenceResolutionError, EvidenceSnapshot, EvidenceState, EvidenceValue, IdentitySelector,
+    LocalAccountSource, MAX_EXPRESSION_DEPTH, MAX_EXPRESSION_LEAVES, MAX_REPORTED_SUBJECTS,
+    ProcessEvidence, SignatureKeyEvidence, SubjectResolution, SystemdEvidence, SystemdSelector,
+    resolve_subject,
+};
 pub use glob::{GlobError, GlobSeg, KeyGlob};
 pub use loader::{
-    LoadError, LoadWarning, PolicySchema, RawPolicy, RawRule, RawSubjectDefinition, load,
+    LoadError, LoadWarning, PolicySchema, RawEvidenceExpression, RawPolicy, RawRule,
+    RawSubjectDefinition, load,
 };
 pub use pdp::{
     ADMIN_EXPLAIN_TARGET, ADMIN_RELOAD_TARGET, ADMIN_REVOKE_TARGET, ADMIN_WATCH_TARGET, AllowVia,
     Decision, DenyReason, EffectiveGrant, Explanation, MatchedRule, Pdp,
 };
 pub use policy::{
-    ActionTerm, ActionTermError, Config, Grant, NameTable, Op, PrincipalSpec, ResolvedPolicy,
-    ResolvedRule, Rule, SignatureKeyAlgorithm, SubjectDefinition, SubjectMatch, SubjectName,
+    ActionTerm, ActionTermError, Config, Grant, NameTable, Op, ResolvedPolicy, ResolvedRule, Rule,
+    SignatureKeyAlgorithm, SubjectDefinition, SubjectName,
 };
 pub use schema::{
     BackendKind, BackendRef, Capability, Catalog, CatalogSchema, Class, Engine, GenerateSpec,

@@ -332,7 +332,7 @@ fn write_line<W: std::io::Write>(w: &mut W, line: &str) -> std::io::Result<()> {
 fn serialize_line(record: &DecisionRecord) -> String {
     let obj = json!({
         "event_kind": "basil.audit.authz",
-        "event_version": 2,
+        "event_version": 3,
         "occurred_at": timestamp(),
         "generation": record.generation,
         "op": op_token(record.op),
@@ -340,7 +340,14 @@ fn serialize_line(record: &DecisionRecord) -> String {
         "target_id": record.key,
         "actor_kind": record.actor_kind,
         "actor_id": record.actor_id,
+        "authorization_domain": record.authorization_domain,
+        "evidence_state": record.evidence_state,
         "authenticated_by": record.authenticated_by,
+        "matching_subjects": record.matching_subjects,
+        "matching_subject_count": record.matching_subject_count,
+        "no_match_subject_count": record.no_match_subject_count,
+        "unavailable_subject_count": record.unavailable_subject_count,
+        "matching_subjects_truncated": record.matching_subjects_truncated,
         "presenter_kind": record.presenter_kind,
         "presenter_id": record.presenter_id,
         "decision": outcome_token(record.outcome),
@@ -351,7 +358,7 @@ fn serialize_line(record: &DecisionRecord) -> String {
         // Infallible in practice (a plain object of strings); keep a non-panic
         // floor so an audit line is emitted even on the impossible error.
         format!(
-            "{{\"event_kind\":\"basil.audit.authz\",\"event_version\":2,\"op\":\"{}\",\"target_kind\":\"catalog_key\",\"target_id\":\"{}\",\"actor_kind\":\"{}\",\"actor_id\":\"{}\",\"outcome\":\"{}\"}}",
+            "{{\"event_kind\":\"basil.audit.authz\",\"event_version\":3,\"op\":\"{}\",\"target_kind\":\"catalog_key\",\"target_id\":\"{}\",\"actor_kind\":\"{}\",\"actor_id\":\"{}\",\"outcome\":\"{}\"}}",
             op_token(record.op),
             record.key,
             record.actor_kind,
@@ -516,7 +523,14 @@ mod tests {
             key: "nats.account".to_string(),
             actor_kind: "subject".to_string(),
             actor_id: "svc.nats".to_string(),
-            authenticated_by: vec!["unix_peercred:svc.nats".to_string()],
+            authorization_domain: Some("host-process".to_string()),
+            evidence_state: "match".to_string(),
+            authenticated_by: vec!["process-credentials:svc.nats".to_string()],
+            matching_subjects: Vec::new(),
+            matching_subject_count: 1,
+            no_match_subject_count: 0,
+            unavailable_subject_count: 0,
+            matching_subjects_truncated: false,
             presenter_kind: "unix_peercred".to_string(),
             presenter_id: "svc-nats(9002)".to_string(),
             outcome: Outcome::Allow,
@@ -531,7 +545,14 @@ mod tests {
             key: "secret.payload".to_string(),
             actor_kind: "subject".to_string(),
             actor_id: "svc.api".to_string(),
-            authenticated_by: vec!["unix_peercred:svc.api".to_string()],
+            authorization_domain: Some("host-process".to_string()),
+            evidence_state: "match".to_string(),
+            authenticated_by: vec!["process-credentials:svc.api".to_string()],
+            matching_subjects: Vec::new(),
+            matching_subject_count: 1,
+            no_match_subject_count: 0,
+            unavailable_subject_count: 0,
+            matching_subjects_truncated: false,
             presenter_kind: "unix_peercred".to_string(),
             presenter_id: "svc-api(7777)".to_string(),
             outcome: Outcome::Deny,
@@ -545,14 +566,20 @@ mod tests {
         assert!(!line.contains('\n'), "a line must be single-line JSONL");
         let v: serde_json::Value = serde_json::from_str(&line).expect("audit line must be JSON");
         assert_eq!(v["event_kind"], "basil.audit.authz");
-        assert_eq!(v["event_version"], 2);
+        assert_eq!(v["event_version"], 3);
         assert_eq!(v["generation"], 1);
         assert_eq!(v["op"], "sign");
         assert_eq!(v["target_kind"], "catalog_key");
         assert_eq!(v["target_id"], "nats.account");
         assert_eq!(v["actor_kind"], "subject");
         assert_eq!(v["actor_id"], "svc.nats");
-        assert_eq!(v["authenticated_by"][0], "unix_peercred:svc.nats");
+        assert_eq!(v["authorization_domain"], "host-process");
+        assert_eq!(v["evidence_state"], "match");
+        assert_eq!(v["authenticated_by"][0], "process-credentials:svc.nats");
+        assert_eq!(v["matching_subject_count"], 1);
+        assert_eq!(v["no_match_subject_count"], 0);
+        assert_eq!(v["unavailable_subject_count"], 0);
+        assert_eq!(v["matching_subjects_truncated"], false);
         assert_eq!(v["presenter_kind"], "unix_peercred");
         assert_eq!(v["presenter_id"], "svc-nats(9002)");
         assert_eq!(v["decision"], "allow");

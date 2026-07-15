@@ -155,7 +155,7 @@ write_policy() {
     "nats_user": ["sign", "get_public_key"]
   },
   "subjects": {
-    "local.user": { "allOf": [{ "kind": "unix", "uid": $uid }] }
+    "local.user": { "domain": "host-process", "match": { "all": [{ "process.uid": $uid }] } }
   },
   "rules": [
     {
