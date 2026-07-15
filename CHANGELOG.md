@@ -10,6 +10,14 @@ SPDX-License-Identifier: Apache-2.0
 
 ### Added
 
+- 2026-07-15: Compose implementation milestones were reconciled with Design
+  0001 revision 1.1. The plan now consistently carries the serial four-operation
+  attestor protocol, retained stream contracts, bounded non-predictive
+  admission, single-image-digest profiles, per-workload protected-mount denial,
+  machine-level signed artifact trust, JSON/TOML delivery manifests, enforcing-
+  LSM enrollment UX, legacy-shape diagnostics, and each independent
+  compatibility version axis.
+
 - 2026-07-15: Compose Phase 1 follow-up tooling now includes a native,
   concurrent `AdminService.Status` load probe with persistent Unix-socket
   connections, bounded concurrency, latency histograms, throughput, failure
