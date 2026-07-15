@@ -85,7 +85,7 @@ pub use catalog::{
 pub use configuration::{
     CORPUS_SCHEMA_VERSION, ComposeInstallOutcome, ConfigOverride, ConfigurationError,
     CorpusDocuments, CorpusSources, DEFAULT_CONFIG_PATH, LoadedBootstrap, OverrideProvenance,
-    install_compose_document, load_bootstrap, load_documents,
+    install_compose_document, load_bootstrap, load_documents, load_documents_with_overrides,
 };
 pub use decision::{DecisionRecord, Outcome};
 pub use event::{BrokerEvent, BrokerEventKind, EventSource};

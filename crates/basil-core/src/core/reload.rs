@@ -49,7 +49,10 @@ use std::sync::Arc;
 use crate::catalog::loader::LoadError;
 use crate::catalog::schema::{BackendKind, Capability, Class, Engine, KeyAlgorithm};
 use crate::catalog::{Catalog, Config, ResolvedPolicy};
-use crate::configuration::{ConfigOverride, CorpusDocuments, load_bootstrap, load_documents};
+use crate::configuration::{
+    ConfigOverride, CorpusDocuments, OverrideProvenance, load_bootstrap,
+    load_documents_with_overrides,
+};
 use crate::state::{BrokerState, Generation};
 
 /// The on-disk inputs a [`reload_generation`] re-reads.
@@ -340,7 +343,12 @@ fn read_reload_inputs_with_observer(
             });
         }
     }
-    let documents = load_documents(&bootstrap.sources).map_err(|error| match error {
+    let documents = load_documents_with_overrides(
+        &bootstrap.sources,
+        &bootstrap.document_overrides,
+        bootstrap.overrides,
+    )
+    .map_err(|error| match error {
         crate::configuration::ConfigurationError::Catalog(error) => ReloadError::Validate(error),
         other => ReloadError::Configuration(other),
     })?;
@@ -379,6 +387,7 @@ struct ValidatedCandidate {
     catalog: Catalog,
     policy: ResolvedPolicy,
     config: Config,
+    overrides: Vec<OverrideProvenance>,
     outcome: ReloadOutcome,
     bundle_changed_trust_domains: Vec<String>,
 }
@@ -409,6 +418,7 @@ fn validate_candidate(state: &BrokerState) -> Result<ValidatedCandidate, ReloadE
         policy_config: config,
         warnings,
         compose: _,
+        overrides,
     } = read_reload_inputs(inputs)?;
     for w in &warnings {
         tracing::warn!(warning = %w, "reload: catalog/policy load warning");
@@ -433,6 +443,7 @@ fn validate_candidate(state: &BrokerState) -> Result<ValidatedCandidate, ReloadE
         catalog,
         policy,
         config,
+        overrides,
         outcome,
         bundle_changed_trust_domains,
     })
@@ -487,11 +498,18 @@ pub fn reload_generation(state: &BrokerState) -> Result<ReloadOutcome, ReloadErr
         catalog,
         policy,
         config,
+        overrides,
         outcome,
         bundle_changed_trust_domains,
     } = candidate;
 
-    let next = Generation::new(outcome.new_generation, Arc::new(catalog), policy, config);
+    let next = Generation::new_with_overrides(
+        outcome.new_generation,
+        Arc::new(catalog),
+        policy,
+        config,
+        overrides,
+    );
     state.swap_generation(Arc::new(next));
     for trust_domain in bundle_changed_trust_domains {
         state.events().bundle_changed(trust_domain);
@@ -509,11 +527,12 @@ mod tests {
     use basil_proto::KeyType;
 
     use super::{
-        ReloadError, ReloadInputs, check_reload, read_reload_inputs_with_observer,
-        reload_generation,
+        ReloadError, ReloadInputs, check_reload, read_reload_inputs,
+        read_reload_inputs_with_observer, reload_generation,
     };
     use crate::backend::{Backend, BackendError, NewKey};
     use crate::catalog::load;
+    use crate::configuration::ConfigOverride;
     use crate::manager::BackendManager;
     use crate::state::{BrokerState, INITIAL_GENERATION_ID};
 
@@ -628,6 +647,25 @@ mod tests {
             BrokerState::new(cat, pol, cfg, manager, "noop").with_reload_inputs(inputs.clone()),
         );
         (state, inputs)
+    }
+
+    #[test]
+    fn reload_reapplies_document_override_and_retains_provenance() {
+        let (_state, mut inputs) = state_with_files(&catalog_json(false), &policy_json(false));
+        inputs.overrides = vec![
+            ConfigOverride::parse("catalog.keys.web.signer.writable=true")
+                .expect("override parses"),
+        ];
+
+        let first = read_reload_inputs(&inputs).expect("first candidate");
+        assert!(first.catalog.keys.get("web.signer").expect("key").writable);
+        assert_eq!(first.overrides[0].path, "catalog.keys.web.signer.writable");
+
+        let bootstrap = crate::load_bootstrap(Some(&inputs.config_path), &[]).expect("bootstrap");
+        std::fs::write(&bootstrap.sources.catalog, catalog_json(false)).expect("replace catalog");
+        let second = read_reload_inputs(&inputs).expect("second candidate");
+        assert!(second.catalog.keys.get("web.signer").expect("key").writable);
+        assert_eq!(second.overrides[0].masked_source, bootstrap.sources.catalog);
     }
 
     fn write_files(inputs: &ReloadInputs, catalog: &str, policy: &str) {

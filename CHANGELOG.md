@@ -17,9 +17,11 @@ SPDX-License-Identifier: Apache-2.0
   private attestor protocol 1 foundation adds bounded length-prefixed protobuf
   framing over Unix streams, peer-credential capture, exact capability/session
   binding, strictly serial `Handshake`/`Health`/`ResolvePeer`/`QueryInstances`
-  state, and bounded inventory integrity checks. Configuration provenance output,
-  cross-document scalar overrides, and strict Compose body schemas remain open
-  under `basil-9tj.8`.
+  state, and bounded inventory integrity checks. Typed, immutable startup
+  overrides now cover eligible catalog scalar leaves and expose non-secret
+  masked-file provenance through doctor, offline explain/effective output, and
+  reload audit. Strict Compose body schemas remain blocked under `basil-9tj.8`
+  until their authoritative field/type schema is approved.
 
 - 2026-07-15: Compose implementation milestones were reconciled with Design
   0001 revision 1.1. The plan now consistently carries the serial four-operation

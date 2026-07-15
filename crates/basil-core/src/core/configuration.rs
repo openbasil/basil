@@ -9,11 +9,15 @@
 //! owns the source boundary so startup, offline tools, and reload cannot drift
 //! into separate discovery or compatibility paths.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value as JsonValue;
+
+const MAX_STARTUP_OVERRIDES: usize = 64;
+const MAX_OVERRIDE_PATH_LEN: usize = 256;
+const MAX_OVERRIDE_VALUE_LEN: usize = 4096;
 
 /// The only unified configuration-corpus version supported by this binary.
 pub const CORPUS_SCHEMA_VERSION: i64 = 3;
@@ -47,6 +51,11 @@ impl ConfigOverride {
                 "override path and value must both be non-empty".to_string(),
             ));
         }
+        if path.len() > MAX_OVERRIDE_PATH_LEN || value.len() > MAX_OVERRIDE_VALUE_LEN {
+            return Err(ConfigurationError::InvalidOverride(format!(
+                "override exceeds the {MAX_OVERRIDE_PATH_LEN}-byte path or {MAX_OVERRIDE_VALUE_LEN}-byte value limit"
+            )));
+        }
         Ok(Self {
             path: path.to_string(),
             value: value.to_string(),
@@ -71,6 +80,12 @@ impl ConfigOverride {
             "config.catalog" | "config.policy" | "config.bundle"
         ) || self.path.starts_with("config.compose.")
     }
+
+    fn is_document_path(&self) -> bool {
+        self.path.starts_with("catalog.")
+            || self.path.starts_with("policy.")
+            || self.path.starts_with("compose.")
+    }
 }
 
 impl std::str::FromStr for ConfigOverride {
@@ -82,7 +97,7 @@ impl std::str::FromStr for ConfigOverride {
 }
 
 /// Non-secret provenance for one applied startup override.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct OverrideProvenance {
     /// Dotted field path that was overridden.
     pub path: String,
@@ -116,6 +131,8 @@ pub struct CorpusDocuments {
     pub warnings: Vec<crate::catalog::LoadWarning>,
     /// Validated named Compose documents, retained for later profile compilers.
     pub compose: BTreeMap<String, JsonValue>,
+    /// Non-secret provenance for every startup override applied to this corpus.
+    pub overrides: Vec<OverrideProvenance>,
 }
 
 /// A selected bootstrap after strict schema validation and safe overrides.
@@ -129,6 +146,8 @@ pub struct LoadedBootstrap {
     pub sources: CorpusSources,
     /// Non-secret override provenance.
     pub overrides: Vec<OverrideProvenance>,
+    /// Ordinary document-leaf overrides deferred until documents are parsed.
+    pub document_overrides: Vec<ConfigOverride>,
 }
 
 /// Result of installing a reviewed Compose document into the authoritative
@@ -213,6 +232,7 @@ pub fn load_bootstrap(
     selected: Option<&Path>,
     overrides: &[ConfigOverride],
 ) -> Result<LoadedBootstrap, ConfigurationError> {
+    validate_override_set(overrides)?;
     let path = selected.map_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH), Path::to_path_buf);
     let raw =
         std::fs::read_to_string(&path).map_err(|source| ConfigurationError::ReadBootstrap {
@@ -236,7 +256,10 @@ pub fn load_bootstrap(
     }
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let sources = extract_sources(&value, parent)?;
-    for config_override in overrides.iter().filter(|item| !item.is_source_path()) {
+    for config_override in overrides
+        .iter()
+        .filter(|item| !item.is_source_path() && !item.is_document_path())
+    {
         apply_scalar_override(&mut value, config_override)?;
         provenance.push(OverrideProvenance {
             path: config_override.path.clone(),
@@ -249,7 +272,30 @@ pub fn load_bootstrap(
         value,
         sources,
         overrides: provenance,
+        document_overrides: overrides
+            .iter()
+            .filter(|item| item.is_document_path())
+            .cloned()
+            .collect(),
     })
+}
+
+fn validate_override_set(overrides: &[ConfigOverride]) -> Result<(), ConfigurationError> {
+    if overrides.len() > MAX_STARTUP_OVERRIDES {
+        return Err(ConfigurationError::InvalidOverride(format!(
+            "at most {MAX_STARTUP_OVERRIDES} startup overrides are accepted"
+        )));
+    }
+    let mut paths = BTreeSet::new();
+    for config_override in overrides {
+        if !paths.insert(config_override.path()) {
+            return Err(ConfigurationError::InvalidOverride(format!(
+                "duplicate target `{}`",
+                config_override.path()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Load every explicitly referenced structured document and validate its slot.
@@ -259,10 +305,48 @@ pub fn load_bootstrap(
 /// Returns an error when any referenced file is absent, malformed, has the wrong
 /// discriminator or Compose name, or fails catalog/policy semantic validation.
 pub fn load_documents(sources: &CorpusSources) -> Result<CorpusDocuments, ConfigurationError> {
-    let catalog_value = read_structured("catalog", &sources.catalog)?;
+    load_documents_with_overrides(sources, &[], Vec::new())
+}
+
+/// Load every document and apply validated ordinary scalar overrides.
+///
+/// Source overrides have already selected `sources`; document overrides are
+/// applied only after the complete structured set has parsed, before typed
+/// semantic validation. `provenance` contains bootstrap/source overrides and is
+/// extended without retaining any override value.
+///
+/// # Errors
+///
+/// Returns an error for an unknown, duplicate, structural, secret-bearing,
+/// identity-bearing, or type-incompatible document target.
+pub fn load_documents_with_overrides(
+    sources: &CorpusSources,
+    overrides: &[ConfigOverride],
+    mut provenance: Vec<OverrideProvenance>,
+) -> Result<CorpusDocuments, ConfigurationError> {
+    let mut catalog_value = read_structured("catalog", &sources.catalog)?;
     require_schema(&catalog_value, "catalog", &sources.catalog)?;
     let policy_value = read_structured("policy", &sources.policy)?;
     require_schema(&policy_value, "policy", &sources.policy)?;
+
+    for config_override in overrides {
+        let masked_source = if config_override.path.starts_with("catalog.") {
+            apply_catalog_override(&mut catalog_value, config_override)?;
+            &sources.catalog
+        } else if config_override.path.starts_with("policy.") {
+            apply_policy_override(&policy_value, config_override)?;
+            &sources.policy
+        } else {
+            return Err(ConfigurationError::InvalidOverride(format!(
+                "target `{}` is structural or delivery-bearing; only eligible catalog/policy scalar leaves may be overridden",
+                config_override.path
+            )));
+        };
+        provenance.push(OverrideProvenance {
+            path: config_override.path.clone(),
+            masked_source: masked_source.clone(),
+        });
+    }
 
     let catalog_json = serde_json::to_string(&catalog_value).map_err(|error| {
         ConfigurationError::InvalidCorpus(format!("serializing catalog candidate: {error}"))
@@ -302,7 +386,114 @@ pub fn load_documents(sources: &CorpusSources) -> Result<CorpusDocuments, Config
         policy_config,
         warnings,
         compose,
+        overrides: provenance,
     })
+}
+
+fn apply_catalog_override(
+    catalog: &mut JsonValue,
+    config_override: &ConfigOverride,
+) -> Result<(), ConfigurationError> {
+    let Some(rest) = config_override.path.strip_prefix("catalog.keys.") else {
+        return Err(forbidden_document_target(&config_override.path));
+    };
+    let keys = catalog
+        .as_object_mut()
+        .and_then(|object| object.get_mut("keys"))
+        .and_then(JsonValue::as_object_mut)
+        .ok_or_else(|| missing_document_target(&config_override.path))?;
+    let (name, leaf) = split_named_leaf(keys, rest)
+        .map(|(name, leaf)| (name.to_string(), leaf.to_string()))
+        .ok_or_else(|| missing_document_target(&config_override.path))?;
+    let target = keys
+        .get_mut(&name)
+        .and_then(JsonValue::as_object_mut)
+        .and_then(|entry| entry.get_mut(&leaf))
+        .ok_or_else(|| missing_document_target(&config_override.path))?;
+    if !matches!(leaf.as_str(), "writable" | "missing" | "description") {
+        return Err(forbidden_document_target(&config_override.path));
+    }
+    *target = parse_json_like(target, config_override.value()).map_err(|reason| {
+        ConfigurationError::InvalidOverride(format!("target `{}` {reason}", config_override.path))
+    })?;
+    Ok(())
+}
+
+fn apply_policy_override(
+    policy: &JsonValue,
+    config_override: &ConfigOverride,
+) -> Result<(), ConfigurationError> {
+    let path = config_override.path();
+    let relative = path
+        .strip_prefix("policy.")
+        .ok_or_else(|| missing_document_target(path))?;
+    let top_level = relative.split('.').next().unwrap_or_default();
+    let known_section = matches!(
+        top_level,
+        "schema" | "subjects" | "unauthenticatedSubject" | "roles" | "rules" | "config"
+    );
+    if known_section
+        && policy
+            .as_object()
+            .is_some_and(|object| object.contains_key(top_level))
+    {
+        return Err(forbidden_document_target(path));
+    }
+    Err(missing_document_target(path))
+}
+
+fn split_named_leaf<'a>(
+    entries: &'a serde_json::Map<String, JsonValue>,
+    rest: &'a str,
+) -> Option<(&'a str, &'a str)> {
+    entries
+        .keys()
+        .filter_map(|name| {
+            rest.strip_prefix(name.as_str())
+                .and_then(|suffix| suffix.strip_prefix('.'))
+                .map(|leaf| (name.as_str(), leaf))
+        })
+        .filter(|(_, leaf)| !leaf.is_empty() && !leaf.contains('.'))
+        .max_by_key(|(name, _)| name.len())
+}
+
+fn missing_document_target(path: &str) -> ConfigurationError {
+    ConfigurationError::InvalidOverride(format!("target `{path}` does not already exist"))
+}
+
+fn forbidden_document_target(path: &str) -> ConfigurationError {
+    ConfigurationError::InvalidOverride(format!(
+        "target `{path}` is secret-bearing, structural, versioned, identity-bearing, policy-bearing, or delivery-bearing"
+    ))
+}
+
+fn parse_json_like(target: &JsonValue, raw: &str) -> Result<JsonValue, &'static str> {
+    match target {
+        JsonValue::String(_) => Ok(JsonValue::String(parse_string_value(raw))),
+        JsonValue::Bool(_) => raw
+            .parse::<bool>()
+            .map(JsonValue::Bool)
+            .map_err(|_| "requires `true` or `false`"),
+        JsonValue::Number(number) if number.is_i64() => raw
+            .parse::<i64>()
+            .map(serde_json::Number::from)
+            .map(JsonValue::Number)
+            .map_err(|_| "requires a signed integer value"),
+        JsonValue::Number(number) if number.is_u64() => raw
+            .parse::<u64>()
+            .map(serde_json::Number::from)
+            .map(JsonValue::Number)
+            .map_err(|_| "requires an unsigned integer value"),
+        JsonValue::Number(_) => raw
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map(JsonValue::Number)
+            .ok_or("requires a finite floating-point value"),
+        JsonValue::Null | JsonValue::Array(_) | JsonValue::Object(_) => {
+            Err("is structural; only scalar leaves may be overridden")
+        }
+    }
 }
 
 /// Install a reviewed named Compose document as a protected copy and register it
@@ -872,6 +1063,75 @@ bundle = "bundle.age"
         assert!(load_bootstrap(Some(&config), &forbidden).is_err());
         let structural = [ConfigOverride::parse("config.compose=x").expect("parse")];
         assert!(load_bootstrap(Some(&config), &structural).is_err());
+        let duplicate = [
+            ConfigOverride::parse("max-payload-size=64").expect("parse"),
+            ConfigOverride::parse("max-payload-size=65").expect("parse"),
+        ];
+        let error = load_bootstrap(Some(&config), &duplicate).expect_err("duplicates reject");
+        assert!(error.to_string().contains("duplicate target"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn catalog_scalar_overrides_are_typed_and_policy_identity_is_immutable() {
+        let dir = temp_dir();
+        let catalog = dir.join("catalog.json");
+        let policy = dir.join("policy.json");
+        write(
+            &catalog,
+            r#"{
+  "schema": "catalog",
+  "backends": {"bao": {"kind": "vault", "addr": "https://127.0.0.1:8200"}},
+  "keys": {"web.signer": {
+    "class": "asymmetric", "keyType": "ed25519", "backend": "bao",
+    "path": "web", "writable": false, "missing": "error",
+    "description": "old description"
+  }}
+}"#,
+        );
+        write(
+            &policy,
+            r#"{
+  "schema": "policy",
+  "subjects": {"svc.web": {"allOf": [{"kind": "unix", "uid": 1000}]}},
+  "roles": {}, "rules": [], "config": {}
+}"#,
+        );
+        let sources = CorpusSources {
+            catalog: catalog.clone(),
+            policy,
+            bundle: dir.join("bundle.age"),
+            compose: BTreeMap::new(),
+        };
+        let overrides = [
+            ConfigOverride::parse("catalog.keys.web.signer.writable=true").expect("parse"),
+            ConfigOverride::parse("catalog.keys.web.signer.description=reviewed").expect("parse"),
+        ];
+        let documents = load_documents_with_overrides(&sources, &overrides, Vec::new())
+            .expect("apply document overrides");
+        let key = documents.catalog.keys.get("web.signer").expect("key");
+        assert!(key.writable);
+        assert_eq!(key.description, "reviewed");
+        assert_eq!(documents.overrides.len(), 2);
+        assert_eq!(documents.overrides[0].masked_source, catalog);
+
+        let wrong_type =
+            [ConfigOverride::parse("catalog.keys.web.signer.writable=yes").expect("parse")];
+        let error = load_documents_with_overrides(&sources, &wrong_type, Vec::new())
+            .expect_err("type change rejects");
+        assert!(error.to_string().contains("requires `true` or `false`"));
+
+        let identity =
+            [ConfigOverride::parse("catalog.keys.web.signer.path=other").expect("parse")];
+        let error = load_documents_with_overrides(&sources, &identity, Vec::new())
+            .expect_err("identity rejects");
+        assert!(error.to_string().contains("identity-bearing"));
+
+        let subject =
+            [ConfigOverride::parse("policy.subjects.svc.web.allOf=false").expect("parse")];
+        let error = load_documents_with_overrides(&sources, &subject, Vec::new())
+            .expect_err("subject mutation rejects");
+        assert!(error.to_string().contains("policy-bearing"));
         std::fs::remove_dir_all(dir).ok();
     }
 

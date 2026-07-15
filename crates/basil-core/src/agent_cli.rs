@@ -34,8 +34,8 @@ use crate::{
     ConfigOverride, DEFAULT_MAX_ENCRYPT_SIZE, DEFAULT_MAX_PAYLOAD_SIZE,
     DEFAULT_ROTATION_GRACE_VERSIONS, DEFAULT_SOCKET_MODE, DEFAULT_SVID_TTL_SECS,
     JwtRevocationStore, ReloadActor, ReloadInputs, ServerConfig, SpiffeConfig, SpiffeVaultBackend,
-    VaultBackend, enforce_capabilities, load_bootstrap, load_documents, reload_generation,
-    run_grpc,
+    VaultBackend, enforce_capabilities, load_bootstrap, load_documents_with_overrides,
+    reload_generation, run_grpc,
 };
 use crate::{bundle_cli, doctor, init, unlock};
 use anyhow::{Context, Result, bail};
@@ -924,6 +924,8 @@ struct JwksConfig {
 struct SetupArgs {
     config_path: PathBuf,
     startup_overrides: Vec<ConfigOverride>,
+    document_overrides: Vec<ConfigOverride>,
+    override_provenance: Vec<crate::OverrideProvenance>,
     catalog: PathBuf,
     policy: PathBuf,
     bundle: PathBuf,
@@ -971,7 +973,7 @@ fn parse_capability_policy(s: &str) -> Result<CapabilityPolicy, String> {
 
 fn load_run_config(overrides: &ConfigOverrides) -> Result<RunConfig> {
     let (file, bootstrap) = load_agent_config(overrides)?;
-    let setup = build_setup(&file, overrides, &bootstrap.path)?;
+    let setup = build_setup(&file, overrides, &bootstrap)?;
     #[cfg(feature = "http")]
     let jwks = resolve_jwks_config(&file.jwks)?;
     #[cfg(not(feature = "http"))]
@@ -1340,7 +1342,7 @@ fn is_plaintext_non_loopback_http(addr: &str) -> bool {
 /// agent start needs, so it sets `passphrase_no_wipe`.
 fn load_key_probe_config(overrides: &ConfigOverrides) -> Result<SetupArgs> {
     let (file, bootstrap) = load_agent_config(overrides)?;
-    let mut setup = build_setup(&file, overrides, &bootstrap.path)?;
+    let mut setup = build_setup(&file, overrides, &bootstrap)?;
     setup.unlock.passphrase_no_wipe = true;
     Ok(setup)
 }
@@ -1604,7 +1606,7 @@ fn required_otel_endpoint(config: &OpenTelemetryLoggingConfigFile) -> Result<Str
 fn build_setup(
     file: &AgentConfigFile,
     overrides: &ConfigOverrides,
-    config_path: &Path,
+    bootstrap: &crate::LoadedBootstrap,
 ) -> Result<SetupArgs> {
     let vault_addr = file
         .vault_addr
@@ -1617,8 +1619,10 @@ fn build_setup(
         .map_err(|err| anyhow::anyhow!("parsing config key `capability-policy`: {err}"))?;
 
     Ok(SetupArgs {
-        config_path: config_path.to_path_buf(),
+        config_path: bootstrap.path.clone(),
         startup_overrides: overrides.values.clone(),
+        document_overrides: bootstrap.document_overrides.clone(),
+        override_provenance: bootstrap.overrides.clone(),
         catalog: file.config.catalog.clone(),
         policy: file.config.policy.clone(),
         bundle: file.config.bundle.clone(),
@@ -1670,6 +1674,7 @@ struct Prepared {
     config: crate::Config,
     manager: BackendManager,
     backend_label: String,
+    override_provenance: Vec<crate::OverrideProvenance>,
 }
 
 /// Load + validate the exported catalog/policy, unlock the sealed bundle, and
@@ -1682,12 +1687,16 @@ async fn prepare_manager(setup: &SetupArgs) -> Result<Prepared> {
         warn!(addr = %setup.vault_addr, "talking to vault over plaintext HTTP");
     }
 
-    let documents = load_documents(&crate::CorpusSources {
-        catalog: setup.catalog.clone(),
-        policy: setup.policy.clone(),
-        bundle: setup.bundle.clone(),
-        compose: setup.compose.clone(),
-    })
+    let documents = load_documents_with_overrides(
+        &crate::CorpusSources {
+            catalog: setup.catalog.clone(),
+            policy: setup.policy.clone(),
+            bundle: setup.bundle.clone(),
+            compose: setup.compose.clone(),
+        },
+        &setup.document_overrides,
+        setup.override_provenance.clone(),
+    )
     .context("loading configuration corpus documents")?;
     let crate::CorpusDocuments {
         catalog,
@@ -1695,6 +1704,7 @@ async fn prepare_manager(setup: &SetupArgs) -> Result<Prepared> {
         policy_config: config,
         warnings,
         compose: _,
+        overrides: override_provenance,
     } = documents;
     for w in &warnings {
         warn!(warning = %w, "catalog/policy load warning");
@@ -1740,6 +1750,7 @@ async fn prepare_manager(setup: &SetupArgs) -> Result<Prepared> {
         config,
         manager,
         backend_label,
+        override_provenance,
     })
 }
 
@@ -1767,6 +1778,7 @@ async fn run_daemon(args: RunArgs, version: &'static str) -> Result<()> {
         config,
         manager,
         backend_label,
+        override_provenance,
     } = prepare_manager(&run_config.setup).await?;
 
     validate_invocation_catalog_bindings(&run_config.invocation, &catalog)
@@ -1809,6 +1821,7 @@ async fn run_daemon(args: RunArgs, version: &'static str) -> Result<()> {
         .context("loading JWT-SVID revocation deny-list")?;
     let mut state =
         BrokerState::with_limits(catalog, policy, config, manager, backend_label, limits)
+            .with_override_provenance(override_provenance)
             // Report the shipped binary's version in `status`/`health`, not this
             // library crate's (they coincide today via the workspace version).
             .with_version(version)
@@ -2011,8 +2024,13 @@ fn load_doctor_inputs(
 ) -> Result<doctor::DoctorInputs> {
     let (file, bootstrap) = load_agent_config(overrides)?;
     let invocation = resolve_invocation_config(&file.broker_identity, &file.invocation)?;
-    load_documents(&bootstrap.sources).context("loading configuration corpus documents")?;
-    let setup = build_setup(&file, overrides, &bootstrap.path)?;
+    let documents = load_documents_with_overrides(
+        &bootstrap.sources,
+        &bootstrap.document_overrides,
+        bootstrap.overrides.clone(),
+    )
+    .context("loading configuration corpus documents")?;
+    let setup = build_setup(&file, overrides, &bootstrap)?;
     let socket = file
         .socket
         .unwrap_or_else(|| crate::DEFAULT_SOCKET_PATH.to_string());
@@ -2023,6 +2041,8 @@ fn load_doctor_inputs(
     let unlock_age_yubikey_selected = setup.unlock.age_yubikey;
 
     Ok(doctor::DoctorInputs {
+        overrides: documents.overrides,
+        validated_catalog: Some(documents.catalog),
         catalog: setup.catalog,
         policy: setup.policy,
         bundle: setup.bundle,
@@ -2112,7 +2132,13 @@ pub fn run_explain(args: &ExplainArgs) -> Result<()> {
         policy_config: config,
         warnings,
         compose: _,
-    } = load_documents(&bootstrap.sources).context("loading configuration corpus documents")?;
+        overrides,
+    } = load_documents_with_overrides(
+        &bootstrap.sources,
+        &bootstrap.document_overrides,
+        bootstrap.overrides,
+    )
+    .context("loading configuration corpus documents")?;
     for w in &warnings {
         warn!(warning = %w, "catalog/policy load warning");
     }
@@ -2120,7 +2146,7 @@ pub fn run_explain(args: &ExplainArgs) -> Result<()> {
     let pdp = Pdp::new(&catalog, &policy, &config);
 
     if args.effective {
-        return print_effective(&pdp, &args.subject, args.json);
+        return print_effective(&pdp, &args.subject, &overrides, args.json);
     }
 
     // Single-tuple explain. clap guarantees op/key are present here (required
@@ -2128,13 +2154,18 @@ pub fn run_explain(args: &ExplainArgs) -> Result<()> {
     let (Some(op), Some(key)) = (args.op, args.key.as_deref()) else {
         bail!("--op and --key are required unless --effective is given");
     };
-    print_explanation(&pdp, &args.subject, op, key, args.json)
+    print_explanation(&pdp, &args.subject, op, key, &overrides, args.json)
 }
 
 /// Print the "preview effective permissions" view for an identity to stdout.
-fn print_effective(pdp: &crate::catalog::Pdp, subject: &str, json: bool) -> Result<()> {
+fn print_effective(
+    pdp: &crate::catalog::Pdp,
+    subject: &str,
+    overrides: &[crate::OverrideProvenance],
+    json: bool,
+) -> Result<()> {
     let mut out = std::io::stdout().lock();
-    render_effective(&mut out, pdp, subject, json)
+    render_effective_with_overrides(&mut out, pdp, subject, overrides, json)
 }
 
 /// Render the "preview effective permissions" view into `out`.
@@ -2142,10 +2173,21 @@ fn print_effective(pdp: &crate::catalog::Pdp, subject: &str, json: bool) -> Resu
 /// The render seam (separate from [`print_effective`]) so the stable `--json`
 /// shape and the human text can be asserted without capturing the process's real
 /// stdout. Production simply renders into a locked `stdout`.
+#[cfg(test)]
 fn render_effective(
     out: &mut impl std::io::Write,
     pdp: &crate::catalog::Pdp,
     subject: &str,
+    json: bool,
+) -> Result<()> {
+    render_effective_with_overrides(out, pdp, subject, &[], json)
+}
+
+fn render_effective_with_overrides(
+    out: &mut impl std::io::Write,
+    pdp: &crate::catalog::Pdp,
+    subject: &str,
+    overrides: &[crate::OverrideProvenance],
     json: bool,
 ) -> Result<()> {
     let grants = pdp.effective(subject);
@@ -2161,7 +2203,11 @@ fn render_effective(
                 })
             })
             .collect();
-        let doc = serde_json::json!({ "subject": subject, "effective": rows });
+        let doc = serde_json::json!({
+            "subject": subject,
+            "effective": rows,
+            "overrides": overrides,
+        });
         writeln!(out, "{}", serde_json::to_string_pretty(&doc)?)?;
         return Ok(());
     }
@@ -2170,6 +2216,7 @@ fn render_effective(
         "effective permissions for subject {subject}: {} grant(s)",
         grants.len()
     )?;
+    render_override_provenance(out, overrides)?;
     for g in &grants {
         let rule = g.rule_id.as_deref().unwrap_or("<public-class>");
         writeln!(
@@ -2193,22 +2240,36 @@ fn print_explanation(
     subject: &str,
     op: crate::catalog::Op,
     key: &str,
+    overrides: &[crate::OverrideProvenance],
     json: bool,
 ) -> Result<()> {
     let mut out = std::io::stdout().lock();
-    render_explanation(&mut out, pdp, subject, op, key, json)
+    render_explanation_with_overrides(&mut out, pdp, subject, op, key, overrides, json)
 }
 
 /// Render a single-tuple explanation into `out`.
 ///
 /// The render seam (separate from [`print_explanation`]) so the stable `--json`
 /// allow/deny shape can be asserted without the process's real stdout.
+#[cfg(test)]
 fn render_explanation(
     out: &mut impl std::io::Write,
     pdp: &crate::catalog::Pdp,
     subject: &str,
     op: crate::catalog::Op,
     key: &str,
+    json: bool,
+) -> Result<()> {
+    render_explanation_with_overrides(out, pdp, subject, op, key, &[], json)
+}
+
+fn render_explanation_with_overrides(
+    out: &mut impl std::io::Write,
+    pdp: &crate::catalog::Pdp,
+    subject: &str,
+    op: crate::catalog::Op,
+    key: &str,
+    overrides: &[crate::OverrideProvenance],
     json: bool,
 ) -> Result<()> {
     use crate::catalog::Decision;
@@ -2219,6 +2280,7 @@ fn render_explanation(
         obj.insert("subject".into(), subject.into());
         obj.insert("op".into(), op.token().into());
         obj.insert("key".into(), key.into());
+        obj.insert("overrides".into(), serde_json::to_value(overrides)?);
         match &ex.decision {
             Decision::Allow { via } => {
                 obj.insert("decision".into(), "allow".into());
@@ -2278,6 +2340,26 @@ fn render_explanation(
             )?;
             writeln!(out, "  {}", deny_explanation(*reason))?;
         }
+    }
+    render_override_provenance(out, overrides)?;
+    Ok(())
+}
+
+fn render_override_provenance(
+    out: &mut impl std::io::Write,
+    overrides: &[crate::OverrideProvenance],
+) -> Result<()> {
+    if overrides.is_empty() {
+        return Ok(());
+    }
+    writeln!(out, "startup overrides: {}", overrides.len())?;
+    for item in overrides {
+        writeln!(
+            out,
+            "  {} masks {}",
+            item.path,
+            item.masked_source.display()
+        )?;
     }
     Ok(())
 }
@@ -3444,6 +3526,44 @@ vault-addr = "http://cfg-vault:8200"
             assert_eq!(doc["matched_rule"]["via"], "subject:svc.grafana");
             assert!(doc["matched_rule"]["action"].is_string());
             assert!(doc["matched_rule"]["target"].is_string());
+        }
+
+        #[test]
+        fn effective_and_explain_render_non_secret_override_provenance() {
+            let (c, p, cfg) = loaded();
+            let pdp = Pdp::new(&c, &p, &cfg);
+            let overrides = [crate::OverrideProvenance {
+                path: "catalog.keys.grafana.admin_password.writable".to_string(),
+                masked_source: PathBuf::from("/etc/basil/catalog.json"),
+            }];
+
+            let mut effective = Vec::new();
+            render_effective_with_overrides(&mut effective, &pdp, "svc.grafana", &overrides, true)
+                .expect("render effective");
+            let doc: serde_json::Value =
+                serde_json::from_slice(&effective).expect("effective JSON");
+            assert_eq!(doc["overrides"][0]["path"], overrides[0].path);
+            assert_eq!(
+                doc["overrides"][0]["masked_source"],
+                "/etc/basil/catalog.json"
+            );
+            assert!(!String::from_utf8_lossy(&effective).contains("=true"));
+
+            let mut explanation = Vec::new();
+            render_explanation_with_overrides(
+                &mut explanation,
+                &pdp,
+                "svc.grafana",
+                Op::Get,
+                "grafana.admin_password",
+                &overrides,
+                false,
+            )
+            .expect("render explanation");
+            let output = String::from_utf8(explanation).expect("utf8");
+            assert!(output.contains("startup overrides: 1"));
+            assert!(output.contains("masks /etc/basil/catalog.json"));
+            assert!(!output.contains("=true"));
         }
 
         #[test]

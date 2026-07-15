@@ -37,6 +37,7 @@ use arc_swap::{ArcSwap, Guard};
 use crate::audit::{AuditLog, ReloadActor};
 use crate::catalog::policy::{Config, ResolvedPolicy};
 use crate::catalog::{Catalog, Pdp};
+use crate::configuration::OverrideProvenance;
 use crate::core::crypto_provider::{ProviderAuditEvent, ProviderAuditOutcome};
 use crate::decision::DecisionRecord;
 use crate::event::EventSource;
@@ -67,6 +68,7 @@ pub struct Generation {
     catalog: Arc<Catalog>,
     policy: ResolvedPolicy,
     config: Config,
+    overrides: Vec<OverrideProvenance>,
 }
 
 impl Generation {
@@ -78,11 +80,24 @@ impl Generation {
         policy: ResolvedPolicy,
         config: Config,
     ) -> Self {
+        Self::new_with_overrides(id, catalog, policy, config, Vec::new())
+    }
+
+    /// Bundle a generation with its non-secret startup-override provenance.
+    #[must_use]
+    pub fn new_with_overrides(
+        id: u64,
+        catalog: impl Into<Arc<Catalog>>,
+        policy: ResolvedPolicy,
+        config: Config,
+        overrides: Vec<OverrideProvenance>,
+    ) -> Self {
         Self {
             id,
             catalog: catalog.into(),
             policy,
             config,
+            overrides,
         }
     }
 
@@ -122,6 +137,12 @@ impl Generation {
     #[must_use]
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+
+    /// Non-secret startup overrides applied to this coherent generation.
+    #[must_use]
+    pub fn override_provenance(&self) -> &[OverrideProvenance] {
+        &self.overrides
     }
 }
 
@@ -404,6 +425,21 @@ impl BrokerState {
         }
     }
 
+    /// Bind non-secret startup-override provenance to the initial generation.
+    #[must_use]
+    pub fn with_override_provenance(self, overrides: Vec<OverrideProvenance>) -> Self {
+        let current = self.generation.load_full();
+        let generation = Generation::new_with_overrides(
+            current.id,
+            Arc::clone(&current.catalog),
+            current.policy.clone(),
+            current.config.clone(),
+            overrides,
+        );
+        self.generation.store(Arc::new(generation));
+        self
+    }
+
     /// Attach a JSONL audit sink (`vault-vq5`), consuming and returning `self`.
     ///
     /// When set, [`BrokerState::audit`] appends one JSONL line per recorded
@@ -633,6 +669,8 @@ impl BrokerState {
         reason: &str,
         actor: ReloadActor,
     ) {
+        let generation = self.load_generation();
+        let overrides = generation.override_provenance();
         match outcome {
             "applied" => tracing::info!(
                 event = "basil.audit.reload",
@@ -640,6 +678,7 @@ impl BrokerState {
                 generation = new_generation,
                 outcome,
                 reason,
+                override_count = overrides.len(),
                 "catalog/policy reload applied",
             ),
             "checked" => tracing::info!(
@@ -648,6 +687,7 @@ impl BrokerState {
                 generation = new_generation,
                 outcome,
                 reason,
+                override_count = overrides.len(),
                 "catalog/policy reload dry-run validated; no swap",
             ),
             _ => tracing::warn!(
@@ -656,11 +696,19 @@ impl BrokerState {
                 generation = new_generation,
                 outcome,
                 reason,
+                override_count = overrides.len(),
                 "catalog/policy reload rejected; previous generation still serving",
             ),
         }
         if let Some(audit) = &self.audit {
-            audit.append_reload(previous_generation, new_generation, outcome, reason, actor);
+            audit.append_reload_with_overrides(
+                previous_generation,
+                new_generation,
+                outcome,
+                reason,
+                actor,
+                overrides,
+            );
         }
     }
 
