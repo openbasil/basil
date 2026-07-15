@@ -2750,7 +2750,7 @@ mod tests {
     /// `transit/<verb>/<name>` from it; a `transit/keys/<name>` path would 404
     /// against a live Vault server (`vault-w3n`).
     const CATALOG: &str = r#"{
-      "schemaVersion": 1,
+      "schema": "catalog",
       "backends": {
         "primary":   {
           "kind": "vault", "addr": "https://127.0.0.1:8200",
@@ -4503,7 +4503,7 @@ mod tests {
         // `load`). A public op then fails closed with MissingPublicPath rather than
         // re-deriving the public from the private (which the op surface forbids).
         const NO_PUB: &str = r#"{
-          "schemaVersion": 1,
+          "schema": "catalog",
           "backends": { "primary": { "kind": "vault", "addr": "https://127.0.0.1:8200" } },
           "keys": {
             "enroll.sealing": {
@@ -4867,7 +4867,7 @@ mod pqc_dispatch_tests {
     }
 
     const PQC_CATALOG: &str = r#"{
-      "schemaVersion": 1,
+      "schema": "catalog",
       "backends": { "primary": { "kind": "vault", "addr": "https://127.0.0.1:8200" } },
       "keys": {
         "pqc.signer44": {

@@ -556,7 +556,7 @@ mod tests {
     //  - grafana.admin    : value, writable           (reader/operator target)
     //  - locked.value     : value, writable=false     (hard-cap on a value)
     const CATALOG: &str = r#"{
-      "schemaVersion": 1,
+      "schema": "catalog",
       "backends": { "bao": { "kind": "vault", "addr": "https://127.0.0.1:8200" } },
       "keys": {
         "nats.account": {
@@ -647,7 +647,7 @@ mod tests {
     fn policy_json() -> String {
         format!(
             r#"{{
-              "schemaVersion": 2,
+              "schema": "policy",
               "subjects": {{ {SUBJECTS} }},
               "roles": {{ {ROLES} }},
               "rules": [ {RULES} ],
@@ -722,7 +722,7 @@ mod tests {
     #[test]
     fn explain_all_of_subject_carries_subject_name() {
         const CAT: &str = r#"{
-          "schemaVersion": 1,
+          "schema": "catalog",
           "backends": { "bao": { "kind": "vault", "addr": "https://127.0.0.1:8200" } },
           "keys": {
             "grafana.admin_password": {
@@ -733,7 +733,7 @@ mod tests {
           }
         }"#;
         const POL: &str = r#"{
-          "schemaVersion": 2,
+          "schema": "policy",
           "subjects": {
             "svc.compound": { "allOf": [
               { "kind": "unix", "uid": 333 },

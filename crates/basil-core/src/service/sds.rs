@@ -447,7 +447,7 @@ mod tests {
     use basil_proto::envoy::extensions::transport_sockets::tls::v3::secret::Type;
 
     const CATALOG: &str = r#"{
-      "schemaVersion": 1,
+      "schema": "catalog",
       "backends": { "bao": { "kind": "vault", "addr": "https://127.0.0.1:8200" } },
       "keys": {
         "spire.x509": {
@@ -466,7 +466,7 @@ mod tests {
     }"#;
 
     const POLICY: &str = r#"{
-      "schemaVersion": 2,
+      "schema": "policy",
       "subjects": {
         "test.runner": { "allOf": [ { "kind": "unix", "uid": 42 } ] }
       },
@@ -645,7 +645,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_secrets_authenticates_before_reporting_no_sds_issuers() {
         let catalog = r#"{
-          "schemaVersion": 1,
+          "schema": "catalog",
           "backends": { "bao": { "kind": "vault", "addr": "https://127.0.0.1:8200" } },
           "keys": {}
         }"#;

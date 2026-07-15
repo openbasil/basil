@@ -494,7 +494,7 @@ mod tests {
     }
 
     const CATALOG: &str = r#"{
-      "schemaVersion": 1,
+      "schema": "catalog",
       "backends": { "bao": { "kind": "vault", "addr": "https://127.0.0.1:8200" } },
       "keys": {
         "cose.sealing": {
@@ -543,7 +543,7 @@ mod tests {
     // uid 42 holds the local-software grant; uid 43 holds encrypt/decrypt but NOT
     // op:use_software_custody, so it cannot drive the local-software provider.
     const POLICY: &str = r#"{
-      "schemaVersion": 2,
+      "schema": "policy",
       "subjects": {
         "svc.granted": { "allOf": [ { "kind": "unix", "uid": 42 } ] },
         "svc.ungranted": { "allOf": [ { "kind": "unix", "uid": 43 } ] }

@@ -1033,11 +1033,12 @@ mod tests {
             grace_versions: u32,
         ) -> BrokerState {
             const MINIMAL_CATALOG: &str = r#"{
-              "schemaVersion": 1,
+              "schema": "catalog",
               "backends": { "b": { "kind": "vault", "addr": "http://127.0.0.1:8200" } },
               "keys": {}
             }"#;
             const EMPTY_POLICY: &str = r#"{
+              "schema": "policy",
               "roles": {},
               "rules": [],
               "config": { "names": { "users": {}, "groups": {} }, "memberships": {} }
@@ -1658,7 +1659,7 @@ mod tests {
         /// [EXCLUDED, wrong class]. The ed25519-jwt key is loader-rejected, so this
         /// catalog is deserialized directly (see `catalog_from_json`).
         const SELECTION_CATALOG: &str = r#"{
-          "schemaVersion": 1,
+          "schema": "catalog",
           "backends": { "rsa": { "kind": "vault", "addr": "http://127.0.0.1:8200" },
                         "other": { "kind": "vault", "addr": "http://127.0.0.1:8200" } },
           "keys": {
@@ -1692,7 +1693,7 @@ mod tests {
 
         /// Two RSA `svid_kind=jwt` asymmetric issuers on separate backends.
         const MULTI_ISSUER_CATALOG: &str = r#"{
-          "schemaVersion": 1,
+          "schema": "catalog",
           "backends": { "one": { "kind": "vault", "addr": "http://127.0.0.1:8200" },
                         "two": { "kind": "vault", "addr": "http://127.0.0.1:8200" } },
           "keys": {

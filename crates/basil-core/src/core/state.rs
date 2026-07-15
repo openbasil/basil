@@ -751,7 +751,7 @@ mod tests {
     /// is unknown → default-deny), without standing up a backend manager.
     fn empty_catalog() -> Catalog {
         Catalog {
-            schema_version: 1,
+            schema: crate::catalog::CatalogSchema::Catalog,
             backends: BTreeMap::new(),
             keys: BTreeMap::new(),
         }

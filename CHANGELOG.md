@@ -10,6 +10,17 @@ SPDX-License-Identifier: Apache-2.0
 
 ### Added
 
+- 2026-07-15: Compose implementation foundations add strict configuration
+  corpus schema 3 loading with an explicit TOML bootstrap, referenced document
+  validation, typed startup overrides, diagnostic-only legacy-shape detection,
+  full-bootstrap reload inputs, and protected staged Compose installation. A
+  private attestor protocol 1 foundation adds bounded length-prefixed protobuf
+  framing over Unix streams, peer-credential capture, exact capability/session
+  binding, strictly serial `Handshake`/`Health`/`ResolvePeer`/`QueryInstances`
+  state, and bounded inventory integrity checks. Configuration provenance output,
+  cross-document scalar overrides, and strict Compose body schemas remain open
+  under `basil-9tj.8`.
+
 - 2026-07-15: Compose implementation milestones were reconciled with Design
   0001 revision 1.1. The plan now consistently carries the serial four-operation
   attestor protocol, retained stream contracts, bounded non-predictive

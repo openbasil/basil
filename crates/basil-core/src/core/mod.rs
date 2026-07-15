@@ -9,6 +9,7 @@ pub mod audit;
 pub mod backend;
 pub mod capability;
 pub mod catalog;
+pub mod configuration;
 pub mod crypto_provider;
 pub mod decision;
 pub mod ed25519_sign;

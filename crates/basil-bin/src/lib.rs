@@ -17,6 +17,7 @@ pub mod client_cli;
 use basil_core::demo;
 use basil_core::{agent_cli, bundle_cli, init};
 use clap::{Args, CommandFactory, Parser, Subcommand};
+use std::path::PathBuf;
 
 /// The shipped `basil` binary version.
 ///
@@ -53,6 +54,9 @@ pub struct Cli {
 pub enum Command {
     /// Scaffold a first-run starter set (config, catalog, policy).
     Init(Box<init::InitArgs>),
+    /// Manage the selected schema-3 configuration corpus.
+    #[command(subcommand)]
+    Config(ConfigCommand),
     /// Run a zero-dependency guided tour: scaffold a throwaway broker on the
     /// built-in keystore backend, start it, and drive a scripted
     /// sign → verify → denied read → explain → encrypt → mint sequence with
@@ -80,6 +84,30 @@ pub enum Command {
     Doctor(agent_cli::DoctorArgs),
     #[command(flatten)]
     Client(client_cli::Command),
+}
+
+/// Configuration-corpus maintenance commands.
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Install a reviewed named Compose document into the protected config area.
+    InstallCompose(InstallComposeArgs),
+}
+
+/// Arguments for protected Compose-document installation.
+#[derive(Debug, Args)]
+pub struct InstallComposeArgs {
+    /// Selected schema-3 bootstrap.
+    #[arg(long)]
+    pub config: PathBuf,
+    /// Stable Compose document name.
+    #[arg(long)]
+    pub name: String,
+    /// Reviewed or staged source document.
+    #[arg(long)]
+    pub source: PathBuf,
+    /// Protected destination beside or below the bootstrap.
+    #[arg(long)]
+    pub destination: PathBuf,
 }
 
 /// `completions` subcommand arguments.

@@ -48,20 +48,20 @@ use std::sync::Arc;
 
 use crate::catalog::loader::LoadError;
 use crate::catalog::schema::{BackendKind, Capability, Class, Engine, KeyAlgorithm};
-use crate::catalog::{Catalog, Config, ResolvedPolicy, load};
+use crate::catalog::{Catalog, Config, ResolvedPolicy};
+use crate::configuration::{ConfigOverride, CorpusDocuments, load_bootstrap, load_documents};
 use crate::state::{BrokerState, Generation};
 
-/// The on-disk inputs a [`reload_generation`] re-reads: the configured catalog
-/// and policy JSON paths the broker was started with.
+/// The on-disk inputs a [`reload_generation`] re-reads.
 ///
 /// Stored on [`BrokerState`] at construction so the reload engine reads from the
 /// **same** paths startup used, never from anywhere else, never from the wire.
 #[derive(Debug, Clone)]
 pub struct ReloadInputs {
-    /// Path to the exported catalog JSON (the key inventory + routing table).
-    pub catalog_path: std::path::PathBuf,
-    /// Path to the exported policy JSON (the authorization allow-list).
-    pub policy_path: std::path::PathBuf,
+    /// Path to the selected schema-3 bootstrap.
+    pub config_path: std::path::PathBuf,
+    /// Immutable startup overrides reapplied to every candidate.
+    pub overrides: Vec<ConfigOverride>,
 }
 
 /// The result of a **successful** [`reload_generation`].
@@ -84,19 +84,10 @@ pub struct ReloadOutcome {
 /// generation keeps serving (fail closed); none of them swap.
 #[derive(Debug, thiserror::Error)]
 pub enum ReloadError {
-    /// The catalog file could not be re-read from its configured path.
-    #[error("reading catalog from {path}: {source}")]
-    ReadCatalog {
-        /// The catalog path that failed to read.
-        path: String,
-        /// The underlying IO error.
-        source: std::io::Error,
-    },
-
-    /// The policy file could not be re-read from its configured path.
-    #[error("reading policy from {path}: {source}")]
-    ReadPolicy {
-        /// The policy path that failed to read.
+    /// A corpus input could not be fingerprinted during candidate assembly.
+    #[error("reading configuration input metadata from {path}: {source}")]
+    ReadInput {
+        /// The input path that failed.
         path: String,
         /// The underlying IO error.
         source: std::io::Error,
@@ -115,6 +106,10 @@ pub enum ReloadError {
     /// (`load`, including the JWT-SVID issuer-alg and `publicPath` guardrails).
     #[error("validating reloaded catalog/policy: {0}")]
     Validate(#[from] LoadError),
+
+    /// The bootstrap or a non-catalog corpus document failed validation.
+    #[error("validating reloaded configuration corpus: {0}")]
+    Configuration(#[from] crate::configuration::ConfigurationError),
 
     /// The candidate changed a **restart-only** routing dimension (a backend was
     /// added/removed/repathed, or a key's `backend`/`path`/`engine`/`key_type`/
@@ -135,10 +130,9 @@ impl ReloadError {
     #[must_use]
     pub const fn audit_reason(&self) -> &'static str {
         match self {
-            Self::ReadCatalog { .. } => "catalog_read_failed",
-            Self::ReadPolicy { .. } => "policy_read_failed",
+            Self::ReadInput { .. } => "configuration_read_failed",
             Self::TornSnapshot { .. } => "inputs_changed_during_read",
-            Self::Validate(_) => "validation_failed",
+            Self::Validate(_) | Self::Configuration(_) => "validation_failed",
             Self::RoutingShapeChanged(_) => "routing_shape_changed",
             Self::NoInputs => "no_reload_inputs",
         }
@@ -320,57 +314,60 @@ fn file_fingerprint(path: &Path) -> std::io::Result<FileFingerprint> {
 fn read_reload_inputs_with_observer(
     inputs: &ReloadInputs,
     observer: impl FnOnce(),
-) -> Result<(String, String), ReloadError> {
-    let catalog_before =
-        file_fingerprint(&inputs.catalog_path).map_err(|source| ReloadError::ReadCatalog {
-            path: inputs.catalog_path.display().to_string(),
-            source,
-        })?;
-    let policy_before =
-        file_fingerprint(&inputs.policy_path).map_err(|source| ReloadError::ReadPolicy {
-            path: inputs.policy_path.display().to_string(),
-            source,
-        })?;
-
-    let catalog_json = std::fs::read_to_string(&inputs.catalog_path).map_err(|source| {
-        ReloadError::ReadCatalog {
-            path: inputs.catalog_path.display().to_string(),
-            source,
-        }
-    })?;
-    let policy_json =
-        std::fs::read_to_string(&inputs.policy_path).map_err(|source| ReloadError::ReadPolicy {
-            path: inputs.policy_path.display().to_string(),
-            source,
-        })?;
+) -> Result<CorpusDocuments, ReloadError> {
+    let config_before = fingerprint(&inputs.config_path)?;
+    let bootstrap = load_bootstrap(Some(&inputs.config_path), &inputs.overrides)?;
+    let mut paths = vec![
+        bootstrap.sources.catalog.clone(),
+        bootstrap.sources.policy.clone(),
+    ];
+    paths.extend(bootstrap.sources.compose.values().cloned());
+    let before = paths
+        .iter()
+        .map(|path| fingerprint(path).map(|value| (path.clone(), value)))
+        .collect::<Result<Vec<_>, _>>()?;
 
     observer();
-
-    let catalog_after =
-        file_fingerprint(&inputs.catalog_path).map_err(|source| ReloadError::ReadCatalog {
-            path: inputs.catalog_path.display().to_string(),
-            source,
-        })?;
-    if catalog_before != catalog_after {
+    if config_before != fingerprint(&inputs.config_path)? {
         return Err(ReloadError::TornSnapshot {
-            path: inputs.catalog_path.display().to_string(),
+            path: inputs.config_path.display().to_string(),
         });
     }
-    let policy_after =
-        file_fingerprint(&inputs.policy_path).map_err(|source| ReloadError::ReadPolicy {
-            path: inputs.policy_path.display().to_string(),
-            source,
-        })?;
-    if policy_before != policy_after {
+    for (path, expected) in &before {
+        if expected != &fingerprint(path)? {
+            return Err(ReloadError::TornSnapshot {
+                path: path.display().to_string(),
+            });
+        }
+    }
+    let documents = load_documents(&bootstrap.sources).map_err(|error| match error {
+        crate::configuration::ConfigurationError::Catalog(error) => ReloadError::Validate(error),
+        other => ReloadError::Configuration(other),
+    })?;
+
+    if config_before != fingerprint(&inputs.config_path)? {
         return Err(ReloadError::TornSnapshot {
-            path: inputs.policy_path.display().to_string(),
+            path: inputs.config_path.display().to_string(),
         });
     }
-
-    Ok((catalog_json, policy_json))
+    for (path, expected) in before {
+        if expected != fingerprint(&path)? {
+            return Err(ReloadError::TornSnapshot {
+                path: path.display().to_string(),
+            });
+        }
+    }
+    Ok(documents)
 }
 
-fn read_reload_inputs(inputs: &ReloadInputs) -> Result<(String, String), ReloadError> {
+fn fingerprint(path: &Path) -> Result<FileFingerprint, ReloadError> {
+    file_fingerprint(path).map_err(|source| ReloadError::ReadInput {
+        path: path.display().to_string(),
+        source,
+    })
+}
+
+fn read_reload_inputs(inputs: &ReloadInputs) -> Result<CorpusDocuments, ReloadError> {
     read_reload_inputs_with_observer(inputs, || {})
 }
 
@@ -406,11 +403,13 @@ struct ValidatedCandidate {
 /// dimension ([`ReloadError::RoutingShapeChanged`]).
 fn validate_candidate(state: &BrokerState) -> Result<ValidatedCandidate, ReloadError> {
     let inputs = state.reload_inputs().ok_or(ReloadError::NoInputs)?;
-    let (catalog_json, policy_json) = read_reload_inputs(inputs)?;
-
-    // Full startup/`check` validation: load() runs every §5 hard-error check
-    // including validate_jwt_svid_issuer_alg and the publicPath guardrail.
-    let (catalog, policy, config, warnings) = load(&catalog_json, &policy_json)?;
+    let CorpusDocuments {
+        catalog,
+        policy,
+        policy_config: config,
+        warnings,
+        compose: _,
+    } = read_reload_inputs(inputs)?;
     for w in &warnings {
         tracing::warn!(warning = %w, "reload: catalog/policy load warning");
     }
@@ -552,7 +551,7 @@ mod tests {
     fn catalog_json(writable: bool) -> String {
         format!(
             r#"{{
-              "schemaVersion": 1,
+              "schema": "catalog",
               "backends": {{ "bao": {{ "kind": "vault", "addr": "http://127.0.0.1:8200" }} }},
               "keys": {{
                 "web.signer": {{
@@ -567,7 +566,7 @@ mod tests {
     /// A catalog whose key routes to a DIFFERENT path: a restart-only change.
     fn catalog_json_repathed() -> String {
         r#"{
-          "schemaVersion": 1,
+          "schema": "catalog",
           "backends": { "bao": { "kind": "vault", "addr": "http://127.0.0.1:8200" } },
           "keys": {
             "web.signer": {
@@ -587,7 +586,7 @@ mod tests {
         };
         format!(
             r#"{{
-              "schemaVersion": 2,
+              "schema": "policy",
               "subjects": {{ "svc.web": {{ "allOf": [ {{ "kind": "unix", "uid": 1000 }} ] }} }},
               "roles": {{}},
               "rules": {rules},
@@ -607,8 +606,14 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let catalog_path = dir.join("catalog.json");
         let policy_path = dir.join("policy.json");
+        let config_path = dir.join("config.toml");
         std::fs::write(&catalog_path, catalog).expect("write catalog");
         std::fs::write(&policy_path, policy).expect("write policy");
+        std::fs::write(
+            &config_path,
+            "schema = \"agent\"\nschemaVersion = 3\n[config]\ncatalog = \"catalog.json\"\npolicy = \"policy.json\"\nbundle = \"bundle.age\"\n",
+        )
+        .expect("write config");
 
         let (cat, pol, cfg, warnings) = load(catalog, policy).expect("fixture loads");
         assert!(warnings.is_empty());
@@ -616,8 +621,8 @@ mod tests {
         backends.insert("bao".into(), Box::new(NoopBackend));
         let manager = BackendManager::new(cat.clone(), backends).expect("manager builds");
         let inputs = ReloadInputs {
-            catalog_path,
-            policy_path,
+            config_path,
+            overrides: Vec::new(),
         };
         let state = Arc::new(
             BrokerState::new(cat, pol, cfg, manager, "noop").with_reload_inputs(inputs.clone()),
@@ -626,8 +631,9 @@ mod tests {
     }
 
     fn write_files(inputs: &ReloadInputs, catalog: &str, policy: &str) {
-        std::fs::write(&inputs.catalog_path, catalog).expect("rewrite catalog");
-        std::fs::write(&inputs.policy_path, policy).expect("rewrite policy");
+        let dir = inputs.config_path.parent().expect("config parent");
+        std::fs::write(dir.join("catalog.json"), catalog).expect("rewrite catalog");
+        std::fs::write(dir.join("policy.json"), policy).expect("rewrite policy");
     }
 
     /// A valid reload (a reloadable-dimension edit) swaps to a new generation id,
@@ -670,7 +676,7 @@ mod tests {
         write_files(
             &inputs,
             &catalog_json(true),
-            r#"{ "schemaVersion": 2, "subjects": { "svc.web": { "allOf": [ { "kind": "unix", "uid": 1000 } ] } }, "roles": {}, "rules": [ { "id": "bad", "subjects": ["svc.web"], "action": ["role:nonexistent"], "target": ["web.signer"] } ], "config": {} }"#,
+            r#"{ "schema": "policy", "subjects": { "svc.web": { "allOf": [ { "kind": "unix", "uid": 1000 } ] } }, "roles": {}, "rules": [ { "id": "bad", "subjects": ["svc.web"], "action": ["role:nonexistent"], "target": ["web.signer"] } ], "config": {} }"#,
         );
 
         let err = reload_generation(&state).expect_err("malformed policy rejected");
@@ -686,7 +692,11 @@ mod tests {
 
         let err = read_reload_inputs_with_observer(&inputs, || {
             std::fs::write(
-                &inputs.policy_path,
+                inputs
+                    .config_path
+                    .parent()
+                    .expect("config parent")
+                    .join("policy.json"),
                 policy_json(true).replace("\"rules\"", "\"rules_changed\""),
             )
             .expect("race policy rewrite");
@@ -709,7 +719,7 @@ mod tests {
     fn non_profile_jwt_svid_issuer_is_rejected_on_reload() {
         // Base: an RSA JWT-SVID issuer (loads at startup).
         let base_catalog = r#"{
-          "schemaVersion": 1,
+          "schema": "catalog",
           "backends": { "bao": { "kind": "vault", "addr": "http://127.0.0.1:8200" } },
           "keys": {
             "spiffe.jwt": {

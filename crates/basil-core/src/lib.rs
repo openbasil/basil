@@ -43,6 +43,7 @@ pub(crate) fn ensure_crypto_provider() {
 }
 
 pub mod agent_cli;
+pub mod attestor_protocol;
 pub mod bundle_cli;
 pub mod core;
 #[cfg(feature = "keystore-backend")]
@@ -57,8 +58,9 @@ pub mod unlock;
 pub use core::identity;
 pub use core::ml_dsa_sign;
 pub use core::{
-    actor, audit, backend, capability, catalog, decision, ed25519_sign, event, manager, minter,
-    ml_kem_envelope, peer, reconcile, reload, revocation, seal, state, x25519_seal,
+    actor, audit, backend, capability, catalog, configuration, decision, ed25519_sign, event,
+    manager, minter, ml_kem_envelope, peer, reconcile, reload, revocation, seal, state,
+    x25519_seal,
 };
 pub use service::broker as grpc;
 #[cfg(feature = "http")]
@@ -79,6 +81,11 @@ pub use capability::{
 pub use catalog::{
     BackendKind, Capability, Catalog, Config, LoadError, LoadWarning, MissingPolicy,
     ResolvedPolicy, load,
+};
+pub use configuration::{
+    CORPUS_SCHEMA_VERSION, ComposeInstallOutcome, ConfigOverride, ConfigurationError,
+    CorpusDocuments, CorpusSources, DEFAULT_CONFIG_PATH, LoadedBootstrap, OverrideProvenance,
+    install_compose_document, load_bootstrap, load_documents,
 };
 pub use decision::{DecisionRecord, Outcome};
 pub use event::{BrokerEvent, BrokerEventKind, EventSource};

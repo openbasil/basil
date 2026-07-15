@@ -160,7 +160,7 @@ mod tests {
     /// over it.
     fn rotate_state() -> Arc<BrokerState> {
         let catalog = r#"{
-          "schemaVersion": 1,
+          "schema": "catalog",
           "backends": { "bao": { "kind": "vault", "addr": "https://127.0.0.1:8200" } },
           "keys": {
             "app.signer": {
@@ -171,7 +171,7 @@ mod tests {
           }
         }"#;
         let policy = r#"{
-          "schemaVersion": 2,
+          "schema": "policy",
           "subjects": {
             "svc.ops": { "allOf": [ { "kind": "unix", "uid": 42 } ] }
           },

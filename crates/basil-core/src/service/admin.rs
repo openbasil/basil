@@ -876,7 +876,7 @@ mod tests {
     // unambiguous: req.signer (missing=error → blocks), warn.value (missing=warn
     // → does not block), gen.signer (missing=generate → does not block).
     const CATALOG: &str = r#"{
-      "schemaVersion": 1,
+      "schema": "catalog",
       "backends": { "b": { "kind": "vault", "addr": "http://127.0.0.1:8200" } },
       "keys": {
         "req.signer": {
@@ -898,6 +898,7 @@ mod tests {
     }"#;
 
     const EMPTY_POLICY: &str = r#"{
+      "schema": "policy",
       "roles": {},
       "rules": [],
       "config": { "names": { "users": {}, "groups": {} }, "memberships": {} }
@@ -1099,7 +1100,7 @@ mod tests {
     #[tokio::test]
     async fn readiness_reclassifies_missing_against_the_serving_generation() {
         const WARN_ONLY: &str = r#"{
-          "schemaVersion": 1,
+          "schema": "catalog",
           "backends": { "b": { "kind": "vault", "addr": "http://127.0.0.1:8200" } },
           "keys": {
             "warn.value": {
@@ -1170,7 +1171,7 @@ mod tests {
     fn reload_catalog(writable: bool) -> String {
         format!(
             r#"{{
-              "schemaVersion": 1,
+              "schema": "catalog",
               "backends": {{ "b": {{ "kind": "vault", "addr": "http://127.0.0.1:8200" }} }},
               "keys": {{
                 "web.signer": {{
@@ -1187,7 +1188,7 @@ mod tests {
     /// change the reload engine must reject (previous generation keeps serving).
     fn reload_catalog_repathed() -> String {
         r#"{
-          "schemaVersion": 1,
+          "schema": "catalog",
           "backends": { "b": { "kind": "vault", "addr": "http://127.0.0.1:8200" } },
           "keys": {
             "web.signer": {
@@ -1203,7 +1204,7 @@ mod tests {
     fn reload_spiffe_catalog(trust_domain: &str) -> String {
         format!(
             r#"{{
-              "schemaVersion": 1,
+              "schema": "catalog",
               "backends": {{ "b": {{ "kind": "vault", "addr": "http://127.0.0.1:8200" }} }},
               "keys": {{
                 "web.signer": {{
@@ -1226,7 +1227,7 @@ mod tests {
     /// `revoke`, and uid 7 is a data-plane signer over web.signer with NO admin
     /// grants.
     const RELOAD_POLICY: &str = r#"{
-      "schemaVersion": 2,
+      "schema": "policy",
       "subjects": {
         "svc.admin": { "allOf": [ { "kind": "unix", "uid": 4242 } ] },
         "svc.explain": { "allOf": [ { "kind": "unix", "uid": 4243 } ] },
@@ -1262,8 +1263,14 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp dir");
         let catalog_path = dir.join("catalog.json");
         let policy_path = dir.join("policy.json");
+        let config_path = dir.join("config.toml");
         std::fs::write(&catalog_path, catalog_json).expect("write catalog");
         std::fs::write(&policy_path, RELOAD_POLICY).expect("write policy");
+        std::fs::write(
+            &config_path,
+            "schema = \"agent\"\nschemaVersion = 3\n[config]\ncatalog = \"catalog.json\"\npolicy = \"policy.json\"\nbundle = \"bundle.age\"\n",
+        )
+        .expect("write config");
 
         let (catalog, policy, config, _w) =
             load(catalog_json, RELOAD_POLICY).expect("reload fixture loads");
@@ -1277,17 +1284,25 @@ mod tests {
         );
         let manager = BackendManager::new(catalog.clone(), backends).expect("manager builds");
         let inputs = ReloadInputs {
-            catalog_path,
-            policy_path,
+            config_path,
+            overrides: Vec::new(),
         };
         let state = BrokerState::new(catalog, policy, config, manager, "vault")
             .with_reload_inputs(inputs.clone());
         (BrokerGrpc::new(Arc::new(state)), inputs)
     }
 
+    fn reload_catalog_path(inputs: &ReloadInputs) -> std::path::PathBuf {
+        inputs
+            .config_path
+            .parent()
+            .expect("config parent")
+            .join("catalog.json")
+    }
+
     async fn revoke_grpc() -> BrokerGrpc {
         let catalog_json = r#"{
-          "schemaVersion": 1,
+          "schema": "catalog",
           "backends": { "b": { "kind": "vault", "addr": "http://127.0.0.1:8200" } },
           "keys": {
             "revocations.jwt": {
@@ -1299,7 +1314,7 @@ mod tests {
           }
         }"#;
         let policy_json = r#"{
-          "schemaVersion": 2,
+          "schema": "policy",
           "subjects": {
             "svc.revoke": { "allOf": [ { "kind": "unix", "uid": 4244 } ] }
           },
@@ -1397,7 +1412,7 @@ mod tests {
         let (grpc, inputs) = reload_grpc();
         assert_eq!(grpc.state.active_generation_id(), 1);
         // Edit a reloadable dimension (flip writable).
-        std::fs::write(&inputs.catalog_path, reload_catalog(true)).expect("rewrite");
+        std::fs::write(reload_catalog_path(&inputs), reload_catalog(true)).expect("rewrite");
 
         let resp = grpc
             .reload(reload_request(4242, false))
@@ -1420,8 +1435,11 @@ mod tests {
     async fn authorized_reload_publishes_bundle_changed_event() {
         let (grpc, inputs) = reload_grpc_with_catalog(&reload_spiffe_catalog("example.org"));
         let mut events = grpc.state.events().subscribe();
-        std::fs::write(&inputs.catalog_path, reload_spiffe_catalog("other.org"))
-            .expect("rewrite catalog");
+        std::fs::write(
+            reload_catalog_path(&inputs),
+            reload_spiffe_catalog("other.org"),
+        )
+        .expect("rewrite catalog");
 
         let resp = grpc
             .reload(reload_request(4242, false))
@@ -1454,7 +1472,7 @@ mod tests {
     #[tokio::test]
     async fn unauthorized_caller_is_denied_and_nothing_reloads() {
         let (grpc, inputs) = reload_grpc();
-        std::fs::write(&inputs.catalog_path, reload_catalog(true)).expect("rewrite");
+        std::fs::write(reload_catalog_path(&inputs), reload_catalog(true)).expect("rewrite");
 
         // uid 7 is a data-plane signer over web.signer, but has NO reload grant.
         let mut request = reload_request(7, false);
@@ -1498,7 +1516,7 @@ mod tests {
     #[tokio::test]
     async fn check_validates_without_swapping() {
         let (grpc, inputs) = reload_grpc();
-        std::fs::write(&inputs.catalog_path, reload_catalog(true)).expect("rewrite");
+        std::fs::write(reload_catalog_path(&inputs), reload_catalog(true)).expect("rewrite");
 
         let resp = grpc
             .reload(reload_request(4242, true))
@@ -1520,7 +1538,7 @@ mod tests {
     #[tokio::test]
     async fn rejected_candidate_keeps_previous_generation() {
         let (grpc, inputs) = reload_grpc();
-        std::fs::write(&inputs.catalog_path, reload_catalog_repathed()).expect("rewrite");
+        std::fs::write(reload_catalog_path(&inputs), reload_catalog_repathed()).expect("rewrite");
 
         let resp = grpc
             .reload(reload_request(4242, false))

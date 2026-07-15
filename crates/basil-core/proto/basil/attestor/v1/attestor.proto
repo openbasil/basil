@@ -1,0 +1,241 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package basil.attestor.v1;
+
+// Envelope is the sole framed message in attestor protocol 1.
+message Envelope {
+  uint32 protocol = 1;
+  oneof body {
+    HandshakeRequest handshake_request = 2;
+    HandshakeResponse handshake_response = 3;
+    HealthRequest health_request = 4;
+    HealthResponse health_response = 5;
+    ResolvePeerRequest resolve_peer_request = 6;
+    ResolvePeerResponse resolve_peer_response = 7;
+    QueryInstancesRequest query_instances_request = 8;
+    QueryInstancesChunk query_instances_chunk = 9;
+  }
+}
+
+message SessionBinding {
+  bytes session_nonce = 1;
+  uint64 generation = 2;
+  bytes challenge = 3;
+}
+
+message HandshakeRequest {
+  SessionBinding binding = 1;
+  repeated string required_capabilities = 2;
+  bytes broker_peer_binding = 3;
+}
+
+message HandshakeResponse {
+  Outcome outcome = 1;
+  SessionBinding binding = 2;
+  repeated string supported_capabilities = 3;
+  bytes broker_peer_binding = 4;
+  bytes attestor_peer_binding = 5;
+}
+
+message HealthRequest {
+  SessionBinding binding = 1;
+  uint64 budget_millis = 2;
+}
+
+message HealthResponse {
+  Outcome outcome = 1;
+  SessionBinding binding = 2;
+  HealthFact health = 3;
+}
+
+message ResolvePeerRequest {
+  SessionBinding binding = 1;
+  uint64 budget_millis = 2;
+  PinnedPeer constraints = 3;
+}
+
+message ResolvePeerResponse {
+  Outcome outcome = 1;
+  SessionBinding binding = 2;
+  InstanceFact instance = 3;
+}
+
+message QueryInstancesRequest {
+  SessionBinding binding = 1;
+  uint64 budget_millis = 2;
+  oneof scope {
+    string instance_id = 3;
+    ProjectScope project = 4;
+    ServiceScope service = 5;
+    GlobalDoctorScope global_doctor = 6;
+  }
+}
+
+message QueryInstancesChunk {
+  Outcome outcome = 1;
+  SessionBinding binding = 2;
+  uint32 chunk_index = 3;
+  uint32 chunk_count = 4;
+  repeated InstanceFact instances = 5;
+  bool final_chunk = 6;
+  uint32 declared_total_count = 7;
+  uint64 declared_total_bytes = 8;
+  bytes final_digest = 9;
+}
+
+message Outcome {
+  OutcomeCode code = 1;
+  string diagnostic = 2;
+}
+
+enum OutcomeCode {
+  OUTCOME_CODE_UNSPECIFIED = 0;
+  OUTCOME_CODE_OK = 1;
+  OUTCOME_CODE_NO_MATCH = 2;
+  OUTCOME_CODE_MULTIPLE_MATCHES = 3;
+  OUTCOME_CODE_CHANGED_DURING_READ = 4;
+  OUTCOME_CODE_UNAVAILABLE = 5;
+  OUTCOME_CODE_RESOURCE_EXHAUSTED = 6;
+  OUTCOME_CODE_DEADLINE_EXCEEDED = 7;
+  OUTCOME_CODE_INVALID_REQUEST = 8;
+  OUTCOME_CODE_INVARIANT_FAILURE = 9;
+}
+
+message HealthFact {
+  RuntimeKind runtime = 1;
+  string diagnostic_version = 2;
+  RuntimeMode runtime_mode = 3;
+  CgroupMode cgroup_mode = 4;
+  bool ready = 5;
+  repeated string missing_capabilities = 6;
+}
+
+message PinnedPeer {
+  uint32 pid = 1;
+  uint64 start_time_ticks = 2;
+  string cgroup = 3;
+  NamespaceInodes namespaces = 4;
+}
+
+message NamespaceInodes {
+  uint64 user = 1;
+  uint64 pid = 2;
+  uint64 mount = 3;
+  uint64 network = 4;
+  uint64 uts = 5;
+  uint64 ipc = 6;
+  uint64 cgroup = 7;
+}
+
+message IdMapRange {
+  uint32 inside_id = 1;
+  uint32 outside_id = 2;
+  uint32 length = 3;
+}
+
+message FactBinding {
+  SessionBinding session = 1;
+  string realm = 2;
+  RuntimeKind provider = 3;
+  uint64 observed_unix_millis = 4;
+}
+
+message InstanceFact {
+  FactBinding provenance = 1;
+  RuntimeKind runtime = 2;
+  string instance_id = 3;
+  PinnedPeer observed_peer = 4;
+  repeated IdMapRange uid_map = 5;
+  repeated IdMapRange gid_map = 6;
+  ComposeFact compose = 7;
+  ImageFact image = 8;
+  repeated MountFact mounts = 9;
+  LifecycleState lifecycle = 10;
+  string diagnostic_runtime_name = 11;
+}
+
+message ComposeFact {
+  string project = 1;
+  string service = 2;
+  bool one_off = 3;
+  optional uint32 replica_ordinal = 4;
+}
+
+message ImageFact {
+  optional string index_digest = 1;
+  string manifest_digest = 2;
+  string config_digest = 3;
+  string os = 4;
+  string architecture = 5;
+  optional string variant = 6;
+}
+
+message MountFact {
+  MountKind kind = 1;
+  string host_source = 2;
+  string container_destination = 3;
+  bool read_only = 4;
+  MountPropagation propagation = 5;
+  optional uint64 tmpfs_size_bytes = 6;
+  optional uint32 tmpfs_mode = 7;
+}
+
+message ProjectScope {
+  string realm = 1;
+  string project = 2;
+}
+
+message ServiceScope {
+  string realm = 1;
+  string project = 2;
+  string service = 3;
+}
+
+message GlobalDoctorScope {}
+
+enum RuntimeKind {
+  RUNTIME_KIND_UNSPECIFIED = 0;
+  RUNTIME_KIND_DOCKER = 1;
+  RUNTIME_KIND_PODMAN = 2;
+}
+
+enum RuntimeMode {
+  RUNTIME_MODE_UNSPECIFIED = 0;
+  RUNTIME_MODE_ROOTFUL = 1;
+  RUNTIME_MODE_ROOTLESS = 2;
+}
+
+enum CgroupMode {
+  CGROUP_MODE_UNSPECIFIED = 0;
+  CGROUP_MODE_V1 = 1;
+  CGROUP_MODE_V2 = 2;
+}
+
+enum MountKind {
+  MOUNT_KIND_UNSPECIFIED = 0;
+  MOUNT_KIND_BIND = 1;
+  MOUNT_KIND_VOLUME = 2;
+  MOUNT_KIND_TMPFS = 3;
+}
+
+enum MountPropagation {
+  MOUNT_PROPAGATION_UNSPECIFIED = 0;
+  MOUNT_PROPAGATION_PRIVATE = 1;
+  MOUNT_PROPAGATION_RPRIVATE = 2;
+  MOUNT_PROPAGATION_SHARED = 3;
+  MOUNT_PROPAGATION_RSHARED = 4;
+  MOUNT_PROPAGATION_SLAVE = 5;
+  MOUNT_PROPAGATION_RSLAVE = 6;
+}
+
+enum LifecycleState {
+  LIFECYCLE_STATE_UNSPECIFIED = 0;
+  LIFECYCLE_STATE_CREATED = 1;
+  LIFECYCLE_STATE_RUNNING = 2;
+  LIFECYCLE_STATE_PAUSED = 3;
+  LIFECYCLE_STATE_EXITED = 4;
+}

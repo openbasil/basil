@@ -831,7 +831,7 @@ fn build_catalog(layout: &Layout) -> Catalog {
     );
 
     Catalog {
-        schema_version: 1,
+        schema: crate::catalog::CatalogSchema::Catalog,
         backends,
         keys,
     }
@@ -885,7 +885,7 @@ fn build_policy(uid: u32) -> RawPolicy {
     );
 
     RawPolicy {
-        schema_version: 2,
+        schema: crate::catalog::PolicySchema::Policy,
         subjects,
         unauthenticated_subject: None,
         roles,
@@ -898,14 +898,16 @@ fn build_policy(uid: u32) -> RawPolicy {
 fn build_config_toml(layout: &Layout) -> String {
     let mut out = String::new();
     out.push_str("# basil-agent config written by `basil demo` (throwaway).\n");
-    let _ = writeln!(out, "catalog = {}", toml_str(&layout.catalog));
-    let _ = writeln!(out, "policy = {}", toml_str(&layout.policy));
-    let _ = writeln!(out, "bundle = {}", toml_str(&layout.bundle));
+    out.push_str("schema = \"agent\"\nschemaVersion = 3\n");
     let _ = writeln!(out, "socket = {}", toml_str(&layout.socket));
     out.push_str("socket-mode = \"0600\"\n");
     out.push_str("db-keystore-cipher = \"aegis256\"\n");
     out.push_str("# One structured JSON event per authorization decision, allow and deny.\n");
     let _ = writeln!(out, "audit-log = {}", toml_str(&layout.audit));
+    out.push_str("\n[config]\n");
+    let _ = writeln!(out, "catalog = {}", toml_str(&layout.catalog));
+    let _ = writeln!(out, "policy = {}", toml_str(&layout.policy));
+    let _ = writeln!(out, "bundle = {}", toml_str(&layout.bundle));
     out.push('\n');
     out.push_str("[unlock]\n");
     let _ = writeln!(
@@ -1033,17 +1035,13 @@ mod tests {
 
         let overrides = crate::agent_cli::ConfigOverrides {
             config: Some(layout.config.clone()),
-            catalog: None,
-            policy: None,
-            bundle: None,
-            socket: None,
-            vault_addr: None,
+            values: Vec::new(),
         };
         let file =
             crate::agent_cli::load_config_file(&overrides).expect("agent parses demo config");
-        assert_eq!(file.catalog.as_deref(), Some(layout.catalog.as_path()));
-        assert_eq!(file.policy.as_deref(), Some(layout.policy.as_path()));
-        assert_eq!(file.bundle.as_deref(), Some(layout.bundle.as_path()));
+        assert_eq!(file.config.catalog, layout.catalog);
+        assert_eq!(file.config.policy, layout.policy);
+        assert_eq!(file.config.bundle, layout.bundle);
         assert_eq!(file.audit_log.as_deref(), Some(layout.audit.as_path()));
 
         std::fs::remove_dir_all(&dir).ok();

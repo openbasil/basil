@@ -511,7 +511,7 @@ mod tests {
 
     fn state_with_backend(backend: Box<dyn Backend>) -> Arc<BrokerState> {
         let catalog = r#"{
-          "schemaVersion": 1,
+          "schema": "catalog",
           "backends": { "bao": { "kind": "vault", "addr": "https://127.0.0.1:8200" } },
           "keys": {
             "issuer.account": {
@@ -543,7 +543,7 @@ mod tests {
           }
         }"#;
         let policy = r#"{
-          "schemaVersion": 2,
+          "schema": "policy",
           "subjects": {
             "svc.mint": { "allOf": [ { "kind": "unix", "uid": 42 } ] }
           },

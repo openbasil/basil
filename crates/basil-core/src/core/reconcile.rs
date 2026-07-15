@@ -638,7 +638,7 @@ mod tests {
     /// A catalog with one key of each (class, missing) combination this reconcile
     /// exercises, all routed to the single mock backend `b`.
     const CATALOG: &str = r#"{
-      "schemaVersion": 1,
+      "schema": "catalog",
       "backends": { "b": { "kind": "vault", "addr": "http://127.0.0.1:8200" } },
       "keys": {
         "req.signer": {
@@ -722,7 +722,7 @@ mod tests {
         // absent, the warn key is logged + counted but the required key still
         // fails. So test warn in isolation via a catalog with no required keys.
         const NO_REQUIRED: &str = r#"{
-          "schemaVersion": 1,
+          "schema": "catalog",
           "backends": {
             "b": {
               "kind": "vault", "addr": "http://127.0.0.1:8200",
@@ -754,7 +754,7 @@ mod tests {
         // A catalog with ONLY generate keys (asym + sym + value), all absent: each
         // must be created via its class-specific path.
         const GEN_ONLY: &str = r#"{
-          "schemaVersion": 1,
+          "schema": "catalog",
           "backends": { "b": { "kind": "vault", "addr": "http://127.0.0.1:8200" } },
           "keys": {
             "gen.signer": {
@@ -806,7 +806,7 @@ mod tests {
     fn generated_asymmetric_catalog(key_type: &str, mint_key_types: &str) -> String {
         format!(
             r#"{{
-          "schemaVersion": 1,
+          "schema": "catalog",
           "backends": {{
             "b": {{
               "kind": "vault", "addr": "http://127.0.0.1:8200",
@@ -895,7 +895,7 @@ mod tests {
     #[tokio::test]
     async fn generate_missing_rejects_key_type_absent_from_static_backend_preset() {
         const GEN_RSA_UNSUPPORTED: &str = r#"{
-          "schemaVersion": 1,
+          "schema": "catalog",
           "backends": {
             "b": {
               "kind": "vault", "addr": "http://127.0.0.1:8200",
@@ -943,7 +943,7 @@ mod tests {
         // write a fresh seed (silently minting signing authority). The seed is
         // provisioned out of band.
         const KV2_SIGNER: &str = r#"{
-          "schemaVersion": 1,
+          "schema": "catalog",
           "backends": { "b": { "kind": "vault", "addr": "http://127.0.0.1:8200" } },
           "keys": {
             "kv2.signer": {
@@ -975,7 +975,7 @@ mod tests {
         // not key_metadata (a transit name that would 404). With Probe::Present the
         // key resolves as present and reconcile is a clean no-op.
         const KV2_SIGNER: &str = r#"{
-          "schemaVersion": 1,
+          "schema": "catalog",
           "backends": { "b": { "kind": "vault", "addr": "http://127.0.0.1:8200" } },
           "keys": {
             "kv2.signer": {
@@ -1010,7 +1010,7 @@ mod tests {
         // so under missing=error it fails closed rather than booting a key whose
         // wrap/get_public_key can never resolve a public.
         const NO_PUB: &str = r#"{
-          "schemaVersion": 1,
+          "schema": "catalog",
           "backends": { "b": { "kind": "vault", "addr": "http://127.0.0.1:8200" } },
           "keys": {
             "kv2.signer": {
@@ -1154,7 +1154,7 @@ mod tests {
         // A catalog with ONLY warn + generate keys, all absent: missing keys are
         // reported, but NONE is error-class, so --strict must NOT fail.
         const WARN_GEN_ONLY: &str = r#"{
-          "schemaVersion": 1,
+          "schema": "catalog",
           "backends": { "b": { "kind": "vault", "addr": "http://127.0.0.1:8200" } },
           "keys": {
             "warn.value": {

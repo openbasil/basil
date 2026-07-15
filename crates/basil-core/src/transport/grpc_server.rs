@@ -262,7 +262,7 @@ mod tests {
 
     fn state() -> Arc<BrokerState> {
         let catalog = r#"{
-          "schemaVersion": 1,
+          "schema": "catalog",
           "backends": { "bao": { "kind": "vault", "addr": "https://127.0.0.1:8200" } },
           "keys": {}
         }"#;
@@ -273,7 +273,7 @@ mod tests {
         let uid = rustix::process::getuid().as_raw();
         let policy = format!(
             r#"{{
-              "schemaVersion": 2,
+              "schema": "policy",
               "subjects": {{ "test.peer": {{ "allOf": [ {{ "kind": "unix", "uid": {uid} }} ] }} }},
               "roles": {{}},
               "rules": [],

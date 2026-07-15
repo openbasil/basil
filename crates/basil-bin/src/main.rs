@@ -8,7 +8,7 @@
 //! tooling can render man pages; this entry point only parses and dispatches.
 
 use anyhow::Result;
-use basil_bin::{Cli, Command, client_cli};
+use basil_bin::{Cli, Command, ConfigCommand, client_cli};
 use basil_core::agent_cli;
 use clap::Parser;
 
@@ -25,6 +25,26 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Init(args) => agent_cli::run_init(cli.socket.as_deref(), &args),
+        Command::Config(ConfigCommand::InstallCompose(args)) => {
+            match basil_core::install_compose_document(
+                &args.config,
+                &args.name,
+                &args.source,
+                &args.destination,
+            )? {
+                basil_core::ComposeInstallOutcome::Installed { destination } => {
+                    println!("installed {}", destination.display());
+                }
+                basil_core::ComposeInstallOutcome::Staged {
+                    staged_copy,
+                    command,
+                } => {
+                    println!("staged {}", staged_copy.display());
+                    println!("{command}");
+                }
+            }
+            Ok(())
+        }
         #[cfg(feature = "keystore-backend")]
         Command::Demo(args) => basil_core::demo::run(&args),
         Command::Completions(args) => {

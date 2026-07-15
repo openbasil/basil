@@ -29,8 +29,9 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::catalog::{
-    BackendKind, BackendRef, Catalog, Class, Config, Engine, KeyAlgorithm, KeyEntry, Labels,
-    MissingPolicy, NameTable, Op, PrincipalSpec, RawPolicy, RawRule, RawSubjectDefinition,
+    BackendKind, BackendRef, Catalog, CatalogSchema, Class, Config, Engine, KeyAlgorithm, KeyEntry,
+    Labels, MissingPolicy, NameTable, Op, PolicySchema, PrincipalSpec, RawPolicy, RawRule,
+    RawSubjectDefinition,
 };
 use anyhow::{Context, Result, bail};
 use clap::{Args, ValueEnum};
@@ -323,7 +324,7 @@ fn build_catalog(args: &InitArgs, layout: &Layout) -> Catalog {
     );
 
     Catalog {
-        schema_version: 1,
+        schema: CatalogSchema::Catalog,
         backends,
         keys,
     }
@@ -369,7 +370,7 @@ fn build_policy(uid: u32) -> RawPolicy {
     );
 
     RawPolicy {
-        schema_version: 2,
+        schema: PolicySchema::Policy,
         subjects,
         unauthenticated_subject: None,
         roles,
@@ -388,10 +389,8 @@ fn build_config_toml(args: &InitArgs, layout: &Layout) -> String {
     out.push_str(
         "# next-steps), then `basil doctor --keys -c this-file` and `run -c this-file`.\n\n",
     );
-    let _ = writeln!(out, "catalog = {}", toml_str(&layout.catalog));
-    let _ = writeln!(out, "policy = {}", toml_str(&layout.policy));
-    out.push_str("# The sealed bundle is NOT created by init. Create it with `bundle create`.\n");
-    let _ = writeln!(out, "bundle = {}", toml_str(&layout.bundle));
+    out.push_str("schema = \"agent\"\n");
+    out.push_str("schemaVersion = 3\n\n");
     let _ = writeln!(out, "socket = {}", toml_str(&layout.socket));
     out.push_str("# Socket mode defaults to 0600 (owner-only); widen deliberately if a peer\n");
     out.push_str("# group must connect, e.g. socket-mode = \"0660\" + socket-group = \"basil\".\n");
@@ -409,6 +408,11 @@ fn build_config_toml(args: &InitArgs, layout: &Layout) -> String {
         );
     }
 
+    out.push_str("\n[config]\n");
+    let _ = writeln!(out, "catalog = {}", toml_str(&layout.catalog));
+    let _ = writeln!(out, "policy = {}", toml_str(&layout.policy));
+    out.push_str("# The sealed bundle is NOT created by init. Create it with `bundle create`.\n");
+    let _ = writeln!(out, "bundle = {}", toml_str(&layout.bundle));
     out.push('\n');
     out.push_str("[unlock]\n");
     match args.unlock {
@@ -918,7 +922,10 @@ mod tests {
         let config = std::fs::read_to_string(&layout.config).expect("read config");
         let parsed: toml::Value = toml::from_str(&config).expect("config is valid TOML");
         assert_eq!(
-            parsed.get("catalog").and_then(toml::Value::as_str),
+            parsed
+                .get("config")
+                .and_then(|value| value.get("catalog"))
+                .and_then(toml::Value::as_str),
             Some(layout.catalog.display().to_string().as_str())
         );
         // Socket mode defaults to 0600 (owner-only) in the generated config.
@@ -944,17 +951,13 @@ mod tests {
 
         let overrides = crate::agent_cli::ConfigOverrides {
             config: Some(layout.config.clone()),
-            catalog: None,
-            policy: None,
-            bundle: None,
-            socket: None,
-            vault_addr: None,
+            values: Vec::new(),
         };
         let file =
             crate::agent_cli::load_config_file(&overrides).expect("agent parses generated config");
-        assert_eq!(file.catalog.as_deref(), Some(layout.catalog.as_path()));
-        assert_eq!(file.policy.as_deref(), Some(layout.policy.as_path()));
-        assert_eq!(file.bundle.as_deref(), Some(layout.bundle.as_path()));
+        assert_eq!(file.config.catalog, layout.catalog);
+        assert_eq!(file.config.policy, layout.policy);
+        assert_eq!(file.config.bundle, layout.bundle);
         assert_eq!(
             file.socket.as_deref(),
             Some(layout.socket.display().to_string().as_str())
@@ -976,11 +979,7 @@ mod tests {
 
         let overrides = crate::agent_cli::ConfigOverrides {
             config: Some(layout.config),
-            catalog: None,
-            policy: None,
-            bundle: None,
-            socket: None,
-            vault_addr: None,
+            values: Vec::new(),
         };
         crate::agent_cli::load_config_file(&overrides)
             .expect("agent parses generated keystore config (db-keystore-cipher key)");
