@@ -19,6 +19,8 @@ use sha2::{Digest as _, Sha256};
 const MAX_STARTUP_OVERRIDES: usize = 64;
 const MAX_OVERRIDE_PATH_LEN: usize = 256;
 const MAX_OVERRIDE_VALUE_LEN: usize = 4096;
+const MAX_CATALOG_POLICY_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_OTHER_SOURCE_BYTES: u64 = 1024 * 1024;
 
 /// The only unified configuration-corpus version supported by this binary.
 pub const CORPUS_SCHEMA_VERSION: i64 = 3;
@@ -299,12 +301,18 @@ fn read_configuration_source_with_observer(
 ) -> std::io::Result<(Vec<u8>, ConfigurationSourceTrace)> {
     let mut file = std::fs::File::open(path)?;
     let before = SourceFileState::from_metadata(&file.metadata()?)?;
+    let max_bytes = source_byte_limit(slot);
+    ensure_source_within_limit(slot, name, path, before.len, max_bytes)?;
     observer();
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+    {
+        let mut limited = std::io::Read::by_ref(&mut file).take(max_bytes.saturating_add(1));
+        limited.read_to_end(&mut bytes)?;
+    }
+    let byte_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    ensure_source_within_limit(slot, name, path, byte_size, max_bytes)?;
     let after = SourceFileState::from_metadata(&file.metadata()?)?;
     let path_after = SourceFileState::from_metadata(&std::fs::metadata(path)?)?;
-    let byte_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     if before != after || after != path_after || byte_size != after.len {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -328,6 +336,33 @@ fn read_configuration_source_with_observer(
         sha256,
     };
     Ok((bytes, trace))
+}
+
+const fn source_byte_limit(slot: &str) -> u64 {
+    match slot.as_bytes() {
+        b"catalog" | b"policy" => MAX_CATALOG_POLICY_SOURCE_BYTES,
+        _ => MAX_OTHER_SOURCE_BYTES,
+    }
+}
+
+fn ensure_source_within_limit(
+    slot: &str,
+    name: Option<&str>,
+    path: &Path,
+    size: u64,
+    max_bytes: u64,
+) -> std::io::Result<()> {
+    if size <= max_bytes {
+        return Ok(());
+    }
+    let label = name.map_or_else(|| slot.to_string(), |name| format!("{slot} `{name}`"));
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "{label} configuration source {} is {size} bytes, exceeding the {max_bytes}-byte limit",
+            path.display()
+        ),
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1307,6 +1342,94 @@ mod tests {
         );
         assert!(trace.modified_unix_seconds > 0);
         assert!(trace.modified_nanoseconds < 1_000_000_000);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn source_read_limits_are_slot_specific_and_inclusive() {
+        let dir = temp_dir();
+        let bundle = dir.join("bundle.age");
+        let catalog = dir.join("catalog.json");
+        let policy = dir.join("policy.json");
+        std::fs::write(
+            &bundle,
+            vec![b'b'; usize::try_from(MAX_OTHER_SOURCE_BYTES).expect("limit fits")],
+        )
+        .expect("write bundle at limit");
+        std::fs::write(
+            &catalog,
+            vec![b'c'; usize::try_from(MAX_CATALOG_POLICY_SOURCE_BYTES).expect("limit fits")],
+        )
+        .expect("write catalog at limit");
+        std::fs::write(
+            &policy,
+            vec![b'p'; usize::try_from(MAX_CATALOG_POLICY_SOURCE_BYTES + 1).expect("limit fits")],
+        )
+        .expect("write oversized policy");
+
+        let (bundle_bytes, bundle_trace) =
+            read_configuration_source("bundle", None, &bundle).expect("bundle limit is inclusive");
+        assert_eq!(
+            bundle_bytes.len(),
+            usize::try_from(MAX_OTHER_SOURCE_BYTES).expect("limit fits")
+        );
+        assert_eq!(bundle_trace.byte_size, MAX_OTHER_SOURCE_BYTES);
+
+        let (catalog_bytes, catalog_trace) = read_configuration_source("catalog", None, &catalog)
+            .expect("catalog limit is inclusive");
+        assert_eq!(
+            catalog_bytes.len(),
+            usize::try_from(MAX_CATALOG_POLICY_SOURCE_BYTES).expect("limit fits")
+        );
+        assert_eq!(catalog_trace.byte_size, MAX_CATALOG_POLICY_SOURCE_BYTES);
+
+        let error =
+            read_configuration_source("policy", None, &policy).expect_err("oversize rejects");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeding the"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn oversized_bootstrap_is_rejected_before_parsing() {
+        let dir = temp_dir();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            vec![b'a'; usize::try_from(MAX_OTHER_SOURCE_BYTES + 1).expect("limit fits")],
+        )
+        .expect("write oversized bootstrap");
+
+        let error = load_bootstrap(Some(&path), &[]).expect_err("oversize rejects");
+
+        assert!(matches!(error, ConfigurationError::ReadBootstrap { .. }));
+        assert!(error.to_string().contains("exceeding the"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn oversized_structured_document_is_rejected_before_parsing() {
+        let dir = temp_dir();
+        let catalog = dir.join("catalog.json");
+        std::fs::write(
+            &catalog,
+            vec![b'{'; usize::try_from(MAX_CATALOG_POLICY_SOURCE_BYTES + 1).expect("limit fits")],
+        )
+        .expect("write oversized catalog");
+        let sources = CorpusSources {
+            catalog,
+            policy: dir.join("policy.json"),
+            bundle: dir.join("bundle.age"),
+            compose: BTreeMap::new(),
+        };
+        let mut traces = Vec::new();
+
+        let error = load_documents_with_trace_collector(&sources, &[], Vec::new(), &mut traces)
+            .expect_err("oversize rejects");
+
+        assert!(matches!(error, ConfigurationError::ReadDocument { .. }));
+        assert!(error.to_string().contains("exceeding the"));
+        assert!(traces.is_empty());
         std::fs::remove_dir_all(dir).ok();
     }
 
