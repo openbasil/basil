@@ -5,6 +5,7 @@
 //! Core broker state, policy, backends, audit, and reconciliation.
 
 pub mod actor;
+pub mod attestor_realm;
 pub mod audit;
 pub mod backend;
 pub mod capability;

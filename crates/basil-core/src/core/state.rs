@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 
 use arc_swap::{ArcSwap, Guard};
 
+use crate::attestor_realm::RealmRegistry;
 use crate::audit::{AuditLog, ReloadActor};
 use crate::catalog::policy::{Config, ResolvedPolicy};
 use crate::catalog::{Catalog, Pdp};
@@ -351,6 +352,8 @@ pub struct BrokerState {
     /// (`basil-y3e.2`) re-reads from. `None` disables reload (the broker has no
     /// configured paths to re-read); a SIGHUP then only reopens the audit log.
     reload_inputs: Option<ReloadInputs>,
+    /// Optional accepted runtime-attestor realm registry.
+    realm_registry: Option<Arc<RealmRegistry>>,
     /// A short TTL cache of the last admin readiness probe (`basil-8nwy`), so a
     /// burst of ungated `Readiness` RPCs re-fans-out to the backend at most once
     /// per [`READINESS_CACHE_TTL`] instead of per call. Guarded by a `Mutex`; the
@@ -419,6 +422,7 @@ impl BrokerState {
             events: EventSource::new(),
             jwt_revocations: JwtRevocationStore::default(),
             reload_inputs: None,
+            realm_registry: None,
             readiness_cache: Mutex::new(None),
             jwks_cache: Mutex::new(None),
             reload_lock: Mutex::new(()),
@@ -480,6 +484,19 @@ impl BrokerState {
     pub fn with_reload_inputs(mut self, inputs: ReloadInputs) -> Self {
         self.reload_inputs = Some(inputs);
         self
+    }
+
+    /// Attach the accepted runtime-attestor realm registry.
+    #[must_use]
+    pub fn with_realm_registry(mut self, registry: Arc<RealmRegistry>) -> Self {
+        self.realm_registry = Some(registry);
+        self
+    }
+
+    /// Return the accepted runtime-attestor realm registry, when configured.
+    #[must_use]
+    pub const fn realm_registry(&self) -> Option<&Arc<RealmRegistry>> {
+        self.realm_registry.as_ref()
     }
 
     /// The configured catalog/policy paths the reload engine re-reads, if any.

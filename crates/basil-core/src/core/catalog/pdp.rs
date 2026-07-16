@@ -538,12 +538,19 @@ pub const ADMIN_REVOKE_TARGET: &str = "broker.revoke";
 /// `{ "action": ["op:watch"], "target": ["broker.watch"] }`.
 pub const ADMIN_WATCH_TARGET: &str = "broker.watch";
 
+/// The reserved policy target for named runtime-attestor realm status.
+///
+/// Grant it only through an explicit `op:realm_status` action. Wildcard admin
+/// or data-plane actions do not imply this inventory-bearing operation.
+pub const ADMIN_REALM_STATUS_TARGET: &str = "broker.realms";
+
 const fn admin_target(op: Op) -> Option<&'static str> {
     match op {
         Op::Reload => Some(ADMIN_RELOAD_TARGET),
         Op::Explain => Some(ADMIN_EXPLAIN_TARGET),
         Op::Revoke => Some(ADMIN_REVOKE_TARGET),
         Op::Watch => Some(ADMIN_WATCH_TARGET),
+        Op::RealmStatus => Some(ADMIN_REALM_STATUS_TARGET),
         Op::Get
         | Op::List
         | Op::GetPublicKey
@@ -1227,7 +1234,13 @@ mod tests {
             9005, // enroll sealer
             0,    // root: `*` action over `*` target
         ] {
-            for op in [Op::Reload, Op::Explain, Op::Revoke, Op::Watch] {
+            for op in [
+                Op::Reload,
+                Op::Explain,
+                Op::Revoke,
+                Op::Watch,
+                Op::RealmStatus,
+            ] {
                 assert_eq!(
                     decide_admin(&pdp, uid, op),
                     Decision::Deny {
@@ -1255,7 +1268,13 @@ mod tests {
                 via: via("breakglass.root")
             }
         );
-        for op in [Op::Reload, Op::Explain, Op::Revoke, Op::Watch] {
+        for op in [
+            Op::Reload,
+            Op::Explain,
+            Op::Revoke,
+            Op::Watch,
+            Op::RealmStatus,
+        ] {
             assert_eq!(
                 pdp.decide_admin(&actor, op),
                 Decision::Deny {

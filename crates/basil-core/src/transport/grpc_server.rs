@@ -495,7 +495,9 @@ mod tests {
         {
             let channel = uds_channel(&socket).await;
             let mut broker = AdminServiceClient::new(channel.clone());
-            let mut request = Request::new(StatusRequest {});
+            let mut request = Request::new(StatusRequest {
+                include_realms: false,
+            });
             request
                 .metadata_mut()
                 .insert("workload.spiffe.io", "true".parse().expect("metadata"));

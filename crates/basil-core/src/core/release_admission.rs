@@ -798,6 +798,7 @@ struct AdmissionState {
     current: ReleaseSlot,
     previous: Option<ReleaseSlot>,
     active_preflights: usize,
+    lifecycle_version: u64,
 }
 
 /// Process-owned bounded model for machine-wide current/previous admission.
@@ -835,6 +836,7 @@ impl ReleaseAdmission {
                 current: ReleaseSlot::new(initial),
                 previous: None,
                 active_preflights: 0,
+                lifecycle_version: 1,
             })),
         }
     }
@@ -846,6 +848,7 @@ impl ReleaseAdmission {
         ReleaseSnapshot {
             current: state.current.status(),
             previous: state.previous.as_ref().map(ReleaseSlot::status),
+            lifecycle_version: state.lifecycle_version,
         }
     }
 
@@ -947,11 +950,13 @@ impl ReleaseAdmission {
     /// rollback target exists.
     pub fn rollback(&self) -> Result<TransitionOutcome, LifecycleError> {
         let mut state = self.lock_state();
+        let lifecycle_version = next_lifecycle_version(&state)?;
         let Some(mut previous) = state.previous.take() else {
             return Err(LifecycleError::NoPreviousRelease);
         };
         std::mem::swap(&mut state.current, &mut previous);
         state.previous = Some(previous);
+        state.lifecycle_version = lifecycle_version;
         let outcome = transition_outcome(&state, TransitionKind::Rollback);
         drop(state);
         Ok(outcome)
@@ -975,11 +980,13 @@ impl ReleaseAdmission {
                 active_preflights: previous.active_preflights,
             });
         }
+        let lifecycle_version = next_lifecycle_version(&state)?;
         let removed = state
             .previous
             .take()
             .map(|slot| slot.manifest.identity())
             .ok_or(LifecycleError::NoPreviousRelease)?;
+        state.lifecycle_version = lifecycle_version;
         drop(state);
         Ok(removed)
     }
@@ -999,9 +1006,11 @@ impl ReleaseAdmission {
                 active_preflights: previous.active_preflights,
             });
         }
+        let lifecycle_version = next_lifecycle_version(&state)?;
         let new_current = ReleaseSlot::new(candidate);
         let old_current = std::mem::replace(&mut state.current, new_current);
         state.previous = Some(old_current);
+        state.lifecycle_version = lifecycle_version;
         let outcome = transition_outcome(&state, kind);
         drop(state);
         Ok(outcome)
@@ -1010,6 +1019,13 @@ impl ReleaseAdmission {
     fn lock_state(&self) -> MutexGuard<'_, AdmissionState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+fn next_lifecycle_version(state: &AdmissionState) -> Result<u64, LifecycleError> {
+    state
+        .lifecycle_version
+        .checked_add(1)
+        .ok_or(LifecycleError::CounterExhausted)
 }
 
 fn validate_candidate_identity(
@@ -1095,11 +1111,16 @@ pub struct ReleaseSnapshot {
     pub current: ReleaseStatus,
     /// Previous admitted release, when retained.
     pub previous: Option<ReleaseStatus>,
+    /// Checked monotonic version of successful lifecycle mutations.
+    pub lifecycle_version: u64,
 }
 
 /// A typed, fail-closed machine-wide release lifecycle error.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum LifecycleError {
+    /// The monotonic lifecycle version cannot advance without wrapping.
+    #[error("release lifecycle counter exhausted")]
+    CounterExhausted,
     /// A candidate belongs to another product.
     #[error("candidate product `{candidate}` does not match current product `{current}`")]
     ProductMismatch {
@@ -1575,10 +1596,12 @@ mod tests {
     #[test]
     fn promotion_downgrade_and_rollback_are_explicit_and_deterministic() {
         let admission = ReleaseAdmission::new(standard_manifest("0.8.0", 1));
+        assert_eq!(admission.snapshot().lifecycle_version, 1);
         let promoted = admission
             .promote(standard_manifest("0.9.0", 2))
             .expect("promotion succeeds");
         assert_eq!(promoted.kind, TransitionKind::Promotion);
+        assert_eq!(admission.snapshot().lifecycle_version, 2);
         assert_eq!(promoted.current.release().as_str(), "0.9.0");
         assert_eq!(
             promoted
@@ -1591,14 +1614,17 @@ mod tests {
         );
         let rolled_back = admission.rollback().expect("rollback succeeds");
         assert_eq!(rolled_back.kind, TransitionKind::Rollback);
+        assert_eq!(admission.snapshot().lifecycle_version, 3);
         assert_eq!(rolled_back.current.release().as_str(), "0.8.0");
         let rolled_forward = admission.rollback().expect("second rollback succeeds");
         assert_eq!(rolled_forward.current.release().as_str(), "0.9.0");
+        assert_eq!(admission.snapshot().lifecycle_version, 4);
         let downgraded = admission
             .downgrade(standard_manifest("0.7.1", 3))
             .expect("explicit downgrade succeeds");
         assert_eq!(downgraded.kind, TransitionKind::Downgrade);
         assert_eq!(downgraded.current.release().as_str(), "0.7.1");
+        assert_eq!(admission.snapshot().lifecycle_version, 5);
     }
 
     #[test]
@@ -1724,6 +1750,21 @@ mod tests {
             Err(LifecycleError::NoPreviousRelease)
         );
         assert_eq!(admission.rollback(), Err(LifecycleError::NoPreviousRelease));
+        assert_eq!(admission.snapshot(), initial);
+    }
+
+    #[test]
+    fn lifecycle_counter_exhaustion_is_failure_atomic() {
+        let admission = ReleaseAdmission::new(standard_manifest("0.8.0", 1));
+        {
+            let mut state = admission.lock_state();
+            state.lifecycle_version = u64::MAX;
+        }
+        let initial = admission.snapshot();
+        assert_eq!(
+            admission.promote(standard_manifest("0.9.0", 2)),
+            Err(LifecycleError::CounterExhausted)
+        );
         assert_eq!(admission.snapshot(), initial);
     }
 

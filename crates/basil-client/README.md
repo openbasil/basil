@@ -47,8 +47,8 @@ by default until a rule grants it.
 - **Sealed invocations** (`sealed_invocation` module): build and open the COSE sealed request /
   response envelopes carried by Basil's invocation service, for callers that reach Basil through
   a courier (for example [`basil-nats-bridge`](../basil-nats-bridge)) instead of the local socket.
-- **Operations**: `status`, `health`, `readiness`, `reload`, `explain` (why a decision would be
-  allowed or denied), `revoke`.
+- **Operations**: `status`, permission-gated `status_with_realms`, `health`, realm-aware
+  `readiness`, `reload`, `explain` (why a decision would be allowed or denied), `revoke`.
 
 ## Errors and wire types
 

@@ -770,7 +770,9 @@ async fn status_observation_with_timeout(
     timeout: Duration,
 ) -> ProbeResult<RpcObservation> {
     let started = Instant::now();
-    let request = tonic::Request::new(StatusRequest {});
+    let request = tonic::Request::new(StatusRequest {
+        include_realms: false,
+    });
     let result = tokio::time::timeout(timeout, client.status(request)).await;
     match result {
         Ok(Ok(_response)) => Ok(RpcObservation::Success {
@@ -1299,6 +1301,7 @@ mod tests {
                 backend: "mock".to_owned(),
                 version: "test".to_owned(),
                 protocol: 1,
+                realms: Vec::new(),
             }))
         }
 

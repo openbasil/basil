@@ -188,6 +188,8 @@ pub struct LoadedBootstrap {
     pub path: PathBuf,
     /// Mutated TOML value ready for typed deserialization.
     pub value: toml::Value,
+    /// Strict protected runtime-attestor realm definitions.
+    pub realms: crate::core::attestor_realm::RealmSet,
     /// Explicit, bootstrap-parent-resolved document sources.
     pub sources: CorpusSources,
     /// Non-secret override provenance.
@@ -521,6 +523,8 @@ pub(crate) fn load_bootstrap_with_trace_collector(
     }
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let sources = extract_sources(&value, parent)?;
+    let realms = crate::core::attestor_realm::RealmSet::from_bootstrap(&value)
+        .map_err(|error| ConfigurationError::InvalidCorpus(error.to_string()))?;
     for config_override in overrides
         .iter()
         .filter(|item| !item.is_source_path() && !item.is_document_path())
@@ -535,6 +539,7 @@ pub(crate) fn load_bootstrap_with_trace_collector(
     Ok(LoadedBootstrap {
         path,
         value,
+        realms,
         sources,
         overrides: provenance,
         document_overrides: overrides
@@ -1157,6 +1162,7 @@ fn apply_scalar_override(
         || path.starts_with("unlock.")
         || path.starts_with("broker-identity.")
         || path.starts_with("invocation.")
+        || path.starts_with("attestor.")
         || path == "jwks.tls.key-file"
         || matches!(path, "jwt-role" | "jwt-audience")
     {
@@ -1592,6 +1598,11 @@ bundle = "bundle.age"
         assert!(load_bootstrap(Some(&config), &forbidden).is_err());
         let structural = [ConfigOverride::parse("import.compose=x").expect("parse")];
         assert!(load_bootstrap(Some(&config), &structural).is_err());
+        let realm_authority =
+            [ConfigOverride::parse("attestor.realms.prod.protocol=1").expect("parse")];
+        let error = load_bootstrap(Some(&config), &realm_authority)
+            .expect_err("realm authority override rejects");
+        assert!(error.to_string().contains("identity-bearing"));
         let duplicate = [
             ConfigOverride::parse("max-payload-size=64").expect("parse"),
             ConfigOverride::parse("max-payload-size=65").expect("parse"),

@@ -1203,6 +1203,10 @@ async fn ready(client: &mut Client, json: bool) -> Result<()> {
         println!("keys_present: {}", r.keys_present);
         println!("keys_required_missing: {}", r.keys_required_missing);
         println!("keys_optional_missing: {}", r.keys_optional_missing);
+        println!("realms_total: {}", r.realms_total);
+        println!("realms_ready: {}", r.realms_ready);
+        println!("realms_degraded: {}", r.realms_degraded);
+        println!("realms_absent: {}", r.realms_absent);
     }
     if ready_exit_code(&r) != 0 {
         // Exit 1 = "not ready" so a probe can gate on the code, distinct from a
@@ -1224,6 +1228,10 @@ fn ready_json(r: &basil::AgentReadiness) -> serde_json::Value {
         "keys_present": r.keys_present,
         "keys_required_missing": r.keys_required_missing,
         "keys_optional_missing": r.keys_optional_missing,
+        "realms_total": r.realms_total,
+        "realms_ready": r.realms_ready,
+        "realms_degraded": r.realms_degraded,
+        "realms_absent": r.realms_absent,
     })
 }
 
@@ -2175,6 +2183,7 @@ mod tests {
             backend: "keystore".to_string(),
             version: "0.7.1".to_string(),
             protocol: 1,
+            realms: Vec::new(),
         };
         let v = status_json(&s);
         assert_eq!(v["backend"], serde_json::json!("keystore"));
@@ -2198,6 +2207,10 @@ mod tests {
             keys_present: present,
             keys_required_missing: total - present,
             keys_optional_missing: 0,
+            realms_total: 0,
+            realms_ready: 0,
+            realms_degraded: 0,
+            realms_absent: 0,
         }
     }
 
@@ -2213,11 +2226,15 @@ mod tests {
         assert_eq!(v["keys_present"], serde_json::json!(4));
         assert_eq!(v["keys_required_missing"], serde_json::json!(0));
         assert_eq!(v["keys_optional_missing"], serde_json::json!(0));
+        assert_eq!(v["realms_total"], serde_json::json!(0));
+        assert_eq!(v["realms_ready"], serde_json::json!(0));
+        assert_eq!(v["realms_degraded"], serde_json::json!(0));
+        assert_eq!(v["realms_absent"], serde_json::json!(0));
         let obj = v.as_object().expect("ready --json is a JSON object");
         assert_eq!(
             obj.len(),
-            7,
-            "ready --json carries the full 7-field summary"
+            11,
+            "ready --json carries the complete key and realm summary"
         );
 
         // The coarse reason tokens automation matches on are stable.

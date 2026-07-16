@@ -1026,10 +1026,75 @@ message ReadinessResponse {
   // Absent keys whose `missing` policy is `warn` or `generate` (reported for
   // visibility; they do not by themselves make the broker not ready).
   uint32 keys_optional_missing = 7;
+  // Accepted attestor realms in this generation.
+  uint32 realms_total = 8;
+  // Accepted realms with one authoritative ready session.
+  uint32 realms_ready = 9;
+  // Accepted non-ready, non-absent realms.
+  uint32 realms_degraded = 10;
+  // Accepted realms whose configured socket is absent.
+  uint32 realms_absent = 11;
 }
 
 // Request for broker status.
-message StatusRequest {}
+message StatusRequest {
+  // Include named realm status. Requires the dedicated `realm_status` admin
+  // grant over `broker.realms`; admin wildcards do not imply it.
+  bool include_realms = 1;
+}
+
+// Closed attestor provider set.
+enum RealmProvider {
+  REALM_PROVIDER_UNSPECIFIED = 0;
+  REALM_PROVIDER_DOCKER = 1;
+  REALM_PROVIDER_PODMAN = 2;
+}
+
+// Closed attestor account/runtime scope.
+enum RealmMode {
+  REALM_MODE_UNSPECIFIED = 0;
+  REALM_MODE_ROOTFUL_HOST = 1;
+  REALM_MODE_ROOTLESS_OWNER = 2;
+}
+
+// Disclosure-safe accepted realm state.
+enum RealmState {
+  REALM_STATE_UNSPECIFIED = 0;
+  REALM_STATE_ABSENT = 1;
+  REALM_STATE_CONNECTING = 2;
+  REALM_STATE_AUTHENTICATING = 3;
+  REALM_STATE_HANDSHAKING = 4;
+  REALM_STATE_HEALTH_CHECKING = 5;
+  REALM_STATE_READY = 6;
+  REALM_STATE_DEGRADED = 7;
+  REALM_STATE_STAGING = 8;
+  REALM_STATE_DRAINING = 9;
+}
+
+// Coarse disclosure-safe reason for a realm state.
+enum RealmReason {
+  REALM_REASON_UNSPECIFIED = 0;
+  REALM_REASON_NONE = 1;
+  REALM_REASON_SOCKET_ABSENT = 2;
+  REALM_REASON_CONNECTING = 3;
+  REALM_REASON_AUTHENTICATION_FAILED = 4;
+  REALM_REASON_ADMISSION_FAILED = 5;
+  REALM_REASON_PROTOCOL_FAILED = 6;
+  REALM_REASON_HEALTH_FAILED = 7;
+  REALM_REASON_DRAINING = 8;
+}
+
+// Named realm inventory available only through the dedicated admin grant.
+message RealmStatus {
+  string name = 1;
+  RealmProvider provider = 2;
+  RealmMode mode = 3;
+  RealmState state = 4;
+  uint64 generation = 5;
+  uint64 session_epoch = 6;
+  uint32 protocol = 7;
+  RealmReason reason = 8;
+}
 
 // Broker identity and protocol info.
 message StatusResponse {
@@ -1039,6 +1104,9 @@ message StatusResponse {
   string version = 2;
   // Wire protocol version number.
   uint32 protocol = 3;
+  // Accepted-generation realms plus removed realms still draining. Empty
+  // unless the request opted in and passed its dedicated authorization check.
+  repeated RealmStatus realms = 4;
 }
 
 // Request to watch for change events, optionally filtered by kind.

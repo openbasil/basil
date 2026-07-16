@@ -89,6 +89,12 @@ pub enum Op {
     /// explicitly over `broker.watch`. `KeyRotated` events additionally stay
     /// filtered per key by the watcher's data-plane grants.
     Watch,
+    /// Read the named runtime-attestor realm inventory.
+    ///
+    /// This broker-wide admin op reveals deployment shape. It is absent from
+    /// [`ALL_OPS`], so wildcard grants never imply it. Grant it explicitly over
+    /// `broker.realms`.
+    RealmStatus,
     /// Permit a caller to use the **local-software** crypto provider for a key
     /// (the software-custodied PQC arm: ML-DSA signing, ML-KEM unwrap).
     ///
@@ -166,6 +172,7 @@ impl Op {
             Self::Explain => "explain",
             Self::Revoke => "revoke",
             Self::Watch => "watch",
+            Self::RealmStatus => "realm_status",
             Self::UseSoftwareCustody => "use_software_custody",
         }
     }
@@ -194,6 +201,7 @@ impl Op {
             "explain" => Self::Explain,
             "revoke" => Self::Revoke,
             "watch" => Self::Watch,
+            "realm_status" => Self::RealmStatus,
             "use_software_custody" => Self::UseSoftwareCustody,
             other => return Err(ActionTermError::UnknownOp(other.to_string())),
         };
@@ -438,10 +446,12 @@ mod tests {
         assert_eq!(Op::parse("explain").unwrap(), Op::Explain);
         assert_eq!(Op::parse("revoke").unwrap(), Op::Revoke);
         assert_eq!(Op::parse("watch").unwrap(), Op::Watch);
+        assert_eq!(Op::parse("realm_status").unwrap(), Op::RealmStatus);
         assert_eq!(Op::Reload.token(), "reload");
         assert_eq!(Op::Explain.token(), "explain");
         assert_eq!(Op::Revoke.token(), "revoke");
         assert_eq!(Op::Watch.token(), "watch");
+        assert_eq!(Op::RealmStatus.token(), "realm_status");
         assert!(matches!(
             Op::parse("nope"),
             Err(ActionTermError::UnknownOp(_))
@@ -450,7 +460,13 @@ mod tests {
 
     #[test]
     fn admin_ops_are_not_write_and_excluded_from_any_op_expansion() {
-        for op in [Op::Reload, Op::Explain, Op::Revoke, Op::Watch] {
+        for op in [
+            Op::Reload,
+            Op::Explain,
+            Op::Revoke,
+            Op::Watch,
+            Op::RealmStatus,
+        ] {
             assert!(!op.is_write());
             assert!(
                 !ALL_OPS.contains(&op),

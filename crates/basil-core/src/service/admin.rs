@@ -12,11 +12,15 @@ use basil_proto::broker::v1::admin_service_server::AdminService;
 use tonic::{Code, Request, Response};
 
 use crate::actor::SubjectResolutionError;
+use crate::attestor_realm::{
+    RealmMode as CoreRealmMode, RealmProvider as CoreRealmProvider, RealmReadiness,
+    RealmReason as CoreRealmReason, RealmState as CoreRealmState, RealmStatus as CoreRealmStatus,
+};
 use crate::audit::ReloadActor;
 use crate::catalog::policy::Op;
 use crate::catalog::{
-    ADMIN_EXPLAIN_TARGET, ADMIN_RELOAD_TARGET, ADMIN_REVOKE_TARGET, ADMIN_WATCH_TARGET, AllowVia,
-    Decision, DenyReason, Explanation, MatchedRule, MissingPolicy,
+    ADMIN_EXPLAIN_TARGET, ADMIN_REALM_STATUS_TARGET, ADMIN_RELOAD_TARGET, ADMIN_REVOKE_TARGET,
+    ADMIN_WATCH_TARGET, AllowVia, Decision, DenyReason, Explanation, MatchedRule, MissingPolicy,
 };
 use crate::decision::DecisionRecord;
 use crate::reload::{ReloadError, check_reload, reload_generation};
@@ -33,6 +37,7 @@ const EXPLAIN_OP_TOKEN: &str = "explain";
 const REVOKE_OP_TOKEN: &str = "revoke";
 const WATCH_OP_TOKEN: &str = "watch";
 const STATUS_OP_TOKEN: &str = "status";
+const REALM_STATUS_OP_TOKEN: &str = "realm_status";
 
 fn admin_resolution_status(op: &'static str, err: &SubjectResolutionError) -> tonic::Status {
     match err {
@@ -75,15 +80,45 @@ impl AdminService for BrokerGrpc {
     async fn status(&self, request: Request<pb::StatusRequest>) -> GrpcResult<pb::StatusResponse> {
         let peer = peer_from_request(&request);
         let generation = self.state.load_generation();
-        generation
+        let actor = generation
             .pdp()
             .resolve_local_actor(&peer)
             .map_err(|err| admin_resolution_status(STATUS_OP_TOKEN, &err))?;
+        let include_realms = request.get_ref().include_realms;
+        if include_realms {
+            let decision = generation.pdp().decide_admin(&actor, Op::RealmStatus);
+            self.state
+                .record_decision(&DecisionRecord::from_actor_decision(
+                    generation.id(),
+                    &actor,
+                    Op::RealmStatus,
+                    ADMIN_REALM_STATUS_TARGET,
+                    &decision,
+                ));
+            if matches!(decision, Decision::Deny { .. }) {
+                return Err(broker_status(
+                    Code::PermissionDenied,
+                    "UNAUTHORIZED",
+                    REALM_STATUS_OP_TOKEN,
+                    "not authorized",
+                ));
+            }
+        }
         drop(generation);
+        let realms = if include_realms {
+            self.state
+                .realm_registry()
+                .map_or_else(Vec::new, |registry| {
+                    registry.statuses().iter().map(realm_status).collect()
+                })
+        } else {
+            Vec::new()
+        };
         Ok(Response::new(pb::StatusResponse {
             backend: self.state.backend_label().to_string(),
             version: self.state.agent_version().to_string(),
             protocol: 1,
+            realms,
         }))
     }
 
@@ -142,6 +177,9 @@ impl AdminService for BrokerGrpc {
         Ok(Response::new(readiness_response(
             outcome,
             self.state.active_generation_id(),
+            self.state
+                .realm_registry()
+                .map_or_else(RealmReadiness::default, |registry| registry.readiness()),
         )))
     }
 
@@ -571,7 +609,11 @@ impl BrokerGrpc {
 /// across calls within the TTL and reused only while the serving generation still
 /// matches; the generation id is always stamped fresh so a hot reload's id is
 /// reflected immediately.
-fn readiness_response(outcome: ReadinessOutcome, generation: u64) -> pb::ReadinessResponse {
+fn readiness_response(
+    outcome: ReadinessOutcome,
+    generation: u64,
+    realms: RealmReadiness,
+) -> pb::ReadinessResponse {
     let reason = match outcome.state {
         ReadinessState::Ready => pb::ReadinessReason::Ready,
         ReadinessState::RequiredKeyMissing => pb::ReadinessReason::RequiredKeyMissing,
@@ -585,6 +627,52 @@ fn readiness_response(outcome: ReadinessOutcome, generation: u64) -> pb::Readine
         keys_present: outcome.keys_present,
         keys_required_missing: outcome.keys_required_missing,
         keys_optional_missing: outcome.keys_optional_missing,
+        realms_total: realms.total,
+        realms_ready: realms.ready,
+        realms_degraded: realms.degraded,
+        realms_absent: realms.absent,
+    }
+}
+
+fn realm_status(status: &CoreRealmStatus) -> pb::RealmStatus {
+    pb::RealmStatus {
+        name: status.name.as_str().to_string(),
+        provider: match status.provider {
+            CoreRealmProvider::Docker => pb::RealmProvider::Docker,
+            CoreRealmProvider::Podman => pb::RealmProvider::Podman,
+        }
+        .into(),
+        mode: match status.mode {
+            CoreRealmMode::RootfulHost => pb::RealmMode::RootfulHost,
+            CoreRealmMode::RootlessOwner => pb::RealmMode::RootlessOwner,
+        }
+        .into(),
+        state: match status.state {
+            CoreRealmState::Absent => pb::RealmState::Absent,
+            CoreRealmState::Connecting => pb::RealmState::Connecting,
+            CoreRealmState::Authenticating => pb::RealmState::Authenticating,
+            CoreRealmState::Handshaking => pb::RealmState::Handshaking,
+            CoreRealmState::HealthChecking => pb::RealmState::HealthChecking,
+            CoreRealmState::Ready => pb::RealmState::Ready,
+            CoreRealmState::Degraded => pb::RealmState::Degraded,
+            CoreRealmState::Staging => pb::RealmState::Staging,
+            CoreRealmState::Draining => pb::RealmState::Draining,
+        }
+        .into(),
+        generation: status.generation,
+        session_epoch: status.session_epoch,
+        protocol: status.protocol,
+        reason: match status.reason {
+            CoreRealmReason::None => pb::RealmReason::None,
+            CoreRealmReason::SocketAbsent => pb::RealmReason::SocketAbsent,
+            CoreRealmReason::Connecting => pb::RealmReason::Connecting,
+            CoreRealmReason::AuthenticationFailed => pb::RealmReason::AuthenticationFailed,
+            CoreRealmReason::AdmissionFailed => pb::RealmReason::AdmissionFailed,
+            CoreRealmReason::ProtocolFailed => pb::RealmReason::ProtocolFailed,
+            CoreRealmReason::HealthFailed => pb::RealmReason::HealthFailed,
+            CoreRealmReason::Draining => pb::RealmReason::Draining,
+        }
+        .into(),
     }
 }
 
@@ -1230,14 +1318,15 @@ mod tests {
     }
 
     /// Policy: uid 4242 may `reload`, uid 4243 may `explain`, uid 4244 may
-    /// `revoke`, and uid 7 is a data-plane signer over web.signer with NO admin
-    /// grants.
+    /// `revoke`, uid 4245 may read realm status, and uid 7 is a data-plane
+    /// signer over web.signer with no admin grants.
     const RELOAD_POLICY: &str = r#"{
       "schema": "policy",
       "subjects": {
         "svc.admin": { "domain": "host-process", "match": { "all": [ { "process.uid": 4242 } ] } },
         "svc.explain": { "domain": "host-process", "match": { "all": [ { "process.uid": 4243 } ] } },
         "svc.revoke": { "domain": "host-process", "match": { "all": [ { "process.uid": 4244 } ] } },
+        "svc.realms": { "domain": "host-process", "match": { "all": [ { "process.uid": 4245 } ] } },
         "svc.app": { "domain": "host-process", "match": { "all": [ { "process.uid": 7 } ] } }
       },
       "roles": { "signer": ["sign", "verify", "get_public_key"] },
@@ -1245,11 +1334,12 @@ mod tests {
         { "id": "admin-reload", "subjects": ["svc.admin"],   "action": ["op:reload"], "target": ["broker.reload"] },
         { "id": "admin-explain", "subjects": ["svc.explain"], "action": ["op:explain"], "target": ["broker.explain"] },
         { "id": "admin-revoke", "subjects": ["svc.revoke"],   "action": ["op:revoke"], "target": ["broker.revoke"] },
+        { "id": "admin-realms", "subjects": ["svc.realms"], "action": ["op:realm_status"], "target": ["broker.realms"] },
         { "id": "data-signer",  "subjects": ["svc.app"],      "action": ["role:signer"], "target": ["web.signer"] }
       ],
       "config": {
-        "names": { "users": { "4242": "svc-admin", "4243": "svc-explain", "4244": "svc-revoke", "7": "svc-app" }, "groups": {} },
-        "memberships": { "4242": [4242], "4243": [4243], "4244": [4244], "7": [7] }
+        "names": { "users": { "4242": "svc-admin", "4243": "svc-explain", "4244": "svc-revoke", "4245": "svc-realms", "7": "svc-app" }, "groups": {} },
+        "memberships": { "4242": [4242], "4243": [4243], "4244": [4244], "4245": [4245], "7": [7] }
       }
     }"#;
 
@@ -1668,13 +1758,17 @@ mod tests {
 
         // No peer credentials at all: fail closed before policy.
         let status = grpc
-            .status(Request::new(pb::StatusRequest {}))
+            .status(Request::new(pb::StatusRequest {
+                include_realms: false,
+            }))
             .await
             .expect_err("no peer credentials");
         assert_eq!(status.code(), Code::Unauthenticated);
 
         // A uid that resolves to no policy subject is denied.
-        let mut req = Request::new(pb::StatusRequest {});
+        let mut req = Request::new(pb::StatusRequest {
+            include_realms: false,
+        });
         req.extensions_mut().insert(PeerInfo {
             uid: Some(9999),
             ..PeerInfo::default()
@@ -1684,7 +1778,9 @@ mod tests {
         assert_status_omits_admin_canaries(&status);
 
         // Any resolved subject (a plain data-plane one, uid 7) may read it.
-        let mut req = Request::new(pb::StatusRequest {});
+        let mut req = Request::new(pb::StatusRequest {
+            include_realms: false,
+        });
         req.extensions_mut().insert(PeerInfo {
             uid: Some(7),
             ..PeerInfo::default()
@@ -1696,6 +1792,62 @@ mod tests {
             .into_inner();
         assert_eq!(resp.backend, "vault");
         assert_eq!(resp.protocol, 1);
+        assert!(resp.realms.is_empty());
+    }
+
+    #[tokio::test]
+    async fn named_realm_status_requires_its_exact_admin_grant() {
+        let (grpc, _inputs) = reload_grpc();
+        let mut denied = Request::new(pb::StatusRequest {
+            include_realms: true,
+        });
+        denied.extensions_mut().insert(PeerInfo {
+            uid: Some(7),
+            ..PeerInfo::default()
+        });
+        let status = grpc
+            .status(denied)
+            .await
+            .expect_err("data-plane wildcard does not reveal realms");
+        assert_eq!(status.code(), Code::PermissionDenied);
+        assert_status_omits_admin_canaries(&status);
+
+        let mut allowed = Request::new(pb::StatusRequest {
+            include_realms: true,
+        });
+        allowed.extensions_mut().insert(PeerInfo {
+            uid: Some(4245),
+            ..PeerInfo::default()
+        });
+        let response = grpc
+            .status(allowed)
+            .await
+            .expect("exact realm-status grant")
+            .into_inner();
+        assert!(response.realms.is_empty());
+    }
+
+    #[test]
+    fn realm_wire_projection_freezes_enum_values_and_fields() {
+        let status = CoreRealmStatus {
+            name: crate::attestor_realm::RealmName::new("production-docker").expect("valid realm"),
+            provider: CoreRealmProvider::Docker,
+            mode: CoreRealmMode::RootfulHost,
+            state: CoreRealmState::Ready,
+            generation: 7,
+            session_epoch: 9,
+            protocol: 1,
+            reason: CoreRealmReason::None,
+        };
+        let wire = realm_status(&status);
+        assert_eq!(wire.name, "production-docker");
+        assert_eq!(wire.provider, 1);
+        assert_eq!(wire.mode, 1);
+        assert_eq!(wire.state, 6);
+        assert_eq!(wire.generation, 7);
+        assert_eq!(wire.session_epoch, 9);
+        assert_eq!(wire.protocol, 1);
+        assert_eq!(wire.reason, 1);
     }
 
     /// No data-plane grant and no *other* admin grant implies watch: the

@@ -216,6 +216,145 @@ pub struct AgentStatus {
     pub version: String,
     /// Wire protocol version number.
     pub protocol: u32,
+    /// Named accepted realms, populated only by [`Client::status_with_realms`].
+    pub realms: Vec<AgentRealmStatus>,
+}
+
+/// Runtime-attestor provider reported by named realm status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RealmProvider {
+    /// Rootful Docker.
+    Docker,
+    /// Rootless Podman.
+    Podman,
+    /// A newer provider enum value unknown to this client.
+    Unknown(i32),
+}
+
+/// Runtime-attestor account scope reported by named realm status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RealmMode {
+    /// Host system service.
+    RootfulHost,
+    /// Exact non-root runtime owner.
+    RootlessOwner,
+    /// A newer mode enum value unknown to this client.
+    Unknown(i32),
+}
+
+/// Disclosure-safe runtime-attestor serving state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RealmState {
+    /// Expected socket is absent.
+    Absent,
+    /// Connecting.
+    Connecting,
+    /// Authenticating peer and release.
+    Authenticating,
+    /// Binding the private protocol.
+    Handshaking,
+    /// Qualifying provider health.
+    HealthChecking,
+    /// Serving authority is ready.
+    Ready,
+    /// Realm failed closed.
+    Degraded,
+    /// Same-socket candidate is staging without serving authority.
+    Staging,
+    /// Removed authority is draining.
+    Draining,
+    /// A newer state enum value unknown to this client.
+    Unknown(i32),
+}
+
+/// Disclosure-safe runtime-attestor state reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RealmReason {
+    /// No failure.
+    None,
+    /// Expected socket is absent.
+    SocketAbsent,
+    /// Connection is pending.
+    Connecting,
+    /// Peer authentication failed.
+    AuthenticationFailed,
+    /// Release admission failed.
+    AdmissionFailed,
+    /// Private protocol failed.
+    ProtocolFailed,
+    /// Provider health failed.
+    HealthFailed,
+    /// Removed authority is draining.
+    Draining,
+    /// A newer reason enum value unknown to this client.
+    Unknown(i32),
+}
+
+/// Named disclosure-safe runtime-attestor status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRealmStatus {
+    /// Canonical protected realm name.
+    pub name: String,
+    /// Closed provider.
+    pub provider: RealmProvider,
+    /// Closed account/runtime scope.
+    pub mode: RealmMode,
+    /// Serving-state projection.
+    pub state: RealmState,
+    /// Accepted configuration generation.
+    pub generation: u64,
+    /// Current authoritative session epoch.
+    pub session_epoch: u64,
+    /// Exact private protocol version.
+    pub protocol: u32,
+    /// Coarse state reason.
+    pub reason: RealmReason,
+}
+
+fn agent_realm_status(status: pb::RealmStatus) -> AgentRealmStatus {
+    AgentRealmStatus {
+        name: status.name,
+        provider: match pb::RealmProvider::try_from(status.provider) {
+            Ok(pb::RealmProvider::Docker) => RealmProvider::Docker,
+            Ok(pb::RealmProvider::Podman) => RealmProvider::Podman,
+            Ok(pb::RealmProvider::Unspecified) | Err(_) => RealmProvider::Unknown(status.provider),
+        },
+        mode: match pb::RealmMode::try_from(status.mode) {
+            Ok(pb::RealmMode::RootfulHost) => RealmMode::RootfulHost,
+            Ok(pb::RealmMode::RootlessOwner) => RealmMode::RootlessOwner,
+            Ok(pb::RealmMode::Unspecified) | Err(_) => RealmMode::Unknown(status.mode),
+        },
+        state: match pb::RealmState::try_from(status.state) {
+            Ok(pb::RealmState::Absent) => RealmState::Absent,
+            Ok(pb::RealmState::Connecting) => RealmState::Connecting,
+            Ok(pb::RealmState::Authenticating) => RealmState::Authenticating,
+            Ok(pb::RealmState::Handshaking) => RealmState::Handshaking,
+            Ok(pb::RealmState::HealthChecking) => RealmState::HealthChecking,
+            Ok(pb::RealmState::Ready) => RealmState::Ready,
+            Ok(pb::RealmState::Degraded) => RealmState::Degraded,
+            Ok(pb::RealmState::Staging) => RealmState::Staging,
+            Ok(pb::RealmState::Draining) => RealmState::Draining,
+            Ok(pb::RealmState::Unspecified) | Err(_) => RealmState::Unknown(status.state),
+        },
+        generation: status.generation,
+        session_epoch: status.session_epoch,
+        protocol: status.protocol,
+        reason: match pb::RealmReason::try_from(status.reason) {
+            Ok(pb::RealmReason::None) => RealmReason::None,
+            Ok(pb::RealmReason::SocketAbsent) => RealmReason::SocketAbsent,
+            Ok(pb::RealmReason::Connecting) => RealmReason::Connecting,
+            Ok(pb::RealmReason::AuthenticationFailed) => RealmReason::AuthenticationFailed,
+            Ok(pb::RealmReason::AdmissionFailed) => RealmReason::AdmissionFailed,
+            Ok(pb::RealmReason::ProtocolFailed) => RealmReason::ProtocolFailed,
+            Ok(pb::RealmReason::HealthFailed) => RealmReason::HealthFailed,
+            Ok(pb::RealmReason::Draining) => RealmReason::Draining,
+            Ok(pb::RealmReason::Unspecified) | Err(_) => RealmReason::Unknown(status.reason),
+        },
+    }
 }
 
 /// Broker liveness, returned by [`Client::health`]. A returned value means the
@@ -286,6 +425,14 @@ pub struct AgentReadiness {
     pub keys_required_missing: u32,
     /// Absent `warn`/`generate` keys (reported, do not block readiness).
     pub keys_optional_missing: u32,
+    /// Accepted runtime-attestor realms.
+    pub realms_total: u32,
+    /// Accepted realms with an authoritative ready session.
+    pub realms_ready: u32,
+    /// Accepted non-ready, non-absent realms.
+    pub realms_degraded: u32,
+    /// Accepted realms whose configured socket is absent.
+    pub realms_absent: u32,
 }
 
 /// Why an admin [`Client::reload`] candidate was rejected. On a rejection the
@@ -1145,9 +1292,21 @@ impl Client {
     /// The broker answers only callers that resolve to a policy subject (no
     /// further grant is needed); an unattested or unconfigured peer is denied.
     pub async fn status(&mut self) -> Result<AgentStatus> {
+        self.status_inner(false).await
+    }
+
+    /// Return broker identity plus the permission-gated named realm inventory.
+    ///
+    /// The caller needs an explicit `op:realm_status` grant over
+    /// `broker.realms`; wildcard policy actions do not imply it.
+    pub async fn status_with_realms(&mut self) -> Result<AgentStatus> {
+        self.status_inner(true).await
+    }
+
+    async fn status_inner(&mut self, include_realms: bool) -> Result<AgentStatus> {
         let response = Self::bounded(
             self.default_timeout,
-            self.admin.status(pb::StatusRequest {}),
+            self.admin.status(pb::StatusRequest { include_realms }),
         )
         .await?;
         let body = response.into_inner();
@@ -1155,6 +1314,7 @@ impl Client {
             backend: body.backend,
             version: body.version,
             protocol: body.protocol,
+            realms: body.realms.into_iter().map(agent_realm_status).collect(),
         })
     }
 
@@ -1194,6 +1354,10 @@ impl Client {
             keys_present: body.keys_present,
             keys_required_missing: body.keys_required_missing,
             keys_optional_missing: body.keys_optional_missing,
+            realms_total: body.realms_total,
+            realms_ready: body.realms_ready,
+            realms_degraded: body.realms_degraded,
+            realms_absent: body.realms_absent,
         })
     }
 

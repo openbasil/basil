@@ -27,6 +27,7 @@ a structured audit record.
 | `core::state`                                                                 | The loaded policy + backend manager bundle shared across services; reload swaps it atomically (`core::reload`).                 |
 | `core::release_admission`                                                     | Bounded verified release-artifact indexing, exact admission, and guarded current/previous lifecycle transitions.               |
 | `core::process_evidence`                                                      | Pinned procfs identity, point-of-use credential refresh, caller/host ID mapping, and fail-closed domain resolution.              |
+| `core::attestor_realm`                                                        | Protected realm schema, serial attestor sessions, isolated readiness, and failure-atomic candidate qualification.               |
 | `core::oci_verification`                                                      | Repository-scoped Sigstore policy, isolated exact-path Cosign execution, and independent OCI digest-chain verification.         |
 | `core::backend`                                                               | Backend adapters (table below).                                                                                                 |
 | `core::audit`, `core::decision`                                               | Decision records: subject, action, target, outcome, policy generation.                                                          |

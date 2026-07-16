@@ -40,8 +40,9 @@ pub use loader::{
     RawSubjectDefinition, load,
 };
 pub use pdp::{
-    ADMIN_EXPLAIN_TARGET, ADMIN_RELOAD_TARGET, ADMIN_REVOKE_TARGET, ADMIN_WATCH_TARGET, AllowVia,
-    Decision, DenyReason, EffectiveGrant, Explanation, MatchedRule, Pdp,
+    ADMIN_EXPLAIN_TARGET, ADMIN_REALM_STATUS_TARGET, ADMIN_RELOAD_TARGET, ADMIN_REVOKE_TARGET,
+    ADMIN_WATCH_TARGET, AllowVia, Decision, DenyReason, EffectiveGrant, Explanation, MatchedRule,
+    Pdp,
 };
 pub use policy::{
     ActionTerm, ActionTermError, Config, Grant, NameTable, Op, ResolvedPolicy, ResolvedRule, Rule,
