@@ -1972,7 +1972,7 @@ async fn run_daemon(args: RunArgs, version: &'static str) -> Result<()> {
                 config_path: run_config.setup.config_path.clone(),
                 overrides: run_config.setup.startup_overrides.clone(),
             });
-    state = attach_oci_verifier(state, run_config.oci_verifier);
+    state = attach_oci_verifier(state, run_config.oci_verifier.clone());
 
     // Optional JSONL audit sink (`vault-vq5`): open the append-only file ONCE at
     // startup so a permissions/path error fails closed here rather than per-op. A
@@ -1993,15 +1993,7 @@ async fn run_daemon(args: RunArgs, version: &'static str) -> Result<()> {
     spawn_sighup_handler(Arc::clone(&state), audit_reopen);
     spawn_retention_sweep(Arc::clone(&state), run_config.retention_sweep_secs);
 
-    let socket_path = run_config
-        .socket
-        .unwrap_or_else(|| crate::DEFAULT_SOCKET_PATH.to_string());
-    let server_config = ServerConfig {
-        socket_path,
-        socket_mode: run_config.socket_mode,
-        socket_group: run_config.socket_group,
-        invocation: run_config.invocation,
-    };
+    let server_config = host_server_config(&run_config);
 
     // Opt-in JWKS HTTP surface (basil-uce.1). When `[jwks] enable` is false (the
     // default) NO listener is bound: the broker stays gRPC-over-unix-socket only.
@@ -2044,6 +2036,19 @@ async fn run_daemon(args: RunArgs, version: &'static str) -> Result<()> {
 
     grpc_result?;
     Ok(())
+}
+
+fn host_server_config(run_config: &RunConfig) -> ServerConfig {
+    ServerConfig {
+        listener_type: crate::transport::grpc_server::ListenerType::Host,
+        socket_path: run_config
+            .socket
+            .clone()
+            .unwrap_or_else(|| crate::DEFAULT_SOCKET_PATH.to_string()),
+        socket_mode: run_config.socket_mode,
+        socket_group: run_config.socket_group.clone(),
+        invocation: run_config.invocation.clone(),
+    }
 }
 
 fn attach_oci_verifier(

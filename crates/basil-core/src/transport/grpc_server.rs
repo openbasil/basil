@@ -103,6 +103,7 @@ pub const ALL_GRPC_SERVICES: [GrpcService; 9] = [
 impl ListenerType {
     /// Return whether this listener type exposes a compiled service.
     #[must_use]
+    #[allow(clippy::match_same_arms)] // Repeated arms keep new services fail-closed at compile time.
     pub const fn exposes(self, service: GrpcService) -> bool {
         match (self, service) {
             (Self::Host, _) => true,
@@ -125,6 +126,8 @@ impl ListenerType {
 /// Runtime configuration for the gRPC listener.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
+    /// Closed compiled service surface exposed by this listener.
+    pub listener_type: ListenerType,
     /// Path to bind the listening Unix socket at.
     pub socket_path: String,
     /// File mode to apply to the listening Unix socket after bind.
@@ -159,6 +162,7 @@ async fn serve_with_shutdown(
 
     info!(
         %path,
+        listener_type = ?config.listener_type,
         mode = %format_socket_mode(config.socket_mode),
         group = ?config.socket_group,
         backend = state.backend_label(),
@@ -166,20 +170,55 @@ async fn serve_with_shutdown(
     );
     let incoming = UnixListenerStream::new(listener);
     let broker = BrokerGrpc::new_with_invocation_config(state.clone(), config.invocation);
+    let listener_type = config.listener_type;
 
     let server = Server::builder()
-        .add_service(InvocationServiceServer::new(broker.clone()))
-        .add_service(SigningServiceServer::new(broker.clone()))
-        .add_service(AeadServiceServer::new(broker.clone()))
-        .add_service(SecretServiceServer::new(broker.clone()))
-        .add_service(MintingServiceServer::new(broker.clone()))
-        .add_service(NatsServiceServer::new(broker.clone()))
-        .add_service(AdminServiceServer::new(broker));
+        .add_optional_service(
+            listener_type
+                .exposes(GrpcService::Invocation)
+                .then(|| InvocationServiceServer::new(broker.clone())),
+        )
+        .add_optional_service(
+            listener_type
+                .exposes(GrpcService::Signing)
+                .then(|| SigningServiceServer::new(broker.clone())),
+        )
+        .add_optional_service(
+            listener_type
+                .exposes(GrpcService::Aead)
+                .then(|| AeadServiceServer::new(broker.clone())),
+        )
+        .add_optional_service(
+            listener_type
+                .exposes(GrpcService::Secret)
+                .then(|| SecretServiceServer::new(broker.clone())),
+        )
+        .add_optional_service(
+            listener_type
+                .exposes(GrpcService::Minting)
+                .then(|| MintingServiceServer::new(broker.clone())),
+        )
+        .add_optional_service(
+            listener_type
+                .exposes(GrpcService::Nats)
+                .then(|| NatsServiceServer::new(broker.clone())),
+        )
+        .add_optional_service(
+            listener_type
+                .exposes(GrpcService::Admin)
+                .then(|| AdminServiceServer::new(broker)),
+        );
     let server = server
-        .add_service(SpiffeWorkloadApiServer::new(SpiffeWorkloadGrpc::new(
-            state.clone(),
-        )))
-        .add_service(SecretDiscoveryServiceServer::new(EnvoySdsGrpc::new(state)));
+        .add_optional_service(
+            listener_type
+                .exposes(GrpcService::SpiffeWorkload)
+                .then(|| SpiffeWorkloadApiServer::new(SpiffeWorkloadGrpc::new(state.clone()))),
+        )
+        .add_optional_service(
+            listener_type
+                .exposes(GrpcService::Sds)
+                .then(|| SecretDiscoveryServiceServer::new(EnvoySdsGrpc::new(state))),
+        );
     let result = server
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await;
@@ -400,8 +439,16 @@ mod tests {
     }
 
     async fn spawn_server(socket: PathBuf) -> oneshot::Sender<()> {
+        spawn_server_with_type(socket, ListenerType::Host).await
+    }
+
+    async fn spawn_server_with_type(
+        socket: PathBuf,
+        listener_type: ListenerType,
+    ) -> oneshot::Sender<()> {
         let (tx, rx) = oneshot::channel();
         let config = ServerConfig {
+            listener_type,
             socket_path: socket.to_string_lossy().into_owned(),
             socket_mode: DEFAULT_SOCKET_MODE,
             socket_group: None,
@@ -479,6 +526,7 @@ mod tests {
         let socket = socket_path("mode");
         let (tx, rx) = oneshot::channel();
         let config = ServerConfig {
+            listener_type: ListenerType::Host,
             socket_path: socket.to_string_lossy().into_owned(),
             socket_mode: 0o660,
             socket_group: None,
@@ -583,6 +631,38 @@ mod tests {
             .await
             .expect("typed status remains available");
         assert_eq!(status.protocol, 1);
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn container_listener_omits_admin_but_retains_workload_services() {
+        let socket = socket_path("container-surface");
+        let shutdown = spawn_server_with_type(socket.clone(), ListenerType::Container).await;
+        let channel = uds_channel(&socket).await;
+
+        let mut admin = AdminServiceClient::new(channel.clone());
+        let status = admin
+            .status(StatusRequest {
+                include_realms: false,
+            })
+            .await
+            .expect_err("Admin must be absent from a container listener");
+        assert_eq!(status.code(), Code::Unimplemented);
+
+        let mut invocation = InvocationServiceClient::new(channel.clone());
+        let status = invocation
+            .invoke(SealedRequest::default())
+            .await
+            .expect_err("invocation remains present but disabled by default");
+        assert_eq!(status.code(), Code::FailedPrecondition);
+
+        let mut spiffe = SpiffeWorkloadApiClient::new(channel);
+        let status = spiffe
+            .fetch_x509_bundles(X509BundlesRequest {})
+            .await
+            .expect_err("SPIFFE remains present and validates its header");
+        assert_eq!(status.code(), Code::InvalidArgument);
 
         let _ = shutdown.send(());
     }
