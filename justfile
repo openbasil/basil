@@ -179,6 +179,7 @@ test-go-live-interop:
     exec bwrap \
       --die-with-parent \
       --bind / / \
+      --dev-bind /dev /dev \
       --ro-bind "$go_client_dir" "$PWD/clients/go" \
       --chdir "$PWD" \
       "$PWD/clients/go/scripts/interop-agent.sh"
