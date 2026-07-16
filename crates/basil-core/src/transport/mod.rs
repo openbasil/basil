@@ -11,6 +11,7 @@
 #![allow(clippy::result_large_err)]
 
 pub mod grpc_server;
+pub mod listener;
 
 use prost::Message;
 use tonic::codegen::Bytes;
@@ -70,7 +71,6 @@ fn peer_from_extensions(extensions: &Extensions) -> PeerInfo {
     if let Some(peer) = extensions.get::<PeerInfo>() {
         return peer.clone();
     }
-
     extensions
         .get::<UdsConnectInfo>()
         .and_then(|info| info.peer_cred.as_ref())
