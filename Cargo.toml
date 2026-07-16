@@ -67,7 +67,7 @@ clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 crypto_secretbox = { version = "0.1.1", default-features = false, features = ["alloc", "salsa20"] }
 data-encoding = { version = "2", default-features = false, features = ["alloc"] }
-db-keystore = "0.4.3"
+db-keystore = "0.4.4"
 ed25519-dalek = { version = "2", default-features = false, features = ["zeroize"] }
 futures = "0.3"
 getrandom = { version = "0.4.3", default-features = false }
@@ -80,13 +80,13 @@ google-cloud-kms = { version = "=0.6.0", default-features = false, features = ["
 google-cloud-gax = "0.19.2"
 hex = "0.4"
 hkdf = { version = "0.12", default-features = false }
-hyper = { version = "1", default-features = false, features = ["http1", "server"] }
-hyper-util = { version = "0.1", default-features = false, features = ["http1", "server-auto", "service", "tokio"] }
+hyper = { version = "1.10.1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1.20", default-features = false, features = ["http1", "server-auto", "service", "tokio"] }
 # jsonwebtoken 10 requires selecting a crypto backend; `rust_crypto` uses the
 # pure-Rust RustCrypto stack (no C toolchain), matching this workspace. Without
 # it the crate cannot determine a provider and panics at sign/verify time.
 jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
-keyring-core = "1.0"
+keyring-core = "1.0.0"
 minicbor = { version = "2.2.2", default-features = false, features = ["alloc"] }
 ml-dsa = { version = "0.1.1", features = ["zeroize"] }
 ml-kem = { version = "0.3", features = ["getrandom", "zeroize"] }
