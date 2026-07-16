@@ -92,7 +92,9 @@ pub use configuration::{
 };
 pub use decision::{DecisionRecord, Outcome};
 pub use event::{BrokerEvent, BrokerEventKind, EventSource};
-pub use grpc_server::{DEFAULT_SOCKET_MODE, ServerConfig, run as run_grpc};
+pub use grpc_server::{
+    DEFAULT_SOCKET_MODE, ServerConfig, run as run_grpc, run_many as run_grpc_many,
+};
 pub use manager::{BackendManager, ManagerError};
 pub use peer::PeerInfo;
 pub use reconcile::{CheckReport, KeyCheck, KeyStatus, ReconcileError, ReconcileSummary};

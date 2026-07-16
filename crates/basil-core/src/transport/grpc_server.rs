@@ -6,8 +6,8 @@
 
 use std::future::Future;
 use std::io;
-use std::os::unix::fs::PermissionsExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 
 use basil_proto::broker::v1::admin_service_server::AdminServiceServer;
@@ -19,9 +19,10 @@ use basil_proto::broker::v1::secret_service_server::SecretServiceServer;
 use basil_proto::broker::v1::signing_service_server::SigningServiceServer;
 use basil_proto::envoy::service::secret::v3::secret_discovery_service_server::SecretDiscoveryServiceServer;
 use basil_proto::spiffe::spiffe_workload_api_server::SpiffeWorkloadApiServer;
-use tokio::net::UnixListener;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio_stream::wrappers::UnixListenerStream;
+use tokio::sync::broadcast;
+use tokio::task::JoinSet;
+use tokio_stream::{StreamExt as _, wrappers::UnixListenerStream};
 use tonic::transport::Server;
 use tracing::{info, warn};
 
@@ -30,13 +31,112 @@ use crate::sds::EnvoySdsGrpc;
 use crate::service::broker::InvocationRuntimeConfig;
 use crate::spiffe::SpiffeWorkloadGrpc;
 use crate::state::BrokerState;
+use crate::transport::connection::ConnectionRegistry;
+use crate::transport::listener::ListenerConfig;
+use crate::transport::listener_manager::{
+    PreparedListenerBatch, PublishedListener, QualifiedListener,
+};
 
 /// Default Unix socket mode: owner read/write only.
 pub const DEFAULT_SOCKET_MODE: u32 = 0o600;
 
+/// Maximum number of named Unix listeners accepted from one agent config.
+pub const MAX_LISTENERS: usize = 32;
+
+/// Closed listener types compiled into the broker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ListenerType {
+    /// Host and operator surface, including the Admin service.
+    Host,
+    /// Container workload surface, excluding the Admin service.
+    Container,
+}
+
+impl FromStr for ListenerType {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "host" => Ok(Self::Host),
+            "container" => Ok(Self::Container),
+            _ => Err("listener type must be `host` or `container`"),
+        }
+    }
+}
+
+/// Every gRPC service compiled into a Basil Unix listener.
+///
+/// Keep this enum exhaustive and update [`ListenerType::exposes`] whenever a
+/// service is added. The registry test prevents an existing service from being
+/// exposed accidentally while listener builders are assembled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrpcService {
+    /// Sealed invocation.
+    Invocation,
+    /// Signing and verification.
+    Signing,
+    /// Authenticated encryption.
+    Aead,
+    /// Secret storage and retrieval.
+    Secret,
+    /// Short-lived credential minting.
+    Minting,
+    /// NATS identity operations.
+    Nats,
+    /// Operator and control-plane operations.
+    Admin,
+    /// SPIFFE Workload API.
+    SpiffeWorkload,
+    /// Envoy Secret Discovery Service.
+    Sds,
+}
+
+/// Exhaustive list used by service-surface validation and diagnostics.
+pub const ALL_GRPC_SERVICES: [GrpcService; 9] = [
+    GrpcService::Invocation,
+    GrpcService::Signing,
+    GrpcService::Aead,
+    GrpcService::Secret,
+    GrpcService::Minting,
+    GrpcService::Nats,
+    GrpcService::Admin,
+    GrpcService::SpiffeWorkload,
+    GrpcService::Sds,
+];
+
+impl ListenerType {
+    /// Return whether this listener type exposes a compiled service.
+    #[must_use]
+    #[allow(clippy::match_same_arms)] // Repeated arms keep new services fail-closed at compile time.
+    pub const fn exposes(self, service: GrpcService) -> bool {
+        match (self, service) {
+            (Self::Host, _) => true,
+            (Self::Container, GrpcService::Admin) => false,
+            (
+                Self::Container,
+                GrpcService::Invocation
+                | GrpcService::Signing
+                | GrpcService::Aead
+                | GrpcService::Secret
+                | GrpcService::Minting
+                | GrpcService::Nats
+                | GrpcService::SpiffeWorkload
+                | GrpcService::Sds,
+            ) => true,
+        }
+    }
+}
+
 /// Runtime configuration for the gRPC listener.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
+    /// Stable name used for connection inventory and trusted diagnostics.
+    pub listener_name: String,
+    /// Closed compiled service surface exposed by this listener.
+    pub listener_type: ListenerType,
+    /// Broker-wide accepted-transport registry shared by every listener.
+    pub connections: ConnectionRegistry,
     /// Path to bind the listening Unix socket at.
     pub socket_path: String,
     /// File mode to apply to the listening Unix socket after bind.
@@ -55,77 +155,196 @@ pub async fn run(config: ServerConfig, state: Arc<BrokerState>) -> std::io::Resu
     serve_with_shutdown(config, state, shutdown_signal()).await
 }
 
+/// Publish and serve every configured listener as one startup transaction.
+///
+/// Every socket is qualified, bound privately, and published before any accept
+/// loop starts. If one preparation or publication fails, all sockets owned by
+/// the transaction are rolled back and no listener serves traffic.
+///
+/// # Errors
+///
+/// Returns a listener preparation, publication, serving, or task failure.
+pub async fn run_many(configs: Vec<ServerConfig>, state: Arc<BrokerState>) -> io::Result<()> {
+    serve_many_with_shutdown(configs, state, shutdown_signal()).await
+}
+
+fn listener_config(config: &ServerConfig) -> io::Result<ListenerConfig> {
+    ListenerConfig::validated(
+        config.listener_name.clone(),
+        config.listener_type,
+        PathBuf::from(&config.socket_path),
+        config.socket_mode,
+        config.socket_group.clone(),
+    )
+    .map_err(io::Error::other)
+}
+
 async fn serve_with_shutdown(
     config: ServerConfig,
     state: Arc<BrokerState>,
     shutdown: impl Future<Output = ()>,
 ) -> std::io::Result<()> {
-    let path = config.socket_path;
-    if Path::new(&path).exists() {
-        std::fs::remove_file(&path)?;
-        warn!(%path, "removed stale socket");
+    let listener_config = listener_config(&config)?;
+    QualifiedListener::validate(&listener_config).map_err(io::Error::other)?;
+    let published = PreparedListenerBatch::prepare([&listener_config])
+        .and_then(PreparedListenerBatch::publish)
+        .map_err(io::Error::other)?;
+    let Some(published) = published.into_listeners().pop() else {
+        return Err(io::Error::other("listener publication returned no socket"));
+    };
+    serve_published(config, state, published, shutdown).await
+}
+
+async fn serve_many_with_shutdown(
+    configs: Vec<ServerConfig>,
+    state: Arc<BrokerState>,
+    shutdown: impl Future<Output = ()>,
+) -> io::Result<()> {
+    if configs.is_empty() {
+        return Err(io::Error::other("no listeners configured"));
+    }
+    let listener_configs = configs
+        .iter()
+        .map(listener_config)
+        .collect::<io::Result<Vec<_>>>()?;
+    let published = PreparedListenerBatch::prepare(listener_configs.iter())
+        .and_then(PreparedListenerBatch::publish)
+        .map_err(io::Error::other)?
+        .into_listeners();
+    if published.len() != configs.len() {
+        return Err(io::Error::other(
+            "listener publication returned an incomplete batch",
+        ));
     }
 
-    let listener = bind_restricted(&path)?;
-    apply_socket_permissions(&path, config.socket_mode, config.socket_group.as_deref())?;
+    let (shutdown_tx, _) = broadcast::channel::<()>(1);
+    let mut servers = JoinSet::new();
+    for (config, published) in configs.into_iter().zip(published) {
+        let state = Arc::clone(&state);
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        servers.spawn(async move {
+            serve_published(config, state, published, async move {
+                let _ = shutdown_rx.recv().await;
+            })
+            .await
+        });
+    }
+
+    tokio::pin!(shutdown);
+    let mut first_error = tokio::select! {
+        () = &mut shutdown => None,
+        joined = servers.join_next() => joined.and_then(server_result_error),
+    };
+    let _ = shutdown_tx.send(());
+    while let Some(joined) = servers.join_next().await {
+        if first_error.is_none() {
+            first_error = server_result_error(joined);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+fn server_result_error(
+    result: Result<io::Result<()>, tokio::task::JoinError>,
+) -> Option<io::Error> {
+    match result {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(error),
+        Err(error) => Some(io::Error::other(format!("listener task failed: {error}"))),
+    }
+}
+
+async fn serve_published(
+    config: ServerConfig,
+    state: Arc<BrokerState>,
+    published: PublishedListener,
+    shutdown: impl Future<Output = ()>,
+) -> io::Result<()> {
+    let path = config.socket_path.clone();
+    let (listener, _socket_lease) = published.into_listener().map_err(io::Error::other)?;
 
     info!(
         %path,
+        listener_type = ?config.listener_type,
         mode = %format_socket_mode(config.socket_mode),
         group = ?config.socket_group,
         backend = state.backend_label(),
         "basil gRPC agent listening"
     );
-    let incoming = UnixListenerStream::new(listener);
+    let listener_name: Arc<str> = Arc::from(config.listener_name);
+    let listener_type = config.listener_type;
+    let connections = config.connections;
+    let incoming = UnixListenerStream::new(listener).filter_map(move |accepted| {
+        let listener_name = Arc::clone(&listener_name);
+        let connections = connections.clone();
+        match accepted {
+            Ok(stream) => match connections.register(stream, listener_name, listener_type) {
+                Ok(stream) => Some(Ok(stream)),
+                Err(error) => {
+                    warn!(%error, ?listener_type, "rejected accepted connection");
+                    None
+                }
+            },
+            Err(error) => Some(Err(error)),
+        }
+    });
     let broker = BrokerGrpc::new_with_invocation_config(state.clone(), config.invocation);
 
     let server = Server::builder()
-        .add_service(InvocationServiceServer::new(broker.clone()))
-        .add_service(SigningServiceServer::new(broker.clone()))
-        .add_service(AeadServiceServer::new(broker.clone()))
-        .add_service(SecretServiceServer::new(broker.clone()))
-        .add_service(MintingServiceServer::new(broker.clone()))
-        .add_service(NatsServiceServer::new(broker.clone()))
-        .add_service(AdminServiceServer::new(broker));
+        .add_optional_service(
+            listener_type
+                .exposes(GrpcService::Invocation)
+                .then(|| InvocationServiceServer::new(broker.clone())),
+        )
+        .add_optional_service(
+            listener_type
+                .exposes(GrpcService::Signing)
+                .then(|| SigningServiceServer::new(broker.clone())),
+        )
+        .add_optional_service(
+            listener_type
+                .exposes(GrpcService::Aead)
+                .then(|| AeadServiceServer::new(broker.clone())),
+        )
+        .add_optional_service(
+            listener_type
+                .exposes(GrpcService::Secret)
+                .then(|| SecretServiceServer::new(broker.clone())),
+        )
+        .add_optional_service(
+            listener_type
+                .exposes(GrpcService::Minting)
+                .then(|| MintingServiceServer::new(broker.clone())),
+        )
+        .add_optional_service(
+            listener_type
+                .exposes(GrpcService::Nats)
+                .then(|| NatsServiceServer::new(broker.clone())),
+        )
+        .add_optional_service(
+            listener_type
+                .exposes(GrpcService::Admin)
+                .then(|| AdminServiceServer::new(broker)),
+        );
     let server = server
-        .add_service(SpiffeWorkloadApiServer::new(SpiffeWorkloadGrpc::new(
-            state.clone(),
-        )))
-        .add_service(SecretDiscoveryServiceServer::new(EnvoySdsGrpc::new(state)));
+        .add_optional_service(
+            listener_type
+                .exposes(GrpcService::SpiffeWorkload)
+                .then(|| SpiffeWorkloadApiServer::new(SpiffeWorkloadGrpc::new(state.clone()))),
+        )
+        .add_optional_service(
+            listener_type
+                .exposes(GrpcService::Sds)
+                .then(|| SecretDiscoveryServiceServer::new(EnvoySdsGrpc::new(state))),
+        );
     let result = server
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await;
 
-    if let Err(e) = std::fs::remove_file(&path)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        warn!(?e, %path, "could not remove socket on shutdown");
-    }
-
     result.map_err(std::io::Error::other)
 }
 
-/// Bind the listening Unix socket with the process umask tightened to `0o177`,
-/// so the socket node is created owner-only no matter how loose the inherited
-/// umask is. The listen backlog is live from `bind`, so the mode must be
-/// restrictive *at creation*; the later [`apply_socket_permissions`] can only
-/// widen it to the configured mode/group (never leaves a permissive window).
-fn bind_restricted(path: &str) -> io::Result<UnixListener> {
-    let inherited = rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o177));
-    let listener = UnixListener::bind(path);
-    rustix::process::umask(inherited);
-    listener
-}
-
-fn apply_socket_permissions(path: &str, mode: u32, group: Option<&str>) -> io::Result<()> {
-    if let Some(group) = group {
-        let gid = resolve_group(group)?;
-        std::os::unix::fs::chown(path, None, Some(gid))?;
-    }
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-}
-
-fn resolve_group(group: &str) -> io::Result<u32> {
+pub(crate) fn resolve_group(group: &str) -> io::Result<u32> {
     if let Ok(gid) = group.parse::<u32>() {
         return Ok(gid);
     }
@@ -197,6 +416,7 @@ async fn shutdown_signal() {
 #[allow(clippy::significant_drop_tightening)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Duration;
@@ -225,6 +445,26 @@ mod tests {
     use crate::backend::{Backend, BackendError, NewKey};
     use crate::catalog::load;
     use crate::manager::BackendManager;
+
+    #[test]
+    fn listener_service_registry_is_closed_and_admin_is_host_only() {
+        for service in ALL_GRPC_SERVICES {
+            assert!(ListenerType::Host.exposes(service));
+            assert_eq!(
+                ListenerType::Container.exposes(service),
+                service != GrpcService::Admin
+            );
+        }
+    }
+
+    #[test]
+    fn listener_type_parser_rejects_unknown_and_ambiguous_values() {
+        assert_eq!("host".parse(), Ok(ListenerType::Host));
+        assert_eq!("container".parse(), Ok(ListenerType::Container));
+        assert!("Host".parse::<ListenerType>().is_err());
+        assert!("workload".parse::<ListenerType>().is_err());
+        assert!("".parse::<ListenerType>().is_err());
+    }
 
     struct DummyBackend;
 
@@ -292,13 +532,20 @@ mod tests {
     }
 
     async fn spawn_server(socket: PathBuf) -> oneshot::Sender<()> {
+        spawn_server_with_type(socket, ListenerType::Host).await
+    }
+
+    async fn spawn_server_with_type(
+        socket: PathBuf,
+        listener_type: ListenerType,
+    ) -> oneshot::Sender<()> {
         let (tx, rx) = oneshot::channel();
-        let config = ServerConfig {
-            socket_path: socket.to_string_lossy().into_owned(),
-            socket_mode: DEFAULT_SOCKET_MODE,
-            socket_group: None,
-            invocation: InvocationRuntimeConfig::default(),
-        };
+        let config = test_server_config(
+            "test",
+            &socket,
+            listener_type,
+            ConnectionRegistry::with_defaults(),
+        );
         tokio::spawn(async move {
             serve_with_shutdown(config, state(), async {
                 let _ = rx.await;
@@ -308,6 +555,23 @@ mod tests {
         });
         wait_for_socket(&socket).await;
         tx
+    }
+
+    fn test_server_config(
+        name: &str,
+        socket: &Path,
+        listener_type: ListenerType,
+        connections: ConnectionRegistry,
+    ) -> ServerConfig {
+        ServerConfig {
+            listener_name: name.to_string(),
+            listener_type,
+            connections,
+            socket_path: socket.to_string_lossy().into_owned(),
+            socket_mode: DEFAULT_SOCKET_MODE,
+            socket_group: None,
+            invocation: InvocationRuntimeConfig::default(),
+        }
     }
 
     async fn wait_for_socket(socket: &Path) {
@@ -325,27 +589,65 @@ mod tests {
         // on Linux. macOS's std::env::temp_dir() (/var/folders/...) is long enough
         // that "basil-{name}-{uuid}.sock" overflowed the macOS limit; anchor at the
         // short, always-writable /tmp so the full path stays well under it.
-        PathBuf::from("/tmp").join(format!("basil-{name}-{}.sock", uuid::Uuid::new_v4()))
+        let directory = PathBuf::from("/tmp").join(format!("b-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).expect("trusted socket parent");
+        directory.join(format!("{name}.sock"))
     }
 
-    #[tokio::test]
-    async fn socket_is_owner_only_at_bind_even_under_a_loose_umask() {
-        // Loosen the process umask: without the tightened bind the socket node
-        // would be group/world-accessible for the instant before the explicit
-        // chmod, with the listen backlog already live.
-        let inherited = rustix::process::umask(rustix::fs::Mode::empty());
-        let socket = socket_path("umask");
-        let listener = bind_restricted(&socket.to_string_lossy()).expect("binds");
-        rustix::process::umask(inherited);
+    #[test]
+    fn concurrent_socket_binds_publish_privately_without_clobbering() {
+        const BIND_COUNT: usize = 16;
 
-        let mode = std::fs::metadata(&socket)
-            .expect("socket metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o600, "socket must be owner-only at bind");
-        drop(listener);
-        let _ = std::fs::remove_file(&socket);
+        let barrier = Arc::new(std::sync::Barrier::new(BIND_COUNT));
+        let results = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..BIND_COUNT {
+                let barrier = Arc::clone(&barrier);
+                handles.push(scope.spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_io()
+                        .build()
+                        .expect("test runtime");
+                    let _runtime_guard = runtime.enter();
+                    let socket = socket_path("umask-race");
+                    barrier.wait();
+                    let config = ListenerConfig::validated(
+                        "host".to_string(),
+                        ListenerType::Host,
+                        socket.clone(),
+                        DEFAULT_SOCKET_MODE,
+                        None,
+                    )
+                    .map_err(io::Error::other)?;
+                    let published = PreparedListenerBatch::prepare([&config])
+                        .and_then(PreparedListenerBatch::publish)
+                        .map_err(io::Error::other)?;
+                    let published = published.into_listeners().pop().ok_or_else(|| {
+                        io::Error::other("listener publication returned no socket")
+                    })?;
+                    let (listener, lease) = published.into_listener().map_err(io::Error::other)?;
+                    Ok::<_, io::Error>((socket, listener, lease))
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("bind thread does not panic"))
+                .collect::<Vec<_>>()
+        });
+        for result in results {
+            let (socket, listener, lease) = result.expect("concurrent bind succeeds");
+            let mode = std::fs::metadata(&socket)
+                .expect("socket metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "socket must be owner-only at publication");
+            drop(listener);
+            drop(lease);
+            assert!(!socket.exists());
+            std::fs::remove_dir(socket.parent().expect("socket parent"))
+                .expect("remove socket parent");
+        }
     }
 
     #[test]
@@ -371,6 +673,9 @@ mod tests {
         let socket = socket_path("mode");
         let (tx, rx) = oneshot::channel();
         let config = ServerConfig {
+            listener_name: "test".to_string(),
+            listener_type: ListenerType::Host,
+            connections: ConnectionRegistry::with_defaults(),
             socket_path: socket.to_string_lossy().into_owned(),
             socket_mode: 0o660,
             socket_group: None,
@@ -478,6 +783,129 @@ mod tests {
 
         let _ = shutdown.send(());
     }
+
+    #[tokio::test]
+    async fn container_listener_omits_admin_but_retains_workload_services() {
+        let socket = socket_path("container-surface");
+        let shutdown = spawn_server_with_type(socket.clone(), ListenerType::Container).await;
+        let channel = uds_channel(&socket).await;
+
+        let mut admin = AdminServiceClient::new(channel.clone());
+        let status = admin
+            .status(StatusRequest {
+                include_realms: false,
+            })
+            .await
+            .expect_err("Admin must be absent from a container listener");
+        assert_eq!(status.code(), Code::Unimplemented);
+
+        let mut invocation = InvocationServiceClient::new(channel.clone());
+        let status = invocation
+            .invoke(SealedRequest::default())
+            .await
+            .expect_err("invocation remains present but disabled by default");
+        assert_eq!(status.code(), Code::FailedPrecondition);
+
+        let mut spiffe = SpiffeWorkloadApiClient::new(channel);
+        let status = spiffe
+            .fetch_x509_bundles(X509BundlesRequest {})
+            .await
+            .expect_err("SPIFFE remains present and validates its header");
+        assert_eq!(status.code(), Code::InvalidArgument);
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn configured_host_and_container_listeners_serve_together() {
+        let host_socket = socket_path("multi-host");
+        let container_socket = socket_path("multi-container");
+        let connections = ConnectionRegistry::with_defaults();
+        let configs = vec![
+            test_server_config(
+                "control",
+                &host_socket,
+                ListenerType::Host,
+                connections.clone(),
+            ),
+            test_server_config(
+                "workloads",
+                &container_socket,
+                ListenerType::Container,
+                connections,
+            ),
+        ];
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            serve_many_with_shutdown(configs, state(), async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+        });
+        wait_for_socket(&host_socket).await;
+        wait_for_socket(&container_socket).await;
+
+        let mut host_admin = AdminServiceClient::new(uds_channel(&host_socket).await);
+        let status = host_admin
+            .status(StatusRequest {
+                include_realms: false,
+            })
+            .await
+            .expect("host listener exposes Admin")
+            .into_inner();
+        assert_eq!(status.backend, "dummy");
+
+        let mut container_admin = AdminServiceClient::new(uds_channel(&container_socket).await);
+        let status = container_admin
+            .status(StatusRequest {
+                include_realms: false,
+            })
+            .await
+            .expect_err("container listener omits Admin");
+        assert_eq!(status.code(), Code::Unimplemented);
+
+        let _ = shutdown_tx.send(());
+        server
+            .await
+            .expect("multi-listener task does not panic")
+            .expect("multi-listener server exits cleanly");
+        assert!(!host_socket.exists());
+        assert!(!container_socket.exists());
+    }
+
+    #[tokio::test]
+    async fn multi_listener_publication_rolls_back_the_complete_batch() {
+        let first_socket = socket_path("rollback-first");
+        let occupied_socket = socket_path("rollback-occupied");
+        std::fs::write(&occupied_socket, "occupied").expect("occupy second listener path");
+        let connections = ConnectionRegistry::with_defaults();
+        let configs = vec![
+            test_server_config(
+                "first",
+                &first_socket,
+                ListenerType::Host,
+                connections.clone(),
+            ),
+            test_server_config(
+                "occupied",
+                &occupied_socket,
+                ListenerType::Container,
+                connections,
+            ),
+        ];
+
+        let error = serve_many_with_shutdown(configs, state(), std::future::pending())
+            .await
+            .expect_err("occupied path rejects the startup transaction");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(!first_socket.exists());
+        assert_eq!(
+            std::fs::read_to_string(&occupied_socket).expect("foreign path remains"),
+            "occupied"
+        );
+        std::fs::remove_file(occupied_socket).expect("remove occupied fixture");
+    }
+
     #[tokio::test]
     async fn broker_and_spiffe_services_share_one_unix_socket() {
         let socket = socket_path("broker-spiffe");

@@ -10,9 +10,13 @@
 
 #![allow(clippy::result_large_err)]
 
+pub mod connection;
 pub mod grpc_server;
+pub mod listener;
+pub mod listener_manager;
 
 use prost::Message;
+use rand::Rng as _;
 use tonic::codegen::Bytes;
 use tonic::codegen::http::Extensions;
 use tonic::transport::server::UdsConnectInfo;
@@ -20,9 +24,20 @@ use tonic::{Code, Request, Status};
 
 use crate::actor::{AuthenticatedActor, SubjectResolutionError};
 use crate::catalog::policy::Op;
+use crate::catalog::{AuthorizationDomain, EvidenceState};
 use crate::decision::{DecisionRecord, op_token};
 use crate::peer::PeerInfo;
 use crate::state::{BrokerState, Generation};
+use connection::ListenerConnectInfo;
+
+// Wire-exact private encoding of the standard `google.rpc.RetryInfo` message.
+// Keeping this local avoids expanding Basil's generated protocol surface; the
+// standard type URL lets clients decode it with their Google RPC library.
+#[derive(Clone, PartialEq, Message)]
+struct RetryInfoDetail {
+    #[prost(message, optional, tag = "1")]
+    retry_delay: Option<prost_types::Duration>,
+}
 
 /// Resolve the attested peer from a tonic request.
 #[must_use]
@@ -70,7 +85,9 @@ fn peer_from_extensions(extensions: &Extensions) -> PeerInfo {
     if let Some(peer) = extensions.get::<PeerInfo>() {
         return peer.clone();
     }
-
+    if let Some(info) = extensions.get::<ListenerConnectInfo>() {
+        return info.peer().clone();
+    }
     extensions
         .get::<UdsConnectInfo>()
         .and_then(|info| info.peer_cred.as_ref())
@@ -91,6 +108,7 @@ fn authorize_extensions_in_generation(
         record_resolution_error(state, generation.id(), &peer, op, key, &err);
         resolution_status(op, &err)
     })?;
+    enforce_listener_domain_extensions(state, generation.id(), extensions, &actor, op, key)?;
 
     let decision = generation.pdp().decide(&actor, op, key);
     state.record_decision(&DecisionRecord::from_actor_decision(
@@ -110,6 +128,72 @@ fn authorize_extensions_in_generation(
     }
 
     Ok(actor)
+}
+
+/// Enforce typed-listener domain admission for a previously resolved actor.
+///
+/// Services with custom authorization flows use this before their first policy
+/// decision.
+pub(crate) fn enforce_listener_domain<T>(
+    state: &BrokerState,
+    generation: u64,
+    request: &Request<T>,
+    actor: &AuthenticatedActor,
+    op: Op,
+    key: &str,
+) -> Result<(), Status> {
+    enforce_listener_domain_extensions(state, generation, request.extensions(), actor, op, key)
+}
+
+fn enforce_listener_domain_extensions(
+    state: &BrokerState,
+    generation: u64,
+    extensions: &Extensions,
+    actor: &AuthenticatedActor,
+    op: Op,
+    key: &str,
+) -> Result<(), Status> {
+    let Some(listener) = extensions.get::<ListenerConnectInfo>() else {
+        state.record_decision(&DecisionRecord::from_actor_evidence_denial(
+            generation,
+            actor,
+            op,
+            key,
+            EvidenceState::Unavailable,
+            "listener_context_unavailable",
+        ));
+        return Err(broker_status(
+            Code::Unavailable,
+            "LISTENER_CONTEXT_UNAVAILABLE",
+            op_token(op),
+            "listener context unavailable",
+        ));
+    };
+    let admitted = match listener.listener_type() {
+        grpc_server::ListenerType::Host => matches!(
+            actor.domain,
+            AuthorizationDomain::HostProcess | AuthorizationDomain::SystemdUnit
+        ),
+        grpc_server::ListenerType::Container => actor.domain == AuthorizationDomain::Container,
+    };
+    if admitted {
+        return Ok(());
+    }
+
+    state.record_decision(&DecisionRecord::from_actor_evidence_denial(
+        generation,
+        actor,
+        op,
+        key,
+        EvidenceState::NoMatch,
+        "listener_domain_mismatch",
+    ));
+    Err(broker_status(
+        Code::PermissionDenied,
+        "LISTENER_DOMAIN_MISMATCH",
+        op_token(op),
+        "listener does not admit resolved workload domain",
+    ))
 }
 
 fn record_resolution_error(
@@ -141,12 +225,9 @@ fn resolution_status(op: Op, err: &SubjectResolutionError) -> Status {
             "missing peer credentials",
         ),
         SubjectResolutionError::DomainUnavailable
-        | SubjectResolutionError::EvidenceUnavailable { .. } => broker_status(
-            Code::Unavailable,
-            "ATTESTATION_UNAVAILABLE",
-            op_token(op),
-            "attestation unavailable",
-        ),
+        | SubjectResolutionError::EvidenceUnavailable { .. } => {
+            attestation_unavailable_status(op_token(op))
+        }
         SubjectResolutionError::NoSubject { .. }
         | SubjectResolutionError::AmbiguousSubject { .. } => broker_status(
             Code::PermissionDenied,
@@ -165,6 +246,40 @@ pub fn broker_status(
     op: &'static str,
     message: impl Into<String>,
 ) -> Status {
+    broker_status_with_details(code, reason, op, message, Vec::new())
+}
+
+/// Build a transient attestation status with bounded, server-jittered retry
+/// guidance.
+#[must_use]
+pub fn attestation_unavailable_status(op: &'static str) -> Status {
+    let retry_millis = rand::thread_rng().gen_range(100_i32..=500_i32);
+    let retry = RetryInfoDetail {
+        retry_delay: Some(prost_types::Duration {
+            seconds: 0,
+            nanos: retry_millis * 1_000_000,
+        }),
+    };
+    let detail = prost_types::Any {
+        type_url: "type.googleapis.com/google.rpc.RetryInfo".to_string(),
+        value: retry.encode_to_vec(),
+    };
+    broker_status_with_details(
+        Code::Unavailable,
+        "ATTESTATION_UNAVAILABLE",
+        op,
+        "attestation unavailable",
+        vec![detail],
+    )
+}
+
+fn broker_status_with_details(
+    code: Code,
+    reason: &'static str,
+    op: &'static str,
+    message: impl Into<String>,
+    mut extra_details: Vec<prost_types::Any>,
+) -> Status {
     let info = basil_proto::broker::v1::BrokerErrorInfo {
         reason: reason.to_string(),
         op: op.to_string(),
@@ -173,10 +288,12 @@ pub fn broker_status(
         type_url: "type.googleapis.com/basil.broker.v1.BrokerErrorInfo".to_string(),
         value: info.encode_to_vec(),
     };
+    let mut details = vec![detail];
+    details.append(&mut extra_details);
     let status = basil_proto::google::rpc::Status {
         code: code as i32,
         message: message.into(),
-        details: vec![detail],
+        details,
     };
     Status::with_details(
         code,
@@ -201,6 +318,12 @@ mod tests {
     use crate::backend::{Backend, BackendError, NewKey};
     use crate::catalog::load;
     use crate::manager::BackendManager;
+
+    #[derive(Clone, PartialEq, Message)]
+    struct StandardRetryInfo {
+        #[prost(message, optional, tag = "1")]
+        retry_delay: Option<prost_types::Duration>,
+    }
 
     const CATALOG: &str = r#"{
       "schema": "catalog",
@@ -287,10 +410,31 @@ mod tests {
 
     fn request_with_uid(uid: u32) -> Request<()> {
         let mut request = Request::new(());
-        request.extensions_mut().insert(PeerInfo {
-            uid: Some(uid),
-            ..PeerInfo::default()
-        });
+        request
+            .extensions_mut()
+            .insert(ListenerConnectInfo::for_test(
+                "host",
+                grpc_server::ListenerType::Host,
+                PeerInfo {
+                    uid: Some(uid),
+                    ..PeerInfo::default()
+                },
+            ));
+        request
+    }
+
+    fn request_on_listener(uid: u32, listener_type: grpc_server::ListenerType) -> Request<()> {
+        let mut request = Request::new(());
+        request
+            .extensions_mut()
+            .insert(ListenerConnectInfo::for_test(
+                "test",
+                listener_type,
+                PeerInfo {
+                    uid: Some(uid),
+                    ..PeerInfo::default()
+                },
+            ));
         request
     }
 
@@ -309,6 +453,19 @@ mod tests {
         let request = request_with_uid(7);
         let status = authorize(&state, &request, Op::Get, "app.secret").expect_err("denied");
         assert_eq!(status.code(), Code::PermissionDenied);
+    }
+
+    #[test]
+    fn container_listener_rejects_resolved_host_domain_before_policy() {
+        let state = state();
+        let request = request_on_listener(42, grpc_server::ListenerType::Container);
+        let status = authorize(&state, &request, Op::Get, "app.secret")
+            .expect_err("host domain must not enter container-listener policy");
+        assert_eq!(status.code(), Code::PermissionDenied);
+        let rpc = RpcStatus::decode(status.details()).expect("details decode");
+        let detail = rpc.details.first().expect("detail present");
+        let info = BrokerErrorInfo::decode(detail.value.as_slice()).expect("info decodes");
+        assert_eq!(info.reason, "LISTENER_DOMAIN_MISMATCH");
     }
 
     #[test]
@@ -340,6 +497,23 @@ mod tests {
     }
 
     #[test]
+    fn authorize_fails_closed_when_listener_context_is_missing() {
+        let state = state();
+        let mut request = Request::new(());
+        request.extensions_mut().insert(PeerInfo {
+            uid: Some(42),
+            ..PeerInfo::default()
+        });
+        let status = authorize(&state, &request, Op::Get, "app.secret")
+            .expect_err("missing listener context must fail closed");
+        assert_eq!(status.code(), Code::Unavailable);
+        let rpc = RpcStatus::decode(status.details()).expect("details decode");
+        let detail = rpc.details.first().expect("detail present");
+        let info = BrokerErrorInfo::decode(detail.value.as_slice()).expect("info decodes");
+        assert_eq!(info.reason, "LISTENER_CONTEXT_UNAVAILABLE");
+    }
+
+    #[test]
     fn peer_from_request_prefers_inserted_peerinfo() {
         let request = request_with_uid(99);
         assert_eq!(peer_from_request(&request).uid, Some(99));
@@ -359,5 +533,22 @@ mod tests {
         let info = BrokerErrorInfo::decode(detail.value.as_slice()).expect("info decodes");
         assert_eq!(info.reason, "INVALID_REQUEST");
         assert_eq!(info.op, "sign");
+    }
+
+    #[test]
+    fn attestation_unavailable_carries_bounded_retry_info() {
+        let status = attestation_unavailable_status("get");
+        assert_eq!(status.code(), Code::Unavailable);
+        let rpc = RpcStatus::decode(status.details()).expect("details decode");
+        assert_eq!(rpc.details.len(), 2);
+        let info_detail = rpc.details.first().expect("error info");
+        let info = BrokerErrorInfo::decode(info_detail.value.as_slice()).expect("info decodes");
+        assert_eq!(info.reason, "ATTESTATION_UNAVAILABLE");
+        let retry =
+            StandardRetryInfo::decode(rpc.details.get(1).expect("retry detail").value.as_slice())
+                .expect("standard retry info wire shape decodes");
+        let delay = retry.retry_delay.expect("retry delay");
+        assert_eq!(delay.seconds, 0);
+        assert!((100_000_000..=500_000_000).contains(&delay.nanos));
     }
 }

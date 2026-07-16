@@ -35,7 +35,7 @@ use crate::{
     DEFAULT_ROTATION_GRACE_VERSIONS, DEFAULT_SOCKET_MODE, DEFAULT_SVID_TTL_SECS,
     JwtRevocationStore, ReloadActor, ReloadInputs, ServerConfig, SpiffeConfig, SpiffeVaultBackend,
     VaultBackend, enforce_capabilities, load_documents_with_overrides,
-    load_documents_with_overrides_and_context, reload_generation, run_grpc,
+    load_documents_with_overrides_and_context, reload_generation, run_grpc_many,
 };
 use crate::{bundle_cli, doctor, init, unlock};
 use anyhow::{Context, Result, bail};
@@ -608,6 +608,7 @@ pub(crate) struct AgentConfigFile {
     pub(crate) socket: Option<String>,
     pub(crate) socket_mode: Option<SocketMode>,
     pub(crate) socket_group: Option<String>,
+    pub(crate) listeners: BTreeMap<String, ListenerConfigFile>,
     pub(crate) vault_addr: Option<String>,
     pub(crate) transit_mount: Option<String>,
     pub(crate) jwt_auth_mount: Option<String>,
@@ -656,6 +657,7 @@ impl Default for AgentConfigFile {
             socket: None,
             socket_mode: None,
             socket_group: None,
+            listeners: BTreeMap::new(),
             vault_addr: None,
             transit_mount: None,
             jwt_auth_mount: None,
@@ -686,6 +688,16 @@ impl Default for AgentConfigFile {
             oci: OciConfigFile::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub(crate) struct ListenerConfigFile {
+    #[serde(rename = "type")]
+    listener_type: crate::transport::grpc_server::ListenerType,
+    path: PathBuf,
+    mode: Option<SocketMode>,
+    group: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1088,9 +1100,7 @@ struct SetupArgs {
 
 #[derive(Debug, Clone)]
 struct RunConfig {
-    socket: Option<String>,
-    socket_mode: u32,
-    socket_group: Option<String>,
+    listeners: crate::transport::listener::ListenerConfigSet,
     max_encrypt_size: usize,
     max_payload_size: usize,
     grace_versions: u32,
@@ -1123,10 +1133,9 @@ fn load_run_config(overrides: &ConfigOverrides) -> Result<RunConfig> {
     let oci_verifier = resolve_oci_config(&file.oci, None)?;
     let oci_cache = resolve_oci_cache(&file.oci)?;
     let oci_denied_subjects = resolve_oci_denylist(&file.oci)?;
+    let listeners = resolve_listener_configs(&file)?;
     Ok(RunConfig {
-        socket: file.socket,
-        socket_mode: file.socket_mode.map_or(DEFAULT_SOCKET_MODE, |mode| mode.0),
-        socket_group: file.socket_group,
+        listeners,
         max_encrypt_size: file.max_encrypt_size.unwrap_or(DEFAULT_MAX_ENCRYPT_SIZE),
         max_payload_size: file.max_payload_size.unwrap_or(DEFAULT_MAX_PAYLOAD_SIZE),
         grace_versions: file
@@ -1144,6 +1153,45 @@ fn load_run_config(overrides: &ConfigOverrides) -> Result<RunConfig> {
         jwks,
         setup,
     })
+}
+
+fn resolve_listener_configs(
+    file: &AgentConfigFile,
+) -> Result<crate::transport::listener::ListenerConfigSet> {
+    let named = file
+        .listeners
+        .iter()
+        .map(|(name, listener)| {
+            (
+                name.clone(),
+                crate::transport::listener::ListenerConfigInput {
+                    listener_type: listener.listener_type,
+                    path: listener.path.clone(),
+                    mode: listener.mode.map(|mode| mode.0),
+                    group: listener.group.clone(),
+                },
+            )
+        })
+        .collect();
+    crate::transport::listener::ListenerConfigSet::resolve(
+        named,
+        crate::transport::listener::LegacyListenerConfig {
+            path: file.socket.as_ref().map(PathBuf::from),
+            mode: file.socket_mode.map(|mode| mode.0),
+            group: file.socket_group.clone(),
+        },
+    )
+    .map_err(anyhow::Error::from)
+}
+
+pub(crate) fn parse_reload_listener_config(
+    value: &toml::Value,
+) -> Result<crate::transport::listener::ListenerConfigSet> {
+    let file = value
+        .clone()
+        .try_into::<AgentConfigFile>()
+        .context("parsing listener configuration")?;
+    resolve_listener_configs(&file)
 }
 
 fn resolve_oci_denylist(
@@ -2191,7 +2239,9 @@ async fn run_daemon(args: RunArgs, version: &'static str) -> Result<()> {
             .with_reload_inputs(ReloadInputs {
                 config_path: run_config.setup.config_path.clone(),
                 overrides: run_config.setup.startup_overrides.clone(),
-            });
+            })
+            .with_listener_configs(run_config.listeners.clone());
+    let server_configs = listener_server_configs(&run_config, state.connections());
     state = attach_oci_runtime(
         state,
         run_config.oci_verifier,
@@ -2217,16 +2267,6 @@ async fn run_daemon(args: RunArgs, version: &'static str) -> Result<()> {
     let state = Arc::new(state);
     spawn_sighup_handler(Arc::clone(&state), audit_reopen);
     spawn_retention_sweep(Arc::clone(&state), run_config.retention_sweep_secs);
-
-    let socket_path = run_config
-        .socket
-        .unwrap_or_else(|| crate::DEFAULT_SOCKET_PATH.to_string());
-    let server_config = ServerConfig {
-        socket_path,
-        socket_mode: run_config.socket_mode,
-        socket_group: run_config.socket_group,
-        invocation: run_config.invocation,
-    };
 
     // Opt-in JWKS HTTP surface (basil-uce.1). When `[jwks] enable` is false (the
     // default) NO listener is bound: the broker stays gRPC-over-unix-socket only.
@@ -2255,7 +2295,7 @@ async fn run_daemon(args: RunArgs, version: &'static str) -> Result<()> {
         (tx, handle)
     });
 
-    let grpc_result = run_grpc(server_config, state).await;
+    let grpc_result = run_grpc_many(server_configs, state).await;
 
     #[cfg(feature = "http")]
     if let Some((tx, handle)) = jwks_shutdown {
@@ -2269,6 +2309,25 @@ async fn run_daemon(args: RunArgs, version: &'static str) -> Result<()> {
 
     grpc_result?;
     Ok(())
+}
+
+fn listener_server_configs(
+    run_config: &RunConfig,
+    connections: &crate::transport::connection::ConnectionRegistry,
+) -> Vec<ServerConfig> {
+    run_config
+        .listeners
+        .iter()
+        .map(|listener| ServerConfig {
+            listener_name: listener.name().into(),
+            listener_type: listener.listener_type(),
+            connections: connections.clone(),
+            socket_path: listener.path().to_string_lossy().into_owned(),
+            socket_mode: listener.mode(),
+            socket_group: listener.group().map(str::to_string),
+            invocation: run_config.invocation.clone(),
+        })
+        .collect()
 }
 
 fn attach_oci_runtime(
@@ -3505,7 +3564,14 @@ strict-bundle-perms = true
         assert_eq!(loaded.setup.catalog, PathBuf::from("/cfg/catalog.json"));
         assert_eq!(loaded.setup.policy, PathBuf::from("/cfg/policy.json"));
         assert_eq!(loaded.setup.bundle, PathBuf::from("/cfg/bundle.sealed"));
-        assert_eq!(loaded.socket.as_deref(), Some("/run/basil.sock"));
+        assert_eq!(
+            loaded
+                .listeners
+                .get("host")
+                .expect("legacy host listener")
+                .path(),
+            Path::new("/run/basil.sock")
+        );
         assert_eq!(loaded.setup.vault_addr, "http://vault.internal:8200");
         assert_eq!(loaded.setup.transit_mount, "basil-transit");
         assert_eq!(loaded.setup.jwt_auth_mount, "jwt-basil");
@@ -3592,8 +3658,9 @@ socket-group = "basil-edge"
 
         let loaded = load_run_config(&args).expect("load run config");
 
-        assert_eq!(loaded.socket_mode, 0o660);
-        assert_eq!(loaded.socket_group.as_deref(), Some("basil-edge"));
+        let host = loaded.listeners.get("host").expect("legacy host listener");
+        assert_eq!(host.mode(), 0o660);
+        assert_eq!(host.group(), Some("basil-edge"));
 
         std::fs::remove_file(config).expect("remove temp config");
     }
@@ -3614,8 +3681,9 @@ bundle = "/cfg/bundle.sealed"
 
         let loaded = load_run_config(&args).expect("load run config");
 
-        assert_eq!(loaded.socket_mode, DEFAULT_SOCKET_MODE);
-        assert!(loaded.socket_group.is_none());
+        let host = loaded.listeners.get("host").expect("legacy host listener");
+        assert_eq!(host.mode(), DEFAULT_SOCKET_MODE);
+        assert!(host.group().is_none());
 
         std::fs::remove_file(config).expect("remove temp config");
     }
@@ -4412,7 +4480,14 @@ vault-addr = "http://cfg-vault:8200"
         assert_eq!(loaded.setup.catalog, PathBuf::from("/cli/catalog.json"));
         assert_eq!(loaded.setup.policy, PathBuf::from("/cli/policy.json"));
         assert_eq!(loaded.setup.bundle, PathBuf::from("/cli/bundle.sealed"));
-        assert_eq!(loaded.socket.as_deref(), Some("/cli/basil.sock"));
+        assert_eq!(
+            loaded
+                .listeners
+                .get("host")
+                .expect("legacy host listener")
+                .path(),
+            Path::new("/cli/basil.sock")
+        );
         assert_eq!(loaded.setup.vault_addr, "http://cli-vault:8200");
 
         std::fs::remove_file(config).expect("remove temp config");

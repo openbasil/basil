@@ -119,6 +119,14 @@ pub enum ReloadError {
     #[error("validating reloaded OCI verification inputs: {0}")]
     OciConfiguration(String),
 
+    /// Typed listener inputs failed closed validation.
+    #[error("validating reloaded listener inputs: {0}")]
+    ListenerConfiguration(String),
+
+    /// Listener transition could not be committed without disruption.
+    #[error("validating listener transition: {0}")]
+    ListenerTransition(String),
+
     /// The candidate changed a **restart-only** routing dimension (a backend was
     /// added/removed/repathed, or a key's `backend`/`path`/`engine`/`key_type`/
     /// `public_path` changed). Such an edit needs a re-unlock and is rejected on
@@ -140,9 +148,11 @@ impl ReloadError {
         match self {
             Self::ReadInput { .. } => "configuration_read_failed",
             Self::TornSnapshot { .. } => "inputs_changed_during_read",
-            Self::Validate(_) | Self::Configuration(_) | Self::OciConfiguration(_) => {
-                "validation_failed"
-            }
+            Self::Validate(_)
+            | Self::Configuration(_)
+            | Self::OciConfiguration(_)
+            | Self::ListenerConfiguration(_)
+            | Self::ListenerTransition(_) => "validation_failed",
             Self::RoutingShapeChanged(_) => "routing_shape_changed",
             Self::NoInputs => "no_reload_inputs",
         }
@@ -384,11 +394,21 @@ fn read_reload_inputs_with_observer_and_context(
 ) -> Result<CorpusDocuments, ReloadError> {
     let mut traces = Vec::new();
     let result = read_reload_inputs_with_observer_and_collector(inputs, observer, &mut traces)
-        .map(|(documents, _, _)| documents);
+        .map(|(documents, _, _, _)| documents);
     for trace in &traces {
         emit_configuration_source_trace(trace, trace_context, result.is_ok());
     }
     result
+}
+
+#[cfg(test)]
+fn read_reload_inputs_with_bootstrap_observer(
+    inputs: &ReloadInputs,
+    observer: impl FnOnce(),
+) -> Result<CorpusDocuments, ReloadError> {
+    let mut traces = Vec::new();
+    read_reload_inputs_with_observers_and_collector(inputs, observer, || {}, &mut traces)
+        .map(|(documents, _, _, _)| documents)
 }
 
 fn read_reload_inputs_with_observer_and_collector(
@@ -399,16 +419,45 @@ fn read_reload_inputs_with_observer_and_collector(
     (
         CorpusDocuments,
         crate::agent_cli::OciConfigFile,
+        crate::transport::listener::ListenerConfigSet,
         ReloadFingerprintSnapshot,
     ),
     ReloadError,
 > {
+    read_reload_inputs_with_observers_and_collector(inputs, || {}, observer, traces)
+}
+
+fn read_reload_inputs_with_observers_and_collector(
+    inputs: &ReloadInputs,
+    bootstrap_observer: impl FnOnce(),
+    observer: impl FnOnce(),
+    traces: &mut Vec<ConfigurationSourceTrace>,
+) -> Result<
+    (
+        CorpusDocuments,
+        crate::agent_cli::OciConfigFile,
+        crate::transport::listener::ListenerConfigSet,
+        ReloadFingerprintSnapshot,
+    ),
+    ReloadError,
+> {
+    // Seed the snapshot before reading the bootstrap. Keeping this exact
+    // fingerprint through the final verification closes the gap where an atomic
+    // replacement after parsing could otherwise pair old listener/OCI values
+    // with newly discovered corpus inputs.
+    let mut snapshot = ReloadFingerprintSnapshot::capture([inputs.config_path.clone()])?;
     let bootstrap =
         load_bootstrap_with_trace_collector(Some(&inputs.config_path), &inputs.overrides, traces)?;
     let oci = crate::agent_cli::parse_reload_oci_config(&bootstrap.value)
         .map_err(|error| ReloadError::OciConfiguration(error.to_string()))?;
+    let listeners = crate::agent_cli::parse_reload_listener_config(&bootstrap.value)
+        .map_err(|error| ReloadError::ListenerConfiguration(error.to_string()))?;
+    // Verify immediately after every source and bootstrap-owned serving value is
+    // discovered. The final verification below protects the same fingerprint
+    // through candidate installation.
+    bootstrap_observer();
+    snapshot.verify_unchanged()?;
     let mut paths = vec![
-        inputs.config_path.clone(),
         bootstrap.sources.catalog.clone(),
         bootstrap.sources.policy.clone(),
     ];
@@ -416,7 +465,7 @@ fn read_reload_inputs_with_observer_and_collector(
     if oci.enabled() {
         paths.extend(oci.trusted_root_path().map(Path::to_path_buf));
     }
-    let mut snapshot = ReloadFingerprintSnapshot::capture(paths)?;
+    snapshot.extend(paths)?;
     let documents = load_documents_with_trace_collector(
         &bootstrap.sources,
         &bootstrap.document_overrides,
@@ -446,7 +495,7 @@ fn read_reload_inputs_with_observer_and_collector(
     // and fingerprinted but before trust bytes are captured for the candidate.
     observer();
     snapshot.verify_unchanged()?;
-    Ok((documents, oci, snapshot))
+    Ok((documents, oci, listeners, snapshot))
 }
 
 fn fingerprint(path: &Path) -> Result<FileFingerprint, ReloadError> {
@@ -471,6 +520,7 @@ struct ValidatedCandidate {
     config: Config,
     overrides: Vec<OverrideProvenance>,
     oci: Option<Arc<crate::state::OciVerificationGeneration>>,
+    listeners: crate::transport::listener::ListenerConfigSet,
     outcome: ReloadOutcome,
     bundle_changed_trust_domains: Vec<String>,
 }
@@ -527,6 +577,7 @@ fn validate_candidate_with_trace_collector_and_observer(
             overrides,
         },
         oci_config,
+        listeners,
         input_snapshot,
     ) = read_reload_inputs_with_observer_and_collector(inputs, || {}, traces)?;
     for w in &warnings {
@@ -537,7 +588,13 @@ fn validate_candidate_with_trace_collector_and_observer(
     // and (b) read the previous id to bump from: one coherent snapshot.
     let current = state.load_generation();
     ensure_reloadable(current.catalog(), &catalog)?;
-
+    let listener_impacts = crate::transport::listener_manager::assess_transition(
+        current.listeners(),
+        &listeners,
+        state.connections(),
+    );
+    crate::transport::listener_manager::require_zero_active(&listener_impacts)
+        .map_err(|error| ReloadError::ListenerTransition(error.to_string()))?;
     let previous_generation = current.id();
     let new_generation = previous_generation.saturating_add(1);
     let bundle_changed_trust_domains = bundle_changed_trust_domains(current.catalog(), &catalog);
@@ -562,6 +619,7 @@ fn validate_candidate_with_trace_collector_and_observer(
         config,
         overrides,
         oci,
+        listeners,
         outcome,
         bundle_changed_trust_domains,
     })
@@ -618,22 +676,34 @@ pub fn reload_generation(state: &BrokerState) -> Result<ReloadOutcome, ReloadErr
         config,
         overrides,
         oci,
+        listeners,
         outcome,
         bundle_changed_trust_domains,
     } = candidate;
 
-    let next = Generation::new_with_overrides_and_oci(
+    let current = state.load_generation();
+    let (_, listener_guard) = crate::transport::listener_manager::begin_transition(
+        current.listeners(),
+        &listeners,
+        state.connections(),
+    )
+    .map_err(|error| ReloadError::ListenerTransition(error.to_string()))?;
+    let next = Generation::new_with_overrides_oci_and_listeners(
         outcome.new_generation,
         Arc::new(catalog),
         policy,
         config,
         overrides,
         oci,
+        Arc::new(listeners),
     );
-    state.swap_generation(Arc::new(next));
-    for trust_domain in bundle_changed_trust_domains {
-        state.events().bundle_changed(trust_domain);
-    }
+    drop(current);
+    listener_guard.commit(|| {
+        state.swap_generation(Arc::new(next));
+        for trust_domain in bundle_changed_trust_domains {
+            state.events().bundle_changed(trust_domain);
+        }
+    });
 
     Ok(outcome)
 }
@@ -654,8 +724,8 @@ mod tests {
 
     use super::{
         ReloadError, ReloadInputs, check_reload, read_reload_inputs,
-        read_reload_inputs_with_observer, reload_generation,
-        validate_candidate_with_trace_collector,
+        read_reload_inputs_with_bootstrap_observer, read_reload_inputs_with_observer,
+        reload_generation, validate_candidate_with_trace_collector,
         validate_candidate_with_trace_collector_and_observer,
     };
     use crate::backend::{Backend, BackendError, NewKey};
@@ -1011,6 +1081,36 @@ mod tests {
     }
 
     #[test]
+    fn listener_candidate_uses_bootstrap_snapshot_and_commits_with_generation() {
+        let (state, inputs) = state_with_files(&catalog_json(false), &policy_json(false));
+        let socket = format!("/tmp/basil-reload-listener-{}.sock", uuid::Uuid::new_v4());
+        std::fs::write(
+            &inputs.config_path,
+            format!(
+                "schema = \"agent\"\nschemaVersion = 3\n[import]\ncatalog = \"catalog.json\"\npolicy = \"policy.json\"\nbundle = \"bundle.age\"\n[listeners.control]\ntype = \"host\"\npath = {socket:?}\nmode = \"0600\"\n"
+            ),
+        )
+        .expect("write named listener candidate");
+
+        let dry = check_reload(&state).expect("listener dry-run validates");
+        assert_eq!(dry.previous_generation, INITIAL_GENERATION_ID);
+        let pinned = state.load_generation();
+        assert_eq!(pinned.id(), INITIAL_GENERATION_ID);
+        assert!(pinned.listeners().get("control").is_none());
+
+        reload_generation(&state).expect("listener candidate commits");
+        let current = state.load_generation();
+        let control = current
+            .listeners()
+            .get("control")
+            .expect("control listener installed");
+        assert_eq!(control.path(), std::path::Path::new(&socket));
+        assert_eq!(current.id(), INITIAL_GENERATION_ID + 1);
+        assert_eq!(pinned.id(), INITIAL_GENERATION_ID);
+        assert!(pinned.listeners().get("control").is_none());
+    }
+
+    #[test]
     fn oci_reload_atomically_rotates_root_key_and_denylist_with_overlap() {
         let fixture = state_with_oci_files();
         let denied =
@@ -1320,6 +1420,38 @@ mod tests {
             INITIAL_GENERATION_ID,
             "helper rejection leaves the serving generation untouched"
         );
+    }
+
+    #[test]
+    fn atomic_bootstrap_replacement_after_listener_parse_is_rejected() {
+        let (state, inputs) = state_with_files(&catalog_json(false), &policy_json(false));
+        let parent = inputs.config_path.parent().expect("config parent");
+        let replacement_policy = parent.join("policy.replacement.json");
+        let replacement_bootstrap = parent.join("config.replacement.toml");
+        std::fs::write(&replacement_policy, policy_json(true)).expect("stage replacement policy");
+        std::fs::write(
+            &replacement_bootstrap,
+            "schema = \"agent\"\nschemaVersion = 3\n[import]\ncatalog = \"catalog.json\"\npolicy = \"policy.json\"\nbundle = \"bundle.age\"\n[listeners.replaced]\ntype = \"host\"\npath = \"/tmp/basil-replaced.sock\"\n",
+        )
+        .expect("stage replacement bootstrap");
+
+        let error = read_reload_inputs_with_bootstrap_observer(&inputs, || {
+            std::fs::rename(&replacement_policy, parent.join("policy.json"))
+                .expect("atomically replace policy");
+            std::fs::rename(&replacement_bootstrap, &inputs.config_path)
+                .expect("atomically replace bootstrap after listener parse");
+        })
+        .expect_err("mixed bootstrap and corpus snapshot must be rejected");
+
+        assert!(matches!(
+            error,
+            ReloadError::TornSnapshot { ref path }
+                if path == &inputs.config_path.display().to_string()
+        ));
+        assert_eq!(state.active_generation_id(), INITIAL_GENERATION_ID);
+        let generation = state.load_generation();
+        assert!(generation.listeners().get("replaced").is_none());
+        assert_eq!(generation.policy().grant_count(), 0);
     }
 
     #[test]

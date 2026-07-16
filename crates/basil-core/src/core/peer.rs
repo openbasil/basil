@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
 
 use tokio::net::UnixStream;
 
@@ -57,6 +57,20 @@ impl Default for PeerInfo {
 }
 
 impl PeerInfo {
+    /// Capture required kernel peer credentials from an accepted Unix stream.
+    ///
+    /// Unlike [`Self::from_stream`], this admission-boundary constructor never
+    /// degrades credential failure to an unknown peer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when `SO_PEERCRED` fails or does not include a
+    /// positive process identifier.
+    pub fn try_from_stream(stream: &UnixStream) -> io::Result<Self> {
+        let credentials = stream.peer_cred()?;
+        required_peer_info(credentials.pid(), credentials.uid(), credentials.gid())
+    }
+
     /// Attest the peer on the far end of `stream`.
     #[must_use]
     pub fn from_stream(stream: &UnixStream) -> Self {
@@ -99,6 +113,19 @@ impl PeerInfo {
         enrich_linux(&mut info);
         info
     }
+}
+
+fn required_peer_info(pid: Option<i32>, uid: u32, gid: u32) -> io::Result<PeerInfo> {
+    let pid = pid
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value != 0)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Unix peer credentials do not include a positive PID",
+            )
+        })?;
+    Ok(PeerInfo::from_unix_cred(Some(pid), uid, gid))
 }
 
 /// Fill in the executable path from `/proc`.
@@ -227,5 +254,17 @@ mod tests {
         assert_eq!(p.attestation_class, "Unknown");
         assert!(!p.signature_valid);
         assert!(p.subject_id.is_none());
+    }
+
+    #[test]
+    fn required_peer_capture_rejects_missing_or_nonpositive_pid() {
+        for pid in [None, Some(0), Some(-1)] {
+            let error = required_peer_info(pid, 1000, 1000).expect_err("PID must be rejected");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+        let peer = required_peer_info(Some(42), 1000, 1001).expect("credentials validate");
+        assert_eq!(peer.pid, Some(42));
+        assert_eq!(peer.uid, Some(1000));
+        assert_eq!(peer.gid, Some(1001));
     }
 }
