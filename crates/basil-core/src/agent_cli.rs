@@ -35,7 +35,7 @@ use crate::{
     DEFAULT_ROTATION_GRACE_VERSIONS, DEFAULT_SOCKET_MODE, DEFAULT_SVID_TTL_SECS,
     JwtRevocationStore, ReloadActor, ReloadInputs, ServerConfig, SpiffeConfig, SpiffeVaultBackend,
     VaultBackend, enforce_capabilities, load_documents_with_overrides,
-    load_documents_with_overrides_and_context, reload_generation, run_grpc,
+    load_documents_with_overrides_and_context, reload_generation, run_grpc_many,
 };
 use crate::{bundle_cli, doctor, init, unlock};
 use anyhow::{Context, Result, bail};
@@ -1101,9 +1101,6 @@ struct SetupArgs {
 #[derive(Debug, Clone)]
 struct RunConfig {
     listeners: crate::transport::listener::ListenerConfigSet,
-    socket: Option<String>,
-    socket_mode: u32,
-    socket_group: Option<String>,
     max_encrypt_size: usize,
     max_payload_size: usize,
     grace_versions: u32,
@@ -1139,9 +1136,6 @@ fn load_run_config(overrides: &ConfigOverrides) -> Result<RunConfig> {
     let listeners = resolve_listener_configs(&file)?;
     Ok(RunConfig {
         listeners,
-        socket: file.socket,
-        socket_mode: file.socket_mode.map_or(DEFAULT_SOCKET_MODE, |mode| mode.0),
-        socket_group: file.socket_group,
         max_encrypt_size: file.max_encrypt_size.unwrap_or(DEFAULT_MAX_ENCRYPT_SIZE),
         max_payload_size: file.max_payload_size.unwrap_or(DEFAULT_MAX_PAYLOAD_SIZE),
         grace_versions: file
@@ -2247,7 +2241,7 @@ async fn run_daemon(args: RunArgs, version: &'static str) -> Result<()> {
                 overrides: run_config.setup.startup_overrides.clone(),
             })
             .with_listener_configs(run_config.listeners.clone());
-    let server_config = host_server_config(&run_config, state.connections().clone());
+    let server_configs = listener_server_configs(&run_config, state.connections());
     state = attach_oci_runtime(
         state,
         run_config.oci_verifier,
@@ -2301,7 +2295,7 @@ async fn run_daemon(args: RunArgs, version: &'static str) -> Result<()> {
         (tx, handle)
     });
 
-    let grpc_result = run_grpc(server_config, state).await;
+    let grpc_result = run_grpc_many(server_configs, state).await;
 
     #[cfg(feature = "http")]
     if let Some((tx, handle)) = jwks_shutdown {
@@ -2317,36 +2311,23 @@ async fn run_daemon(args: RunArgs, version: &'static str) -> Result<()> {
     Ok(())
 }
 
-fn host_server_config(
+fn listener_server_configs(
     run_config: &RunConfig,
-    connections: crate::transport::connection::ConnectionRegistry,
-) -> ServerConfig {
-    let host = run_config.listeners.iter().find(|listener| {
-        listener.listener_type() == crate::transport::grpc_server::ListenerType::Host
-    });
-    ServerConfig {
-        listener_name: host.map_or_else(|| "host".to_string(), |listener| listener.name().into()),
-        listener_type: crate::transport::grpc_server::ListenerType::Host,
-        connections,
-        socket_path: host.map_or_else(
-            || {
-                run_config
-                    .socket
-                    .clone()
-                    .unwrap_or_else(|| crate::DEFAULT_SOCKET_PATH.to_string())
-            },
-            |listener| listener.path().to_string_lossy().into_owned(),
-        ),
-        socket_mode: host.map_or(
-            run_config.socket_mode,
-            crate::transport::listener::ListenerConfig::mode,
-        ),
-        socket_group: host.map_or_else(
-            || run_config.socket_group.clone(),
-            |listener| listener.group().map(str::to_string),
-        ),
-        invocation: run_config.invocation.clone(),
-    }
+    connections: &crate::transport::connection::ConnectionRegistry,
+) -> Vec<ServerConfig> {
+    run_config
+        .listeners
+        .iter()
+        .map(|listener| ServerConfig {
+            listener_name: listener.name().into(),
+            listener_type: listener.listener_type(),
+            connections: connections.clone(),
+            socket_path: listener.path().to_string_lossy().into_owned(),
+            socket_mode: listener.mode(),
+            socket_group: listener.group().map(str::to_string),
+            invocation: run_config.invocation.clone(),
+        })
+        .collect()
 }
 
 fn attach_oci_runtime(
@@ -3583,7 +3564,14 @@ strict-bundle-perms = true
         assert_eq!(loaded.setup.catalog, PathBuf::from("/cfg/catalog.json"));
         assert_eq!(loaded.setup.policy, PathBuf::from("/cfg/policy.json"));
         assert_eq!(loaded.setup.bundle, PathBuf::from("/cfg/bundle.sealed"));
-        assert_eq!(loaded.socket.as_deref(), Some("/run/basil.sock"));
+        assert_eq!(
+            loaded
+                .listeners
+                .get("host")
+                .expect("legacy host listener")
+                .path(),
+            Path::new("/run/basil.sock")
+        );
         assert_eq!(loaded.setup.vault_addr, "http://vault.internal:8200");
         assert_eq!(loaded.setup.transit_mount, "basil-transit");
         assert_eq!(loaded.setup.jwt_auth_mount, "jwt-basil");
@@ -3670,8 +3658,9 @@ socket-group = "basil-edge"
 
         let loaded = load_run_config(&args).expect("load run config");
 
-        assert_eq!(loaded.socket_mode, 0o660);
-        assert_eq!(loaded.socket_group.as_deref(), Some("basil-edge"));
+        let host = loaded.listeners.get("host").expect("legacy host listener");
+        assert_eq!(host.mode(), 0o660);
+        assert_eq!(host.group(), Some("basil-edge"));
 
         std::fs::remove_file(config).expect("remove temp config");
     }
@@ -3692,8 +3681,9 @@ bundle = "/cfg/bundle.sealed"
 
         let loaded = load_run_config(&args).expect("load run config");
 
-        assert_eq!(loaded.socket_mode, DEFAULT_SOCKET_MODE);
-        assert!(loaded.socket_group.is_none());
+        let host = loaded.listeners.get("host").expect("legacy host listener");
+        assert_eq!(host.mode(), DEFAULT_SOCKET_MODE);
+        assert!(host.group().is_none());
 
         std::fs::remove_file(config).expect("remove temp config");
     }
@@ -4490,7 +4480,14 @@ vault-addr = "http://cfg-vault:8200"
         assert_eq!(loaded.setup.catalog, PathBuf::from("/cli/catalog.json"));
         assert_eq!(loaded.setup.policy, PathBuf::from("/cli/policy.json"));
         assert_eq!(loaded.setup.bundle, PathBuf::from("/cli/bundle.sealed"));
-        assert_eq!(loaded.socket.as_deref(), Some("/cli/basil.sock"));
+        assert_eq!(
+            loaded
+                .listeners
+                .get("host")
+                .expect("legacy host listener")
+                .path(),
+            Path::new("/cli/basil.sock")
+        );
         assert_eq!(loaded.setup.vault_addr, "http://cli-vault:8200");
 
         std::fs::remove_file(config).expect("remove temp config");

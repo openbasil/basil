@@ -20,6 +20,8 @@ use basil_proto::broker::v1::signing_service_server::SigningServiceServer;
 use basil_proto::envoy::service::secret::v3::secret_discovery_service_server::SecretDiscoveryServiceServer;
 use basil_proto::spiffe::spiffe_workload_api_server::SpiffeWorkloadApiServer;
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::broadcast;
+use tokio::task::JoinSet;
 use tokio_stream::{StreamExt as _, wrappers::UnixListenerStream};
 use tonic::transport::Server;
 use tracing::{info, warn};
@@ -31,7 +33,9 @@ use crate::spiffe::SpiffeWorkloadGrpc;
 use crate::state::BrokerState;
 use crate::transport::connection::ConnectionRegistry;
 use crate::transport::listener::ListenerConfig;
-use crate::transport::listener_manager::{PreparedListenerBatch, QualifiedListener};
+use crate::transport::listener_manager::{
+    PreparedListenerBatch, PublishedListener, QualifiedListener,
+};
 
 /// Default Unix socket mode: owner read/write only.
 pub const DEFAULT_SOCKET_MODE: u32 = 0o600;
@@ -151,20 +155,36 @@ pub async fn run(config: ServerConfig, state: Arc<BrokerState>) -> std::io::Resu
     serve_with_shutdown(config, state, shutdown_signal()).await
 }
 
+/// Publish and serve every configured listener as one startup transaction.
+///
+/// Every socket is qualified, bound privately, and published before any accept
+/// loop starts. If one preparation or publication fails, all sockets owned by
+/// the transaction are rolled back and no listener serves traffic.
+///
+/// # Errors
+///
+/// Returns a listener preparation, publication, serving, or task failure.
+pub async fn run_many(configs: Vec<ServerConfig>, state: Arc<BrokerState>) -> io::Result<()> {
+    serve_many_with_shutdown(configs, state, shutdown_signal()).await
+}
+
+fn listener_config(config: &ServerConfig) -> io::Result<ListenerConfig> {
+    ListenerConfig::validated(
+        config.listener_name.clone(),
+        config.listener_type,
+        PathBuf::from(&config.socket_path),
+        config.socket_mode,
+        config.socket_group.clone(),
+    )
+    .map_err(io::Error::other)
+}
+
 async fn serve_with_shutdown(
     config: ServerConfig,
     state: Arc<BrokerState>,
     shutdown: impl Future<Output = ()>,
 ) -> std::io::Result<()> {
-    let path = config.socket_path;
-    let listener_config = ListenerConfig::validated(
-        config.listener_name.clone(),
-        config.listener_type,
-        PathBuf::from(&path),
-        config.socket_mode,
-        config.socket_group.clone(),
-    )
-    .map_err(io::Error::other)?;
+    let listener_config = listener_config(&config)?;
     QualifiedListener::validate(&listener_config).map_err(io::Error::other)?;
     let published = PreparedListenerBatch::prepare([&listener_config])
         .and_then(PreparedListenerBatch::publish)
@@ -172,6 +192,75 @@ async fn serve_with_shutdown(
     let Some(published) = published.into_listeners().pop() else {
         return Err(io::Error::other("listener publication returned no socket"));
     };
+    serve_published(config, state, published, shutdown).await
+}
+
+async fn serve_many_with_shutdown(
+    configs: Vec<ServerConfig>,
+    state: Arc<BrokerState>,
+    shutdown: impl Future<Output = ()>,
+) -> io::Result<()> {
+    if configs.is_empty() {
+        return Err(io::Error::other("no listeners configured"));
+    }
+    let listener_configs = configs
+        .iter()
+        .map(listener_config)
+        .collect::<io::Result<Vec<_>>>()?;
+    let published = PreparedListenerBatch::prepare(listener_configs.iter())
+        .and_then(PreparedListenerBatch::publish)
+        .map_err(io::Error::other)?
+        .into_listeners();
+    if published.len() != configs.len() {
+        return Err(io::Error::other(
+            "listener publication returned an incomplete batch",
+        ));
+    }
+
+    let (shutdown_tx, _) = broadcast::channel::<()>(1);
+    let mut servers = JoinSet::new();
+    for (config, published) in configs.into_iter().zip(published) {
+        let state = Arc::clone(&state);
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        servers.spawn(async move {
+            serve_published(config, state, published, async move {
+                let _ = shutdown_rx.recv().await;
+            })
+            .await
+        });
+    }
+
+    tokio::pin!(shutdown);
+    let mut first_error = tokio::select! {
+        () = &mut shutdown => None,
+        joined = servers.join_next() => joined.and_then(server_result_error),
+    };
+    let _ = shutdown_tx.send(());
+    while let Some(joined) = servers.join_next().await {
+        if first_error.is_none() {
+            first_error = server_result_error(joined);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+fn server_result_error(
+    result: Result<io::Result<()>, tokio::task::JoinError>,
+) -> Option<io::Error> {
+    match result {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(error),
+        Err(error) => Some(io::Error::other(format!("listener task failed: {error}"))),
+    }
+}
+
+async fn serve_published(
+    config: ServerConfig,
+    state: Arc<BrokerState>,
+    published: PublishedListener,
+    shutdown: impl Future<Output = ()>,
+) -> io::Result<()> {
+    let path = config.socket_path.clone();
     let (listener, _socket_lease) = published.into_listener().map_err(io::Error::other)?;
 
     info!(
@@ -451,15 +540,12 @@ mod tests {
         listener_type: ListenerType,
     ) -> oneshot::Sender<()> {
         let (tx, rx) = oneshot::channel();
-        let config = ServerConfig {
-            listener_name: "test".to_string(),
+        let config = test_server_config(
+            "test",
+            &socket,
             listener_type,
-            connections: ConnectionRegistry::with_defaults(),
-            socket_path: socket.to_string_lossy().into_owned(),
-            socket_mode: DEFAULT_SOCKET_MODE,
-            socket_group: None,
-            invocation: InvocationRuntimeConfig::default(),
-        };
+            ConnectionRegistry::with_defaults(),
+        );
         tokio::spawn(async move {
             serve_with_shutdown(config, state(), async {
                 let _ = rx.await;
@@ -469,6 +555,23 @@ mod tests {
         });
         wait_for_socket(&socket).await;
         tx
+    }
+
+    fn test_server_config(
+        name: &str,
+        socket: &Path,
+        listener_type: ListenerType,
+        connections: ConnectionRegistry,
+    ) -> ServerConfig {
+        ServerConfig {
+            listener_name: name.to_string(),
+            listener_type,
+            connections,
+            socket_path: socket.to_string_lossy().into_owned(),
+            socket_mode: DEFAULT_SOCKET_MODE,
+            socket_group: None,
+            invocation: InvocationRuntimeConfig::default(),
+        }
     }
 
     async fn wait_for_socket(socket: &Path) {
@@ -712,6 +815,97 @@ mod tests {
 
         let _ = shutdown.send(());
     }
+
+    #[tokio::test]
+    async fn configured_host_and_container_listeners_serve_together() {
+        let host_socket = socket_path("multi-host");
+        let container_socket = socket_path("multi-container");
+        let connections = ConnectionRegistry::with_defaults();
+        let configs = vec![
+            test_server_config(
+                "control",
+                &host_socket,
+                ListenerType::Host,
+                connections.clone(),
+            ),
+            test_server_config(
+                "workloads",
+                &container_socket,
+                ListenerType::Container,
+                connections,
+            ),
+        ];
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            serve_many_with_shutdown(configs, state(), async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+        });
+        wait_for_socket(&host_socket).await;
+        wait_for_socket(&container_socket).await;
+
+        let mut host_admin = AdminServiceClient::new(uds_channel(&host_socket).await);
+        let status = host_admin
+            .status(StatusRequest {
+                include_realms: false,
+            })
+            .await
+            .expect("host listener exposes Admin")
+            .into_inner();
+        assert_eq!(status.backend, "dummy");
+
+        let mut container_admin = AdminServiceClient::new(uds_channel(&container_socket).await);
+        let status = container_admin
+            .status(StatusRequest {
+                include_realms: false,
+            })
+            .await
+            .expect_err("container listener omits Admin");
+        assert_eq!(status.code(), Code::Unimplemented);
+
+        let _ = shutdown_tx.send(());
+        server
+            .await
+            .expect("multi-listener task does not panic")
+            .expect("multi-listener server exits cleanly");
+        assert!(!host_socket.exists());
+        assert!(!container_socket.exists());
+    }
+
+    #[tokio::test]
+    async fn multi_listener_publication_rolls_back_the_complete_batch() {
+        let first_socket = socket_path("rollback-first");
+        let occupied_socket = socket_path("rollback-occupied");
+        std::fs::write(&occupied_socket, "occupied").expect("occupy second listener path");
+        let connections = ConnectionRegistry::with_defaults();
+        let configs = vec![
+            test_server_config(
+                "first",
+                &first_socket,
+                ListenerType::Host,
+                connections.clone(),
+            ),
+            test_server_config(
+                "occupied",
+                &occupied_socket,
+                ListenerType::Container,
+                connections,
+            ),
+        ];
+
+        let error = serve_many_with_shutdown(configs, state(), std::future::pending())
+            .await
+            .expect_err("occupied path rejects the startup transaction");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(!first_socket.exists());
+        assert_eq!(
+            std::fs::read_to_string(&occupied_socket).expect("foreign path remains"),
+            "occupied"
+        );
+        std::fs::remove_file(occupied_socket).expect("remove occupied fixture");
+    }
+
     #[tokio::test]
     async fn broker_and_spiffe_services_share_one_unix_socket() {
         let socket = socket_path("broker-spiffe");
