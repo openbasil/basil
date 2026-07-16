@@ -43,7 +43,7 @@
 //! path beyond what startup reconcile already settled.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::catalog::loader::LoadError;
@@ -115,6 +115,10 @@ pub enum ReloadError {
     #[error("validating reloaded configuration corpus: {0}")]
     Configuration(#[from] crate::configuration::ConfigurationError),
 
+    /// OCI trust inputs could not be parsed or snapshotted for the candidate.
+    #[error("validating reloaded OCI verification inputs: {0}")]
+    OciConfiguration(String),
+
     /// The candidate changed a **restart-only** routing dimension (a backend was
     /// added/removed/repathed, or a key's `backend`/`path`/`engine`/`key_type`/
     /// `public_path` changed). Such an edit needs a re-unlock and is rejected on
@@ -136,7 +140,9 @@ impl ReloadError {
         match self {
             Self::ReadInput { .. } => "configuration_read_failed",
             Self::TornSnapshot { .. } => "inputs_changed_during_read",
-            Self::Validate(_) | Self::Configuration(_) => "validation_failed",
+            Self::Validate(_) | Self::Configuration(_) | Self::OciConfiguration(_) => {
+                "validation_failed"
+            }
             Self::RoutingShapeChanged(_) => "routing_shape_changed",
             Self::NoInputs => "no_reload_inputs",
         }
@@ -283,6 +289,49 @@ struct FileFingerprint {
     ctime_nsec: i64,
 }
 
+const MAX_RELOAD_FINGERPRINT_PATHS: usize = 2048;
+
+#[derive(Debug)]
+struct ReloadFingerprintSnapshot {
+    files: BTreeMap<PathBuf, FileFingerprint>,
+}
+
+impl ReloadFingerprintSnapshot {
+    fn capture(paths: impl IntoIterator<Item = PathBuf>) -> Result<Self, ReloadError> {
+        let mut snapshot = Self {
+            files: BTreeMap::new(),
+        };
+        snapshot.extend(paths)?;
+        Ok(snapshot)
+    }
+
+    fn extend(&mut self, paths: impl IntoIterator<Item = PathBuf>) -> Result<(), ReloadError> {
+        for path in paths {
+            if self.files.contains_key(&path) {
+                continue;
+            }
+            if self.files.len() >= MAX_RELOAD_FINGERPRINT_PATHS {
+                return Err(ReloadError::OciConfiguration(
+                    "reload input fingerprint set exceeds safety bound".to_owned(),
+                ));
+            }
+            self.files.insert(path.clone(), fingerprint(&path)?);
+        }
+        Ok(())
+    }
+
+    fn verify_unchanged(&self) -> Result<(), ReloadError> {
+        for (path, expected) in &self.files {
+            if expected != &fingerprint(path)? {
+                return Err(ReloadError::TornSnapshot {
+                    path: path.display().to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(unix)]
 fn file_fingerprint(path: &Path) -> std::io::Result<FileFingerprint> {
     use std::os::unix::fs::MetadataExt;
@@ -334,7 +383,8 @@ fn read_reload_inputs_with_observer_and_context(
     trace_context: ConfigurationTraceContext,
 ) -> Result<CorpusDocuments, ReloadError> {
     let mut traces = Vec::new();
-    let result = read_reload_inputs_with_observer_and_collector(inputs, observer, &mut traces);
+    let result = read_reload_inputs_with_observer_and_collector(inputs, observer, &mut traces)
+        .map(|(documents, _, _)| documents);
     for trace in &traces {
         emit_configuration_source_trace(trace, trace_context, result.is_ok());
     }
@@ -345,33 +395,28 @@ fn read_reload_inputs_with_observer_and_collector(
     inputs: &ReloadInputs,
     observer: impl FnOnce(),
     traces: &mut Vec<ConfigurationSourceTrace>,
-) -> Result<CorpusDocuments, ReloadError> {
-    let config_before = fingerprint(&inputs.config_path)?;
+) -> Result<
+    (
+        CorpusDocuments,
+        crate::agent_cli::OciConfigFile,
+        ReloadFingerprintSnapshot,
+    ),
+    ReloadError,
+> {
     let bootstrap =
         load_bootstrap_with_trace_collector(Some(&inputs.config_path), &inputs.overrides, traces)?;
+    let oci = crate::agent_cli::parse_reload_oci_config(&bootstrap.value)
+        .map_err(|error| ReloadError::OciConfiguration(error.to_string()))?;
     let mut paths = vec![
+        inputs.config_path.clone(),
         bootstrap.sources.catalog.clone(),
         bootstrap.sources.policy.clone(),
     ];
     paths.extend(bootstrap.sources.compose.values().cloned());
-    let before = paths
-        .iter()
-        .map(|path| fingerprint(path).map(|value| (path.clone(), value)))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    observer();
-    if config_before != fingerprint(&inputs.config_path)? {
-        return Err(ReloadError::TornSnapshot {
-            path: inputs.config_path.display().to_string(),
-        });
+    if oci.enabled() {
+        paths.extend(oci.trusted_root_path().map(Path::to_path_buf));
     }
-    for (path, expected) in &before {
-        if expected != &fingerprint(path)? {
-            return Err(ReloadError::TornSnapshot {
-                path: path.display().to_string(),
-            });
-        }
-    }
+    let mut snapshot = ReloadFingerprintSnapshot::capture(paths)?;
     let documents = load_documents_with_trace_collector(
         &bootstrap.sources,
         &bootstrap.document_overrides,
@@ -382,20 +427,26 @@ fn read_reload_inputs_with_observer_and_collector(
         crate::configuration::ConfigurationError::Catalog(error) => ReloadError::Validate(error),
         other => ReloadError::Configuration(other),
     })?;
+    if oci.enabled() {
+        snapshot.extend(
+            documents
+                .policy
+                .oci_signer_policies
+                .values()
+                .filter_map(|policy| match &policy.signer {
+                    crate::core::oci_verification::OciSignerMode::PinnedKey {
+                        public_key, ..
+                    } => Some(public_key.clone()),
+                    crate::core::oci_verification::OciSignerMode::Keyless { .. } => None,
+                }),
+        )?;
+    }
 
-    if config_before != fingerprint(&inputs.config_path)? {
-        return Err(ReloadError::TornSnapshot {
-            path: inputs.config_path.display().to_string(),
-        });
-    }
-    for (path, expected) in before {
-        if expected != fingerprint(&path)? {
-            return Err(ReloadError::TornSnapshot {
-                path: path.display().to_string(),
-            });
-        }
-    }
-    Ok(documents)
+    // The observer models a writer racing after every input has been identified
+    // and fingerprinted but before trust bytes are captured for the candidate.
+    observer();
+    snapshot.verify_unchanged()?;
+    Ok((documents, oci, snapshot))
 }
 
 fn fingerprint(path: &Path) -> Result<FileFingerprint, ReloadError> {
@@ -419,6 +470,7 @@ struct ValidatedCandidate {
     policy: ResolvedPolicy,
     config: Config,
     overrides: Vec<OverrideProvenance>,
+    oci: Option<Arc<crate::state::OciVerificationGeneration>>,
     outcome: ReloadOutcome,
     bundle_changed_trust_domains: Vec<String>,
 }
@@ -456,15 +508,27 @@ fn validate_candidate_with_trace_collector(
     state: &BrokerState,
     traces: &mut Vec<ConfigurationSourceTrace>,
 ) -> Result<ValidatedCandidate, ReloadError> {
+    validate_candidate_with_trace_collector_and_observer(state, traces, || {})
+}
+
+fn validate_candidate_with_trace_collector_and_observer(
+    state: &BrokerState,
+    traces: &mut Vec<ConfigurationSourceTrace>,
+    observer: impl FnOnce(),
+) -> Result<ValidatedCandidate, ReloadError> {
     let inputs = state.reload_inputs().ok_or(ReloadError::NoInputs)?;
-    let CorpusDocuments {
-        catalog,
-        policy,
-        policy_config: config,
-        warnings,
-        compose: _,
-        overrides,
-    } = read_reload_inputs_with_observer_and_collector(inputs, || {}, traces)?;
+    let (
+        CorpusDocuments {
+            catalog,
+            policy,
+            policy_config: config,
+            warnings,
+            compose: _,
+            overrides,
+        },
+        oci_config,
+        input_snapshot,
+    ) = read_reload_inputs_with_observer_and_collector(inputs, || {}, traces)?;
     for w in &warnings {
         tracing::warn!(warning = %w, "reload: catalog/policy load warning");
     }
@@ -477,6 +541,14 @@ fn validate_candidate_with_trace_collector(
     let previous_generation = current.id();
     let new_generation = previous_generation.saturating_add(1);
     let bundle_changed_trust_domains = bundle_changed_trust_domains(current.catalog(), &catalog);
+    let oci = crate::agent_cli::resolve_reloaded_oci_generation(
+        &oci_config,
+        current.oci(),
+        &policy.oci_signer_policies,
+    )
+    .map_err(|error| ReloadError::OciConfiguration(error.to_string()))?;
+    observer();
+    input_snapshot.verify_unchanged()?;
     let outcome = ReloadOutcome {
         previous_generation,
         new_generation,
@@ -489,6 +561,7 @@ fn validate_candidate_with_trace_collector(
         policy,
         config,
         overrides,
+        oci,
         outcome,
         bundle_changed_trust_domains,
     })
@@ -544,16 +617,18 @@ pub fn reload_generation(state: &BrokerState) -> Result<ReloadOutcome, ReloadErr
         policy,
         config,
         overrides,
+        oci,
         outcome,
         bundle_changed_trust_domains,
     } = candidate;
 
-    let next = Generation::new_with_overrides(
+    let next = Generation::new_with_overrides_and_oci(
         outcome.new_generation,
         Arc::new(catalog),
         policy,
         config,
         overrides,
+        oci,
     );
     state.swap_generation(Arc::new(next));
     for trust_domain in bundle_changed_trust_domains {
@@ -566,7 +641,9 @@ pub fn reload_generation(state: &BrokerState) -> Result<ReloadOutcome, ReloadErr
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt as _;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use async_trait::async_trait;
     use basil_proto::KeyType;
@@ -579,6 +656,7 @@ mod tests {
         ReloadError, ReloadInputs, check_reload, read_reload_inputs,
         read_reload_inputs_with_observer, reload_generation,
         validate_candidate_with_trace_collector,
+        validate_candidate_with_trace_collector_and_observer,
     };
     use crate::backend::{Backend, BackendError, NewKey};
     use crate::catalog::load;
@@ -786,6 +864,99 @@ mod tests {
         (state, inputs)
     }
 
+    struct OciReloadFixture {
+        state: Arc<BrokerState>,
+        inputs: ReloadInputs,
+        root: std::path::PathBuf,
+        key: std::path::PathBuf,
+    }
+
+    fn oci_policy_json(key: &std::path::Path) -> String {
+        format!(
+            r#"{{
+              "schema": "policy",
+              "subjects": {{ "svc.web": {{ "domain": "host-process", "match": {{ "all": [ {{ "process.uid": 1000 }} ] }} }} }},
+              "ociSignerPolicies": {{
+                "production": {{
+                  "repository": "registry.example/team/app",
+                  "mode": "pinned-key",
+                  "publicKey": "{}",
+                  "transparency": "optional"
+                }}
+              }},
+              "roles": {{}}, "rules": [], "config": {{}}
+            }}"#,
+            key.display()
+        )
+    }
+
+    fn write_oci_config(inputs: &ReloadInputs, trusted_root: &std::path::Path, denied: &[&str]) {
+        let denied = denied
+            .iter()
+            .map(|digest| format!("\"{digest}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(
+            &inputs.config_path,
+            format!(
+                "schema = \"agent\"\nschemaVersion = 3\n[import]\ncatalog = \"catalog.json\"\npolicy = \"policy.json\"\nbundle = \"bundle.age\"\n[oci]\nenable = true\ntrusted-root = {:?}\ndenied-digests = [{denied}]\n",
+                trusted_root.display().to_string()
+            ),
+        )
+        .expect("write OCI reload config");
+    }
+
+    fn state_with_oci_files() -> OciReloadFixture {
+        let (state, inputs) = state_with_files(&catalog_json(false), &policy_json(false));
+        let directory = inputs.config_path.parent().expect("config parent");
+        let root = directory.join("trusted-root.json");
+        let key = directory.join("cosign.pub");
+        let executable = directory.join("cosign");
+        let temp_parent = directory.join("cosign-temp");
+        std::fs::write(&root, b"root-v1").expect("write root");
+        std::fs::write(&key, b"key-v1").expect("write key");
+        std::fs::write(&executable, b"#!/usr/bin/env bash\nexit 1\n").expect("write executable");
+        std::fs::create_dir(&temp_parent).expect("create temp parent");
+        for path in [&root, &key] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .expect("protect trust file");
+        }
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+            .expect("protect executable");
+        std::fs::set_permissions(&temp_parent, std::fs::Permissions::from_mode(0o700))
+            .expect("protect temp parent");
+        let policy_json = oci_policy_json(&key);
+        write_files(&inputs, &catalog_json(false), &policy_json);
+        write_oci_config(&inputs, &root, &[]);
+        let (_, policy, _, _) = load(&catalog_json(false), &policy_json).expect("OCI policy loads");
+        let bootstrap =
+            crate::load_bootstrap(Some(&inputs.config_path), &[]).expect("load OCI bootstrap");
+        let oci_config =
+            crate::agent_cli::parse_reload_oci_config(&bootstrap.value).expect("parse OCI config");
+        let verifier = crate::core::oci_verification::CosignVerifier::for_public_registries(
+            crate::core::oci_verification::CosignConfig {
+                executable,
+                temp_parent,
+                deadline: Duration::from_secs(2),
+            },
+        )
+        .expect("construct verifier")
+        .with_restart_shape(crate::agent_cli::oci_restart_shape(&oci_config))
+        .with_trusted_root(&root)
+        .expect("snapshot root")
+        .with_signer_policies(&policy.oci_signer_policies)
+        .expect("snapshot pinned key");
+        let state = Arc::try_unwrap(state)
+            .unwrap_or_else(|_| panic!("fixture state has one owner"))
+            .with_oci_verification(Arc::new(verifier), std::collections::BTreeSet::default());
+        OciReloadFixture {
+            state: Arc::new(state),
+            inputs,
+            root,
+            key,
+        }
+    }
+
     #[test]
     fn reload_reapplies_document_override_and_retains_provenance() {
         let (_state, mut inputs) = state_with_files(&catalog_json(false), &policy_json(false));
@@ -837,6 +1008,128 @@ mod tests {
         // a fresh load sees the NEW one.
         assert_eq!(pinned.id(), INITIAL_GENERATION_ID);
         assert_eq!(state.active_generation_id(), INITIAL_GENERATION_ID + 1);
+    }
+
+    #[test]
+    fn oci_reload_atomically_rotates_root_key_and_denylist_with_overlap() {
+        let fixture = state_with_oci_files();
+        let denied =
+            crate::core::oci_verification::OciDigest::parse(&format!("sha256:{}", "a".repeat(64)))
+                .expect("denied digest");
+        let guard = fixture.state.load_generation();
+        let pinned = Arc::clone(&guard);
+        drop(guard);
+        let ready = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let thread_ready = Arc::clone(&ready);
+        let thread_release = Arc::clone(&release);
+        let key = fixture.key.clone();
+        let operation = std::thread::spawn(move || {
+            thread_ready.wait();
+            thread_release.wait();
+            let oci = pinned.oci().expect("old OCI generation");
+            (
+                oci.verifier()
+                    .trusted_root_snapshot()
+                    .expect("old root")
+                    .to_vec(),
+                oci.verifier()
+                    .pinned_key_snapshot(&key)
+                    .expect("old key")
+                    .to_vec(),
+                oci.denied_subjects().clone(),
+            )
+        });
+        ready.wait();
+
+        // A single trusted-root document may deliberately overlap old and new
+        // authorities while the pinned key rotates to the new key only.
+        std::fs::write(&fixture.root, b"root-v1\nroot-v2").expect("rotate root with overlap");
+        std::fs::write(&fixture.key, b"key-v2").expect("rotate pinned key");
+        write_oci_config(&fixture.inputs, &fixture.root, &[&denied.to_string()]);
+        let outcome = reload_generation(&fixture.state).expect("apply OCI trust reload");
+        assert_eq!(outcome.new_generation, INITIAL_GENERATION_ID + 1);
+        release.wait();
+
+        let (old_root, old_key, old_denied) = operation.join().expect("old operation completes");
+        assert_eq!(old_root, b"root-v1");
+        assert_eq!(old_key, b"key-v1");
+        assert!(old_denied.is_empty());
+        let current = fixture.state.load_generation();
+        let oci = current.oci().expect("new OCI generation");
+        assert_eq!(
+            oci.verifier().trusted_root_snapshot(),
+            Some(b"root-v1\nroot-v2".as_slice())
+        );
+        assert_eq!(
+            oci.verifier().pinned_key_snapshot(&fixture.key),
+            Some(b"key-v2".as_slice())
+        );
+        assert!(oci.denied_subjects().contains(&denied));
+        drop(current);
+
+        // Removing the old root from the overlap takes effect on the next
+        // atomic generation; no process restart or cache deletion is required.
+        std::fs::write(&fixture.root, b"root-v2").expect("remove old overlapping root");
+        write_oci_config(&fixture.inputs, &fixture.root, &[&denied.to_string()]);
+        let outcome = reload_generation(&fixture.state).expect("revoke old root");
+        assert_eq!(outcome.new_generation, INITIAL_GENERATION_ID + 2);
+        assert_eq!(
+            fixture
+                .state
+                .load_generation()
+                .oci()
+                .expect("post-overlap OCI generation")
+                .verifier()
+                .trusted_root_snapshot(),
+            Some(b"root-v2".as_slice())
+        );
+    }
+
+    #[test]
+    fn invalid_oci_candidate_and_restart_shape_change_preserve_old_generation() {
+        let fixture = state_with_oci_files();
+        let original = fixture.state.load_generation();
+        let original_root = original
+            .oci()
+            .expect("OCI generation")
+            .verifier()
+            .trusted_root_snapshot()
+            .expect("root snapshot")
+            .to_vec();
+        drop(original);
+
+        std::fs::set_permissions(&fixture.root, std::fs::Permissions::from_mode(0o666))
+            .expect("make candidate root unsafe");
+        assert!(matches!(
+            reload_generation(&fixture.state),
+            Err(ReloadError::OciConfiguration(_))
+        ));
+        assert_eq!(fixture.state.active_generation_id(), INITIAL_GENERATION_ID);
+        assert_eq!(
+            fixture
+                .state
+                .load_generation()
+                .oci()
+                .expect("old OCI generation")
+                .verifier()
+                .trusted_root_snapshot(),
+            Some(original_root.as_slice())
+        );
+
+        std::fs::set_permissions(&fixture.root, std::fs::Permissions::from_mode(0o600))
+            .expect("restore root protection");
+        let config = std::fs::read_to_string(&fixture.inputs.config_path).expect("read config");
+        std::fs::write(
+            &fixture.inputs.config_path,
+            config.replace("[oci]\n", "[oci]\ndeadline-secs = 31\n"),
+        )
+        .expect("change restart-only deadline");
+        assert!(matches!(
+            reload_generation(&fixture.state),
+            Err(ReloadError::OciConfiguration(_))
+        ));
+        assert_eq!(fixture.state.active_generation_id(), INITIAL_GENERATION_ID);
     }
 
     /// An invalid candidate (malformed policy) is REJECTED, the previous
@@ -1026,6 +1319,62 @@ mod tests {
             state.active_generation_id(),
             INITIAL_GENERATION_ID,
             "helper rejection leaves the serving generation untouched"
+        );
+    }
+
+    #[test]
+    fn trusted_root_change_during_reload_snapshot_is_rejected() {
+        let fixture = state_with_oci_files();
+        let error = read_reload_inputs_with_observer(&fixture.inputs, || {
+            std::fs::write(&fixture.root, b"root-raced").expect("race trusted root rewrite");
+        })
+        .expect_err("changed trusted-root fingerprint rejects torn generation");
+
+        assert!(matches!(error, ReloadError::TornSnapshot { .. }));
+        assert_eq!(error.audit_reason(), "inputs_changed_during_read");
+        assert_eq!(fixture.state.active_generation_id(), INITIAL_GENERATION_ID);
+    }
+
+    #[test]
+    fn pinned_key_change_during_reload_snapshot_is_rejected() {
+        let fixture = state_with_oci_files();
+        let error = read_reload_inputs_with_observer(&fixture.inputs, || {
+            std::fs::write(&fixture.key, b"key-raced").expect("race pinned key rewrite");
+        })
+        .expect_err("changed pinned-key fingerprint rejects torn generation");
+
+        assert!(matches!(error, ReloadError::TornSnapshot { .. }));
+        assert_eq!(error.audit_reason(), "inputs_changed_during_read");
+        assert_eq!(fixture.state.active_generation_id(), INITIAL_GENERATION_ID);
+    }
+
+    #[test]
+    fn trust_change_after_candidate_capture_is_rejected_before_generation_install() {
+        let fixture = state_with_oci_files();
+        let mut traces = Vec::new();
+        let result = validate_candidate_with_trace_collector_and_observer(
+            &fixture.state,
+            &mut traces,
+            || {
+                std::fs::write(&fixture.key, b"key-after-capture")
+                    .expect("race after protected key capture");
+            },
+        );
+        let Err(error) = result else {
+            panic!("post-capture fingerprint mismatch must reject candidate");
+        };
+
+        assert!(matches!(error, ReloadError::TornSnapshot { .. }));
+        assert_eq!(fixture.state.active_generation_id(), INITIAL_GENERATION_ID);
+        assert_eq!(
+            fixture
+                .state
+                .load_generation()
+                .oci()
+                .expect("serving OCI generation")
+                .verifier()
+                .pinned_key_snapshot(&fixture.key),
+            Some(b"key-v1".as_slice())
         );
     }
 

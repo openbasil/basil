@@ -31,6 +31,7 @@ a structured audit record.
 | `attestor_protocol`                                                           | Framed private protocol with bounded serial health, peer-resolution, and inventory operations.                                  |
 | `runtime_attestor`                                                            | Facts-only runtime providers; Compose 1.0 supports rootful Docker on cgroup v2 without user-namespace remapping.                 |
 | `core::oci_verification`                                                      | Repository-scoped Sigstore policy, isolated exact-path Cosign execution, and independent OCI digest-chain verification.         |
+| `core::oci_evidence_cache`                                                    | Private bounded OCI evidence persistence, current-generation local revalidation, refresh health, and preview-first pruning.     |
 | `core::backend`                                                               | Backend adapters (table below).                                                                                                 |
 | `core::audit`, `core::decision`                                               | Decision records: subject, action, target, outcome, policy generation.                                                          |
 | `core::seal`, `x25519_seal`, `ed25519_sign`, `ml_dsa_sign`, `ml_kem_envelope` | Local crypto used for sealed invocations and materialize-to-use operations.                                                     |

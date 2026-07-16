@@ -20,7 +20,7 @@
 // Tests index `serde_json::Value` (e.g. `doc["decision"]`) by construction.
 #![cfg_attr(test, allow(clippy::indexing_slicing))]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -49,6 +49,7 @@ use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use serde::Deserialize;
 use serde::de::{self, Visitor};
+use sha2::{Digest as _, Sha256};
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -227,6 +228,69 @@ impl DoctorArgs {
     pub const fn rootless_expected_containers(&self) -> Option<u32> {
         self.rootless_expected_containers
     }
+}
+
+/// Inspect or prune the private persistent OCI evidence cache.
+#[derive(Debug, clap::Args)]
+pub struct CacheArgs {
+    /// Inspect cache entries without removing them.
+    #[arg(long)]
+    check: bool,
+    /// Select entries not used for this duration, for example `60d`.
+    #[arg(long, value_parser = parse_cache_age, requires = "check")]
+    age: Option<u64>,
+    /// Emit one strict cache identifier per line.
+    #[arg(short = 'q', long, conflicts_with = "json")]
+    quiet: bool,
+    /// Emit stable machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+    /// Cache maintenance operation.
+    #[command(subcommand)]
+    command: Option<CacheCommand>,
+    #[command(flatten)]
+    overrides: ConfigOverrides,
+}
+
+/// Mutating persistent-cache operations.
+#[derive(Debug, clap::Subcommand)]
+pub enum CacheCommand {
+    /// Preview or execute removal by exact cache ID or observed image reference.
+    Prune(CachePruneArgs),
+}
+
+/// Arguments for preview-first cache pruning.
+#[derive(Debug, clap::Args)]
+pub struct CachePruneArgs {
+    /// Execute the deterministic plan instead of only printing it.
+    #[arg(long)]
+    force: bool,
+    /// Exact cache IDs or previously observed image references.
+    #[arg(required = true, num_args = 1..)]
+    selectors: Vec<String>,
+}
+
+fn parse_cache_age(value: &str) -> Result<u64, String> {
+    let (number, multiplier) = if let Some(days) = value.strip_suffix('d') {
+        (days, 24_u64 * 60 * 60)
+    } else if let Some(hours) = value.strip_suffix('h') {
+        (hours, 60_u64 * 60)
+    } else if let Some(minutes) = value.strip_suffix('m') {
+        (minutes, 60_u64)
+    } else if let Some(seconds) = value.strip_suffix('s') {
+        (seconds, 1_u64)
+    } else {
+        return Err("cache age requires a d, h, m, or s suffix".to_owned());
+    };
+    let quantity = number
+        .parse::<u64>()
+        .map_err(|_| "cache age must be a positive integer duration".to_owned())?;
+    if quantity == 0 {
+        return Err("cache age must be greater than zero".to_owned());
+    }
+    quantity
+        .checked_mul(multiplier)
+        .ok_or_else(|| "cache age is too large".to_owned())
 }
 
 /// Backend-connection defaults applied to every cred that pins none of its own:
@@ -922,6 +986,16 @@ pub(crate) struct OciConfigFile {
     temp_parent: PathBuf,
     /// Complete verifier deadline in seconds.
     deadline_secs: u64,
+    /// Private persistent public-evidence cache directory.
+    cache_directory: PathBuf,
+    /// Maximum aggregate encoded cache bytes.
+    cache_max_bytes: u64,
+    /// Maximum persistent evidence entries.
+    cache_max_entries: usize,
+    /// Protected local Sigstore trusted-root JSON for keyless offline verification.
+    trusted_root: Option<PathBuf>,
+    /// Exact OCI subject digests denied by the active local configuration.
+    denied_digests: Vec<String>,
     /// One protected Docker authentication source.
     registry_auth: RegistryAuthConfigFile,
     /// Exact normalized authority to protected CA-bundle path.
@@ -935,9 +1009,24 @@ impl Default for OciConfigFile {
             cosign_executable: PathBuf::from("/usr/libexec/basil/cosign"),
             temp_parent: PathBuf::from("/run/basil/cosign"),
             deadline_secs: 30,
+            cache_directory: PathBuf::from("/var/cache/basil/oci"),
+            cache_max_bytes: crate::core::oci_evidence_cache::DEFAULT_CACHE_BYTES,
+            cache_max_entries: crate::core::oci_evidence_cache::DEFAULT_CACHE_ENTRIES,
+            trusted_root: None,
+            denied_digests: Vec::new(),
             registry_auth: RegistryAuthConfigFile::default(),
             registry_ca: BTreeMap::new(),
         }
+    }
+}
+
+impl OciConfigFile {
+    pub(crate) const fn enabled(&self) -> bool {
+        self.enable
+    }
+
+    pub(crate) fn trusted_root_path(&self) -> Option<&Path> {
+        self.trusted_root.as_deref()
     }
 }
 
@@ -1011,6 +1100,8 @@ struct RunConfig {
     no_reconcile: bool,
     invocation: InvocationRuntimeConfig,
     oci_verifier: Option<crate::core::oci_verification::CosignVerifier>,
+    oci_cache: Option<Arc<crate::core::oci_evidence_cache::OciEvidenceCache>>,
+    oci_denied_subjects: BTreeSet<crate::core::oci_verification::OciDigest>,
     #[cfg(feature = "http")]
     jwks: JwksConfig,
     setup: SetupArgs,
@@ -1030,6 +1121,8 @@ fn load_run_config(overrides: &ConfigOverrides) -> Result<RunConfig> {
     #[cfg(not(feature = "http"))]
     reject_jwks_config(&file.jwks)?;
     let oci_verifier = resolve_oci_config(&file.oci, None)?;
+    let oci_cache = resolve_oci_cache(&file.oci)?;
+    let oci_denied_subjects = resolve_oci_denylist(&file.oci)?;
     Ok(RunConfig {
         socket: file.socket,
         socket_mode: file.socket_mode.map_or(DEFAULT_SOCKET_MODE, |mode| mode.0),
@@ -1045,10 +1138,83 @@ fn load_run_config(overrides: &ConfigOverrides) -> Result<RunConfig> {
         no_reconcile: file.no_reconcile.unwrap_or(false),
         invocation: resolve_invocation_config(&file.broker_identity, &file.invocation)?,
         oci_verifier,
+        oci_cache,
+        oci_denied_subjects,
         #[cfg(feature = "http")]
         jwks,
         setup,
     })
+}
+
+fn resolve_oci_denylist(
+    file: &OciConfigFile,
+) -> Result<BTreeSet<crate::core::oci_verification::OciDigest>> {
+    if file.denied_digests.len() > 10_000 {
+        bail!("oci.denied-digests exceeds the 10,000-entry safety bound");
+    }
+    file.denied_digests
+        .iter()
+        .map(|digest| {
+            crate::core::oci_verification::OciDigest::parse(digest)
+                .map_err(|_| anyhow::anyhow!("oci.denied-digests contains an invalid digest"))
+        })
+        .collect()
+}
+
+pub(crate) fn parse_reload_oci_config(value: &toml::Value) -> Result<OciConfigFile> {
+    let file: AgentConfigFile = value
+        .clone()
+        .try_into()
+        .context("parsing reloaded agent configuration")?;
+    Ok(file.oci)
+}
+
+pub(crate) fn resolve_reloaded_oci_generation(
+    file: &OciConfigFile,
+    current: Option<&Arc<crate::state::OciVerificationGeneration>>,
+    policies: &BTreeMap<String, crate::core::oci_verification::OciSignerPolicy>,
+) -> Result<Option<Arc<crate::state::OciVerificationGeneration>>> {
+    if !file.enable {
+        if current.is_some() {
+            bail!("disabling OCI verification changes restart-only runtime shape");
+        }
+        return Ok(None);
+    }
+    let current = current
+        .context("enabling OCI verification requires restart to load immutable registry access")?;
+    if current.verifier().restart_shape() != Some(oci_restart_shape(file)) {
+        bail!("reloaded OCI configuration changes restart-only runtime shape");
+    }
+    let verifier = current
+        .verifier()
+        .refreshed_trust(file.trusted_root.as_deref(), policies)
+        .context("capturing reloaded OCI trust bytes")?;
+    let denied_subjects = resolve_oci_denylist(file)?;
+    Ok(Some(Arc::new(
+        crate::state::OciVerificationGeneration::new(Arc::new(verifier), denied_subjects),
+    )))
+}
+
+fn oci_cache_config(
+    file: &OciConfigFile,
+) -> crate::core::oci_evidence_cache::OciEvidenceCacheConfig {
+    crate::core::oci_evidence_cache::OciEvidenceCacheConfig {
+        root: file.cache_directory.clone(),
+        max_bytes: file.cache_max_bytes,
+        max_entries: file.cache_max_entries,
+    }
+}
+
+fn resolve_oci_cache(
+    file: &OciConfigFile,
+) -> Result<Option<Arc<crate::core::oci_evidence_cache::OciEvidenceCache>>> {
+    if !file.enable {
+        return Ok(None);
+    }
+    crate::core::oci_evidence_cache::OciEvidenceCache::open(oci_cache_config(file))
+        .map(Arc::new)
+        .map(Some)
+        .context("opening private OCI evidence cache")
 }
 
 fn resolve_oci_config(
@@ -1097,7 +1263,7 @@ fn resolve_oci_config(
             },
         )
         .context("loading protected OCI registry access")?;
-    let verifier = crate::core::oci_verification::CosignVerifier::new(
+    let mut verifier = crate::core::oci_verification::CosignVerifier::new(
         crate::core::oci_verification::CosignConfig {
             executable: file.cosign_executable.clone(),
             temp_parent: file.temp_parent.clone(),
@@ -1105,8 +1271,61 @@ fn resolve_oci_config(
         },
         access,
     )
-    .context("constructing packaged OCI verifier")?;
+    .context("constructing packaged OCI verifier")?
+    .with_restart_shape(oci_restart_shape(file));
+    if let Some(trusted_root) = &file.trusted_root {
+        verifier = verifier
+            .with_trusted_root(trusted_root)
+            .context("loading protected OCI trusted root")?;
+    }
     Ok(Some(verifier))
+}
+
+pub(crate) fn oci_restart_shape(file: &OciConfigFile) -> [u8; 32] {
+    fn append(output: &mut Vec<u8>, value: &[u8]) {
+        output.extend_from_slice(&u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+        output.extend_from_slice(value);
+    }
+
+    let mut encoded = Vec::new();
+    append(
+        &mut encoded,
+        file.cosign_executable.as_os_str().as_encoded_bytes(),
+    );
+    append(
+        &mut encoded,
+        file.temp_parent.as_os_str().as_encoded_bytes(),
+    );
+    append(&mut encoded, &file.deadline_secs.to_be_bytes());
+    append(
+        &mut encoded,
+        file.cache_directory.as_os_str().as_encoded_bytes(),
+    );
+    append(&mut encoded, &file.cache_max_bytes.to_be_bytes());
+    append(
+        &mut encoded,
+        &u64::try_from(file.cache_max_entries)
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    append(
+        &mut encoded,
+        match file.registry_auth.source {
+            RegistryAuthSourceKind::SystemdCredential => b"systemd-credential",
+            RegistryAuthSourceKind::ProtectedFile => b"protected-file",
+        },
+    );
+    if let Some(credential) = &file.registry_auth.credential {
+        append(&mut encoded, credential.as_bytes());
+    }
+    if let Some(path) = &file.registry_auth.file {
+        append(&mut encoded, path.as_os_str().as_encoded_bytes());
+    }
+    for (authority, path) in &file.registry_ca {
+        append(&mut encoded, authority.as_bytes());
+        append(&mut encoded, path.as_os_str().as_encoded_bytes());
+    }
+    Sha256::digest(encoded).into()
 }
 
 fn resolve_invocation_config(
@@ -1908,6 +2127,7 @@ fn enforce_startup_capabilities(catalog: &crate::Catalog, policy: CapabilityPoli
 
 /// Run the broker daemon: load catalog/policy + the sealed bundle, unlock,
 /// construct backends from the decrypted creds, then serve.
+#[allow(clippy::too_many_lines)]
 async fn run_daemon(args: RunArgs, version: &'static str) -> Result<()> {
     let run_config = load_run_config(&args.overrides)?;
     // Shared setup: load catalog/policy, unlock the bundle, build the manager
@@ -1972,7 +2192,12 @@ async fn run_daemon(args: RunArgs, version: &'static str) -> Result<()> {
                 config_path: run_config.setup.config_path.clone(),
                 overrides: run_config.setup.startup_overrides.clone(),
             });
-    state = attach_oci_verifier(state, run_config.oci_verifier);
+    state = attach_oci_runtime(
+        state,
+        run_config.oci_verifier,
+        run_config.oci_cache,
+        run_config.oci_denied_subjects,
+    )?;
 
     // Optional JSONL audit sink (`vault-vq5`): open the append-only file ONCE at
     // startup so a permissions/path error fails closed here rather than per-op. A
@@ -2046,14 +2271,28 @@ async fn run_daemon(args: RunArgs, version: &'static str) -> Result<()> {
     Ok(())
 }
 
-fn attach_oci_verifier(
+fn attach_oci_runtime(
     state: BrokerState,
     verifier: Option<crate::core::oci_verification::CosignVerifier>,
-) -> BrokerState {
-    match verifier {
-        Some(verifier) => state.with_oci_verifier(Arc::new(verifier)),
+    cache: Option<Arc<crate::core::oci_evidence_cache::OciEvidenceCache>>,
+    denied_subjects: BTreeSet<crate::core::oci_verification::OciDigest>,
+) -> Result<BrokerState> {
+    let state = match verifier {
+        Some(verifier) => {
+            let generation = state.load_generation();
+            let verifier = verifier
+                .with_signer_policies(&generation.policy().oci_signer_policies)
+                .context("capturing protected OCI signer public keys")?;
+            drop(generation);
+            state.with_oci_verification(Arc::new(verifier), denied_subjects)
+        }
         None => state,
-    }
+    };
+    let state = match cache {
+        Some(cache) => state.with_oci_evidence_cache(cache),
+        None => state,
+    };
+    Ok(state)
 }
 
 /// Install the SIGHUP handler. SIGHUP is the operational "reload" signal: it
@@ -2215,8 +2454,11 @@ fn load_doctor_inputs(
 /// binds the socket, or mutates anything; `--keys` explicitly unlocks only to run
 /// the authenticated read-only per-key existence probe.
 async fn run_doctor(args: DoctorArgs) -> Result<()> {
+    let (agent_file, _) = load_agent_config(&args.overrides)?;
     let inputs = load_doctor_inputs(&args.overrides, args.rootless_expected_containers)?;
     let mut report = doctor::run_doctor(&inputs, doctor::EnabledFeatures::current()).await;
+    report.checks.push(oci_cache_doctor_row(&agent_file.oci));
+    report = doctor::DoctorReport::from_checks(report.checks);
     if args.keys {
         let mut key_rows = doctor_key_material_rows(&args.overrides).await;
         report.checks.append(&mut key_rows);
@@ -2235,6 +2477,78 @@ async fn run_doctor(args: DoctorArgs) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+fn oci_cache_doctor_row(file: &OciConfigFile) -> doctor::CheckResult {
+    if !file.enable {
+        return doctor::CheckResult::ok("oci_evidence_cache", "OCI verification is disabled");
+    }
+    if !file.cache_directory.exists() {
+        return doctor::CheckResult::ok(
+            "oci_evidence_cache",
+            "cache is empty and will be created at agent startup",
+        );
+    }
+    let cache = match crate::core::oci_evidence_cache::OciEvidenceCache::open_existing_read_only(
+        oci_cache_config(file),
+    ) {
+        Ok(cache) => cache,
+        Err(error) => {
+            return doctor::CheckResult::fatal(
+                "oci_evidence_cache",
+                format!("cache layout cannot be inspected: {error}"),
+                "restore owner-only cache directories and regular owner-only entry files",
+            );
+        }
+    };
+    let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs(),
+        Err(_) => {
+            return doctor::CheckResult::fatal(
+                "oci_evidence_cache",
+                "system clock is before the Unix epoch",
+                "correct the host clock before starting Basil",
+            );
+        }
+    };
+    match cache.doctor_read_only(now) {
+        Ok(report) if report.at_capacity || report.refresh_degraded > 0 => {
+            doctor::CheckResult::warn(
+                "oci_evidence_cache",
+                format!(
+                    "{} entries ({}%), {} bytes ({}%), {} degraded refreshes, oldest age {}s, refresh threshold {}s, longest degradation {}s",
+                    report.entry_count,
+                    report.entry_pressure_percent,
+                    report.total_bytes,
+                    report.byte_pressure_percent,
+                    report.refresh_degraded,
+                    report.oldest_age_seconds.unwrap_or(0),
+                    report.refresh_threshold_seconds,
+                    report.longest_degraded_duration_seconds.unwrap_or(0)
+                ),
+                "preview selective removal with `basil cache prune`; investigate degraded refreshes",
+            )
+        }
+        Ok(report) => doctor::CheckResult::ok(
+            "oci_evidence_cache",
+            format!(
+                "{} entries ({}%), {} bytes ({}%), {} due for refresh, oldest age {}s, last successful refresh {}, threshold {}s",
+                report.entry_count,
+                report.entry_pressure_percent,
+                report.total_bytes,
+                report.byte_pressure_percent,
+                report.refresh_due,
+                report.oldest_age_seconds.unwrap_or(0),
+                report.oldest_last_successful_refresh.unwrap_or(0),
+                report.refresh_threshold_seconds
+            ),
+        ),
+        Err(error) => doctor::CheckResult::fatal(
+            "oci_evidence_cache",
+            format!("cache inspection failed: {error}"),
+            "repair the private cache layout or prune the affected exact entry",
+        ),
+    }
 }
 
 /// Unlock the sealed bundle and run the authenticated read-only per-key existence
@@ -2609,6 +2923,172 @@ pub async fn run_doctor_command(args: DoctorArgs) -> Result<()> {
     .await
 }
 
+/// Run read-only inspection or preview-first pruning behind `basil cache`.
+pub async fn run_cache_command(args: CacheArgs) -> Result<()> {
+    let overrides = args.overrides.clone();
+    let suppress_stdout_logging = args.json || args.quiet;
+    Box::pin(run_with_config_logging(
+        &overrides,
+        ConfigurationTraceContext::Offline,
+        suppress_stdout_logging,
+        async move { run_cache(args) },
+    ))
+    .await
+}
+
+fn run_cache(args: CacheArgs) -> Result<()> {
+    let (file, _) = load_agent_config(&args.overrides)?;
+    let cache =
+        crate::core::oci_evidence_cache::OciEvidenceCache::open(oci_cache_config(&file.oci))
+            .context("opening private OCI evidence cache")?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| anyhow::anyhow!("system clock is before the Unix epoch"))?
+        .as_secs();
+    match args.command {
+        Some(CacheCommand::Prune(prune)) => {
+            run_cache_prune(&cache, &prune, now, args.quiet, args.json)
+        }
+        None if args.check => run_cache_check(&cache, args.age, now, args.quiet, args.json),
+        None => bail!("cache requires --check or a maintenance subcommand"),
+    }
+}
+
+fn run_cache_check(
+    cache: &crate::core::oci_evidence_cache::OciEvidenceCache,
+    age: Option<u64>,
+    now: u64,
+    quiet: bool,
+    json: bool,
+) -> Result<()> {
+    let mut report = cache.check(now).context("checking OCI evidence cache")?;
+    if let Some(age) = age {
+        let cutoff = now.saturating_sub(age);
+        report.entries.retain(|entry| entry.last_used <= cutoff);
+        report.total_bytes = report.entries.iter().try_fold(0_u64, |total, entry| {
+            total
+                .checked_add(entry.encoded_bytes)
+                .context("cache inspection byte count overflowed")
+        })?;
+    }
+    render_cache_entries(&report.entries, quiet, json)?;
+    if !quiet && !json {
+        println!(
+            "{} entries, {} encoded bytes, {} corrupt entries removed",
+            report.entries.len(),
+            report.total_bytes,
+            report.corrupt_removed
+        );
+    }
+    Ok(())
+}
+
+fn run_cache_prune(
+    cache: &crate::core::oci_evidence_cache::OciEvidenceCache,
+    args: &CachePruneArgs,
+    now: u64,
+    quiet: bool,
+    json: bool,
+) -> Result<()> {
+    let selectors = args
+        .selectors
+        .iter()
+        .map(|selector| {
+            crate::core::oci_evidence_cache::CacheEntryId::parse(selector).map_or_else(
+                |_| crate::core::oci_evidence_cache::PruneSelector::Reference(selector.clone()),
+                crate::core::oci_evidence_cache::PruneSelector::Id,
+            )
+        })
+        .collect::<Vec<_>>();
+    let plan = cache
+        .plan_prune(&selectors, now)
+        .context("planning OCI evidence cache prune")?;
+    let entries = plan.entries();
+    render_cache_entries(&entries, quiet, json)?;
+    if args.force {
+        let result = cache
+            .execute_prune(plan)
+            .context("executing OCI evidence cache prune")?;
+        if !quiet && !json {
+            println!(
+                "removed {}, skipped {} changed entries",
+                result.removed, result.skipped
+            );
+        }
+    } else if !quiet && !json {
+        println!(
+            "preview only; pass --force to remove {} entries",
+            entries.len()
+        );
+    }
+    Ok(())
+}
+
+fn render_cache_entries(
+    entries: &[crate::core::oci_evidence_cache::CacheEntryInfo],
+    quiet: bool,
+    json: bool,
+) -> Result<()> {
+    if quiet {
+        for entry in entries {
+            println!("{}", entry.id);
+        }
+        return Ok(());
+    }
+    if json {
+        println!("{}", cache_entries_json(entries)?);
+        return Ok(());
+    }
+    for entry in entries {
+        println!(
+            "{} {} {} bytes last-used={} age={}s refresh-threshold={}s degraded={} source={} references={}",
+            entry.id,
+            entry.subject,
+            entry.encoded_bytes,
+            entry.last_used,
+            entry.age_seconds,
+            entry.refresh_threshold_seconds,
+            entry
+                .degraded_duration_seconds
+                .map_or_else(|| "no".to_owned(), |duration| format!("{duration}s")),
+            entry.source_context,
+            entry
+                .references
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+    Ok(())
+}
+
+fn cache_entries_json(
+    entries: &[crate::core::oci_evidence_cache::CacheEntryInfo],
+) -> Result<String> {
+    let rows = entries
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "id": entry.id.as_str(),
+                "subject": entry.subject.to_string(),
+                "references": entry.references,
+                "source": entry.source_context,
+                "lastUse": entry.last_used,
+                "collectedAt": entry.collected_at,
+                "lastSuccessfulRefresh": entry.last_successful_refresh,
+                "ageSeconds": entry.age_seconds,
+                "refreshThresholdSeconds": entry.refresh_threshold_seconds,
+                "refreshDue": entry.refresh_due,
+                "degradedSince": entry.degraded_since,
+                "degradedDurationSeconds": entry.degraded_duration_seconds,
+                "encodedSize": entry.encoded_bytes,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&rows).context("serializing OCI evidence cache entries")
+}
+
 /// Run first-run config scaffolding behind top-level `basil init`.
 ///
 /// `socket` is the resolved global `--socket <path>` flag (clap folds
@@ -2857,6 +3337,52 @@ mod tests {
                 "{addr} must not warn"
             );
         }
+    }
+
+    #[test]
+    fn cache_json_diagnostics_have_a_stable_explicit_schema() {
+        use crate::core::oci_evidence_cache::{CacheEntryId, CacheEntryInfo, EvidenceRefreshState};
+        use crate::core::oci_verification::OciDigest;
+
+        let entry = CacheEntryInfo {
+            id: CacheEntryId::parse(&"1".repeat(64)).expect("cache identifier"),
+            subject: OciDigest::parse(&format!("sha256:{}", "2".repeat(64)))
+                .expect("subject digest"),
+            source_context: "registry.example/team/app".to_owned(),
+            references: std::collections::BTreeSet::from([
+                "registry.example/team/app@sha256:manifest".to_owned(),
+            ]),
+            encoded_bytes: 4096,
+            last_used: 100,
+            collected_at: 10,
+            last_successful_refresh: 20,
+            age_seconds: 80,
+            refresh_threshold_seconds: 2_592_000,
+            degraded_since: Some(40),
+            degraded_duration_seconds: Some(60),
+            refresh_due: true,
+            refresh: EvidenceRefreshState::Due {
+                age_seconds: 80,
+                degraded_since: Some(40),
+            },
+        };
+
+        assert_eq!(
+            cache_entries_json(&[entry]).expect("serialize diagnostics"),
+            concat!(
+                "[{\"ageSeconds\":80,\"collectedAt\":10,",
+                "\"degradedDurationSeconds\":60,\"degradedSince\":40,",
+                "\"encodedSize\":4096,\"id\":\"",
+                "1111111111111111111111111111111111111111111111111111111111111111",
+                "\",\"lastSuccessfulRefresh\":20,\"lastUse\":100,",
+                "\"references\":[\"registry.example/team/app@sha256:manifest\"],",
+                "\"refreshDue\":true,\"refreshThresholdSeconds\":2592000,",
+                "\"source\":\"registry.example/team/app\",",
+                "\"subject\":\"sha256:",
+                "2222222222222222222222222222222222222222222222222222222222222222",
+                "\"}]"
+            )
+        );
     }
 
     fn overrides_for(config: PathBuf) -> ConfigOverrides {
