@@ -55,6 +55,20 @@ pub struct ListenerConnectInfo {
 }
 
 impl ListenerConnectInfo {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        listener_name: impl Into<Arc<str>>,
+        listener_type: ListenerType,
+        peer: PeerInfo,
+    ) -> Self {
+        Self {
+            connection_id: ConnectionId(1),
+            listener_name: listener_name.into(),
+            listener_type,
+            peer,
+        }
+    }
+
     /// Stable connection identifier.
     #[must_use]
     pub const fn connection_id(&self) -> ConnectionId {
@@ -368,6 +382,16 @@ impl ListenerTransitionGuard {
     pub fn active_for_listener(&self, listener_name: &str) -> usize {
         self.active.get(listener_name).copied().unwrap_or(0)
     }
+
+    /// Apply the complete listener-set commit while admission remains gated.
+    ///
+    /// The guard is consumed so callers cannot accidentally release admission
+    /// before the commit closure returns. It is also released on unwinding.
+    pub fn commit<R>(self, apply: impl FnOnce() -> R) -> R {
+        let result = apply();
+        drop(self);
+        result
+    }
 }
 
 impl Drop for ListenerTransitionGuard {
@@ -621,7 +645,15 @@ mod tests {
         assert_eq!(transition.active_for_listener("host"), 0);
         assert_eq!(registry.active_for_listener("host"), 0);
 
-        drop(transition);
+        let committed = transition.commit(|| {
+            let (stream, _peer) = pair();
+            assert!(matches!(
+                registry.register(stream, "host", ListenerType::Host),
+                Err(ConnectionRegistryError::ListenerGated(name)) if name == "host"
+            ));
+            "committed"
+        });
+        assert_eq!(committed, "committed");
         let (stream, _peer) = pair();
         let tracked = registry
             .register(stream, "host", ListenerType::Host)

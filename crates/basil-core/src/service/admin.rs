@@ -26,8 +26,10 @@ use crate::decision::DecisionRecord;
 use crate::reload::{ReloadError, check_reload, reload_generation};
 use crate::service::broker::{BoxStream, BrokerGrpc, GrpcResult};
 use crate::service::shared::{event_allowed, payload_too_large, proto_event};
-use crate::state::{ReadinessOutcome, ReadinessState};
-use crate::transport::{broker_status, peer_from_request};
+use crate::state::{BrokerState, Generation, ReadinessOutcome, ReadinessState};
+use crate::transport::{
+    attestation_unavailable_status, broker_status, enforce_listener_domain, peer_from_request,
+};
 use tracing::warn;
 
 /// The reload op's stable wire token, used in the `BrokerErrorInfo.op` field of a
@@ -48,17 +50,30 @@ fn admin_resolution_status(op: &'static str, err: &SubjectResolutionError) -> to
             "missing peer credentials",
         ),
         SubjectResolutionError::DomainUnavailable
-        | SubjectResolutionError::EvidenceUnavailable { .. } => broker_status(
-            Code::Unavailable,
-            "ATTESTATION_UNAVAILABLE",
-            op,
-            "attestation unavailable",
-        ),
+        | SubjectResolutionError::EvidenceUnavailable { .. } => attestation_unavailable_status(op),
         SubjectResolutionError::NoSubject { .. }
         | SubjectResolutionError::AmbiguousSubject { .. } => {
             broker_status(Code::PermissionDenied, "UNAUTHORIZED", op, "not authorized")
         }
     }
+}
+
+fn enforce_admin_listener<T>(
+    state: &BrokerState,
+    generation: &Generation,
+    request: &Request<T>,
+    actor: &crate::actor::AuthenticatedActor,
+    op: Op,
+) -> Result<(), tonic::Status> {
+    let target = match op {
+        Op::Watch => ADMIN_WATCH_TARGET,
+        Op::Reload => ADMIN_RELOAD_TARGET,
+        Op::Explain => ADMIN_EXPLAIN_TARGET,
+        Op::Revoke => ADMIN_REVOKE_TARGET,
+        Op::RealmStatus => ADMIN_REALM_STATUS_TARGET,
+        _ => "admin",
+    };
+    enforce_listener_domain(state, generation.id(), request, actor, op, target)
 }
 
 #[tonic::async_trait]
@@ -84,6 +99,7 @@ impl AdminService for BrokerGrpc {
             .pdp()
             .resolve_local_actor(&peer)
             .map_err(|err| admin_resolution_status(STATUS_OP_TOKEN, &err))?;
+        enforce_admin_listener(&self.state, &generation, &request, &actor, Op::RealmStatus)?;
         let include_realms = request.get_ref().include_realms;
         if include_realms {
             let decision = generation.pdp().decide_admin(&actor, Op::RealmStatus);
@@ -206,6 +222,7 @@ impl AdminService for BrokerGrpc {
             .pdp()
             .resolve_local_actor(&peer)
             .map_err(|err| admin_resolution_status(WATCH_OP_TOKEN, &err))?;
+        enforce_admin_listener(&self.state, &generation, &request, &actor, Op::Watch)?;
 
         let decision = generation.pdp().decide_admin(&actor, Op::Watch);
         self.state
@@ -297,6 +314,7 @@ impl AdminService for BrokerGrpc {
             .pdp()
             .resolve_local_actor(&peer)
             .map_err(|err| admin_resolution_status(RELOAD_OP_TOKEN, &err))?;
+        enforce_admin_listener(&self.state, &generation, &request, &actor, Op::Reload)?;
         let uid = Self::require_unix_uid(&actor, RELOAD_OP_TOKEN)?;
 
         let decision = generation.pdp().decide_admin(&actor, Op::Reload);
@@ -427,6 +445,7 @@ impl AdminService for BrokerGrpc {
             .pdp()
             .resolve_local_actor(&peer)
             .map_err(|err| admin_resolution_status(EXPLAIN_OP_TOKEN, &err))?;
+        enforce_admin_listener(&self.state, &generation, &request, &actor, Op::Explain)?;
 
         let decision = generation.pdp().decide_admin(&actor, Op::Explain);
         self.state
@@ -477,6 +496,7 @@ impl AdminService for BrokerGrpc {
             .pdp()
             .resolve_local_actor(&peer)
             .map_err(|err| admin_resolution_status(REVOKE_OP_TOKEN, &err))?;
+        enforce_admin_listener(&self.state, &generation, &request, &actor, Op::Revoke)?;
 
         let decision = generation.pdp().decide_admin(&actor, Op::Revoke);
         self.state

@@ -6,6 +6,8 @@
 
 use std::ffi::OsString;
 use std::io;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd as _;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Component, Path, PathBuf};
@@ -270,7 +272,9 @@ impl QualifiedListener {
         })
     }
 
-    /// Bind a non-serving socket at a private sibling path with mode `0600`.
+    /// Bind a non-serving socket inside a private `0700` sibling directory and
+    /// apply its configured ACL through the pinned directory descriptor before
+    /// publication.
     ///
     /// # Errors
     ///
@@ -321,7 +325,8 @@ impl QualifiedListener {
                     });
                 }
             };
-            let listener = match UnixListener::bind(&stage_path) {
+            let bind_path = pinned_stage_bind_path(&stage_fd, &stage_path);
+            let listener = match UnixListener::bind(&bind_path) {
                 Ok(listener) => listener,
                 Err(source) => {
                     cleanup_private_stage(self.parent_fd.as_ref(), &stage_name, Some(&stage_fd));
@@ -638,6 +643,20 @@ fn open_trusted_parent(listener: &str, parent: &Path) -> Result<OwnedFd, Listene
     Ok(current_fd)
 }
 
+#[cfg(target_os = "linux")]
+fn pinned_stage_bind_path(stage_fd: &OwnedFd, _display_path: &Path) -> PathBuf {
+    PathBuf::from("/proc/self/fd")
+        .join(stage_fd.as_raw_fd().to_string())
+        .join("s")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pinned_stage_bind_path(_stage_fd: &OwnedFd, display_path: &Path) -> PathBuf {
+    // The qualified parent is owner-controlled and non-writable to group/world;
+    // platforms without Linux procfs retain the validated textual path.
+    display_path.to_path_buf()
+}
+
 fn apply_private_socket_permissions(
     listener: &str,
     stage_fd: &OwnedFd,
@@ -851,8 +870,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn validation_rejects_writable_parent_and_prepare_fails_closed_on_symlink_swap() {
+    #[tokio::test]
+    async fn validation_rejects_writable_parent_and_prepare_fails_closed_on_symlink_swap() {
         let directory = TestDirectory::new();
         let writable = directory.path().join("writable");
         std::fs::create_dir(&writable).expect("writable parent");
@@ -874,7 +893,9 @@ mod tests {
         std::fs::rename(&live, &pinned).expect("move qualified parent");
         std::os::unix::fs::symlink(&attacker, &live).expect("replace path with symlink");
 
-        assert!(qualified.prepare().is_err());
+        let prepared = qualified
+            .prepare()
+            .expect("pinned stage remains usable after textual swap");
         assert!(
             std::fs::read_dir(&attacker)
                 .expect("attacker directory")
@@ -882,6 +903,7 @@ mod tests {
                 .is_none(),
             "path swap must not create an attacker-controlled socket"
         );
+        drop(prepared);
         assert!(
             std::fs::read_dir(&pinned)
                 .expect("pinned directory")
@@ -939,6 +961,22 @@ mod tests {
         );
         drop(published);
         assert!(!final_path.exists());
+
+        let published = QualifiedListener::validate(&listener)
+            .expect("qualifies for replacement test")
+            .prepare()
+            .expect("stages replacement test")
+            .publish()
+            .expect("publishes replacement test");
+        let (bound, lease) = published.into_listener().expect("transfers listener");
+        std::fs::remove_file(&final_path).expect("unlink owned socket");
+        std::fs::write(&final_path, b"foreign replacement").expect("install foreign inode");
+        drop(lease);
+        drop(bound);
+        assert_eq!(
+            std::fs::read(&final_path).expect("foreign inode preserved"),
+            b"foreign replacement"
+        );
     }
 
     #[tokio::test]
@@ -963,7 +1001,7 @@ mod tests {
                         listener_type: ListenerType::Host,
                         path: second_path.clone(),
                         mode: Some(0o600),
-                        group: Some("basil-definitely-missing-group".to_string()),
+                        group: None,
                     },
                 ),
             ]),
@@ -973,8 +1011,13 @@ mod tests {
         let first = configs.get("first").expect("first");
         let second = configs.get("second").expect("second");
 
-        assert!(PreparedListenerBatch::prepare([first, second]).is_err());
+        let prepared = PreparedListenerBatch::prepare([first, second]).expect("batch prepares");
+        std::fs::write(&second_path, b"race winner").expect("occupy second final path");
+        assert!(prepared.publish().is_err());
         assert!(!first_path.exists());
-        assert!(!second_path.exists());
+        assert_eq!(
+            std::fs::read(&second_path).expect("race winner remains"),
+            b"race winner"
+        );
     }
 }
