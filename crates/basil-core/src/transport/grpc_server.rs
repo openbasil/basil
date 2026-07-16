@@ -257,14 +257,18 @@ async fn serve_with_shutdown(
 /// umask is. The listen backlog is live from `bind`, so the mode must be
 /// restrictive *at creation*; the later [`apply_socket_permissions`] can only
 /// widen it to the configured mode/group (never leaves a permissive window).
-fn bind_restricted(path: &str) -> io::Result<UnixListener> {
+pub(crate) fn bind_restricted(path: &str) -> io::Result<UnixListener> {
     let inherited = rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o177));
     let listener = UnixListener::bind(path);
     rustix::process::umask(inherited);
     listener
 }
 
-fn apply_socket_permissions(path: &str, mode: u32, group: Option<&str>) -> io::Result<()> {
+pub(crate) fn apply_socket_permissions(
+    path: &str,
+    mode: u32,
+    group: Option<&str>,
+) -> io::Result<()> {
     if let Some(group) = group {
         let gid = resolve_group(group)?;
         std::os::unix::fs::chown(path, None, Some(gid))?;
