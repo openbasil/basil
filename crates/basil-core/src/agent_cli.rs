@@ -2040,7 +2040,9 @@ async fn run_daemon(args: RunArgs, version: &'static str) -> Result<()> {
 
 fn host_server_config(run_config: &RunConfig) -> ServerConfig {
     ServerConfig {
+        listener_name: "host".to_string(),
         listener_type: crate::transport::grpc_server::ListenerType::Host,
+        connections: crate::transport::connection::ConnectionRegistry::with_defaults(),
         socket_path: run_config
             .socket
             .clone()

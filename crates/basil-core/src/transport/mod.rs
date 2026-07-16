@@ -10,6 +10,7 @@
 
 #![allow(clippy::result_large_err)]
 
+pub mod connection;
 pub mod grpc_server;
 pub mod listener;
 
@@ -24,6 +25,7 @@ use crate::catalog::policy::Op;
 use crate::decision::{DecisionRecord, op_token};
 use crate::peer::PeerInfo;
 use crate::state::{BrokerState, Generation};
+use connection::ListenerConnectInfo;
 
 /// Resolve the attested peer from a tonic request.
 #[must_use]
@@ -70,6 +72,9 @@ pub fn authorize_in_generation<T>(
 fn peer_from_extensions(extensions: &Extensions) -> PeerInfo {
     if let Some(peer) = extensions.get::<PeerInfo>() {
         return peer.clone();
+    }
+    if let Some(info) = extensions.get::<ListenerConnectInfo>() {
+        return info.peer().clone();
     }
     extensions
         .get::<UdsConnectInfo>()

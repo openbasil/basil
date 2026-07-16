@@ -22,7 +22,7 @@ use basil_proto::envoy::service::secret::v3::secret_discovery_service_server::Se
 use basil_proto::spiffe::spiffe_workload_api_server::SpiffeWorkloadApiServer;
 use tokio::net::UnixListener;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio_stream::wrappers::UnixListenerStream;
+use tokio_stream::{StreamExt as _, wrappers::UnixListenerStream};
 use tonic::transport::Server;
 use tracing::{info, warn};
 
@@ -31,6 +31,7 @@ use crate::sds::EnvoySdsGrpc;
 use crate::service::broker::InvocationRuntimeConfig;
 use crate::spiffe::SpiffeWorkloadGrpc;
 use crate::state::BrokerState;
+use crate::transport::connection::ConnectionRegistry;
 
 /// Default Unix socket mode: owner read/write only.
 pub const DEFAULT_SOCKET_MODE: u32 = 0o600;
@@ -126,8 +127,12 @@ impl ListenerType {
 /// Runtime configuration for the gRPC listener.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
+    /// Stable name used for connection inventory and trusted diagnostics.
+    pub listener_name: String,
     /// Closed compiled service surface exposed by this listener.
     pub listener_type: ListenerType,
+    /// Broker-wide accepted-transport registry shared by every listener.
+    pub connections: ConnectionRegistry,
     /// Path to bind the listening Unix socket at.
     pub socket_path: String,
     /// File mode to apply to the listening Unix socket after bind.
@@ -168,9 +173,24 @@ async fn serve_with_shutdown(
         backend = state.backend_label(),
         "basil gRPC agent listening"
     );
-    let incoming = UnixListenerStream::new(listener);
-    let broker = BrokerGrpc::new_with_invocation_config(state.clone(), config.invocation);
+    let listener_name: Arc<str> = Arc::from(config.listener_name);
     let listener_type = config.listener_type;
+    let connections = config.connections;
+    let incoming = UnixListenerStream::new(listener).filter_map(move |accepted| {
+        let listener_name = Arc::clone(&listener_name);
+        let connections = connections.clone();
+        match accepted {
+            Ok(stream) => match connections.register(stream, listener_name, listener_type) {
+                Ok(stream) => Some(Ok(stream)),
+                Err(error) => {
+                    warn!(%error, ?listener_type, "rejected accepted connection");
+                    None
+                }
+            },
+            Err(error) => Some(Err(error)),
+        }
+    });
+    let broker = BrokerGrpc::new_with_invocation_config(state.clone(), config.invocation);
 
     let server = Server::builder()
         .add_optional_service(
@@ -448,7 +468,9 @@ mod tests {
     ) -> oneshot::Sender<()> {
         let (tx, rx) = oneshot::channel();
         let config = ServerConfig {
+            listener_name: "test".to_string(),
             listener_type,
+            connections: ConnectionRegistry::with_defaults(),
             socket_path: socket.to_string_lossy().into_owned(),
             socket_mode: DEFAULT_SOCKET_MODE,
             socket_group: None,
@@ -526,7 +548,9 @@ mod tests {
         let socket = socket_path("mode");
         let (tx, rx) = oneshot::channel();
         let config = ServerConfig {
+            listener_name: "test".to_string(),
             listener_type: ListenerType::Host,
+            connections: ConnectionRegistry::with_defaults(),
             socket_path: socket.to_string_lossy().into_owned(),
             socket_mode: 0o660,
             socket_group: None,
