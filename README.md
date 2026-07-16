@@ -32,8 +32,11 @@ credentials with PID start time, caller/host ID maps, namespaces, cgroups, and
 the opened executable object; mutable credential predicates are reread at each
 authorization. Container signer evidence binds a named pinned-key or keyless
 Sigstore policy to the exact repository, platform, OCI index/manifest, and
-running config digest. A policy subject combines these typed facts through
-bounded recursive `all` and `any` expressions. Exactly one subject must match
+running config digest. After a direct Cosign child completes, Basil terminates
+its process group and confirms the group is gone before removing private
+credential and trust views. Timeout and cancellation signal the group
+immediately. A policy subject combines these typed facts through bounded
+recursive `all` and `any` expressions. Exactly one subject must match
 before any grant or public-class read is considered; missing or unavailable
 evidence never grants authority. When approved by policy, Basil performs the
 operation against the backend, where the key material stays put, and writes a

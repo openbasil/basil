@@ -16,17 +16,22 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write as _};
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine as _;
-use rustix::process::{Pid, Signal, kill_process_group};
+use rustix::process::{
+    Pid, PidfdFlags, Signal, kill_process_group, pidfd_open, test_kill_process_group,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio::io::AsyncReadExt as _;
+use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
 use tokio::process::{Child, Command};
 use tokio::time::{Instant, timeout_at};
 use tracing::warn;
@@ -1826,26 +1831,123 @@ impl Drop for PrivateTempDir {
     }
 }
 
-struct ProcessGroupGuard(Option<Pid>);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessLifecycleEvent {
+    ExitObservedWithoutReap,
+    GroupKillCompleted,
+    LeaderReaped,
+    GroupGone,
+}
 
-impl ProcessGroupGuard {
-    fn new(child: &Child) -> Self {
-        Self(
-            child
-                .id()
-                .and_then(|id| i32::try_from(id).ok())
-                .and_then(Pid::from_raw),
-        )
+#[derive(Default)]
+struct ProcessLifecycleObserver {
+    #[cfg(test)]
+    events: Option<Arc<Mutex<Vec<ProcessLifecycleEvent>>>>,
+}
+
+impl ProcessLifecycleObserver {
+    #[cfg(test)]
+    const fn recording(events: Arc<Mutex<Vec<ProcessLifecycleEvent>>>) -> Self {
+        Self {
+            events: Some(events),
+        }
     }
 
-    const fn disarm(&mut self) {
-        self.0 = None;
+    #[cfg(test)]
+    fn record(&self, event: ProcessLifecycleEvent) {
+        if let Some(events) = &self.events
+            && let Ok(mut events) = events.lock()
+        {
+            events.push(event);
+        }
+    }
+
+    #[cfg(not(test))]
+    const fn record(&self, event: ProcessLifecycleEvent) {
+        let _ = (self, event);
+    }
+}
+
+struct ProcessGroupGuard {
+    pid: Option<Pid>,
+    exit: AsyncFd<OwnedFd>,
+    observer: ProcessLifecycleObserver,
+}
+
+impl ProcessGroupGuard {
+    fn new(
+        child: &Child,
+        observer: ProcessLifecycleObserver,
+    ) -> Result<Self, OciVerificationError> {
+        let pid = child
+            .id()
+            .and_then(|id| i32::try_from(id).ok())
+            .and_then(Pid::from_raw)
+            .ok_or(OciVerificationError::Unavailable)?;
+        let pidfd = pidfd_open(pid, PidfdFlags::empty()).map_err(|_| {
+            let _ = kill_process_group(pid, Signal::KILL);
+            OciVerificationError::Unavailable
+        })?;
+        let exit = AsyncFd::with_interest(pidfd, Interest::READABLE).map_err(|_| {
+            let _ = kill_process_group(pid, Signal::KILL);
+            OciVerificationError::Unavailable
+        })?;
+        Ok(Self {
+            pid: Some(pid),
+            exit,
+            observer,
+        })
+    }
+
+    async fn observe_exit_without_reaping(&self) -> Result<(), OciVerificationError> {
+        let mut readiness = self
+            .exit
+            .readable()
+            .await
+            .map_err(|_| OciVerificationError::Unavailable)?;
+        readiness.retain_ready();
+        self.observer
+            .record(ProcessLifecycleEvent::ExitObservedWithoutReap);
+        Ok(())
+    }
+
+    fn terminate_and_disarm(&mut self) -> Result<Pid, OciVerificationError> {
+        let pid = self.pid.ok_or(OciVerificationError::Unavailable)?;
+        match kill_process_group(pid, Signal::KILL) {
+            Ok(()) | Err(rustix::io::Errno::SRCH) => {}
+            Err(_) => return Err(OciVerificationError::Unavailable),
+        }
+        self.pid = None;
+        self.observer
+            .record(ProcessLifecycleEvent::GroupKillCompleted);
+        Ok(pid)
+    }
+
+    async fn wait_until_group_gone(
+        &self,
+        pid: Pid,
+        deadline: Instant,
+    ) -> Result<(), OciVerificationError> {
+        loop {
+            match test_kill_process_group(pid) {
+                Err(rustix::io::Errno::SRCH) => {
+                    self.observer.record(ProcessLifecycleEvent::GroupGone);
+                    return Ok(());
+                }
+                Ok(()) => {}
+                Err(_) => return Err(OciVerificationError::Unavailable),
+            }
+            if Instant::now() >= deadline {
+                return Err(OciVerificationError::Timeout);
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
     }
 }
 
 impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
-        if let Some(pid) = self.0 {
+        if let Some(pid) = self.pid {
             let _ = kill_process_group(pid, Signal::KILL);
         }
     }
@@ -1857,11 +1959,26 @@ struct BoundedOutput {
 }
 
 async fn wait_bounded(
-    mut child: Child,
+    child: Child,
     duration: Duration,
     stdout_limit: u64,
 ) -> Result<BoundedOutput, OciVerificationError> {
-    let mut guard = ProcessGroupGuard::new(&child);
+    wait_bounded_inner(
+        child,
+        duration,
+        stdout_limit,
+        ProcessLifecycleObserver::default(),
+    )
+    .await
+}
+
+async fn wait_bounded_inner(
+    mut child: Child,
+    duration: Duration,
+    stdout_limit: u64,
+    observer: ProcessLifecycleObserver,
+) -> Result<BoundedOutput, OciVerificationError> {
+    let mut guard = ProcessGroupGuard::new(&child, observer)?;
     let stdout = child
         .stdout
         .take()
@@ -1874,19 +1991,29 @@ async fn wait_bounded(
     let operation = async {
         let stdout = read_pipe(stdout, stdout_limit);
         let stderr = read_pipe(stderr, MAX_COSIGN_STDERR_BYTES);
-        let status = child.wait();
+        let status = async {
+            guard.observe_exit_without_reaping().await?;
+            let pid = guard.terminate_and_disarm()?;
+            // The group leader still reserves `pid` until this wait reaps it.
+            // Disarming first guarantees cancellation after the group kill can
+            // never signal a later process group that reuses the numeric ID.
+            let status = child
+                .wait()
+                .await
+                .map_err(|_| OciVerificationError::Unavailable)?;
+            guard.observer.record(ProcessLifecycleEvent::LeaderReaped);
+            guard.wait_until_group_gone(pid, deadline).await?;
+            Ok::<_, OciVerificationError>(status)
+        };
         let (stdout, stderr, status) = tokio::join!(stdout, stderr, status);
         let stdout = stdout?;
         let _stderr = Zeroizing::new(stderr?);
-        let status = status.map_err(|_| OciVerificationError::Unavailable)?;
+        let status = status?;
         Ok::<_, OciVerificationError>(BoundedOutput { status, stdout })
     };
     timeout_at(deadline, operation)
         .await
-        .map_or(Err(OciVerificationError::Timeout), |result| {
-            guard.disarm();
-            result
-        })
+        .unwrap_or(Err(OciVerificationError::Timeout))
 }
 
 async fn read_pipe<R: tokio::io::AsyncRead + Unpin>(
@@ -2599,6 +2726,41 @@ mod tests {
             self.executable(&format!(
                 "printf '%s' '[{{\"critical\":{{\"identity\":{{\"docker-reference\":\"registry.example/team/app\"}},\"image\":{{\"docker-manifest-digest\":\"{signed}\"}}}},\"optional\":{optional}}}]'"
             ))
+        }
+
+        fn exiting_parent_script(&self, exit_status: i32) -> (PathBuf, PathBuf) {
+            let descendant = self
+                .root
+                .join(format!("descendant-{}", uuid::Uuid::new_v4()));
+            let ready = self.root.join(format!("ready-{}", uuid::Uuid::new_v4()));
+            let signed = self.manifest.digest;
+            let executable = self.executable(&format!(
+                r#"case "$1" in
+verify)
+  parent=$BASHPID
+  descendant_ready=0
+  trap 'descendant_ready=1' USR1
+  (
+    exec >/dev/null 2>&1
+    exec 9<"$DOCKER_CONFIG/config.json"
+    printf '%s' ready > {ready}
+    kill -USR1 "$parent"
+    kill -STOP "$BASHPID"
+  ) &
+  descendant=$!
+  printf '%s' "$descendant" > {descendant}
+  while (( descendant_ready == 0 )); do :; done
+  trap - USR1
+  test -e {ready}
+  printf '%s' '[{{"critical":{{"identity":{{"docker-reference":"registry.example/team/app"}},"image":{{"docker-manifest-digest":"{signed}"}}}},"optional":{{}}}}]'
+  exit {exit_status}
+  ;;
+*) exit 1 ;;
+esac"#,
+                ready = ready.display(),
+                descendant = descendant.display(),
+            ));
+            (executable, descendant)
         }
     }
 
@@ -4063,6 +4225,111 @@ printf '%s' '[{{"critical":{{"identity":{{"docker-reference":"{repository}"}},"i
                 .count();
             assert_eq!(private_views, 0);
         }
+    }
+
+    #[tokio::test]
+    async fn successful_parent_exit_kills_descendant_holding_registry_view() {
+        let fixture = Fixture::new();
+        let (script, descendant) = fixture.exiting_parent_script(0);
+        let access = fixture
+            .registry_access(r#"{"auths":{"registry.example":{"identitytoken":"private-token"}}}"#);
+        let verifier = fixture.verifier_with_registry(script, access);
+
+        let result = verifier
+            .verify(
+                "production",
+                &fixture.policy(),
+                &fixture.chain(SignedOciObject::Manifest),
+            )
+            .await;
+
+        assert!(result.is_ok(), "{result:?}");
+        let raw = fs::read_to_string(descendant)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        let pid = Pid::from_raw(raw).unwrap();
+        assert_eq!(
+            rustix::process::test_kill_process(pid),
+            Err(rustix::io::Errno::SRCH)
+        );
+        assert!(fixture.root.read_dir().unwrap().flatten().all(|entry| {
+            !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("basil-cosign-")
+        }));
+    }
+
+    #[tokio::test]
+    async fn failed_parent_exit_kills_descendant_holding_registry_view() {
+        let fixture = Fixture::new();
+        let (script, descendant) = fixture.exiting_parent_script(1);
+        let access = fixture
+            .registry_access(r#"{"auths":{"registry.example":{"identitytoken":"private-token"}}}"#);
+        let verifier = fixture.verifier_with_registry(script, access);
+
+        assert_eq!(
+            verifier
+                .verify(
+                    "production",
+                    &fixture.policy(),
+                    &fixture.chain(SignedOciObject::Manifest),
+                )
+                .await,
+            Err(OciVerificationError::Rejected)
+        );
+        let raw = fs::read_to_string(descendant)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        let pid = Pid::from_raw(raw).unwrap();
+        assert_eq!(
+            rustix::process::test_kill_process(pid),
+            Err(rustix::io::Errno::SRCH)
+        );
+        assert!(fixture.root.read_dir().unwrap().flatten().all(|entry| {
+            !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("basil-cosign-")
+        }));
+    }
+
+    #[tokio::test]
+    async fn completed_child_cleanup_kills_group_before_reaping_leader() {
+        let fixture = Fixture::new();
+        let mut command = Command::new(fixture.executable("exit 0"));
+        command
+            .env_clear()
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .process_group(0);
+        let child = command.spawn().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observer = ProcessLifecycleObserver::recording(Arc::clone(&events));
+
+        let output = wait_bounded_inner(
+            child,
+            Duration::from_secs(2),
+            MAX_COSIGN_STDOUT_BYTES,
+            observer,
+        )
+        .await
+        .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                ProcessLifecycleEvent::ExitObservedWithoutReap,
+                ProcessLifecycleEvent::GroupKillCompleted,
+                ProcessLifecycleEvent::LeaderReaped,
+                ProcessLifecycleEvent::GroupGone,
+            ]
+        );
     }
 
     #[test]
