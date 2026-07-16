@@ -1605,6 +1605,7 @@ fn non_zero(value: u64) -> Option<u64> {
 
 #[cfg(test)]
 mod nats_client_tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1616,6 +1617,8 @@ mod nats_client_tests {
 
     use super::*;
     use basil_proto::broker::v1::nats_service_server::{NatsService, NatsServiceServer};
+
+    static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
 
     #[derive(Clone, Default)]
     struct FakeNatsService {
@@ -1894,7 +1897,11 @@ mod nats_client_tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
-        std::env::temp_dir().join(format!("basil-client-{nanos}.sock"))
+        let sequence = NEXT_SOCKET.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "basil-client-{}-{nanos}-{sequence}.sock",
+            std::process::id()
+        ))
     }
 }
 

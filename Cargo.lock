@@ -821,7 +821,7 @@ dependencies = [
 
 [[package]]
 name = "basil"
-version = "0.7.1"
+version = "0.8.0-pre.1"
 dependencies = [
  "aes 0.9.1",
  "aes-gcm 0.11.0",
@@ -849,7 +849,7 @@ dependencies = [
 
 [[package]]
 name = "basil-bin"
-version = "0.7.1"
+version = "0.8.0-pre.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -870,7 +870,7 @@ dependencies = [
 
 [[package]]
 name = "basil-compose"
-version = "0.7.1"
+version = "0.8.0-pre.1"
 dependencies = [
  "hex",
  "serde",
@@ -883,7 +883,7 @@ dependencies = [
 
 [[package]]
 name = "basil-core"
-version = "0.7.1"
+version = "0.8.0-pre.1"
 dependencies = [
  "aes 0.9.1",
  "aes-gcm 0.11.0",
@@ -964,7 +964,7 @@ dependencies = [
 
 [[package]]
 name = "basil-cose"
-version = "0.7.1"
+version = "0.8.0-pre.1"
 dependencies = [
  "aes 0.9.1",
  "aes-gcm 0.11.0",
@@ -982,7 +982,7 @@ dependencies = [
 
 [[package]]
 name = "basil-keystore-backend"
-version = "0.7.1"
+version = "0.8.0-pre.1"
 dependencies = [
  "aes 0.9.1",
  "aes-gcm 0.11.0",
@@ -1003,7 +1003,7 @@ dependencies = [
 
 [[package]]
 name = "basil-nats"
-version = "0.7.1"
+version = "0.8.0-pre.1"
 dependencies = [
  "base64 0.22.1",
  "crypto_secretbox",
@@ -1021,7 +1021,7 @@ dependencies = [
 
 [[package]]
 name = "basil-nats-bridge"
-version = "0.7.1"
+version = "0.8.0-pre.1"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -1045,7 +1045,7 @@ dependencies = [
 
 [[package]]
 name = "basil-proto"
-version = "0.7.1"
+version = "0.8.0-pre.1"
 dependencies = [
  "basil-cose",
  "p256",
@@ -1062,7 +1062,7 @@ dependencies = [
 
 [[package]]
 name = "basil-tests"
-version = "0.7.1"
+version = "0.8.0-pre.1"
 dependencies = [
  "async-nats",
  "base64 0.22.1",
@@ -6900,7 +6900,7 @@ checksum = "66fee0b777b0f5ac1c69bb06d361268faafa61cd4682ae064a171c16c433e9e4"
 
 [[package]]
 name = "xtask"
-version = "0.7.1"
+version = "0.8.0-pre.1"
 dependencies = [
  "anyhow",
  "basil-bin",

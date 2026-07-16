@@ -779,8 +779,6 @@ fn create_private_file(path: &Path) -> Result<File, RegistryIsolationError> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     use super::*;
 
     struct Fixture {
@@ -789,11 +787,8 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let suffix = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("clock after epoch")
-                .as_nanos();
-            let root = env::temp_dir().join(format!("basil-registry-isolation-{suffix}"));
+            let root =
+                env::temp_dir().join(format!("basil-registry-isolation-{}", uuid::Uuid::new_v4()));
             fs::create_dir(&root).expect("create fixture");
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("protect fixture");
             Self { root }

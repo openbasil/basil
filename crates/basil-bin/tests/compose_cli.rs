@@ -13,7 +13,12 @@ use std::os::unix::fs::PermissionsExt as _;
 #[cfg(feature = "compose")]
 use std::path::PathBuf;
 #[cfg(feature = "compose")]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "compose")]
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(feature = "compose")]
+static NEXT_FRONTEND: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(feature = "compose")]
 struct TempFrontend(PathBuf);
@@ -25,8 +30,9 @@ impl TempFrontend {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        let sequence = NEXT_FRONTEND.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "basil-compose-cli-test-{}-{nonce}",
+            "basil-compose-cli-test-{}-{nonce}-{sequence}",
             std::process::id()
         ));
         fs::write(&path, format!("#!/usr/bin/env bash\n{body}\n")).unwrap();

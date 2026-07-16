@@ -19,7 +19,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.1"
+version = "0.8.0-pre.1"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["info@openbasil.org"]
@@ -28,15 +28,15 @@ homepage = "https://github.com/openbasil/basil"
 documentation = "https://docs.openbasil.org"
 
 [workspace.dependencies]
-basil = { version = "0.7.1", path = "crates/basil-client" }
-basil-cose = { version = "0.7.1", path = "crates/basil-cose" }
-basil-proto = { version = "0.7.1", path = "crates/basil-proto" }
-basil-nats = { version = "0.7.1", path = "crates/basil-nats" }
-basil-nats-bridge = { version = "0.7.1", path = "crates/basil-nats-bridge" }
-basil-keystore-backend = { version = "0.7.1", path = "crates/basil-keystore-backend" }
-basil-compose = { version = "0.7.1", path = "crates/basil-compose" }
-basil-core = { version = "0.7.1", path = "crates/basil-core", default-features = false }
-basil-bin = { version = "0.7.1", path = "crates/basil-bin" }
+basil = { version = "0.8.0-pre.1", path = "crates/basil-client" }
+basil-cose = { version = "0.8.0-pre.1", path = "crates/basil-cose" }
+basil-proto = { version = "0.8.0-pre.1", path = "crates/basil-proto" }
+basil-nats = { version = "0.8.0-pre.1", path = "crates/basil-nats" }
+basil-nats-bridge = { version = "0.8.0-pre.1", path = "crates/basil-nats-bridge" }
+basil-keystore-backend = { version = "0.8.0-pre.1", path = "crates/basil-keystore-backend" }
+basil-compose = { version = "0.8.0-pre.1", path = "crates/basil-compose" }
+basil-core = { version = "0.8.0-pre.1", path = "crates/basil-core", default-features = false }
+basil-bin = { version = "0.8.0-pre.1", path = "crates/basil-bin" }
 
 # `aes` is depended on directly (alongside aes-gcm's own `zeroize` feature, which
 # only scrubs the GHASH key) so its `zeroize` feature zeroizes AES round-key
@@ -44,7 +44,7 @@ basil-bin = { version = "0.7.1", path = "crates/basil-bin" }
 aes = { version = "0.9.1", default-features = false, features = ["zeroize"] }
 aes-gcm = { version = "0.11.0", default-features = false, features = ["aes", "alloc", "zeroize"] }
 aes-kw = "0.3"
-age = { version = "0.11", features = ["plugin"] }
+age = { version = "0.11.5", features = ["plugin"] }
 anyhow = "1"
 argon2 = "0.5"
 async-trait = "0.1"
@@ -89,7 +89,7 @@ jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
 keyring-core = "1.0.0"
 minicbor = { version = "2.2.2", default-features = false, features = ["alloc"] }
 ml-dsa = { version = "0.1.1", features = ["zeroize"] }
-ml-kem = { version = "0.3", features = ["getrandom", "zeroize"] }
+ml-kem = { version = "0.3.2", features = ["getrandom", "zeroize"] }
 mimalloc = { version = "0.1.52", default-features = false }
 nkeys = { version = "0.4", features = ["xkeys"] }
 opentelemetry-appender-tracing = "0.32"

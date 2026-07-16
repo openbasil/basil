@@ -2292,7 +2292,6 @@ mod tests {
     use std::collections::BTreeMap;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     use std::sync::{Arc, Mutex};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
     use crate::core::registry_isolation::{
@@ -2441,11 +2440,8 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let suffix = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let root = std::env::temp_dir().join(format!("basil-cosign-test-{suffix}"));
+            let root =
+                std::env::temp_dir().join(format!("basil-cosign-test-{}", uuid::Uuid::new_v4()));
             fs::create_dir(&root).unwrap();
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
             let key = root.join("cosign.pub");

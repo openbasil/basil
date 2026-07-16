@@ -1620,10 +1620,10 @@ mod tests {
         assert_eq!(rolled_forward.current.release().as_str(), "0.9.0");
         assert_eq!(admission.snapshot().lifecycle_version, 4);
         let downgraded = admission
-            .downgrade(standard_manifest("0.7.1", 3))
+            .downgrade(standard_manifest("0.8.0-pre.1", 3))
             .expect("explicit downgrade succeeds");
         assert_eq!(downgraded.kind, TransitionKind::Downgrade);
-        assert_eq!(downgraded.current.release().as_str(), "0.7.1");
+        assert_eq!(downgraded.current.release().as_str(), "0.8.0-pre.1");
         assert_eq!(admission.snapshot().lifecycle_version, 5);
     }
 

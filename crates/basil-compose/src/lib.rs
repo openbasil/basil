@@ -371,7 +371,10 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_FRONTEND: AtomicU64 = AtomicU64::new(0);
 
     struct TempFrontend(PathBuf);
 
@@ -381,8 +384,11 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let path = std::env::temp_dir()
-                .join(format!("basil-compose-test-{}-{nonce}", std::process::id()));
+            let sequence = NEXT_FRONTEND.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "basil-compose-test-{}-{nonce}-{sequence}",
+                std::process::id()
+            ));
             fs::write(&path, format!("#!/usr/bin/env bash\n{body}\n")).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
             Self(path)
