@@ -841,6 +841,8 @@ mod tests {
     use crate::event::BrokerEventKind;
     use crate::manager::BackendManager;
     use crate::state::BrokerState;
+    use crate::transport::connection::ListenerConnectInfo;
+    use crate::transport::grpc_server::ListenerType;
 
     /// How the mock backend answers an existence probe.
     #[derive(Clone, Copy)]
@@ -1462,12 +1464,22 @@ mod tests {
         BrokerGrpc::new(Arc::new(state))
     }
 
+    fn attach_host_peer<T>(request: &mut Request<T>, uid: u32) {
+        request
+            .extensions_mut()
+            .insert(ListenerConnectInfo::for_test(
+                "host",
+                ListenerType::Host,
+                PeerInfo {
+                    uid: Some(uid),
+                    ..PeerInfo::default()
+                },
+            ));
+    }
+
     fn reload_request(uid: u32, check: bool) -> Request<pb::ReloadRequest> {
         let mut req = Request::new(pb::ReloadRequest { check });
-        req.extensions_mut().insert(PeerInfo {
-            uid: Some(uid),
-            ..PeerInfo::default()
-        });
+        attach_host_peer(&mut req, uid);
         req
     }
 
@@ -1482,10 +1494,7 @@ mod tests {
             op: op.to_string(),
             key: key.to_string(),
         });
-        req.extensions_mut().insert(PeerInfo {
-            uid: Some(caller_uid),
-            ..PeerInfo::default()
-        });
+        attach_host_peer(&mut req, caller_uid);
         req
     }
 
@@ -1500,10 +1509,7 @@ mod tests {
             jti: jti.to_string(),
             expires_at_unix,
         });
-        req.extensions_mut().insert(PeerInfo {
-            uid: Some(uid),
-            ..PeerInfo::default()
-        });
+        attach_host_peer(&mut req, uid);
         req
     }
 
@@ -1789,10 +1795,7 @@ mod tests {
         let mut req = Request::new(pb::StatusRequest {
             include_realms: false,
         });
-        req.extensions_mut().insert(PeerInfo {
-            uid: Some(9999),
-            ..PeerInfo::default()
-        });
+        attach_host_peer(&mut req, 9999);
         let status = grpc.status(req).await.expect_err("unresolved subject");
         assert_eq!(status.code(), Code::PermissionDenied);
         assert_status_omits_admin_canaries(&status);
@@ -1801,10 +1804,7 @@ mod tests {
         let mut req = Request::new(pb::StatusRequest {
             include_realms: false,
         });
-        req.extensions_mut().insert(PeerInfo {
-            uid: Some(7),
-            ..PeerInfo::default()
-        });
+        attach_host_peer(&mut req, 7);
         let resp = grpc
             .status(req)
             .await
@@ -1821,10 +1821,7 @@ mod tests {
         let mut denied = Request::new(pb::StatusRequest {
             include_realms: true,
         });
-        denied.extensions_mut().insert(PeerInfo {
-            uid: Some(7),
-            ..PeerInfo::default()
-        });
+        attach_host_peer(&mut denied, 7);
         let status = grpc
             .status(denied)
             .await
@@ -1835,10 +1832,7 @@ mod tests {
         let mut allowed = Request::new(pb::StatusRequest {
             include_realms: true,
         });
-        allowed.extensions_mut().insert(PeerInfo {
-            uid: Some(4245),
-            ..PeerInfo::default()
-        });
+        attach_host_peer(&mut allowed, 4245);
         let response = grpc
             .status(allowed)
             .await
