@@ -23,7 +23,7 @@ use crate::catalog::{
     ADMIN_WATCH_TARGET, AllowVia, Decision, DenyReason, Explanation, MatchedRule, MissingPolicy,
 };
 use crate::decision::DecisionRecord;
-use crate::reload::{ReloadError, check_reload, reload_generation};
+use crate::reload::{ReloadError, check_reload, reload_generation_live};
 use crate::service::broker::{BoxStream, BrokerGrpc, GrpcResult};
 use crate::service::shared::{event_allowed, payload_too_large, proto_event};
 use crate::state::{BrokerState, Generation, ReadinessOutcome, ReadinessState};
@@ -298,7 +298,7 @@ impl AdminService for BrokerGrpc {
     /// [`BrokerState::record_reload`].
     ///
     /// On `check = true` this is a **dry-run**: it runs the identical validation a
-    /// real reload runs ([`check_reload`] and [`reload_generation`] share one
+    /// real reload runs ([`check_reload`] and [`reload_generation_live`] share one
     /// `validate_candidate`) and reports the would-be outcome **without** swapping.
     /// On a validation/routing rejection the previous generation keeps serving and
     /// the RPC returns `OK` with a [`pb::ReloadRejection`]. The trust boundary holds
@@ -343,7 +343,7 @@ impl AdminService for BrokerGrpc {
         let result = if check {
             check_reload(&self.state)
         } else {
-            reload_generation(&self.state)
+            reload_generation_live(&self.state).await
         };
 
         match result {

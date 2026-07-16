@@ -30,7 +30,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use arc_swap::{ArcSwap, Guard};
@@ -419,6 +419,7 @@ pub struct BrokerState {
     /// Every RPC loads exactly one snapshot of this and pins the whole op to it.
     generation: ArcSwap<Generation>,
     connections: ConnectionRegistry,
+    listener_runtime: OnceLock<Arc<crate::transport::grpc_server::ListenerRuntime>>,
     manager: BackendManager,
     /// A stable backend label reported in a `status` response. The manager does
     /// not expose its backend kinds, so the binary supplies one at construction
@@ -463,6 +464,7 @@ pub struct BrokerState {
     /// the newer one (a silent lost update). Holds no data: it only orders the
     /// two triggers. Reloads are rare, so contention is irrelevant.
     reload_lock: Mutex<()>,
+    live_reload_lock: tokio::sync::Mutex<()>,
 }
 
 impl BrokerState {
@@ -507,6 +509,7 @@ impl BrokerState {
         Self {
             generation: ArcSwap::from_pointee(generation),
             connections: ConnectionRegistry::with_defaults(),
+            listener_runtime: OnceLock::new(),
             manager,
             backend_label: backend_label.into(),
             // Default to this crate's version; the binary overrides with its own
@@ -523,6 +526,7 @@ impl BrokerState {
             readiness_cache: Mutex::new(None),
             jwks_cache: Mutex::new(None),
             reload_lock: Mutex::new(()),
+            live_reload_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -606,6 +610,31 @@ impl BrokerState {
     #[must_use]
     pub const fn connections(&self) -> &ConnectionRegistry {
         &self.connections
+    }
+
+    /// Install the live accept-loop owner exactly once at agent startup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a runtime was already installed.
+    pub fn install_listener_runtime(
+        &self,
+        runtime: Arc<crate::transport::grpc_server::ListenerRuntime>,
+    ) -> Result<(), &'static str> {
+        self.listener_runtime
+            .set(runtime)
+            .map_err(|_| "listener runtime already installed")
+    }
+
+    /// Live accept-loop owner, once agent startup has published its listeners.
+    #[must_use]
+    pub fn listener_runtime(&self) -> Option<&Arc<crate::transport::grpc_server::ListenerRuntime>> {
+        self.listener_runtime.get()
+    }
+
+    /// Serialize asynchronous listener-aware reload transitions.
+    pub(crate) const fn live_reload_lock(&self) -> &tokio::sync::Mutex<()> {
+        &self.live_reload_lock
     }
 
     /// Attach the accepted runtime-attestor realm registry.

@@ -139,6 +139,11 @@ pub enum ReloadError {
     /// fail-closed rather than reading from an unknown source.
     #[error("reload unavailable: broker has no configured catalog/policy paths")]
     NoInputs,
+
+    /// A synchronous reload was attempted after live accept-loop management was
+    /// installed; callers must use [`reload_generation_live`].
+    #[error("reload requires the listener-aware asynchronous reload path")]
+    LiveRuntimeRequired,
 }
 
 impl ReloadError {
@@ -155,6 +160,7 @@ impl ReloadError {
             | Self::ListenerTransition(_) => "validation_failed",
             Self::RoutingShapeChanged(_) => "routing_shape_changed",
             Self::NoInputs => "no_reload_inputs",
+            Self::LiveRuntimeRequired => "listener_runtime_required",
         }
     }
 }
@@ -660,6 +666,9 @@ pub fn check_reload(state: &BrokerState) -> Result<ReloadOutcome, ReloadError> {
 /// ([`ReloadError::Validate`]), or the candidate changes a restart-only routing
 /// dimension ([`ReloadError::RoutingShapeChanged`]).
 pub fn reload_generation(state: &BrokerState) -> Result<ReloadOutcome, ReloadError> {
+    if state.listener_runtime().is_some() {
+        return Err(ReloadError::LiveRuntimeRequired);
+    }
     // Serialize the whole validate→swap sequence: SIGHUP and the admin RPC can
     // trigger concurrently, and without this two reloads could both pin
     // generation N, both stamp N+1, and let the staler candidate silently
@@ -708,6 +717,64 @@ pub fn reload_generation(state: &BrokerState) -> Result<ReloadOutcome, ReloadErr
     Ok(outcome)
 }
 
+/// Reload a running agent and apply listener accept-loop changes atomically with
+/// the new generation.
+///
+/// When no live listener runtime is installed, this delegates to
+/// [`reload_generation`]. A running agent serializes validation and transition,
+/// gates affected listener admission, requires zero active transports for
+/// removals and reconfiguration, and swaps the generation only after every new
+/// socket has been published successfully.
+///
+/// # Errors
+///
+/// Returns the same validation errors as [`reload_generation`] plus a listener
+/// transition error when an accept loop cannot be changed or restored safely.
+pub async fn reload_generation_live(state: &BrokerState) -> Result<ReloadOutcome, ReloadError> {
+    let Some(runtime) = state.listener_runtime() else {
+        return reload_generation(state);
+    };
+    let _reload_guard = state.live_reload_lock().lock().await;
+    let candidate = validate_candidate(state)?;
+    let ValidatedCandidate {
+        catalog,
+        policy,
+        config,
+        overrides,
+        oci,
+        listeners,
+        outcome,
+        bundle_changed_trust_domains,
+    } = candidate;
+    let current = state.load_generation();
+    if current.id() != outcome.previous_generation {
+        return Err(ReloadError::ListenerTransition(
+            "serving generation changed during listener-aware reload".to_string(),
+        ));
+    }
+    let current_listeners = current.listeners().clone();
+    drop(current);
+    let next = Generation::new_with_overrides_oci_and_listeners(
+        outcome.new_generation,
+        Arc::new(catalog),
+        policy,
+        config,
+        overrides,
+        oci,
+        Arc::new(listeners.clone()),
+    );
+    runtime
+        .transition(&current_listeners, &listeners, || {
+            state.swap_generation(Arc::new(next));
+            for trust_domain in bundle_changed_trust_domains {
+                state.events().bundle_changed(trust_domain);
+            }
+        })
+        .await
+        .map_err(|error| ReloadError::ListenerTransition(error.to_string()))?;
+    Ok(outcome)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -725,14 +792,19 @@ mod tests {
     use super::{
         ReloadError, ReloadInputs, check_reload, read_reload_inputs,
         read_reload_inputs_with_bootstrap_observer, read_reload_inputs_with_observer,
-        reload_generation, validate_candidate_with_trace_collector,
+        reload_generation, reload_generation_live, validate_candidate_with_trace_collector,
         validate_candidate_with_trace_collector_and_observer,
     };
     use crate::backend::{Backend, BackendError, NewKey};
     use crate::catalog::load;
     use crate::configuration::ConfigOverride;
     use crate::manager::BackendManager;
+    use crate::service::broker::InvocationRuntimeConfig;
     use crate::state::{BrokerState, INITIAL_GENERATION_ID};
+    use crate::transport::grpc_server::{ListenerRuntime, ListenerType, ServerConfig};
+    use crate::transport::listener::{
+        LegacyListenerConfig, ListenerConfigInput, ListenerConfigSet,
+    };
 
     #[derive(Clone, Default)]
     struct EventCapture {
@@ -1108,6 +1180,74 @@ mod tests {
         assert_eq!(current.id(), INITIAL_GENERATION_ID + 1);
         assert_eq!(pinned.id(), INITIAL_GENERATION_ID);
         assert!(pinned.listeners().get("control").is_none());
+    }
+
+    #[tokio::test]
+    async fn live_reload_publishes_added_listener_with_generation() {
+        let (state, inputs) = state_with_files(&catalog_json(false), &policy_json(false));
+        let parent = inputs.config_path.parent().expect("config parent");
+        let host_socket = parent.join("host.sock");
+        let workload_socket = parent.join("workload.sock");
+        let initial = ListenerConfigSet::resolve(
+            BTreeMap::from([(
+                "control".to_string(),
+                ListenerConfigInput {
+                    listener_type: ListenerType::Host,
+                    path: host_socket.clone(),
+                    mode: None,
+                    group: None,
+                },
+            )]),
+            LegacyListenerConfig::default(),
+        )
+        .expect("initial listener config");
+        let state = Arc::new(
+            Arc::try_unwrap(state)
+                .unwrap_or_else(|_| panic!("fixture state has one owner"))
+                .with_listener_configs(initial),
+        );
+        let runtime = Arc::new(
+            ListenerRuntime::start(
+                vec![ServerConfig {
+                    listener_name: "control".to_string(),
+                    listener_type: ListenerType::Host,
+                    connections: state.connections().clone(),
+                    socket_path: host_socket.to_string_lossy().into_owned(),
+                    socket_mode: crate::DEFAULT_SOCKET_MODE,
+                    socket_group: None,
+                    invocation: InvocationRuntimeConfig::default(),
+                }],
+                Arc::clone(&state),
+            )
+            .await
+            .expect("start listener runtime"),
+        );
+        state
+            .install_listener_runtime(Arc::clone(&runtime))
+            .expect("install listener runtime");
+        std::fs::write(
+            &inputs.config_path,
+            format!(
+                "schema = \"agent\"\nschemaVersion = 3\n[import]\ncatalog = \"catalog.json\"\npolicy = \"policy.json\"\nbundle = \"bundle.age\"\n[listeners.control]\ntype = \"host\"\npath = {host_socket:?}\n[listeners.workloads]\ntype = \"container\"\npath = {workload_socket:?}\n"
+            ),
+        )
+        .expect("write added-listener candidate");
+
+        let outcome = reload_generation_live(&state)
+            .await
+            .expect("live reload succeeds");
+        assert_eq!(outcome.new_generation, INITIAL_GENERATION_ID + 1);
+        assert!(workload_socket.exists());
+        let generation = state.load_generation();
+        assert_eq!(generation.id(), outcome.new_generation);
+        assert!(generation.listeners().get("workloads").is_some());
+        drop(generation);
+        runtime
+            .run_until_shutdown(std::future::ready(()))
+            .await
+            .expect("listener runtime shuts down");
+        assert!(!host_socket.exists());
+        assert!(!workload_socket.exists());
     }
 
     #[test]

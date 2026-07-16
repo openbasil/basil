@@ -4,6 +4,7 @@
 
 //! tonic server wiring for the broker gRPC API.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -20,8 +21,8 @@ use basil_proto::broker::v1::signing_service_server::SigningServiceServer;
 use basil_proto::envoy::service::secret::v3::secret_discovery_service_server::SecretDiscoveryServiceServer;
 use basil_proto::spiffe::spiffe_workload_api_server::SpiffeWorkloadApiServer;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::broadcast;
-use tokio::task::JoinSet;
+use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tokio_stream::{StreamExt as _, wrappers::UnixListenerStream};
 use tonic::transport::Server;
 use tracing::{info, warn};
@@ -32,9 +33,10 @@ use crate::service::broker::InvocationRuntimeConfig;
 use crate::spiffe::SpiffeWorkloadGrpc;
 use crate::state::BrokerState;
 use crate::transport::connection::ConnectionRegistry;
-use crate::transport::listener::ListenerConfig;
+use crate::transport::listener::{ListenerConfig, ListenerConfigSet};
 use crate::transport::listener_manager::{
-    PreparedListenerBatch, PublishedListener, QualifiedListener,
+    ExchangedListener, PreparedListener, PreparedListenerBatch, PublishedListener,
+    PublishedSocketLease, QualifiedListener,
 };
 
 /// Default Unix socket mode: owner read/write only.
@@ -165,7 +167,12 @@ pub async fn run(config: ServerConfig, state: Arc<BrokerState>) -> std::io::Resu
 ///
 /// Returns a listener preparation, publication, serving, or task failure.
 pub async fn run_many(configs: Vec<ServerConfig>, state: Arc<BrokerState>) -> io::Result<()> {
-    serve_many_with_shutdown(configs, state, shutdown_signal()).await
+    let runtime = Arc::new(ListenerRuntime::prepare(configs, Arc::clone(&state))?);
+    state
+        .install_listener_runtime(Arc::clone(&runtime))
+        .map_err(io::Error::other)?;
+    runtime.activate().await?;
+    runtime.run_until_shutdown(shutdown_signal()).await
 }
 
 fn listener_config(config: &ServerConfig) -> io::Result<ListenerConfig> {
@@ -195,62 +202,385 @@ async fn serve_with_shutdown(
     serve_published(config, state, published, shutdown).await
 }
 
+#[cfg(test)]
 async fn serve_many_with_shutdown(
     configs: Vec<ServerConfig>,
     state: Arc<BrokerState>,
     shutdown: impl Future<Output = ()>,
 ) -> io::Result<()> {
-    if configs.is_empty() {
-        return Err(io::Error::other("no listeners configured"));
-    }
-    let listener_configs = configs
-        .iter()
-        .map(listener_config)
-        .collect::<io::Result<Vec<_>>>()?;
-    let published = PreparedListenerBatch::prepare(listener_configs.iter())
-        .and_then(PreparedListenerBatch::publish)
-        .map_err(io::Error::other)?
-        .into_listeners();
-    if published.len() != configs.len() {
-        return Err(io::Error::other(
-            "listener publication returned an incomplete batch",
-        ));
-    }
-
-    let (shutdown_tx, _) = broadcast::channel::<()>(1);
-    let mut servers = JoinSet::new();
-    for (config, published) in configs.into_iter().zip(published) {
-        let state = Arc::clone(&state);
-        let mut shutdown_rx = shutdown_tx.subscribe();
-        servers.spawn(async move {
-            serve_published(config, state, published, async move {
-                let _ = shutdown_rx.recv().await;
-            })
-            .await
-        });
-    }
-
-    tokio::pin!(shutdown);
-    let mut first_error = tokio::select! {
-        () = &mut shutdown => None,
-        joined = servers.join_next() => joined.and_then(server_result_error),
-    };
-    let _ = shutdown_tx.send(());
-    while let Some(joined) = servers.join_next().await {
-        if first_error.is_none() {
-            first_error = server_result_error(joined);
-        }
-    }
-    first_error.map_or(Ok(()), Err)
+    let runtime = ListenerRuntime::start(configs, state).await?;
+    runtime.run_until_shutdown(shutdown).await
 }
 
-fn server_result_error(
-    result: Result<io::Result<()>, tokio::task::JoinError>,
-) -> Option<io::Error> {
-    match result {
-        Ok(Ok(())) => None,
-        Ok(Err(error)) => Some(error),
-        Err(error) => Some(io::Error::other(format!("listener task failed: {error}"))),
+struct RunningListener {
+    config: ServerConfig,
+    lease: PublishedSocketLease,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: JoinHandle<io::Result<()>>,
+}
+
+impl RunningListener {
+    async fn stop(mut self) -> io::Result<ServerConfig> {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        self.task
+            .await
+            .map_err(|error| io::Error::other(format!("listener task failed: {error}")))??;
+        Ok(self.config)
+    }
+}
+
+struct ListenerRuntimeState {
+    running: BTreeMap<String, RunningListener>,
+    pending: Vec<(ServerConfig, PublishedListener)>,
+    initialized: bool,
+}
+
+struct PreparedRuntimeTransition {
+    changed: Vec<String>,
+    ordinary: Vec<(ServerConfig, PublishedListener)>,
+    exchanged: Vec<(ServerConfig, ExchangedListener)>,
+}
+
+fn rollback_exchanges(exchanges: Vec<(ServerConfig, ExchangedListener)>) -> io::Result<()> {
+    for (_, exchange) in exchanges.into_iter().rev() {
+        exchange.rollback().map_err(io::Error::other)?;
+    }
+    Ok(())
+}
+
+/// Live listener accept-loop owner used by reload transitions.
+pub struct ListenerRuntime {
+    state: Arc<BrokerState>,
+    connections: ConnectionRegistry,
+    invocation: InvocationRuntimeConfig,
+    inner: Mutex<ListenerRuntimeState>,
+    failures: Mutex<mpsc::UnboundedReceiver<(String, String)>>,
+    failure_tx: mpsc::UnboundedSender<(String, String)>,
+}
+
+impl std::fmt::Debug for ListenerRuntime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ListenerRuntime")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ListenerRuntime {
+    fn prepare(configs: Vec<ServerConfig>, state: Arc<BrokerState>) -> io::Result<Self> {
+        let Some(first) = configs.first() else {
+            return Err(io::Error::other("no listeners configured"));
+        };
+        let connections = first.connections.clone();
+        let invocation = first.invocation.clone();
+        let listener_configs = configs
+            .iter()
+            .map(listener_config)
+            .collect::<io::Result<Vec<_>>>()?;
+        let published = PreparedListenerBatch::prepare(listener_configs.iter())
+            .and_then(PreparedListenerBatch::publish)
+            .map_err(io::Error::other)?
+            .into_listeners();
+        if published.len() != configs.len() {
+            return Err(io::Error::other(
+                "listener publication returned an incomplete batch",
+            ));
+        }
+        let (failure_tx, failures) = mpsc::unbounded_channel();
+        let mut names = std::collections::BTreeSet::new();
+        let pending = configs
+            .into_iter()
+            .zip(published)
+            .map(|(config, published)| {
+                if !names.insert(config.listener_name.clone()) {
+                    return Err(io::Error::other(format!(
+                        "duplicate runtime listener name `{}`",
+                        config.listener_name
+                    )));
+                }
+                Ok((config, published))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        if pending.is_empty() {
+            return Err(io::Error::other("listener publication returned no sockets"));
+        }
+        Ok(Self {
+            state,
+            connections,
+            invocation,
+            inner: Mutex::new(ListenerRuntimeState {
+                running: BTreeMap::new(),
+                pending,
+                initialized: false,
+            }),
+            failures: Mutex::new(failures),
+            failure_tx,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn start(
+        configs: Vec<ServerConfig>,
+        state: Arc<BrokerState>,
+    ) -> io::Result<Self> {
+        let runtime = Self::prepare(configs, state)?;
+        runtime.activate().await?;
+        Ok(runtime)
+    }
+
+    async fn activate(&self) -> io::Result<()> {
+        let mut runtime = self.inner.lock().await;
+        let pending = std::mem::take(&mut runtime.pending);
+        for (config, published) in pending {
+            let listener = Self::spawn_listener(
+                config.clone(),
+                Arc::clone(&self.state),
+                published,
+                self.failure_tx.clone(),
+            )?;
+            runtime
+                .running
+                .insert(config.listener_name.clone(), listener);
+        }
+        runtime.initialized = true;
+        drop(runtime);
+        Ok(())
+    }
+
+    fn spawn_listener(
+        config: ServerConfig,
+        state: Arc<BrokerState>,
+        published: PublishedListener,
+        failures: mpsc::UnboundedSender<(String, String)>,
+    ) -> io::Result<RunningListener> {
+        let (listener, lease) = published.into_listener().map_err(io::Error::other)?;
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        let task_config = config.clone();
+        let name = config.listener_name.clone();
+        let task = tokio::spawn(async move {
+            let result = serve_bound(task_config, state, listener, async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+            if let Err(error) = &result {
+                let _ = failures.send((name, error.to_string()));
+            }
+            result
+        });
+        Ok(RunningListener {
+            config,
+            lease,
+            shutdown: Some(shutdown),
+            task,
+        })
+    }
+
+    fn config_for(&self, listener: &ListenerConfig) -> ServerConfig {
+        ServerConfig {
+            listener_name: listener.name().to_string(),
+            listener_type: listener.listener_type(),
+            connections: self.connections.clone(),
+            socket_path: listener.path().to_string_lossy().into_owned(),
+            socket_mode: listener.mode(),
+            socket_group: listener.group().map(str::to_string),
+            invocation: self.invocation.clone(),
+        }
+    }
+
+    /// Apply one validated listener-set transition while affected accepts are
+    /// gated and disruptive listeners have zero active transports.
+    pub async fn transition(
+        &self,
+        current: &ListenerConfigSet,
+        candidate: &ListenerConfigSet,
+        commit: impl FnOnce(),
+    ) -> io::Result<()> {
+        self.transition_with_precommit(current, candidate, || Ok(()), commit)
+            .await
+    }
+
+    async fn transition_with_precommit(
+        &self,
+        current: &ListenerConfigSet,
+        candidate: &ListenerConfigSet,
+        precommit: impl FnOnce() -> io::Result<()>,
+        commit: impl FnOnce(),
+    ) -> io::Result<()> {
+        let (impacts, guard) = crate::transport::listener_manager::begin_transition(
+            current,
+            candidate,
+            &self.connections,
+        )
+        .map_err(io::Error::other)?;
+        let changed = impacts
+            .iter()
+            .map(|impact| impact.name().to_string())
+            .collect::<Vec<_>>();
+        let mut runtime = self.inner.lock().await;
+        if !runtime.initialized {
+            return Err(io::Error::other("listener runtime is not active"));
+        }
+        let mut ordinary_configs = Vec::new();
+        let mut same_path = Vec::<(ServerConfig, PreparedListener)>::new();
+        for listener in candidate
+            .iter()
+            .filter(|listener| changed.iter().any(|name| name == listener.name()))
+        {
+            let config = self.config_for(listener);
+            match runtime.running.get(listener.name()) {
+                Some(running) if running.config.socket_path == config.socket_path => {
+                    let prepared =
+                        QualifiedListener::validate_replacement(listener, &running.lease)
+                            .and_then(QualifiedListener::prepare)
+                            .map_err(io::Error::other)?;
+                    same_path.push((config, prepared));
+                }
+                _ => ordinary_configs.push(config),
+            }
+        }
+        let ordinary_listener_configs = ordinary_configs
+            .iter()
+            .map(listener_config)
+            .collect::<io::Result<Vec<_>>>()?;
+        let ordinary_published = PreparedListenerBatch::prepare(ordinary_listener_configs.iter())
+            .and_then(PreparedListenerBatch::publish)
+            .map_err(io::Error::other)?
+            .into_listeners();
+
+        let mut exchanged = Vec::<(ServerConfig, ExchangedListener)>::new();
+        for (config, prepared) in same_path {
+            let Some(current) = runtime.running.get(&config.listener_name) else {
+                rollback_exchanges(exchanged)?;
+                return Err(io::Error::other(
+                    "runtime listener disappeared during exchange",
+                ));
+            };
+            match prepared.exchange(&current.lease) {
+                Ok(exchange) => exchanged.push((config, exchange)),
+                Err(error) => {
+                    rollback_exchanges(exchanged)?;
+                    return Err(io::Error::other(error));
+                }
+            }
+        }
+        if let Err(error) = precommit() {
+            rollback_exchanges(exchanged)?;
+            return Err(error);
+        }
+
+        let prepared = PreparedRuntimeTransition {
+            changed,
+            ordinary: ordinary_configs
+                .into_iter()
+                .zip(ordinary_published)
+                .collect(),
+            exchanged,
+        };
+        self.install_transition(&mut runtime, candidate, &guard, prepared, commit)
+            .await?;
+        drop(runtime);
+        drop(guard);
+        Ok(())
+    }
+
+    async fn install_transition(
+        &self,
+        runtime: &mut ListenerRuntimeState,
+        candidate: &ListenerConfigSet,
+        guard: &crate::transport::connection::ListenerTransitionGuard,
+        prepared: PreparedRuntimeTransition,
+        commit: impl FnOnce(),
+    ) -> io::Result<()> {
+        guard.commit(commit);
+        let mut retired = Vec::new();
+        for (config, published) in prepared.ordinary {
+            let replacement = Self::spawn_listener(
+                config.clone(),
+                Arc::clone(&self.state),
+                published,
+                self.failure_tx.clone(),
+            )?;
+            if let Some(old) = runtime
+                .running
+                .insert(config.listener_name.clone(), replacement)
+            {
+                retired.push(old);
+            }
+        }
+        for (config, exchange) in prepared.exchanged {
+            let replacement = Self::spawn_listener(
+                config.clone(),
+                Arc::clone(&self.state),
+                exchange.commit(),
+                self.failure_tx.clone(),
+            )?;
+            if let Some(old) = runtime
+                .running
+                .insert(config.listener_name.clone(), replacement)
+            {
+                retired.push(old);
+            }
+        }
+        for name in prepared
+            .changed
+            .iter()
+            .filter(|name| candidate.get(name).is_none())
+        {
+            if let Some(old) = runtime.running.remove(name) {
+                retired.push(old);
+            }
+        }
+        for listener in retired {
+            listener.stop().await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn transition_with_injected_precommit_failure(
+        &self,
+        current: &ListenerConfigSet,
+        candidate: &ListenerConfigSet,
+        commit: impl FnOnce(),
+    ) -> io::Result<()> {
+        self.transition_with_precommit(
+            current,
+            candidate,
+            || Err(io::Error::other("injected pre-commit failure")),
+            commit,
+        )
+        .await
+    }
+
+    pub(crate) async fn run_until_shutdown(
+        &self,
+        shutdown: impl Future<Output = ()>,
+    ) -> io::Result<()> {
+        tokio::pin!(shutdown);
+        let mut failures = self.failures.lock().await;
+        let failure = tokio::select! {
+            () = &mut shutdown => None,
+            failure = failures.recv() => failure,
+        };
+        drop(failures);
+        let mut runtime = self.inner.lock().await;
+        let running = std::mem::take(&mut runtime.running);
+        drop(runtime);
+        let mut stop_error = None;
+        for (_, listener) in running {
+            if let Err(error) = listener.stop().await {
+                stop_error.get_or_insert(error);
+            }
+        }
+        match (failure, stop_error) {
+            (Some((name, error)), _) => Err(io::Error::other(format!(
+                "listener `{name}` terminated: {error}"
+            ))),
+            (None, Some(error)) => Err(error),
+            (None, None) => Ok(()),
+        }
     }
 }
 
@@ -260,8 +590,17 @@ async fn serve_published(
     published: PublishedListener,
     shutdown: impl Future<Output = ()>,
 ) -> io::Result<()> {
-    let path = config.socket_path.clone();
     let (listener, _socket_lease) = published.into_listener().map_err(io::Error::other)?;
+    serve_bound(config, state, listener, shutdown).await
+}
+
+async fn serve_bound(
+    config: ServerConfig,
+    state: Arc<BrokerState>,
+    listener: tokio::net::UnixListener,
+    shutdown: impl Future<Output = ()>,
+) -> io::Result<()> {
+    let path = config.socket_path.clone();
 
     info!(
         %path,
@@ -416,9 +755,10 @@ async fn shutdown_signal() {
 #[allow(clippy::significant_drop_tightening)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -445,6 +785,7 @@ mod tests {
     use crate::backend::{Backend, BackendError, NewKey};
     use crate::catalog::load;
     use crate::manager::BackendManager;
+    use crate::transport::listener::{LegacyListenerConfig, ListenerConfigInput};
 
     #[test]
     fn listener_service_registry_is_closed_and_admin_is_host_only() {
@@ -572,6 +913,43 @@ mod tests {
             socket_group: None,
             invocation: InvocationRuntimeConfig::default(),
         }
+    }
+
+    fn listener_set(
+        listeners: impl IntoIterator<Item = (&'static str, ListenerType, PathBuf)>,
+    ) -> ListenerConfigSet {
+        let named = listeners
+            .into_iter()
+            .map(|(name, listener_type, path)| {
+                (
+                    name.to_string(),
+                    ListenerConfigInput {
+                        listener_type,
+                        path,
+                        mode: None,
+                        group: None,
+                    },
+                )
+            })
+            .collect();
+        ListenerConfigSet::resolve(named, LegacyListenerConfig::default())
+            .expect("listener set validates")
+    }
+
+    fn single_host_listener_set(name: &str, path: PathBuf, mode: u32) -> ListenerConfigSet {
+        ListenerConfigSet::resolve(
+            BTreeMap::from([(
+                name.to_string(),
+                ListenerConfigInput {
+                    listener_type: ListenerType::Host,
+                    path,
+                    mode: Some(mode),
+                    group: None,
+                },
+            )]),
+            LegacyListenerConfig::default(),
+        )
+        .expect("single host listener validates")
     }
 
     async fn wait_for_socket(socket: &Path) {
@@ -904,6 +1282,243 @@ mod tests {
             "occupied"
         );
         std::fs::remove_file(occupied_socket).expect("remove occupied fixture");
+    }
+
+    #[tokio::test]
+    async fn live_runtime_adds_reconfigures_and_removes_accept_loops() {
+        let host_socket = socket_path("runtime-host");
+        let first_container = socket_path("runtime-container-a");
+        let second_container = socket_path("runtime-container-b");
+        let connections = ConnectionRegistry::with_defaults();
+        let runtime = ListenerRuntime::start(
+            vec![test_server_config(
+                "control",
+                &host_socket,
+                ListenerType::Host,
+                connections.clone(),
+            )],
+            state(),
+        )
+        .await
+        .expect("runtime starts");
+        wait_for_socket(&host_socket).await;
+        let initial = listener_set([("control", ListenerType::Host, host_socket.clone())]);
+        let added = listener_set([
+            ("control", ListenerType::Host, host_socket.clone()),
+            (
+                "workloads",
+                ListenerType::Container,
+                first_container.clone(),
+            ),
+        ]);
+        let committed = Arc::new(AtomicBool::new(false));
+        let commit_flag = Arc::clone(&committed);
+        runtime
+            .transition(&initial, &added, move || {
+                commit_flag.store(true, Ordering::SeqCst);
+            })
+            .await
+            .expect("hot add succeeds");
+        assert!(committed.load(Ordering::SeqCst));
+        wait_for_socket(&first_container).await;
+        let mut container_admin = AdminServiceClient::new(uds_channel(&first_container).await);
+        assert_eq!(
+            container_admin
+                .status(StatusRequest {
+                    include_realms: false,
+                })
+                .await
+                .expect_err("container Admin remains absent")
+                .code(),
+            Code::Unimplemented
+        );
+        drop(container_admin);
+        for _ in 0..100 {
+            if connections.active_for_listener("workloads") == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(connections.active_for_listener("workloads"), 0);
+
+        let reconfigured = listener_set([
+            ("control", ListenerType::Host, host_socket.clone()),
+            (
+                "workloads",
+                ListenerType::Container,
+                second_container.clone(),
+            ),
+        ]);
+        runtime
+            .transition(&added, &reconfigured, || {})
+            .await
+            .expect("zero-active reconfigure succeeds");
+        assert!(!first_container.exists());
+        wait_for_socket(&second_container).await;
+
+        runtime
+            .transition(&reconfigured, &initial, || {})
+            .await
+            .expect("zero-active removal succeeds");
+        assert!(!second_container.exists());
+        let mut host_admin = AdminServiceClient::new(uds_channel(&host_socket).await);
+        host_admin
+            .status(StatusRequest {
+                include_realms: false,
+            })
+            .await
+            .expect("unchanged host listener keeps serving");
+        runtime
+            .run_until_shutdown(std::future::ready(()))
+            .await
+            .expect("runtime shuts down");
+    }
+
+    #[tokio::test]
+    async fn live_runtime_rejects_occupied_new_path_without_disturbing_old_listener() {
+        let original_socket = socket_path("runtime-rollback-original");
+        let occupied_socket = socket_path("runtime-rollback-occupied");
+        std::fs::write(&occupied_socket, "foreign").expect("occupy candidate path");
+        let connections = ConnectionRegistry::with_defaults();
+        let runtime = ListenerRuntime::start(
+            vec![test_server_config(
+                "control",
+                &original_socket,
+                ListenerType::Host,
+                connections,
+            )],
+            state(),
+        )
+        .await
+        .expect("runtime starts");
+        wait_for_socket(&original_socket).await;
+        let initial = listener_set([("control", ListenerType::Host, original_socket.clone())]);
+        let rejected = listener_set([("control", ListenerType::Host, occupied_socket.clone())]);
+        let committed = AtomicBool::new(false);
+
+        runtime
+            .transition(&initial, &rejected, || {
+                committed.store(true, Ordering::SeqCst);
+            })
+            .await
+            .expect_err("occupied replacement fails");
+        assert!(!committed.load(Ordering::SeqCst));
+        wait_for_socket(&original_socket).await;
+        let mut host_admin = AdminServiceClient::new(uds_channel(&original_socket).await);
+        host_admin
+            .status(StatusRequest {
+                include_realms: false,
+            })
+            .await
+            .expect("rolled-back listener serves again");
+        assert_eq!(
+            std::fs::read_to_string(&occupied_socket).expect("foreign path remains"),
+            "foreign"
+        );
+        runtime
+            .run_until_shutdown(std::future::ready(()))
+            .await
+            .expect("runtime shuts down");
+        std::fs::remove_file(occupied_socket).expect("remove occupied fixture");
+    }
+
+    #[tokio::test]
+    async fn live_runtime_exchanges_back_after_post_exchange_precommit_failure() {
+        let socket = socket_path("runtime-exchange-rollback");
+        let connections = ConnectionRegistry::with_defaults();
+        let runtime = ListenerRuntime::start(
+            vec![test_server_config(
+                "control",
+                &socket,
+                ListenerType::Host,
+                connections,
+            )],
+            state(),
+        )
+        .await
+        .expect("runtime starts");
+        wait_for_socket(&socket).await;
+        let old_inode = std::fs::metadata(&socket)
+            .expect("old socket metadata")
+            .ino();
+        let initial = single_host_listener_set("control", socket.clone(), 0o600);
+        let replacement = single_host_listener_set("control", socket.clone(), 0o660);
+        let committed = AtomicBool::new(false);
+
+        runtime
+            .transition_with_injected_precommit_failure(&initial, &replacement, || {
+                committed.store(true, Ordering::SeqCst);
+            })
+            .await
+            .expect_err("injected pre-commit failure rolls exchange back");
+
+        assert!(!committed.load(Ordering::SeqCst));
+        let metadata = std::fs::metadata(&socket).expect("old path restored");
+        assert_eq!(metadata.ino(), old_inode);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        let mut host_admin = AdminServiceClient::new(uds_channel(&socket).await);
+        host_admin
+            .status(StatusRequest {
+                include_realms: false,
+            })
+            .await
+            .expect("old listener keeps serving after exchange-back");
+        drop(host_admin);
+        runtime
+            .run_until_shutdown(std::future::ready(()))
+            .await
+            .expect("runtime shuts down");
+    }
+
+    #[tokio::test]
+    async fn live_runtime_preserves_foreign_inode_replacing_expected_socket() {
+        let socket = socket_path("runtime-foreign-replacement");
+        let connections = ConnectionRegistry::with_defaults();
+        let runtime = ListenerRuntime::start(
+            vec![test_server_config(
+                "control",
+                &socket,
+                ListenerType::Host,
+                connections,
+            )],
+            state(),
+        )
+        .await
+        .expect("runtime starts");
+        wait_for_socket(&socket).await;
+        let initial = single_host_listener_set("control", socket.clone(), 0o600);
+        let replacement = single_host_listener_set("control", socket.clone(), 0o660);
+        std::fs::remove_file(&socket).expect("unlink expected socket inode");
+        std::fs::write(&socket, "foreign").expect("install foreign inode");
+        let foreign_inode = std::fs::metadata(&socket).expect("foreign metadata").ino();
+        let committed = AtomicBool::new(false);
+
+        runtime
+            .transition(&initial, &replacement, || {
+                committed.store(true, Ordering::SeqCst);
+            })
+            .await
+            .expect_err("foreign replacement rejects exchange");
+        assert!(!committed.load(Ordering::SeqCst));
+        assert_eq!(
+            std::fs::metadata(&socket)
+                .expect("foreign inode remains")
+                .ino(),
+            foreign_inode
+        );
+        assert_eq!(
+            std::fs::read_to_string(&socket).expect("foreign contents remain"),
+            "foreign"
+        );
+        runtime
+            .run_until_shutdown(std::future::ready(()))
+            .await
+            .expect("runtime shuts down");
+        assert_eq!(
+            std::fs::read_to_string(&socket).expect("shutdown preserves foreign inode"),
+            "foreign"
+        );
+        std::fs::remove_file(socket).expect("remove foreign fixture");
     }
 
     #[tokio::test]

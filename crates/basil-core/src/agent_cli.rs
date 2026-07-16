@@ -35,7 +35,7 @@ use crate::{
     DEFAULT_ROTATION_GRACE_VERSIONS, DEFAULT_SOCKET_MODE, DEFAULT_SVID_TTL_SECS,
     JwtRevocationStore, ReloadActor, ReloadInputs, ServerConfig, SpiffeConfig, SpiffeVaultBackend,
     VaultBackend, enforce_capabilities, load_documents_with_overrides,
-    load_documents_with_overrides_and_context, reload_generation, run_grpc_many,
+    load_documents_with_overrides_and_context, reload_generation_live, run_grpc_many,
 };
 use crate::{bundle_cli, doctor, init, unlock};
 use anyhow::{Context, Result, bail};
@@ -2363,7 +2363,7 @@ fn attach_oci_runtime(
 /// (`nixos-rebuild switch` on a catalog/policy edit) to `kill -HUP $MAINPID`; the
 /// broker must absorb that and reload in place, not die or re-unlock.
 ///
-/// The reload is the shared [`reload_generation`] engine: it re-reads the
+/// The reload is the shared [`reload_generation_live`] engine: it re-reads the
 /// configured catalog/policy paths, runs the full startup/`check` validation, and
 /// on success atomically swaps in a new generation. On **any** failure it fails
 /// closed (the previous generation keeps serving) and the rejection is audited;
@@ -2393,11 +2393,11 @@ fn spawn_sighup_handler(state: Arc<BrokerState>, audit: Option<Arc<AuditLog>>) {
     std::mem::drop(handle);
 }
 
-/// Run one SIGHUP-driven reload via the shared [`reload_generation`] engine and
+/// Run one SIGHUP-driven reload via the shared [`reload_generation_live`] engine and
 /// audit the outcome. Never panics; on rejection the previous generation keeps
 /// serving and the reason is recorded.
 async fn handle_sighup_reload(state: &BrokerState) {
-    match reload_generation(state) {
+    match reload_generation_live(state).await {
         Ok(outcome) => {
             info!(
                 previous_generation = outcome.previous_generation,

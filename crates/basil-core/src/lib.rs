@@ -98,7 +98,10 @@ pub use grpc_server::{
 pub use manager::{BackendManager, ManagerError};
 pub use peer::PeerInfo;
 pub use reconcile::{CheckReport, KeyCheck, KeyStatus, ReconcileError, ReconcileSummary};
-pub use reload::{ReloadError, ReloadInputs, ReloadOutcome, check_reload, reload_generation};
+pub use reload::{
+    ReloadError, ReloadInputs, ReloadOutcome, check_reload, reload_generation,
+    reload_generation_live,
+};
 pub use revocation::JwtRevocationStore;
 pub use seal::{
     BackendCred, CredBundle, MasterKek, MethodKind, MethodRegistry, ParsedBundle, SealError,

@@ -385,12 +385,12 @@ impl ListenerTransitionGuard {
 
     /// Apply the complete listener-set commit while admission remains gated.
     ///
-    /// The guard is consumed so callers cannot accidentally release admission
-    /// before the commit closure returns. It is also released on unwinding.
-    pub fn commit<R>(self, apply: impl FnOnce() -> R) -> R {
-        let result = apply();
-        drop(self);
-        result
+    /// The guard remains held after the closure returns and releases admission
+    /// only when the caller drops it. This lets listener runtimes start and retire
+    /// accept loops after an irrevocable configuration commit while admission is
+    /// still closed.
+    pub fn commit<R>(&self, apply: impl FnOnce() -> R) -> R {
+        apply()
     }
 }
 

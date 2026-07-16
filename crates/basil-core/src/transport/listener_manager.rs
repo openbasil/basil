@@ -272,6 +272,52 @@ impl QualifiedListener {
         })
     }
 
+    /// Qualify a same-path replacement against the runtime-owned old inode.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error if the final path no longer names the exact socket
+    /// owned by `current` or path traversal is untrusted.
+    pub fn validate_replacement(
+        config: &ListenerConfig,
+        current: &PublishedSocketLease,
+    ) -> Result<Self, ListenerManagerError> {
+        let parent =
+            config
+                .path()
+                .parent()
+                .ok_or_else(|| ListenerManagerError::UntrustedParent {
+                    listener: config.name().to_string(),
+                    path: config.path().to_path_buf(),
+                })?;
+        let parent_fd = Arc::new(open_trusted_parent(config.name(), parent)?);
+        let final_name =
+            config
+                .path()
+                .file_name()
+                .ok_or_else(|| ListenerManagerError::UntrustedParent {
+                    listener: config.name().to_string(),
+                    path: config.path().to_path_buf(),
+                })?;
+        let identity = socket_identity_at(config.name(), &parent_fd, final_name, config.path())?;
+        let qualified_parent = descriptor_identity(config.name(), &parent_fd, parent)?;
+        let current_parent = descriptor_identity(config.name(), &current.parent_fd, parent)?;
+        if identity != current.identity
+            || final_name != current.final_name
+            || qualified_parent != current_parent
+        {
+            return Err(ListenerManagerError::PathOccupied {
+                listener: config.name().to_string(),
+                path: config.path().to_path_buf(),
+            });
+        }
+        Ok(Self {
+            config: config.clone(),
+            parent: parent.to_path_buf(),
+            parent_fd,
+        })
+    }
+
     /// Bind a non-serving socket inside a private `0700` sibling directory and
     /// apply its configured ACL through the pinned directory descriptor before
     /// publication.
@@ -325,6 +371,7 @@ impl QualifiedListener {
                     });
                 }
             };
+            let stage_fd = Arc::new(stage_fd);
             let bind_path = pinned_stage_bind_path(&stage_fd, &stage_path);
             let listener = match UnixListener::bind(&bind_path) {
                 Ok(listener) => listener,
@@ -377,7 +424,7 @@ pub struct PreparedListener {
     listener: Option<UnixListener>,
     parent_fd: Arc<OwnedFd>,
     stage_name: OsString,
-    stage_fd: OwnedFd,
+    stage_fd: Arc<OwnedFd>,
     stage_path: PathBuf,
     identity: SocketIdentity,
 }
@@ -503,6 +550,197 @@ impl PreparedListener {
         // The published guard now owns cleanup.
         self.identity = SocketIdentity::INVALID;
         Ok(published)
+    }
+
+    /// Atomically exchange this staged socket with an exact runtime-owned socket.
+    ///
+    /// The returned guard restores the old inode on drop until [`ExchangedListener::commit`]
+    /// is called. Both sides are verified through pinned directory descriptors
+    /// before and after the exchange.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error without replacing a foreign or changed inode.
+    pub fn exchange(
+        mut self,
+        current: &PublishedSocketLease,
+    ) -> Result<ExchangedListener, ListenerManagerError> {
+        let final_path = self.config.path().to_path_buf();
+        let Some(final_name) = final_path.file_name().map(ToOwned::to_owned) else {
+            return Err(ListenerManagerError::UntrustedParent {
+                listener: self.config.name().to_string(),
+                path: final_path,
+            });
+        };
+        let old_identity = socket_identity_at(
+            self.config.name(),
+            self.parent_fd.as_ref(),
+            &final_name,
+            &final_path,
+        )?;
+        if old_identity != current.identity || final_name != current.final_name {
+            return Err(ListenerManagerError::PathOccupied {
+                listener: self.config.name().to_string(),
+                path: final_path,
+            });
+        }
+        let Some(listener) = self.listener.take() else {
+            return Err(ListenerManagerError::StageUnavailable {
+                listener: self.config.name().to_string(),
+            });
+        };
+        renameat_with(
+            self.stage_fd.as_ref(),
+            "s",
+            self.parent_fd.as_ref(),
+            &final_name,
+            RenameFlags::EXCHANGE,
+        )
+        .map_err(io::Error::from)
+        .map_err(|source| ListenerManagerError::Io {
+            listener: self.config.name().to_string(),
+            path: final_path.clone(),
+            source,
+        })?;
+        let final_identity = socket_identity_at(
+            self.config.name(),
+            self.parent_fd.as_ref(),
+            &final_name,
+            &final_path,
+        );
+        let staged_old_identity = socket_identity_at(
+            self.config.name(),
+            self.stage_fd.as_ref(),
+            "s",
+            &self.stage_path,
+        );
+        if final_identity.as_ref().ok() != Some(&self.identity)
+            || staged_old_identity.as_ref().ok() != Some(&old_identity)
+        {
+            let _ = renameat_with(
+                self.stage_fd.as_ref(),
+                "s",
+                self.parent_fd.as_ref(),
+                &final_name,
+                RenameFlags::EXCHANGE,
+            );
+            return Err(final_identity
+                .err()
+                .or_else(|| staged_old_identity.err())
+                .unwrap_or_else(|| ListenerManagerError::PathOccupied {
+                    listener: self.config.name().to_string(),
+                    path: final_path,
+                }));
+        }
+        let exchange = ExchangedListener {
+            config: self.config.clone(),
+            listener: Some(listener),
+            parent_fd: Arc::clone(&self.parent_fd),
+            final_name,
+            stage_name: self.stage_name.clone(),
+            stage_fd: Arc::clone(&self.stage_fd),
+            new_identity: self.identity,
+            old_identity,
+            exchanged: true,
+        };
+        self.identity = SocketIdentity::INVALID;
+        Ok(exchange)
+    }
+}
+
+/// Same-path socket exchange with automatic exchange-back rollback.
+pub struct ExchangedListener {
+    config: ListenerConfig,
+    listener: Option<UnixListener>,
+    parent_fd: Arc<OwnedFd>,
+    final_name: OsString,
+    stage_name: OsString,
+    stage_fd: Arc<OwnedFd>,
+    new_identity: SocketIdentity,
+    old_identity: SocketIdentity,
+    exchanged: bool,
+}
+
+impl ExchangedListener {
+    /// Make the replacement irrevocable and return its published listener.
+    #[must_use]
+    pub fn commit(mut self) -> PublishedListener {
+        remove_owned_socket_at(self.stage_fd.as_ref(), "s", self.old_identity);
+        let _ = unlinkat(
+            self.parent_fd.as_ref(),
+            &self.stage_name,
+            AtFlags::REMOVEDIR,
+        );
+        self.exchanged = false;
+        let listener = self.listener.take();
+        let published = PublishedListener {
+            config: self.config.clone(),
+            listener,
+            parent_fd: Arc::clone(&self.parent_fd),
+            final_name: self.final_name.clone(),
+            identity: self.new_identity,
+        };
+        self.new_identity = SocketIdentity::INVALID;
+        published
+    }
+
+    /// Explicitly restore the old socket and remove the staged replacement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either exchanged inode changed before rollback.
+    pub fn rollback(mut self) -> Result<(), ListenerManagerError> {
+        self.exchange_back()?;
+        Ok(())
+    }
+
+    fn exchange_back(&mut self) -> Result<(), ListenerManagerError> {
+        if !self.exchanged {
+            return Ok(());
+        }
+        let final_path = self.config.path();
+        let final_identity = socket_identity_at(
+            self.config.name(),
+            self.parent_fd.as_ref(),
+            &self.final_name,
+            final_path,
+        )?;
+        let staged_identity =
+            socket_identity_at(self.config.name(), self.stage_fd.as_ref(), "s", final_path)?;
+        if final_identity != self.new_identity || staged_identity != self.old_identity {
+            return Err(ListenerManagerError::PathOccupied {
+                listener: self.config.name().to_string(),
+                path: final_path.to_path_buf(),
+            });
+        }
+        renameat_with(
+            self.stage_fd.as_ref(),
+            "s",
+            self.parent_fd.as_ref(),
+            &self.final_name,
+            RenameFlags::EXCHANGE,
+        )
+        .map_err(io::Error::from)
+        .map_err(|source| ListenerManagerError::Io {
+            listener: self.config.name().to_string(),
+            path: final_path.to_path_buf(),
+            source,
+        })?;
+        self.exchanged = false;
+        remove_owned_socket_at(self.stage_fd.as_ref(), "s", self.new_identity);
+        let _ = unlinkat(
+            self.parent_fd.as_ref(),
+            &self.stage_name,
+            AtFlags::REMOVEDIR,
+        );
+        self.new_identity = SocketIdentity::INVALID;
+        Ok(())
+    }
+}
+
+impl Drop for ExchangedListener {
+    fn drop(&mut self) {
+        let _ = self.exchange_back();
     }
 }
 
@@ -712,6 +950,22 @@ fn socket_identity_at(
             path: display_path.to_path_buf(),
         });
     }
+    Ok(SocketIdentity {
+        device: stat.st_dev,
+        inode: stat.st_ino,
+    })
+}
+
+fn descriptor_identity(
+    listener: &str,
+    descriptor: &OwnedFd,
+    display_path: &Path,
+) -> Result<SocketIdentity, ListenerManagerError> {
+    let stat = fstat(descriptor).map_err(|error| ListenerManagerError::Io {
+        listener: listener.to_string(),
+        path: display_path.to_path_buf(),
+        source: io::Error::from(error),
+    })?;
     Ok(SocketIdentity {
         device: stat.st_dev,
         inode: stat.st_ino,
