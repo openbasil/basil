@@ -242,6 +242,23 @@ ssh_user() { local u=$1; shift; ssh "${ssh_base[@]}" "$u@127.0.0.1" "$@"; }
 # shellcheck disable=SC2029
 ssh_script() { local u=$1 envp=${2:-}; ssh "${ssh_base[@]}" "$u@127.0.0.1" "$envp bash -s"; }
 
+wait_for_user_unit_rejection_marker() {
+  local owner=$1 unit=$2 pid=$3 journal="" marker
+  [[ $unit =~ ^[a-zA-Z0-9_.@-]+$ && $pid =~ ^[1-9][0-9]*$ ]] || return 1
+  marker="BASIL_PRE_HANDSHAKE_REJECTION_CONFIRMED(_NO_CONNECT)? pid=$pid"
+  for _ in $(seq 1 20); do
+    journal=$(ssh_user "$owner" "export XDG_RUNTIME_DIR=/run/user/\$(id -u); \
+      journalctl --user -u '$unit' --no-pager --output=cat" 2>&1 || true)
+    if grep -Eq "$marker" <<<"$journal"; then
+      printf '%s\n' "$journal" >>"$SCRATCH/podman-unit-trust.log"
+      return 0
+    fi
+    sleep 1
+  done
+  printf '%s\n' "$journal" >>"$SCRATCH/podman-unit-trust.log"
+  return 1
+}
+
 main() {
   : >"$GUEST_LOG"
   guest_fact driver.started PASS "suite=$SUITE"
@@ -694,7 +711,8 @@ run_podman_attestor_acceptance() {
   local staging="$cache/podman-attestor-acceptance-staging"
   local binary="$staging/basil-core-test" manifest="$staging/manifest.tsv"
   local stores="$staging/store-paths.txt" expected actual interpreter store
-  local output rc foreign_a foreign_b core_a_ok=0 core_b_ok=0
+  local output rc foreign_a foreign_b foreign_outcome_a="" foreign_outcome_b=""
+  local core_a_ok=0 core_b_ok=0
   local -a closure=()
   [[ -f $binary && ! -L $binary && -f $manifest && ! -L $manifest \
     && -f $stores && ! -L $stores ]] \
@@ -752,10 +770,16 @@ GUEST_EOF
   local broker_uid attestor_uid extra_uid realm_unit wrong_unit ready unit_ok=0 wrong_ok=0 acl_ok=0
   broker_uid=$(ssh_user phase1-b 'id -u')
   attestor_uid=$(ssh_user phase1-a 'id -u')
-  extra_uid=$(ssh_user phase1-b 'id -u')
+  extra_uid=$(ssh_user basil-ci 'id -u')
   realm_unit=basil-attestor-owner-podman.service
   wrong_unit=basil-attestor-wrong.service
   ready=/run/user/$attestor_uid/basil/attestors/owner-podman/server.ready
+  if [[ ! $broker_uid =~ ^[1-9][0-9]*$ || ! $attestor_uid =~ ^[1-9][0-9]*$ \
+    || ! $extra_uid =~ ^[1-9][0-9]*$ || $broker_uid == "$attestor_uid" \
+    || $broker_uid == "$extra_uid" || $attestor_uid == "$extra_uid" ]]; then
+    set_res podman.unit-trust INFRA_ERROR PODMAN_SYSTEMD_USER_UIDS_INVALID \
+      "broker=$broker_uid attestor=$attestor_uid extra=$extra_uid"
+  else
   ssh_user phase1-a "rm -f '$ready'; export XDG_RUNTIME_DIR=/run/user/$attestor_uid; \
     systemd-run --user --unit=$realm_unit --collect \
       --setenv=BASIL_REALM_BROKER_UID=$broker_uid \
@@ -803,17 +827,15 @@ GUEST_EOF
     ssh_user phase1-a "test -f '$ready'" >/dev/null 2>&1 && break
     sleep 1
   done
+  local wrong_pid=""
+  wrong_pid=$(ssh_user phase1-a "cat '$ready'" 2>/dev/null || true)
   if ssh_user phase1-b \
     "BASIL_REALM_BROKER_UID=$broker_uid BASIL_REALM_ATTESTOR_UID=$attestor_uid \
      BASIL_REALM_EXPECTED_UNIT=$realm_unit BASIL_REALM_EXPECT_RESULT=reject \
      $interpreter /opt/basil-core-test --ignored --exact \
      core::attestor_realm_unix::tests::live_unix_realm_systemd_connector --nocapture" \
     >/dev/null 2>&1; then
-    sleep 1
-    if ssh_user phase1-a "export XDG_RUNTIME_DIR=/run/user/$attestor_uid; \
-      journalctl --user -u $wrong_unit --no-pager" 2>&1 \
-      | tee -a "$SCRATCH/podman-unit-trust.log" \
-      | grep -q BASIL_PRE_HANDSHAKE_REJECTION_CONFIRMED; then
+    if wait_for_user_unit_rejection_marker phase1-a "$wrong_unit" "$wrong_pid"; then
       wrong_ok=1
     fi
   fi
@@ -837,17 +859,15 @@ GUEST_EOF
     ssh_user phase1-a "test -f '$ready'" >/dev/null 2>&1 && break
     sleep 1
   done
+  local acl_pid=""
+  acl_pid=$(ssh_user phase1-a "cat '$ready'" 2>/dev/null || true)
   if ssh_user phase1-b \
     "BASIL_REALM_BROKER_UID=$broker_uid BASIL_REALM_ATTESTOR_UID=$attestor_uid \
      BASIL_REALM_EXPECTED_UNIT=$realm_unit BASIL_REALM_EXPECT_RESULT=reject \
      $interpreter /opt/basil-core-test --ignored --exact \
      core::attestor_realm_unix::tests::live_unix_realm_systemd_connector --nocapture" \
     >/dev/null 2>&1; then
-    sleep 1
-    if ssh_user phase1-a "export XDG_RUNTIME_DIR=/run/user/$attestor_uid; \
-      journalctl --user -u $realm_unit --no-pager" 2>&1 \
-      | tee -a "$SCRATCH/podman-unit-trust.log" \
-      | grep -q BASIL_PRE_HANDSHAKE_REJECTION_CONFIRMED; then
+    if wait_for_user_unit_rejection_marker phase1-a "$realm_unit" "$acl_pid"; then
       acl_ok=1
     fi
   fi
@@ -860,12 +880,16 @@ GUEST_EOF
     set_res podman.unit-trust TEST_FAIL PODMAN_SYSTEMD_USER_UNIT_TRUST_FAILED \
       "accept=$unit_ok wrong_unit=$wrong_ok extra_acl=$acl_ok"
   fi
+  fi
 
   foreign_b=$(ssh_script phase1-b "WTAG=$wtag" <<'GUEST_EOF'
 export XDG_RUNTIME_DIR=/run/user/$(id -u)
 podman rm -f basil-podman-attestor-foreign >/dev/null 2>&1 || true
 id=$(podman run -d --network none --name basil-podman-attestor-foreign \
-  --label io.openbasil.podman-attestor-acceptance=foreign "$WTAG" sleep 1200)
+  --label io.openbasil.podman-attestor-acceptance=foreign \
+  --label com.docker.compose.project=basil-podman-attestor \
+  --label com.docker.compose.service=api \
+  --label com.docker.compose.oneoff=False "$WTAG" sleep 1200)
 podman inspect --format '{{.State.Pid}}' "$id"
 GUEST_EOF
   ) || foreign_b=""
@@ -885,7 +909,14 @@ GUEST_EOF
       set_res podman.provider-core TEST_FAIL PODMAN_OWNER_A_MATRIX_FAILED "test_rc=$rc"
       set_res podman.owner-isolation TEST_FAIL PODMAN_CROSS_OWNER_A_FAILED "test_rc=$rc"
     else
-      core_a_ok=1
+      foreign_outcome_a=$(sed -n 's/^BASIL_FOREIGN_ROUTE_OUTCOME=//p' \
+        "$SCRATCH/podman-owner-a.log" | tail -1)
+      if [[ $foreign_outcome_a == no_match || $foreign_outcome_a == unavailable ]]; then
+        core_a_ok=1
+      else
+        set_res podman.owner-isolation TEST_FAIL PODMAN_CROSS_OWNER_OUTCOME_MISSING \
+          "owner A did not report no_match or unavailable"
+      fi
     fi
   fi
 
@@ -893,7 +924,10 @@ GUEST_EOF
 export XDG_RUNTIME_DIR=/run/user/$(id -u)
 podman rm -f basil-podman-attestor-foreign >/dev/null 2>&1 || true
 id=$(podman run -d --network none --name basil-podman-attestor-foreign \
-  --label io.openbasil.podman-attestor-acceptance=foreign "$WTAG" sleep 1200)
+  --label io.openbasil.podman-attestor-acceptance=foreign \
+  --label com.docker.compose.project=basil-podman-attestor \
+  --label com.docker.compose.service=api \
+  --label com.docker.compose.oneoff=False "$WTAG" sleep 1200)
 podman inspect --format '{{.State.Pid}}' "$id"
 GUEST_EOF
   ) || foreign_a=""
@@ -913,14 +947,21 @@ GUEST_EOF
       set_res podman.provider-core TEST_FAIL PODMAN_OWNER_B_MATRIX_FAILED "test_rc=$rc"
       set_res podman.owner-isolation TEST_FAIL PODMAN_CROSS_OWNER_B_FAILED "test_rc=$rc"
     else
-      core_b_ok=1
+      foreign_outcome_b=$(sed -n 's/^BASIL_FOREIGN_ROUTE_OUTCOME=//p' \
+        "$SCRATCH/podman-owner-b.log" | tail -1)
+      if [[ $foreign_outcome_b == no_match || $foreign_outcome_b == unavailable ]]; then
+        core_b_ok=1
+      else
+        set_res podman.owner-isolation TEST_FAIL PODMAN_CROSS_OWNER_OUTCOME_MISSING \
+          "owner B did not report no_match or unavailable"
+      fi
     fi
   fi
   if (( core_a_ok == 1 && core_b_ok == 1 )); then
     set_res podman.provider-core PASS PODMAN_PROVIDER_REAL_MATRIX_PASS \
       "both owners: replicas, exec, PID reuse, restart, OCI, Compose, mounts, SELinux"
     set_res podman.owner-isolation PASS PODMAN_OWNER_REALMS_ISOLATED \
-      "same container UID 0 maps to distinct owners; cross-route is no-match and inventories stay local"
+      "same container UID 0 maps to distinct owners; owner-local inventories; owner_a_cross_route=$foreign_outcome_a owner_b_cross_route=$foreign_outcome_b"
   fi
   # shellcheck disable=SC2016 # `id` expands in the guest shell.
   ssh_user phase1-a 'export XDG_RUNTIME_DIR=/run/user/$(id -u); podman rm -f basil-podman-attestor-foreign >/dev/null 2>&1 || true' \

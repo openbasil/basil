@@ -693,11 +693,8 @@ capabilities = ["health", "query-instances", "resolve-peer"]
         let listener = UnixListener::bind(&config.socket_path).unwrap();
         install_live_acl(&config);
         let ready = std::env::var("BASIL_REALM_READY").unwrap();
-        fs::write(
-            &ready,
-            format!("{}\n", rustix::process::getpid().as_raw_nonzero().get()),
-        )
-        .unwrap();
+        let server_pid = rustix::process::getpid().as_raw_nonzero().get();
+        fs::write(&ready, format!("{server_pid}\n")).unwrap();
         let mode = std::env::var("BASIL_REALM_SERVER_MODE").unwrap();
         let count = if mode == "accept" { 2 } else { 1 };
         for epoch in 1..=count {
@@ -710,7 +707,7 @@ capabilities = ["health", "query-instances", "resolve-peer"]
                     .map(Result::unwrap)
             };
             let Some((stream, _)) = accepted else {
-                eprintln!("BASIL_PRE_HANDSHAKE_REJECTION_CONFIRMED_NO_CONNECT");
+                eprintln!("BASIL_PRE_HANDSHAKE_REJECTION_CONFIRMED_NO_CONNECT pid={server_pid}");
                 return;
             };
             let pin = current_pin();
@@ -752,7 +749,7 @@ capabilities = ["health", "query-instances", "resolve-peer"]
                 let rejected =
                     tokio::time::timeout(Duration::from_secs(5), session.handshake()).await;
                 assert!(!matches!(rejected, Ok(Ok(()))));
-                eprintln!("BASIL_PRE_HANDSHAKE_REJECTION_CONFIRMED");
+                eprintln!("BASIL_PRE_HANDSHAKE_REJECTION_CONFIRMED pid={server_pid}");
                 return;
             }
             session.handshake().await.unwrap();

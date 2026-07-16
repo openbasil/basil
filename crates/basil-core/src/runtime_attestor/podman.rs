@@ -1653,6 +1653,37 @@ mod tests {
         wire::OutcomeCode::try_from(reply.outcome().code).unwrap()
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ForeignRouteOutcome {
+        NoMatch,
+        Unavailable,
+    }
+
+    impl ForeignRouteOutcome {
+        const fn label(self) -> &'static str {
+            match self {
+                Self::NoMatch => "no_match",
+                Self::Unavailable => "unavailable",
+            }
+        }
+    }
+
+    async fn foreign_route_outcome(provider: &PodmanAttestor, pid: u32) -> ForeignRouteOutcome {
+        match provider.processes.observe(pid) {
+            Ok(foreign) => {
+                let result = provider
+                    .resolve_peer(&foreign.peer, OPERATION_TIMEOUT)
+                    .await;
+                assert_eq!(outcome_code(&result), wire::OutcomeCode::NoMatch);
+                ForeignRouteOutcome::NoMatch
+            }
+            Err(error) => {
+                assert_eq!(error, ProcError::Unavailable);
+                ForeignRouteOutcome::Unavailable
+            }
+        }
+    }
+
     #[test]
     fn public_configuration_rejects_root_and_ambiguous_paths() {
         assert!(matches!(
@@ -1779,6 +1810,24 @@ mod tests {
         assert_eq!(outcome_code(&result), wire::OutcomeCode::NoMatch);
         assert_eq!(api.info_calls.load(Ordering::Relaxed), 0);
         assert_eq!(api.list_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn foreign_route_reporting_distinguishes_no_match_from_unavailable() {
+        let foreign_pid = 222;
+        let foreign_cgroup = format!("/user.slice/libpod-{}.scope", id('a'));
+        let foreign = process_for(foreign_pid, 9, &foreign_cgroup, 20, 1002, 1002);
+        let no_match = provider(Arc::new(fake_api(Vec::new())), vec![foreign]);
+        assert_eq!(
+            foreign_route_outcome(&no_match, foreign_pid).await,
+            ForeignRouteOutcome::NoMatch
+        );
+
+        let unavailable = provider(Arc::new(fake_api(Vec::new())), Vec::new());
+        assert_eq!(
+            foreign_route_outcome(&unavailable, foreign_pid).await,
+            ForeignRouteOutcome::Unavailable
+        );
     }
 
     #[tokio::test]
@@ -2280,17 +2329,8 @@ mod tests {
             .ok()
             .and_then(|value| value.parse::<u32>().ok())
         {
-            match provider.processes.observe(foreign_pid) {
-                Ok(foreign) => assert_eq!(
-                    outcome_code(
-                        &provider
-                            .resolve_peer(&foreign.peer, OPERATION_TIMEOUT)
-                            .await
-                    ),
-                    wire::OutcomeCode::NoMatch,
-                ),
-                Err(error) => assert_eq!(error, ProcError::Unavailable),
-            }
+            let outcome = foreign_route_outcome(&provider, foreign_pid).await;
+            eprintln!("BASIL_FOREIGN_ROUTE_OUTCOME={}", outcome.label());
         }
 
         podman_command(&["restart", "basil-podman-attestor-two"]);

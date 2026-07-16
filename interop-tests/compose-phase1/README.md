@@ -317,10 +317,16 @@ suite keeps SELinux enforcing and runs the provider as both lingering rootless
 owners. It covers same-container UID collisions, cross-owner routing and
 inventory isolation, replicas, exec processes, stale PID evidence, restarts,
 protected mount facts and labels, runtime outage, logout and reboot recovery,
-and rejection of a real rootful Podman socket. A distinct-UID broker also
-connects twice to an exact transient `systemd --user` attestor unit through a
-broker-only traversal/connect ACL. Wrong-unit and extra-ACL variants must close
-before the protocol handshake and retain the server-side marker.
+and rejection of a real rootful Podman socket. The suite also exercises a
+distinct-UID broker against an exact transient `systemd --user` attestor unit
+through a broker-only traversal/connect ACL. The retained Fedora run referenced
+in `basil-9tj.14` passed six of seven terminals, including wrong-unit rejection,
+but did not prove cross-UID connector acceptance, exact unit trust, or rejection
+of an ACL granted to a distinct third UID. The broker cannot inspect the
+attestor's live executable and namespace links across UIDs on that host
+(`EACCES` before the protocol handshake). P1 design task `basil-ln84` therefore
+blocks this acceptance ticket; the harness remains fail-closed and retains
+PID-specific, bounded-wait rejection markers.
 
 Podman 5.8 rejects an explicit `noswap` option on rootless tmpfs mounts because
 that option is rootful-only. This suite therefore verifies the other protected
