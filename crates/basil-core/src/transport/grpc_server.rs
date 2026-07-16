@@ -6,8 +6,6 @@
 
 use std::future::Future;
 use std::io;
-use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -21,13 +19,10 @@ use basil_proto::broker::v1::secret_service_server::SecretServiceServer;
 use basil_proto::broker::v1::signing_service_server::SigningServiceServer;
 use basil_proto::envoy::service::secret::v3::secret_discovery_service_server::SecretDiscoveryServiceServer;
 use basil_proto::spiffe::spiffe_workload_api_server::SpiffeWorkloadApiServer;
-use tokio::net::UnixListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_stream::{StreamExt as _, wrappers::UnixListenerStream};
 use tonic::transport::Server;
 use tracing::{info, warn};
-
-use rustix::fs::{CWD, RenameFlags, renameat_with};
 
 use crate::grpc::BrokerGrpc;
 use crate::sds::EnvoySdsGrpc;
@@ -35,6 +30,8 @@ use crate::service::broker::InvocationRuntimeConfig;
 use crate::spiffe::SpiffeWorkloadGrpc;
 use crate::state::BrokerState;
 use crate::transport::connection::ConnectionRegistry;
+use crate::transport::listener::ListenerConfig;
+use crate::transport::listener_manager::{PreparedListenerBatch, QualifiedListener};
 
 /// Default Unix socket mode: owner read/write only.
 pub const DEFAULT_SOCKET_MODE: u32 = 0o600;
@@ -160,13 +157,22 @@ async fn serve_with_shutdown(
     shutdown: impl Future<Output = ()>,
 ) -> std::io::Result<()> {
     let path = config.socket_path;
-    if Path::new(&path).exists() {
-        std::fs::remove_file(&path)?;
-        warn!(%path, "removed stale socket");
-    }
-
-    let listener = bind_restricted(&path)?;
-    apply_socket_permissions(&path, config.socket_mode, config.socket_group.as_deref())?;
+    let listener_config = ListenerConfig::validated(
+        config.listener_name.clone(),
+        config.listener_type,
+        PathBuf::from(&path),
+        config.socket_mode,
+        config.socket_group.clone(),
+    )
+    .map_err(io::Error::other)?;
+    QualifiedListener::validate(&listener_config).map_err(io::Error::other)?;
+    let published = PreparedListenerBatch::prepare([&listener_config])
+        .and_then(PreparedListenerBatch::publish)
+        .map_err(io::Error::other)?;
+    let Some(published) = published.into_listeners().pop() else {
+        return Err(io::Error::other("listener publication returned no socket"));
+    };
+    let (listener, _socket_lease) = published.into_listener().map_err(io::Error::other)?;
 
     info!(
         %path,
@@ -246,101 +252,10 @@ async fn serve_with_shutdown(
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await;
 
-    if let Err(e) = std::fs::remove_file(&path)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        warn!(?e, %path, "could not remove socket on shutdown");
-    }
-
     result.map_err(std::io::Error::other)
 }
 
-/// Bind a socket privately, set it owner-only, then publish it without replacing
-/// an existing path.
-///
-/// The private directory is created with mode `0700` on the target filesystem,
-/// so an inherited permissive process umask cannot expose the live socket before
-/// its mode is tightened. This deliberately avoids changing the process-global
-/// umask, which is unsafe when listeners are prepared concurrently.
-pub(crate) fn bind_restricted(path: &str) -> io::Result<UnixListener> {
-    const MAX_ATTEMPTS: usize = 8;
-
-    let final_path = Path::new(path);
-    let parent = final_path
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "socket path has no parent"))?;
-    for _ in 0..MAX_ATTEMPTS {
-        let suffix = uuid::Uuid::new_v4()
-            .as_simple()
-            .to_string()
-            .chars()
-            .take(8)
-            .collect::<String>();
-        let directory = parent.join(format!(".b-{suffix}"));
-        let socket = directory.join("s");
-        if socket.as_os_str().as_bytes().len() > super::listener::MAX_UNIX_SOCKET_PATH_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "private socket staging path is too long",
-            ));
-        }
-        match std::fs::DirBuilder::new().mode(0o700).create(&directory) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
-        let mut stage = PrivateBindStage::new(directory, socket);
-        let listener = UnixListener::bind(&stage.socket)?;
-        std::fs::set_permissions(&stage.socket, std::fs::Permissions::from_mode(0o600))?;
-        renameat_with(CWD, &stage.socket, CWD, final_path, RenameFlags::NOREPLACE)
-            .map_err(io::Error::from)?;
-        stage.published = true;
-        return Ok(listener);
-    }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "could not allocate private socket staging directory",
-    ))
-}
-
-struct PrivateBindStage {
-    directory: PathBuf,
-    socket: PathBuf,
-    published: bool,
-}
-
-impl PrivateBindStage {
-    const fn new(directory: PathBuf, socket: PathBuf) -> Self {
-        Self {
-            directory,
-            socket,
-            published: false,
-        }
-    }
-}
-
-impl Drop for PrivateBindStage {
-    fn drop(&mut self) {
-        if !self.published {
-            let _ = std::fs::remove_file(&self.socket);
-        }
-        let _ = std::fs::remove_dir(&self.directory);
-    }
-}
-
-pub(crate) fn apply_socket_permissions(
-    path: &str,
-    mode: u32,
-    group: Option<&str>,
-) -> io::Result<()> {
-    if let Some(group) = group {
-        let gid = resolve_group(group)?;
-        std::os::unix::fs::chown(path, None, Some(gid))?;
-    }
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-}
-
-fn resolve_group(group: &str) -> io::Result<u32> {
+pub(crate) fn resolve_group(group: &str) -> io::Result<u32> {
     if let Ok(gid) = group.parse::<u32>() {
         return Ok(gid);
     }
@@ -412,6 +327,7 @@ async fn shutdown_signal() {
 #[allow(clippy::significant_drop_tightening)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Duration;
@@ -570,16 +486,15 @@ mod tests {
         // on Linux. macOS's std::env::temp_dir() (/var/folders/...) is long enough
         // that "basil-{name}-{uuid}.sock" overflowed the macOS limit; anchor at the
         // short, always-writable /tmp so the full path stays well under it.
-        PathBuf::from("/tmp").join(format!("basil-{name}-{}.sock", uuid::Uuid::new_v4()))
+        let directory = PathBuf::from("/tmp").join(format!("b-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).expect("trusted socket parent");
+        directory.join(format!("{name}.sock"))
     }
 
     #[test]
-    fn concurrent_socket_binds_are_private_without_changing_umask() {
+    fn concurrent_socket_binds_publish_privately_without_clobbering() {
         const BIND_COUNT: usize = 16;
 
-        // A loose inherited umask proves privacy comes from the inaccessible
-        // staging directory plus pre-publication chmod, not global mutation.
-        let inherited = rustix::process::umask(rustix::fs::Mode::empty());
         let barrier = Arc::new(std::sync::Barrier::new(BIND_COUNT));
         let results = std::thread::scope(|scope| {
             let mut handles = Vec::new();
@@ -593,7 +508,22 @@ mod tests {
                     let _runtime_guard = runtime.enter();
                     let socket = socket_path("umask-race");
                     barrier.wait();
-                    bind_restricted(&socket.to_string_lossy()).map(|listener| (socket, listener))
+                    let config = ListenerConfig::validated(
+                        "host".to_string(),
+                        ListenerType::Host,
+                        socket.clone(),
+                        DEFAULT_SOCKET_MODE,
+                        None,
+                    )
+                    .map_err(io::Error::other)?;
+                    let published = PreparedListenerBatch::prepare([&config])
+                        .and_then(PreparedListenerBatch::publish)
+                        .map_err(io::Error::other)?;
+                    let published = published.into_listeners().pop().ok_or_else(|| {
+                        io::Error::other("listener publication returned no socket")
+                    })?;
+                    let (listener, lease) = published.into_listener().map_err(io::Error::other)?;
+                    Ok::<_, io::Error>((socket, listener, lease))
                 }));
             }
             handles
@@ -601,15 +531,8 @@ mod tests {
                 .map(|handle| handle.join().expect("bind thread does not panic"))
                 .collect::<Vec<_>>()
         });
-        let observed = rustix::process::umask(inherited);
-        assert_eq!(
-            observed,
-            rustix::fs::Mode::empty(),
-            "umask must be unchanged"
-        );
-
         for result in results {
-            let (socket, listener) = result.expect("concurrent bind succeeds");
+            let (socket, listener, lease) = result.expect("concurrent bind succeeds");
             let mode = std::fs::metadata(&socket)
                 .expect("socket metadata")
                 .permissions()
@@ -617,7 +540,10 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600, "socket must be owner-only at publication");
             drop(listener);
-            let _ = std::fs::remove_file(&socket);
+            drop(lease);
+            assert!(!socket.exists());
+            std::fs::remove_dir(socket.parent().expect("socket parent"))
+                .expect("remove socket parent");
         }
     }
 

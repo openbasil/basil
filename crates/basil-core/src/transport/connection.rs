@@ -4,7 +4,7 @@
 
 //! Bounded accepted-transport registry and cancellable Unix-stream wrapper.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future as _;
 use std::io;
@@ -119,6 +119,9 @@ pub enum ConnectionRegistryError {
     /// Required kernel peer credentials could not be captured.
     #[error("required Unix peer credentials unavailable")]
     PeerCredentials(#[source] io::Error),
+    /// The listener is gated for an atomic configuration transition.
+    #[error("listener `{0}` is not accepting during configuration transition")]
+    ListenerGated(String),
 }
 
 /// Synchronous bounded inventory shared by all listener accept loops.
@@ -137,6 +140,7 @@ struct RegistryState {
     next_id: Option<u64>,
     entries: BTreeMap<ConnectionId, RegistryEntry>,
     listener_counts: BTreeMap<Arc<str>, usize>,
+    gated_listeners: BTreeSet<Arc<str>>,
 }
 
 struct RegistryEntry {
@@ -156,6 +160,7 @@ impl ConnectionRegistry {
                     next_id: Some(1),
                     entries: BTreeMap::new(),
                     listener_counts: BTreeMap::new(),
+                    gated_listeners: BTreeSet::new(),
                 }),
             }),
         }
@@ -182,6 +187,7 @@ impl ConnectionRegistry {
                     next_id: Some(1),
                     entries: BTreeMap::new(),
                     listener_counts: BTreeMap::new(),
+                    gated_listeners: BTreeSet::new(),
                 }),
             }),
         })
@@ -205,6 +211,11 @@ impl ConnectionRegistry {
         let peer =
             PeerInfo::try_from_stream(&stream).map_err(ConnectionRegistryError::PeerCredentials)?;
         let mut state = lock_state(&self.inner);
+        if state.gated_listeners.contains(&listener_name) {
+            return Err(ConnectionRegistryError::ListenerGated(
+                listener_name.to_string(),
+            ));
+        }
         if state.entries.len() >= self.inner.maximum {
             return Err(ConnectionRegistryError::GlobalLimit);
         }
@@ -297,6 +308,74 @@ impl ConnectionRegistry {
             .get(listener_name)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Gate registration for listener names and atomically snapshot their active
+    /// counts under the same lock registration uses.
+    ///
+    /// The returned guard keeps registration closed until it is dropped. This is
+    /// the transition primitive used before zero-active validation, so a new
+    /// accepted transport cannot appear between the count and listener commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConnectionRegistryError::ListenerGated`] if another transition
+    /// already owns one of the requested listener gates.
+    pub fn begin_listener_transition(
+        &self,
+        listener_names: impl IntoIterator<Item = String>,
+    ) -> Result<ListenerTransitionGuard, ConnectionRegistryError> {
+        let names = listener_names
+            .into_iter()
+            .map(Arc::<str>::from)
+            .collect::<BTreeSet<_>>();
+        let mut state = lock_state(&self.inner);
+        if let Some(name) = names
+            .iter()
+            .find(|name| state.gated_listeners.contains(*name))
+        {
+            return Err(ConnectionRegistryError::ListenerGated(name.to_string()));
+        }
+        state.gated_listeners.extend(names.iter().cloned());
+        let active = names
+            .iter()
+            .map(|name| {
+                (
+                    Arc::clone(name),
+                    state.listener_counts.get(name).copied().unwrap_or(0),
+                )
+            })
+            .collect();
+        drop(state);
+        Ok(ListenerTransitionGuard {
+            registry: Arc::clone(&self.inner),
+            names,
+            active,
+        })
+    }
+}
+
+/// Exclusive admission gate for an atomic listener transition.
+pub struct ListenerTransitionGuard {
+    registry: Arc<RegistryInner>,
+    names: BTreeSet<Arc<str>>,
+    active: BTreeMap<Arc<str>, usize>,
+}
+
+impl ListenerTransitionGuard {
+    /// Active count captured atomically when the listener gate closed.
+    #[must_use]
+    pub fn active_for_listener(&self, listener_name: &str) -> usize {
+        self.active.get(listener_name).copied().unwrap_or(0)
+    }
+}
+
+impl Drop for ListenerTransitionGuard {
+    fn drop(&mut self) {
+        let mut state = lock_state(&self.registry);
+        for name in &self.names {
+            state.gated_listeners.remove(name);
+        }
     }
 }
 
@@ -524,5 +603,30 @@ mod tests {
         drop(tracked);
         assert_eq!(registry.active_for_listener("host"), 0);
         assert!(registry.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn transition_gate_makes_zero_active_check_atomic_with_registration() {
+        let registry = ConnectionRegistry::new(2, 2).expect("registry");
+        let transition = registry
+            .begin_listener_transition(["host".to_string()])
+            .expect("transition gate");
+        assert_eq!(transition.active_for_listener("host"), 0);
+
+        let (stream, _peer) = pair();
+        assert!(matches!(
+            registry.register(stream, "host", ListenerType::Host),
+            Err(ConnectionRegistryError::ListenerGated(name)) if name == "host"
+        ));
+        assert_eq!(transition.active_for_listener("host"), 0);
+        assert_eq!(registry.active_for_listener("host"), 0);
+
+        drop(transition);
+        let (stream, _peer) = pair();
+        let tracked = registry
+            .register(stream, "host", ListenerType::Host)
+            .expect("registration resumes after transition");
+        assert_eq!(registry.active_for_listener("host"), 1);
+        drop(tracked);
     }
 }

@@ -59,6 +59,26 @@ pub struct ListenerConfig {
 }
 
 impl ListenerConfig {
+    pub(crate) fn validated(
+        name: String,
+        listener_type: ListenerType,
+        path: PathBuf,
+        mode: u32,
+        group: Option<String>,
+    ) -> Result<Self, ListenerConfigError> {
+        validate_name(&name)?;
+        validate_path(&path)?;
+        validate_mode(mode)?;
+        validate_group(group.as_deref())?;
+        Ok(Self {
+            name,
+            listener_type,
+            path,
+            mode,
+            group,
+        })
+    }
+
     /// Stable local listener name.
     #[must_use]
     pub fn name(&self) -> &str {
@@ -137,24 +157,18 @@ impl ListenerConfigSet {
         let mut listeners = BTreeMap::new();
         let mut has_host = false;
         for (name, input) in inputs {
-            validate_name(&name)?;
-            validate_path(&input.path)?;
-            validate_mode(input.mode.unwrap_or(DEFAULT_SOCKET_MODE))?;
-            validate_group(input.group.as_deref())?;
             if !paths.insert(input.path.clone()) {
                 return Err(ListenerConfigError::DuplicatePath(input.path));
             }
             has_host |= input.listener_type == ListenerType::Host;
-            listeners.insert(
+            let config = ListenerConfig::validated(
                 name.clone(),
-                ListenerConfig {
-                    name,
-                    listener_type: input.listener_type,
-                    path: input.path,
-                    mode: input.mode.unwrap_or(DEFAULT_SOCKET_MODE),
-                    group: input.group,
-                },
-            );
+                input.listener_type,
+                input.path,
+                input.mode.unwrap_or(DEFAULT_SOCKET_MODE),
+                input.group,
+            )?;
+            listeners.insert(name, config);
         }
         if !has_host {
             return Err(ListenerConfigError::MissingHost);

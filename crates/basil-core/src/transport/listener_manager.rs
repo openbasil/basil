@@ -4,17 +4,23 @@
 
 //! Non-serving listener preparation and no-replace socket publication.
 
+use std::ffi::OsString;
 use std::io;
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
-use rustix::fs::{CWD, RenameFlags, renameat_with};
+use rustix::fs::{
+    AtFlags, CWD, FileType, Mode, OFlags, RenameFlags, chmodat, chownat, fstat, mkdirat, openat,
+    renameat_with, statat, unlinkat,
+};
+use rustix::process::Gid;
 use thiserror::Error;
 use tokio::net::UnixListener;
 
-use super::connection::ConnectionRegistry;
-use super::grpc_server::{apply_socket_permissions, bind_restricted};
+use super::connection::{ConnectionRegistry, ConnectionRegistryError, ListenerTransitionGuard};
+use super::grpc_server::resolve_group;
 use super::listener::{ListenerConfig, ListenerConfigSet, MAX_UNIX_SOCKET_PATH_BYTES};
 
 const MAX_STAGE_ATTEMPTS: usize = 8;
@@ -63,6 +69,17 @@ impl ListenerImpact {
 #[error("listener transition requires zero active connections")]
 pub struct ActiveListenerTransition {
     impacts: Vec<ListenerImpact>,
+}
+
+/// Failure to acquire and validate an atomic listener transition gate.
+#[derive(Debug, Error)]
+pub enum ListenerTransitionError {
+    /// Another transition already gates an affected listener.
+    #[error(transparent)]
+    Registry(#[from] ConnectionRegistryError),
+    /// A removal or reconfiguration still has accepted transports.
+    #[error(transparent)]
+    Active(#[from] ActiveListenerTransition),
 }
 
 impl ActiveListenerTransition {
@@ -129,6 +146,37 @@ pub fn require_zero_active(impacts: &[ListenerImpact]) -> Result<(), ActiveListe
     }
 }
 
+/// Gate disruptive listeners and validate zero active transports atomically
+/// against connection registration.
+///
+/// The caller must retain the returned guard through listener-set commit. If
+/// validation fails, the temporary gates are released before this function
+/// returns.
+///
+/// # Errors
+///
+/// Returns a registry conflict or the bounded active impact set.
+pub fn begin_transition(
+    current: &ListenerConfigSet,
+    candidate: &ListenerConfigSet,
+    connections: &ConnectionRegistry,
+) -> Result<(Vec<ListenerImpact>, ListenerTransitionGuard), ListenerTransitionError> {
+    let mut impacts = assess_transition(current, candidate, connections);
+    let disruptive = impacts
+        .iter()
+        .filter(|impact| impact.kind != ListenerChangeKind::Add)
+        .map(|impact| impact.name.clone())
+        .collect::<Vec<_>>();
+    let guard = connections.begin_listener_transition(disruptive)?;
+    for impact in &mut impacts {
+        if impact.kind != ListenerChangeKind::Add {
+            impact.active_connections = guard.active_for_listener(&impact.name);
+        }
+    }
+    require_zero_active(&impacts)?;
+    Ok((impacts, guard))
+}
+
 /// Listener preparation or publication failure.
 #[derive(Debug, Error)]
 pub enum ListenerManagerError {
@@ -168,10 +216,11 @@ pub enum ListenerManagerError {
 }
 
 /// Read-only qualification result for one listener candidate.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct QualifiedListener {
     config: ListenerConfig,
     parent: PathBuf,
+    parent_fd: Arc<OwnedFd>,
 }
 
 impl QualifiedListener {
@@ -189,26 +238,35 @@ impl QualifiedListener {
                     listener: config.name().to_string(),
                     path: config.path().to_path_buf(),
                 })?;
-        validate_parent(config.name(), parent)?;
-        match std::fs::symlink_metadata(config.path()) {
+        let parent_fd = Arc::new(open_trusted_parent(config.name(), parent)?);
+        let final_name =
+            config
+                .path()
+                .file_name()
+                .ok_or_else(|| ListenerManagerError::UntrustedParent {
+                    listener: config.name().to_string(),
+                    path: config.path().to_path_buf(),
+                })?;
+        match statat(parent_fd.as_ref(), final_name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(_) => {
                 return Err(ListenerManagerError::PathOccupied {
                     listener: config.name().to_string(),
                     path: config.path().to_path_buf(),
                 });
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => {
+            Err(rustix::io::Errno::NOENT) => {}
+            Err(error) => {
                 return Err(ListenerManagerError::Io {
                     listener: config.name().to_string(),
                     path: config.path().to_path_buf(),
-                    source,
+                    source: io::Error::from(error),
                 });
             }
         }
         Ok(Self {
             config: config.clone(),
             parent: parent.to_path_buf(),
+            parent_fd,
         })
     }
 
@@ -218,37 +276,89 @@ impl QualifiedListener {
     ///
     /// Returns a typed staging error. The final path remains untouched.
     pub fn prepare(self) -> Result<PreparedListener, ListenerManagerError> {
-        // Repeat read-only qualification immediately before mutation to narrow
-        // validation/use races. Publication still uses atomic no-replace.
-        Self::validate(&self.config)?;
         for _ in 0..MAX_STAGE_ATTEMPTS {
-            let stage_path = self
-                .parent
-                .join(format!(".basil-{}.sock", uuid::Uuid::new_v4().as_simple()));
+            let suffix = uuid::Uuid::new_v4()
+                .as_simple()
+                .to_string()
+                .chars()
+                .take(8)
+                .collect::<String>();
+            let stage_name = OsString::from(format!(".b-{suffix}"));
+            let stage_path = self.parent.join(&stage_name).join("s");
             if stage_path.as_os_str().as_bytes().len() > MAX_UNIX_SOCKET_PATH_BYTES {
                 return Err(ListenerManagerError::StageUnavailable {
                     listener: self.config.name().to_string(),
                 });
             }
-            match bind_restricted(&stage_path.to_string_lossy()) {
-                Ok(listener) => {
-                    let identity = socket_identity(self.config.name(), &stage_path)?;
-                    return Ok(PreparedListener {
-                        config: self.config,
-                        listener: Some(listener),
-                        stage_path,
-                        identity,
+            match mkdirat(
+                self.parent_fd.as_ref(),
+                &stage_name,
+                Mode::from_raw_mode(0o700),
+            ) {
+                Ok(()) => {}
+                Err(rustix::io::Errno::EXIST) => continue,
+                Err(error) => {
+                    return Err(ListenerManagerError::Io {
+                        listener: self.config.name().to_string(),
+                        path: self.parent.join(&stage_name),
+                        source: io::Error::from(error),
                     });
                 }
-                Err(error) if error.kind() == io::ErrorKind::AddrInUse => {}
+            }
+            let stage_fd = match openat(
+                self.parent_fd.as_ref(),
+                &stage_name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(stage_fd) => stage_fd,
+                Err(error) => {
+                    cleanup_private_stage(self.parent_fd.as_ref(), &stage_name, None);
+                    return Err(ListenerManagerError::Io {
+                        listener: self.config.name().to_string(),
+                        path: self.parent.join(&stage_name),
+                        source: io::Error::from(error),
+                    });
+                }
+            };
+            let listener = match UnixListener::bind(&stage_path) {
+                Ok(listener) => listener,
                 Err(source) => {
+                    cleanup_private_stage(self.parent_fd.as_ref(), &stage_name, Some(&stage_fd));
                     return Err(ListenerManagerError::Io {
                         listener: self.config.name().to_string(),
                         path: stage_path,
                         source,
                     });
                 }
+            };
+            if let Err(error) = apply_private_socket_permissions(
+                self.config.name(),
+                &stage_fd,
+                self.config.mode(),
+                self.config.group(),
+                &stage_path,
+            ) {
+                cleanup_private_stage(self.parent_fd.as_ref(), &stage_name, Some(&stage_fd));
+                return Err(error);
             }
+            let identity = match socket_identity_at(self.config.name(), &stage_fd, "s", &stage_path)
+            {
+                Ok(identity) => identity,
+                Err(error) => {
+                    cleanup_private_stage(self.parent_fd.as_ref(), &stage_name, Some(&stage_fd));
+                    return Err(error);
+                }
+            };
+            return Ok(PreparedListener {
+                config: self.config,
+                listener: Some(listener),
+                parent_fd: self.parent_fd,
+                stage_name,
+                stage_fd,
+                stage_path,
+                identity,
+            });
         }
         Err(ListenerManagerError::StageUnavailable {
             listener: self.config.name().to_string(),
@@ -260,6 +370,9 @@ impl QualifiedListener {
 pub struct PreparedListener {
     config: ListenerConfig,
     listener: Option<UnixListener>,
+    parent_fd: Arc<OwnedFd>,
+    stage_name: OsString,
+    stage_fd: OwnedFd,
     stage_path: PathBuf,
     identity: SocketIdentity,
 }
@@ -341,7 +454,21 @@ impl PreparedListener {
     /// the exact socket inode owned by this guard.
     pub fn publish(mut self) -> Result<PublishedListener, ListenerManagerError> {
         let final_path = self.config.path().to_path_buf();
-        rename_no_replace(&self.stage_path, &final_path).map_err(|source| {
+        let Some(final_name) = final_path.file_name().map(ToOwned::to_owned) else {
+            return Err(ListenerManagerError::UntrustedParent {
+                listener: self.config.name().to_string(),
+                path: final_path,
+            });
+        };
+        renameat_with(
+            &self.stage_fd,
+            "s",
+            self.parent_fd.as_ref(),
+            &final_name,
+            RenameFlags::NOREPLACE,
+        )
+        .map_err(io::Error::from)
+        .map_err(|source| {
             if source.kind() == io::ErrorKind::AlreadyExists {
                 ListenerManagerError::PathOccupied {
                     listener: self.config.name().to_string(),
@@ -355,19 +482,6 @@ impl PreparedListener {
                 }
             }
         })?;
-        self.stage_path.clone_from(&final_path);
-        if let Err(source) = apply_socket_permissions(
-            &final_path.to_string_lossy(),
-            self.config.mode(),
-            self.config.group(),
-        ) {
-            remove_owned_socket(&final_path, self.identity);
-            return Err(ListenerManagerError::Io {
-                listener: self.config.name().to_string(),
-                path: final_path,
-                source,
-            });
-        }
         let Some(listener) = self.listener.take() else {
             return Err(ListenerManagerError::StageUnavailable {
                 listener: self.config.name().to_string(),
@@ -375,8 +489,9 @@ impl PreparedListener {
         };
         let published = PublishedListener {
             config: self.config.clone(),
-            listener,
-            path: final_path,
+            listener: Some(listener),
+            parent_fd: Arc::clone(&self.parent_fd),
+            final_name,
             identity: self.identity,
         };
         // The published guard now owns cleanup.
@@ -387,15 +502,21 @@ impl PreparedListener {
 
 impl Drop for PreparedListener {
     fn drop(&mut self) {
-        remove_owned_socket(&self.stage_path, self.identity);
+        remove_owned_socket_at(&self.stage_fd, "s", self.identity);
+        let _ = unlinkat(
+            self.parent_fd.as_ref(),
+            &self.stage_name,
+            AtFlags::REMOVEDIR,
+        );
     }
 }
 
 /// Published socket and bound listener, ready to enter an accept loop.
 pub struct PublishedListener {
     config: ListenerConfig,
-    listener: UnixListener,
-    path: PathBuf,
+    listener: Option<UnixListener>,
+    parent_fd: Arc<OwnedFd>,
+    final_name: OsString,
     identity: SocketIdentity,
 }
 
@@ -408,14 +529,49 @@ impl PublishedListener {
 
     /// Borrow the bound listener for accept-loop construction.
     #[must_use]
-    pub const fn listener(&self) -> &UnixListener {
-        &self.listener
+    pub const fn listener(&self) -> Option<&UnixListener> {
+        self.listener.as_ref()
+    }
+
+    /// Transfer the bound listener while retaining inode-guarded path cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns a staging error if internal ownership was already transferred.
+    pub fn into_listener(
+        mut self,
+    ) -> Result<(UnixListener, PublishedSocketLease), ListenerManagerError> {
+        let Some(listener) = self.listener.take() else {
+            return Err(ListenerManagerError::StageUnavailable {
+                listener: self.config.name().to_string(),
+            });
+        };
+        let lease = PublishedSocketLease {
+            parent_fd: Arc::clone(&self.parent_fd),
+            final_name: self.final_name.clone(),
+            identity: self.identity,
+        };
+        self.identity = SocketIdentity::INVALID;
+        Ok((listener, lease))
     }
 }
 
 impl Drop for PublishedListener {
     fn drop(&mut self) {
-        remove_owned_socket(&self.path, self.identity);
+        remove_owned_socket_at(&self.parent_fd, &self.final_name, self.identity);
+    }
+}
+
+/// Cleanup lease retained for the lifetime of an active accept loop.
+pub struct PublishedSocketLease {
+    parent_fd: Arc<OwnedFd>,
+    final_name: OsString,
+    identity: SocketIdentity,
+}
+
+impl Drop for PublishedSocketLease {
+    fn drop(&mut self) {
+        remove_owned_socket_at(&self.parent_fd, &self.final_name, self.identity);
     }
 }
 
@@ -432,68 +588,133 @@ impl SocketIdentity {
     };
 }
 
-fn validate_parent(listener: &str, parent: &Path) -> Result<(), ListenerManagerError> {
-    let mut current = PathBuf::from("/");
+fn open_trusted_parent(listener: &str, parent: &Path) -> Result<OwnedFd, ListenerManagerError> {
+    let mut current_path = PathBuf::from("/");
+    let mut current_fd = openat(
+        CWD,
+        "/",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| ListenerManagerError::Io {
+        listener: listener.to_string(),
+        path: PathBuf::from("/"),
+        source: io::Error::from(error),
+    })?;
     for component in parent.components() {
         match component {
             Component::RootDir => continue,
-            Component::Normal(value) => current.push(value),
+            Component::Normal(value) => current_path.push(value),
             _ => {
                 return Err(ListenerManagerError::UntrustedParent {
                     listener: listener.to_string(),
-                    path: current,
+                    path: current_path,
                 });
             }
         }
-        let metadata =
-            std::fs::symlink_metadata(&current).map_err(|source| ListenerManagerError::Io {
-                listener: listener.to_string(),
-                path: current.clone(),
-                source,
-            })?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(ListenerManagerError::UntrustedParent {
-                listener: listener.to_string(),
-                path: current,
-            });
-        }
-    }
-    Ok(())
-}
-
-fn socket_identity(listener: &str, path: &Path) -> Result<SocketIdentity, ListenerManagerError> {
-    let metadata = std::fs::symlink_metadata(path).map_err(|source| ListenerManagerError::Io {
-        listener: listener.to_string(),
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if !metadata.file_type().is_socket() {
-        return Err(ListenerManagerError::PathOccupied {
+        current_fd = openat(
+            &current_fd,
+            component.as_os_str(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| ListenerManagerError::UntrustedParent {
             listener: listener.to_string(),
-            path: path.to_path_buf(),
+            path: current_path.clone(),
+        })?;
+    }
+    let stat = fstat(&current_fd).map_err(|error| ListenerManagerError::Io {
+        listener: listener.to_string(),
+        path: parent.to_path_buf(),
+        source: io::Error::from(error),
+    })?;
+    let effective_uid = rustix::process::geteuid().as_raw();
+    if stat.st_uid != effective_uid || stat.st_mode & 0o022 != 0 {
+        return Err(ListenerManagerError::UntrustedParent {
+            listener: listener.to_string(),
+            path: parent.to_path_buf(),
         });
     }
-    Ok(SocketIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
+    Ok(current_fd)
+}
+
+fn apply_private_socket_permissions(
+    listener: &str,
+    stage_fd: &OwnedFd,
+    mode: u32,
+    group: Option<&str>,
+    path: &Path,
+) -> Result<(), ListenerManagerError> {
+    if let Some(group) = group {
+        let gid = resolve_group(group).map_err(|source| ListenerManagerError::Io {
+            listener: listener.to_string(),
+            path: path.to_path_buf(),
+            source,
+        })?;
+        chownat(
+            stage_fd,
+            "s",
+            None,
+            Some(Gid::from_raw(gid)),
+            AtFlags::empty(),
+        )
+        .map_err(|error| ListenerManagerError::Io {
+            listener: listener.to_string(),
+            path: path.to_path_buf(),
+            source: io::Error::from(error),
+        })?;
+    }
+    chmodat(stage_fd, "s", Mode::from_raw_mode(mode), AtFlags::empty()).map_err(|error| {
+        ListenerManagerError::Io {
+            listener: listener.to_string(),
+            path: path.to_path_buf(),
+            source: io::Error::from(error),
+        }
     })
 }
 
-fn remove_owned_socket(path: &Path, identity: SocketIdentity) {
-    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+fn socket_identity_at(
+    listener: &str,
+    directory: &OwnedFd,
+    name: impl AsRef<Path>,
+    display_path: &Path,
+) -> Result<SocketIdentity, ListenerManagerError> {
+    let stat = statat(directory, name.as_ref(), AtFlags::SYMLINK_NOFOLLOW).map_err(|error| {
+        ListenerManagerError::Io {
+            listener: listener.to_string(),
+            path: display_path.to_path_buf(),
+            source: io::Error::from(error),
+        }
+    })?;
+    if !FileType::from_raw_mode(stat.st_mode).is_socket() {
+        return Err(ListenerManagerError::PathOccupied {
+            listener: listener.to_string(),
+            path: display_path.to_path_buf(),
+        });
+    }
+    Ok(SocketIdentity {
+        device: stat.st_dev,
+        inode: stat.st_ino,
+    })
+}
+
+fn remove_owned_socket_at(directory: &OwnedFd, name: impl AsRef<Path>, identity: SocketIdentity) {
+    let Ok(stat) = statat(directory, name.as_ref(), AtFlags::SYMLINK_NOFOLLOW) else {
         return;
     };
-    if metadata.file_type().is_socket()
-        && metadata.dev() == identity.device
-        && metadata.ino() == identity.inode
+    if FileType::from_raw_mode(stat.st_mode).is_socket()
+        && stat.st_dev == identity.device
+        && stat.st_ino == identity.inode
     {
-        let _ = std::fs::remove_file(path);
+        let _ = unlinkat(directory, name.as_ref(), AtFlags::empty());
     }
 }
 
-fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
-    renameat_with(CWD, source, CWD, destination, RenameFlags::NOREPLACE)
-        .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))
+fn cleanup_private_stage(parent: &OwnedFd, name: impl AsRef<Path>, stage: Option<&OwnedFd>) {
+    if let Some(stage) = stage {
+        let _ = unlinkat(stage, "s", AtFlags::empty());
+    }
+    let _ = unlinkat(parent, name.as_ref(), AtFlags::REMOVEDIR);
 }
 
 #[cfg(test)]
@@ -630,6 +851,46 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn validation_rejects_writable_parent_and_prepare_fails_closed_on_symlink_swap() {
+        let directory = TestDirectory::new();
+        let writable = directory.path().join("writable");
+        std::fs::create_dir(&writable).expect("writable parent");
+        std::fs::set_permissions(&writable, std::fs::Permissions::from_mode(0o777))
+            .expect("loosen parent");
+        let listener = config(writable.join("agent.sock"), 0o600);
+        assert!(matches!(
+            QualifiedListener::validate(&listener),
+            Err(ListenerManagerError::UntrustedParent { .. })
+        ));
+
+        let live = directory.path().join("live");
+        let pinned = directory.path().join("pinned");
+        let attacker = directory.path().join("attacker");
+        std::fs::create_dir(&live).expect("live parent");
+        std::fs::create_dir(&attacker).expect("attacker parent");
+        let listener = config(live.join("agent.sock"), 0o600);
+        let qualified = QualifiedListener::validate(&listener).expect("parent is pinned");
+        std::fs::rename(&live, &pinned).expect("move qualified parent");
+        std::os::unix::fs::symlink(&attacker, &live).expect("replace path with symlink");
+
+        assert!(qualified.prepare().is_err());
+        assert!(
+            std::fs::read_dir(&attacker)
+                .expect("attacker directory")
+                .next()
+                .is_none(),
+            "path swap must not create an attacker-controlled socket"
+        );
+        assert!(
+            std::fs::read_dir(&pinned)
+                .expect("pinned directory")
+                .next()
+                .is_none(),
+            "failed staging must clean the pinned directory"
+        );
+    }
+
     #[tokio::test]
     async fn prepare_is_private_publish_is_no_replace_and_guards_cleanup() {
         let directory = TestDirectory::new();
@@ -647,7 +908,7 @@ mod tests {
                 .permissions()
                 .mode()
                 & 0o777,
-            0o600
+            0o660
         );
 
         std::fs::write(&final_path, b"race winner").expect("occupy final path");
@@ -712,8 +973,7 @@ mod tests {
         let first = configs.get("first").expect("first");
         let second = configs.get("second").expect("second");
 
-        let prepared = PreparedListenerBatch::prepare([first, second]).expect("batch stages");
-        assert!(prepared.publish().is_err());
+        assert!(PreparedListenerBatch::prepare([first, second]).is_err());
         assert!(!first_path.exists());
         assert!(!second_path.exists());
     }
