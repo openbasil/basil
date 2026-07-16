@@ -426,14 +426,14 @@ fn rootless_keyring_quota_check(expected_containers: u32) -> CheckResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RootlessKeyringQuotaProblem {
     Unreadable,
-    Unparseable,
+    Unparsable,
 }
 
 impl RootlessKeyringQuotaProblem {
     const fn detail(self) -> &'static str {
         match self {
             Self::Unreadable => "is unreadable",
-            Self::Unparseable => "does not contain an unsigned integer",
+            Self::Unparsable => "does not contain an unsigned integer",
         }
     }
 }
@@ -445,7 +445,7 @@ fn parse_rootless_keyring_quota(
         RootlessKeyringQuotaReading::Contents(contents) => contents
             .trim()
             .parse::<u64>()
-            .map_err(|_| RootlessKeyringQuotaProblem::Unparseable),
+            .map_err(|_| RootlessKeyringQuotaProblem::Unparsable),
         RootlessKeyringQuotaReading::Unreadable => Err(RootlessKeyringQuotaProblem::Unreadable),
     }
 }
@@ -1399,15 +1399,15 @@ mod tests {
         assert!(unreadable.detail.contains("maxkeys is unreadable"));
         assert!(!unreadable.remediation.contains("sysctl -w"));
 
-        let unparseable =
+        let unparsable =
             evaluate_rootless_keyring_quota(1_000, quota_readings("not-a-number", "2000000"));
-        assert_eq!(unparseable.status, CheckStatus::Warn);
+        assert_eq!(unparsable.status, CheckStatus::Warn);
         assert!(
-            unparseable
+            unparsable
                 .detail
                 .contains("maxkeys does not contain an unsigned integer")
         );
-        assert!(!unparseable.remediation.contains("sysctl -w"));
+        assert!(!unparsable.remediation.contains("sysctl -w"));
     }
 
     #[test]
