@@ -554,16 +554,33 @@ impl PreparedListener {
 
     /// Atomically exchange this staged socket with an exact runtime-owned socket.
     ///
-    /// The returned guard restores the old inode on drop until [`ExchangedListener::commit`]
-    /// is called. Both sides are verified through pinned directory descriptors
-    /// before and after the exchange.
+    /// The returned guard restores the old inode on drop until
+    /// [`PreparedExchangedListener::commit`] is called. Both sides are verified
+    /// through pinned directory descriptors before and after the exchange.
     ///
     /// # Errors
     ///
     /// Returns a typed error without replacing a foreign or changed inode.
     pub fn exchange(
+        self,
+        current: &PublishedSocketLease,
+    ) -> Result<ExchangedListener, ListenerManagerError> {
+        self.exchange_inner(current, || {})
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exchange_with_post_exchange(
+        self,
+        current: &PublishedSocketLease,
+        post_exchange: impl FnOnce(),
+    ) -> Result<ExchangedListener, ListenerManagerError> {
+        self.exchange_inner(current, post_exchange)
+    }
+
+    fn exchange_inner(
         mut self,
         current: &PublishedSocketLease,
+        post_exchange: impl FnOnce(),
     ) -> Result<ExchangedListener, ListenerManagerError> {
         let final_path = self.config.path().to_path_buf();
         let Some(final_name) = final_path.file_name().map(ToOwned::to_owned) else {
@@ -602,6 +619,7 @@ impl PreparedListener {
             path: final_path.clone(),
             source,
         })?;
+        post_exchange();
         let final_identity = socket_identity_at(
             self.config.name(),
             self.parent_fd.as_ref(),
@@ -617,13 +635,19 @@ impl PreparedListener {
         if final_identity.as_ref().ok() != Some(&self.identity)
             || staged_old_identity.as_ref().ok() != Some(&old_identity)
         {
-            let _ = renameat_with(
-                self.stage_fd.as_ref(),
-                "s",
+            // A path participant changed after the exchange. Never exchange
+            // blindly here: doing so could move an attacker's replacement into
+            // Basil's private stage and publish an unrelated inode. Remove only
+            // the two exact socket inodes this transaction owns; a foreign
+            // final-path inode is deliberately preserved.
+            remove_owned_socket_at(self.parent_fd.as_ref(), &final_name, self.identity);
+            remove_owned_socket_at(self.stage_fd.as_ref(), "s", old_identity);
+            let _ = unlinkat(
                 self.parent_fd.as_ref(),
-                &final_name,
-                RenameFlags::EXCHANGE,
+                &self.stage_name,
+                AtFlags::REMOVEDIR,
             );
+            self.identity = SocketIdentity::INVALID;
             return Err(final_identity
                 .err()
                 .or_else(|| staged_old_identity.err())
@@ -662,9 +686,20 @@ pub struct ExchangedListener {
 }
 
 impl ExchangedListener {
-    /// Make the replacement irrevocable and return its published listener.
-    #[must_use]
-    pub fn commit(mut self) -> PublishedListener {
+    /// Preflight transfer of the bound listener before generation commit.
+    pub(crate) fn prepare(mut self) -> Result<PreparedExchangedListener, ListenerManagerError> {
+        let Some(listener) = self.listener.take() else {
+            return Err(ListenerManagerError::StageUnavailable {
+                listener: self.config.name().to_string(),
+            });
+        };
+        Ok(PreparedExchangedListener {
+            exchange: self,
+            listener,
+        })
+    }
+
+    fn commit_lease(mut self) -> PublishedSocketLease {
         remove_owned_socket_at(self.stage_fd.as_ref(), "s", self.old_identity);
         let _ = unlinkat(
             self.parent_fd.as_ref(),
@@ -672,16 +707,13 @@ impl ExchangedListener {
             AtFlags::REMOVEDIR,
         );
         self.exchanged = false;
-        let listener = self.listener.take();
-        let published = PublishedListener {
-            config: self.config.clone(),
-            listener,
+        let lease = PublishedSocketLease {
             parent_fd: Arc::clone(&self.parent_fd),
             final_name: self.final_name.clone(),
             identity: self.new_identity,
         };
         self.new_identity = SocketIdentity::INVALID;
-        published
+        lease
     }
 
     /// Explicitly restore the old socket and remove the staged replacement.
@@ -704,10 +736,24 @@ impl ExchangedListener {
             self.parent_fd.as_ref(),
             &self.final_name,
             final_path,
-        )?;
+        );
         let staged_identity =
-            socket_identity_at(self.config.name(), self.stage_fd.as_ref(), "s", final_path)?;
-        if final_identity != self.new_identity || staged_identity != self.old_identity {
+            socket_identity_at(self.config.name(), self.stage_fd.as_ref(), "s", final_path);
+        if final_identity.as_ref().ok() != Some(&self.new_identity)
+            || staged_identity.as_ref().ok() != Some(&self.old_identity)
+        {
+            // The final path was replaced after the exchange. Preserve it and
+            // clean only Basil-owned exact inodes; never swap an unverified
+            // participant into either namespace.
+            remove_owned_socket_at(self.parent_fd.as_ref(), &self.final_name, self.new_identity);
+            remove_owned_socket_at(self.stage_fd.as_ref(), "s", self.old_identity);
+            let _ = unlinkat(
+                self.parent_fd.as_ref(),
+                &self.stage_name,
+                AtFlags::REMOVEDIR,
+            );
+            self.exchanged = false;
+            self.new_identity = SocketIdentity::INVALID;
             return Err(ListenerManagerError::PathOccupied {
                 listener: self.config.name().to_string(),
                 path: final_path.to_path_buf(),
@@ -735,6 +781,20 @@ impl ExchangedListener {
         );
         self.new_identity = SocketIdentity::INVALID;
         Ok(())
+    }
+}
+
+/// Same-path replacement whose only fallible ownership transfer is complete.
+pub(crate) struct PreparedExchangedListener {
+    exchange: ExchangedListener,
+    listener: UnixListener,
+}
+
+impl PreparedExchangedListener {
+    /// Commit the filesystem exchange and return infallible accept-loop inputs.
+    pub(crate) fn commit(self) -> (UnixListener, PublishedSocketLease) {
+        let Self { exchange, listener } = self;
+        (listener, exchange.commit_lease())
     }
 }
 
@@ -1232,6 +1292,46 @@ mod tests {
             std::fs::read(&final_path).expect("foreign inode preserved"),
             b"foreign replacement"
         );
+    }
+
+    #[tokio::test]
+    async fn post_exchange_validation_preserves_a_foreign_final_inode() {
+        let directory = TestDirectory::new();
+        let final_path = directory.path().join("agent.sock");
+        let current = config(final_path.clone(), 0o600);
+        let mut published = PreparedListenerBatch::prepare([&current])
+            .and_then(PreparedListenerBatch::publish)
+            .expect("publish current socket")
+            .into_listeners();
+        let published = published.pop().expect("one published socket");
+        let (current_listener, current_lease) = published
+            .into_listener()
+            .expect("transfer current listener");
+        let replacement = config(final_path.clone(), 0o660);
+        let prepared = QualifiedListener::validate_replacement(&replacement, &current_lease)
+            .and_then(QualifiedListener::prepare)
+            .expect("stage same-path replacement");
+
+        let result = prepared.exchange_with_post_exchange(&current_lease, || {
+            std::fs::remove_file(&final_path).expect("remove exchanged candidate");
+            std::fs::write(&final_path, "foreign").expect("install foreign inode");
+        });
+        let Err(error) = result else {
+            panic!("post-exchange substitution accepted the candidate");
+        };
+        assert!(matches!(error, ListenerManagerError::PathOccupied { .. }));
+        assert_eq!(
+            std::fs::read_to_string(&final_path).expect("foreign inode remains"),
+            "foreign"
+        );
+
+        drop(current_listener);
+        drop(current_lease);
+        assert_eq!(
+            std::fs::read_to_string(&final_path).expect("lease preserves foreign inode"),
+            "foreign"
+        );
+        std::fs::remove_file(final_path).expect("remove foreign fixture");
     }
 
     #[tokio::test]

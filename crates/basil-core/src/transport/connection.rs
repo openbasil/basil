@@ -654,6 +654,7 @@ mod tests {
             "committed"
         });
         assert_eq!(committed, "committed");
+        drop(transition);
         let (stream, _peer) = pair();
         let tracked = registry
             .register(stream, "host", ListenerType::Host)

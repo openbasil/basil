@@ -35,8 +35,8 @@ use crate::state::BrokerState;
 use crate::transport::connection::ConnectionRegistry;
 use crate::transport::listener::{ListenerConfig, ListenerConfigSet};
 use crate::transport::listener_manager::{
-    ExchangedListener, PreparedListener, PreparedListenerBatch, PublishedListener,
-    PublishedSocketLease, QualifiedListener,
+    ExchangedListener, PreparedExchangedListener, PreparedListener, PreparedListenerBatch,
+    PublishedListener, PublishedSocketLease, QualifiedListener,
 };
 
 /// Default Unix socket mode: owner read/write only.
@@ -167,12 +167,33 @@ pub async fn run(config: ServerConfig, state: Arc<BrokerState>) -> std::io::Resu
 ///
 /// Returns a listener preparation, publication, serving, or task failure.
 pub async fn run_many(configs: Vec<ServerConfig>, state: Arc<BrokerState>) -> io::Result<()> {
+    run_many_with_ready(configs, state, || {}).await
+}
+
+/// Start every listener under reload serialization, then enable reload triggers.
+pub(crate) async fn run_many_with_ready(
+    configs: Vec<ServerConfig>,
+    state: Arc<BrokerState>,
+    ready: impl FnOnce(),
+) -> io::Result<()> {
+    let runtime = initialize_many(configs, state, ready).await?;
+    runtime.run_until_shutdown(shutdown_signal()).await
+}
+
+async fn initialize_many(
+    configs: Vec<ServerConfig>,
+    state: Arc<BrokerState>,
+    ready: impl FnOnce(),
+) -> io::Result<Arc<ListenerRuntime>> {
     let runtime = Arc::new(ListenerRuntime::prepare(configs, Arc::clone(&state))?);
+    let startup_guard = state.live_reload_lock().lock().await;
     state
         .install_listener_runtime(Arc::clone(&runtime))
         .map_err(io::Error::other)?;
     runtime.activate().await?;
-    runtime.run_until_shutdown(shutdown_signal()).await
+    ready();
+    drop(startup_guard);
+    Ok(runtime)
 }
 
 fn listener_config(config: &ServerConfig) -> io::Result<ListenerConfig> {
@@ -220,6 +241,16 @@ struct RunningListener {
 }
 
 impl RunningListener {
+    fn preflight(&self) -> io::Result<()> {
+        if self.task.is_finished() {
+            return Err(io::Error::other(format!(
+                "listener `{}` accept task is not active",
+                self.config.listener_name
+            )));
+        }
+        Ok(())
+    }
+
     async fn stop(mut self) -> io::Result<ServerConfig> {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
@@ -231,6 +262,63 @@ impl RunningListener {
     }
 }
 
+struct PreparedRunningListener {
+    config: ServerConfig,
+    listener: tokio::net::UnixListener,
+    lease: PublishedSocketLease,
+}
+
+impl PreparedRunningListener {
+    fn from_published(config: ServerConfig, published: PublishedListener) -> io::Result<Self> {
+        let (listener, lease) = published.into_listener().map_err(io::Error::other)?;
+        Ok(Self {
+            config,
+            listener,
+            lease,
+        })
+    }
+
+    fn from_exchange(config: ServerConfig, exchange: PreparedExchangedListener) -> Self {
+        let (listener, lease) = exchange.commit();
+        Self {
+            config,
+            listener,
+            lease,
+        }
+    }
+
+    fn spawn(
+        self,
+        state: Arc<BrokerState>,
+        failures: mpsc::UnboundedSender<(String, String)>,
+    ) -> RunningListener {
+        let Self {
+            config,
+            listener,
+            lease,
+        } = self;
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        let task_config = config.clone();
+        let name = config.listener_name.clone();
+        let task = tokio::spawn(async move {
+            let result = serve_bound(task_config, state, listener, async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+            if let Err(error) = &result {
+                let _ = failures.send((name, error.to_string()));
+            }
+            result
+        });
+        RunningListener {
+            config,
+            lease,
+            shutdown: Some(shutdown),
+            task,
+        }
+    }
+}
+
 struct ListenerRuntimeState {
     running: BTreeMap<String, RunningListener>,
     pending: Vec<(ServerConfig, PublishedListener)>,
@@ -239,8 +327,8 @@ struct ListenerRuntimeState {
 
 struct PreparedRuntimeTransition {
     changed: Vec<String>,
-    ordinary: Vec<(ServerConfig, PublishedListener)>,
-    exchanged: Vec<(ServerConfig, ExchangedListener)>,
+    ordinary: Vec<PreparedRunningListener>,
+    exchanged: Vec<(ServerConfig, PreparedExchangedListener)>,
 }
 
 fn rollback_exchanges(exchanges: Vec<(ServerConfig, ExchangedListener)>) -> io::Result<()> {
@@ -333,48 +421,18 @@ impl ListenerRuntime {
     async fn activate(&self) -> io::Result<()> {
         let mut runtime = self.inner.lock().await;
         let pending = std::mem::take(&mut runtime.pending);
-        for (config, published) in pending {
-            let listener = Self::spawn_listener(
-                config.clone(),
-                Arc::clone(&self.state),
-                published,
-                self.failure_tx.clone(),
-            )?;
-            runtime
-                .running
-                .insert(config.listener_name.clone(), listener);
+        let prepared = pending
+            .into_iter()
+            .map(|(config, published)| PreparedRunningListener::from_published(config, published))
+            .collect::<io::Result<Vec<_>>>()?;
+        for prepared in prepared {
+            let name = prepared.config.listener_name.clone();
+            let listener = prepared.spawn(Arc::clone(&self.state), self.failure_tx.clone());
+            runtime.running.insert(name, listener);
         }
         runtime.initialized = true;
         drop(runtime);
         Ok(())
-    }
-
-    fn spawn_listener(
-        config: ServerConfig,
-        state: Arc<BrokerState>,
-        published: PublishedListener,
-        failures: mpsc::UnboundedSender<(String, String)>,
-    ) -> io::Result<RunningListener> {
-        let (listener, lease) = published.into_listener().map_err(io::Error::other)?;
-        let (shutdown, shutdown_rx) = oneshot::channel();
-        let task_config = config.clone();
-        let name = config.listener_name.clone();
-        let task = tokio::spawn(async move {
-            let result = serve_bound(task_config, state, listener, async {
-                let _ = shutdown_rx.await;
-            })
-            .await;
-            if let Err(error) = &result {
-                let _ = failures.send((name, error.to_string()));
-            }
-            result
-        });
-        Ok(RunningListener {
-            config,
-            lease,
-            shutdown: Some(shutdown),
-            task,
-        })
     }
 
     fn config_for(&self, listener: &ListenerConfig) -> ServerConfig {
@@ -408,6 +466,18 @@ impl ListenerRuntime {
         precommit: impl FnOnce() -> io::Result<()>,
         commit: impl FnOnce(),
     ) -> io::Result<()> {
+        self.transition_with_hooks(current, candidate, precommit, |_| {}, commit)
+            .await
+    }
+
+    async fn transition_with_hooks(
+        &self,
+        current: &ListenerConfigSet,
+        candidate: &ListenerConfigSet,
+        precommit: impl FnOnce() -> io::Result<()>,
+        postcommit: impl FnOnce(&mut ListenerRuntimeState),
+        commit: impl FnOnce(),
+    ) -> io::Result<()> {
         let (impacts, guard) = crate::transport::listener_manager::begin_transition(
             current,
             candidate,
@@ -421,6 +491,11 @@ impl ListenerRuntime {
         let mut runtime = self.inner.lock().await;
         if !runtime.initialized {
             return Err(io::Error::other("listener runtime is not active"));
+        }
+        for name in &changed {
+            if let Some(running) = runtime.running.get(name) {
+                running.preflight()?;
+            }
         }
         let mut ordinary_configs = Vec::new();
         let mut same_path = Vec::<(ServerConfig, PreparedListener)>::new();
@@ -448,6 +523,11 @@ impl ListenerRuntime {
             .and_then(PreparedListenerBatch::publish)
             .map_err(io::Error::other)?
             .into_listeners();
+        let ordinary = ordinary_configs
+            .into_iter()
+            .zip(ordinary_published)
+            .map(|(config, published)| PreparedRunningListener::from_published(config, published))
+            .collect::<io::Result<Vec<_>>>()?;
 
         let mut exchanged = Vec::<(ServerConfig, ExchangedListener)>::new();
         for (config, prepared) in same_path {
@@ -469,17 +549,26 @@ impl ListenerRuntime {
             rollback_exchanges(exchanged)?;
             return Err(error);
         }
+        let exchanged = exchanged
+            .into_iter()
+            .map(|(config, exchange)| exchange.prepare().map(|exchange| (config, exchange)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(io::Error::other)?;
 
         let prepared = PreparedRuntimeTransition {
             changed,
-            ordinary: ordinary_configs
-                .into_iter()
-                .zip(ordinary_published)
-                .collect(),
+            ordinary,
             exchanged,
         };
-        self.install_transition(&mut runtime, candidate, &guard, prepared, commit)
-            .await?;
+        self.install_transition(
+            &mut runtime,
+            candidate,
+            &guard,
+            prepared,
+            postcommit,
+            commit,
+        )
+        .await;
         drop(runtime);
         drop(guard);
         Ok(())
@@ -491,31 +580,22 @@ impl ListenerRuntime {
         candidate: &ListenerConfigSet,
         guard: &crate::transport::connection::ListenerTransitionGuard,
         prepared: PreparedRuntimeTransition,
+        postcommit: impl FnOnce(&mut ListenerRuntimeState),
         commit: impl FnOnce(),
-    ) -> io::Result<()> {
+    ) {
         guard.commit(commit);
+        postcommit(runtime);
         let mut retired = Vec::new();
-        for (config, published) in prepared.ordinary {
-            let replacement = Self::spawn_listener(
-                config.clone(),
-                Arc::clone(&self.state),
-                published,
-                self.failure_tx.clone(),
-            )?;
-            if let Some(old) = runtime
-                .running
-                .insert(config.listener_name.clone(), replacement)
-            {
+        for prepared in prepared.ordinary {
+            let name = prepared.config.listener_name.clone();
+            let replacement = prepared.spawn(Arc::clone(&self.state), self.failure_tx.clone());
+            if let Some(old) = runtime.running.insert(name, replacement) {
                 retired.push(old);
             }
         }
         for (config, exchange) in prepared.exchanged {
-            let replacement = Self::spawn_listener(
-                config.clone(),
-                Arc::clone(&self.state),
-                exchange.commit(),
-                self.failure_tx.clone(),
-            )?;
+            let prepared = PreparedRunningListener::from_exchange(config.clone(), exchange);
+            let replacement = prepared.spawn(Arc::clone(&self.state), self.failure_tx.clone());
             if let Some(old) = runtime
                 .running
                 .insert(config.listener_name.clone(), replacement)
@@ -533,9 +613,14 @@ impl ListenerRuntime {
             }
         }
         for listener in retired {
-            listener.stop().await?;
+            let name = listener.config.listener_name.clone();
+            if listener.stop().await.is_err() {
+                warn!(
+                    listener = %name,
+                    "retired listener cleanup failed after applied reload"
+                );
+            }
         }
-        Ok(())
     }
 
     #[cfg(test)]
@@ -549,6 +634,28 @@ impl ListenerRuntime {
             current,
             candidate,
             || Err(io::Error::other("injected pre-commit failure")),
+            commit,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn transition_with_injected_postcommit_task_abort(
+        &self,
+        current: &ListenerConfigSet,
+        candidate: &ListenerConfigSet,
+        listener_name: &str,
+        commit: impl FnOnce(),
+    ) -> io::Result<()> {
+        self.transition_with_hooks(
+            current,
+            candidate,
+            || Ok(()),
+            |runtime| {
+                if let Some(listener) = runtime.running.get(listener_name) {
+                    listener.task.abort();
+                }
+            },
             commit,
         )
         .await
@@ -1285,6 +1392,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_enables_reload_only_after_runtime_activation_under_lock() {
+        let socket = socket_path("startup-reload-order");
+        let state = state();
+        let hook_state = Arc::clone(&state);
+        let hook_socket = socket.clone();
+        let observed = Arc::new(AtomicBool::new(false));
+        let hook_observed = Arc::clone(&observed);
+        let runtime = initialize_many(
+            vec![test_server_config(
+                "control",
+                &socket,
+                ListenerType::Host,
+                ConnectionRegistry::with_defaults(),
+            )],
+            state,
+            move || {
+                let runtime = hook_state
+                    .listener_runtime()
+                    .expect("runtime installed before reload hook");
+                let inner = runtime
+                    .inner
+                    .try_lock()
+                    .expect("activation released the runtime lock");
+                assert!(inner.initialized);
+                assert_eq!(inner.running.len(), 1);
+                assert!(hook_state.live_reload_lock().try_lock().is_err());
+                assert!(hook_socket.exists());
+                hook_observed.store(true, Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect("startup transaction succeeds");
+        assert!(observed.load(Ordering::SeqCst));
+        let mut admin = AdminServiceClient::new(uds_channel(&socket).await);
+        admin
+            .status(StatusRequest {
+                include_realms: false,
+            })
+            .await
+            .expect("activated listener serves before reload hook returns");
+        drop(admin);
+        runtime
+            .run_until_shutdown(std::future::ready(()))
+            .await
+            .expect("runtime shuts down");
+    }
+
+    #[tokio::test]
     async fn live_runtime_adds_reconfigures_and_removes_accept_loops() {
         let host_socket = socket_path("runtime-host");
         let first_container = socket_path("runtime-container-a");
@@ -1468,6 +1623,106 @@ mod tests {
             .run_until_shutdown(std::future::ready(()))
             .await
             .expect("runtime shuts down");
+    }
+
+    #[tokio::test]
+    async fn live_runtime_reports_applied_after_postcommit_old_task_failure() {
+        let socket = socket_path("runtime-postcommit-task-failure");
+        let runtime = ListenerRuntime::start(
+            vec![test_server_config(
+                "control",
+                &socket,
+                ListenerType::Host,
+                ConnectionRegistry::with_defaults(),
+            )],
+            state(),
+        )
+        .await
+        .expect("runtime starts");
+        wait_for_socket(&socket).await;
+        let initial = single_host_listener_set("control", socket.clone(), 0o600);
+        let replacement = single_host_listener_set("control", socket.clone(), 0o660);
+        let committed = AtomicBool::new(false);
+
+        runtime
+            .transition_with_injected_postcommit_task_abort(
+                &initial,
+                &replacement,
+                "control",
+                || committed.store(true, Ordering::SeqCst),
+            )
+            .await
+            .expect("postcommit retire failure cannot reject an applied generation");
+        assert!(committed.load(Ordering::SeqCst));
+        assert_eq!(
+            std::fs::metadata(&socket)
+                .expect("replacement metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o660
+        );
+        let mut admin = AdminServiceClient::new(uds_channel(&socket).await);
+        admin
+            .status(StatusRequest {
+                include_realms: false,
+            })
+            .await
+            .expect("replacement listener serves after applied outcome");
+        drop(admin);
+        runtime
+            .run_until_shutdown(std::future::ready(()))
+            .await
+            .expect("runtime shuts down");
+    }
+
+    #[tokio::test]
+    async fn live_runtime_preserves_foreign_inode_during_exchange_rollback() {
+        let socket = socket_path("runtime-foreign-rollback");
+        let runtime = ListenerRuntime::start(
+            vec![test_server_config(
+                "control",
+                &socket,
+                ListenerType::Host,
+                ConnectionRegistry::with_defaults(),
+            )],
+            state(),
+        )
+        .await
+        .expect("runtime starts");
+        wait_for_socket(&socket).await;
+        let initial = single_host_listener_set("control", socket.clone(), 0o600);
+        let replacement = single_host_listener_set("control", socket.clone(), 0o660);
+        let hook_socket = socket.clone();
+        let committed = AtomicBool::new(false);
+
+        runtime
+            .transition_with_precommit(
+                &initial,
+                &replacement,
+                move || {
+                    std::fs::remove_file(&hook_socket).expect("remove exchanged candidate");
+                    std::fs::write(&hook_socket, "foreign").expect("install foreign inode");
+                    Err(io::Error::other("injected precommit failure"))
+                },
+                || committed.store(true, Ordering::SeqCst),
+            )
+            .await
+            .expect_err("foreign substitution rejects the transition");
+        assert!(!committed.load(Ordering::SeqCst));
+        assert_eq!(
+            std::fs::read_to_string(&socket).expect("foreign final inode remains"),
+            "foreign"
+        );
+        runtime
+            .run_until_shutdown(std::future::ready(()))
+            .await
+            .expect("runtime shuts down");
+        assert_eq!(
+            std::fs::read_to_string(&socket).expect("shutdown preserves foreign inode"),
+            "foreign"
+        );
+        std::fs::remove_file(socket).expect("remove foreign fixture");
     }
 
     #[tokio::test]

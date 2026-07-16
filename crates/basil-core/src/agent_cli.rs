@@ -29,13 +29,14 @@ use std::time::Duration;
 use crate::catalog::{Class, KeyAlgorithm};
 use crate::seal::{BackendCred, CredBundle};
 use crate::service::broker::{BrokerIdentityRuntimeConfig, InvocationRuntimeConfig};
+use crate::transport::grpc_server::run_many_with_ready;
 use crate::{
     AuditLog, Backend, BackendKind, BackendManager, BrokerLimits, BrokerState, CapabilityPolicy,
     ConfigOverride, ConfigurationTraceContext, DEFAULT_MAX_ENCRYPT_SIZE, DEFAULT_MAX_PAYLOAD_SIZE,
     DEFAULT_ROTATION_GRACE_VERSIONS, DEFAULT_SOCKET_MODE, DEFAULT_SVID_TTL_SECS,
     JwtRevocationStore, ReloadActor, ReloadInputs, ServerConfig, SpiffeConfig, SpiffeVaultBackend,
     VaultBackend, enforce_capabilities, load_documents_with_overrides,
-    load_documents_with_overrides_and_context, reload_generation_live, run_grpc_many,
+    load_documents_with_overrides_and_context, reload_generation_live,
 };
 use crate::{bundle_cli, doctor, init, unlock};
 use anyhow::{Context, Result, bail};
@@ -2265,7 +2266,7 @@ async fn run_daemon(args: RunArgs, version: &'static str) -> Result<()> {
     };
 
     let state = Arc::new(state);
-    spawn_sighup_handler(Arc::clone(&state), audit_reopen);
+    let sighup = InstalledSighupHandler::install(Arc::clone(&state), audit_reopen);
     spawn_retention_sweep(Arc::clone(&state), run_config.retention_sweep_secs);
 
     // Opt-in JWKS HTTP surface (basil-uce.1). When `[jwks] enable` is false (the
@@ -2295,7 +2296,7 @@ async fn run_daemon(args: RunArgs, version: &'static str) -> Result<()> {
         (tx, handle)
     });
 
-    let grpc_result = run_grpc_many(server_configs, state).await;
+    let grpc_result = run_many_with_ready(server_configs, state, || sighup.spawn()).await;
 
     #[cfg(feature = "http")]
     if let Some((tx, handle)) = jwks_shutdown {
@@ -2370,27 +2371,51 @@ fn attach_oci_runtime(
 /// the broker never panics. Reload runs **before** the audit-log reopen so the
 /// reload outcome lands in the current log segment. With no audit log configured,
 /// the reload still runs (it is signal-driven, not audit-driven).
-fn spawn_sighup_handler(state: Arc<BrokerState>, audit: Option<Arc<AuditLog>>) {
-    let handle = tokio::spawn(async move {
-        let mut hangup = match signal(SignalKind::hangup()) {
-            Ok(signal) => signal,
+struct InstalledSighupHandler {
+    state: Arc<BrokerState>,
+    audit: Option<Arc<AuditLog>>,
+    hangup: Option<tokio::signal::unix::Signal>,
+}
+
+impl InstalledSighupHandler {
+    fn install(state: Arc<BrokerState>, audit: Option<Arc<AuditLog>>) -> Self {
+        let hangup = match signal(SignalKind::hangup()) {
+            Ok(signal) => Some(signal),
             Err(err) => {
                 warn!(error = %err, "SIGHUP handler disabled");
-                return;
+                None
             }
         };
-        while hangup.recv().await.is_some() {
-            // 1. Reload the catalog/policy generation (fail-closed: a rejection
-            //    keeps the previous generation serving; both outcomes audited).
-            handle_sighup_reload(&state).await;
-            // 2. Reopen the audit log (rotation), if one is configured.
-            if let Some(audit) = &audit {
-                audit.request_reopen();
-                info!("SIGHUP: requested audit log reopen");
-            }
+        Self {
+            state,
+            audit,
+            hangup,
         }
-    });
-    std::mem::drop(handle);
+    }
+
+    fn spawn(self) {
+        let Self {
+            state,
+            audit,
+            hangup,
+        } = self;
+        let Some(mut hangup) = hangup else {
+            return;
+        };
+        let handle = tokio::spawn(async move {
+            while hangup.recv().await.is_some() {
+                // 1. Reload the catalog/policy generation (fail-closed: a rejection
+                //    keeps the previous generation serving; both outcomes audited).
+                handle_sighup_reload(&state).await;
+                // 2. Reopen the audit log (rotation), if one is configured.
+                if let Some(audit) = &audit {
+                    audit.request_reopen();
+                    info!("SIGHUP: requested audit log reopen");
+                }
+            }
+        });
+        std::mem::drop(handle);
+    }
 }
 
 /// Run one SIGHUP-driven reload via the shared [`reload_generation_live`] engine and
