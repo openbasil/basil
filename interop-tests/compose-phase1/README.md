@@ -279,6 +279,36 @@ scripts/compose-phase1-evidence.sh collect    --run RUN_ID
 scripts/compose-phase1-evidence.sh verify-run --run RUN_ID
 ```
 
+### Docker attestor acceptance
+
+Run `scripts/docker-attestor-e2e.sh` to build the current `basil-core` test
+binary, stage its Nix runtime libraries, and execute the
+`docker-attestor-acceptance` suite in the same Ubuntu guest. The suite enables
+Docker's containerd image store and exercises the real provider against
+replicas, exec processes, stale PID evidence, restarts, protected tmpfs mounts,
+runtime outage, and the 1,000-instance bound. It then restarts Docker with
+`userns-remap` and verifies rejection.
+
+The wrapper stages Nix-built RootlessKit and `newuidmap`/`newgidmap` with their
+runtime closures. The guest installs the mapping helpers as root-owned setuid
+binaries, configures subordinate ID ranges for `basil-ci`, and starts a real
+rootless daemon. Ubuntu restricts unprivileged user namespaces through
+AppArmor, so this disposable test guest loads Ubuntu's recommended `userns`
+profile bound to the staged RootlessKit store path. This test-only exception
+does not change production host posture. RootlessKit gives the daemon private
+copies of `/etc` and `/run`, matching the standard rootless runtime shape. Moby
+hardcodes its Linux plugin socket root, so the disposable guest also gives
+`basil-ci` group traversal through the root-owned, mode-0750 `/run/docker`
+parent and a private, mode-0700 `/run/docker/plugins` leaf after the rootful
+daemon stops. The lane asserts both ownership and mode before launch. The guest
+does not grant the rootless daemon authority to replace host AppArmor policy.
+Because the check launches no rootless container, its daemon disables the
+bridge and both iptables integrations. The lane still requires a ready Docker
+API whose `/info` response proves rootless mode before Basil rejects it.
+If the guest still refuses the daemon, `docker.rootless-rejection` reports
+`UNSUPPORTED` with its daemon log retained.
+Only a provider rejection against a ready rootless daemon reports `PASS`.
+
 Development lane-smoke evidence: run `20260714T070109Z-a6eb31d62fe947df`
 (status `PASS`, reason `DRIVER_TESTS_PASSED`, all six terminals `PASS`, manifest
 sha256 `9573c57ffb4b48c1561959c4def90e79f8f9b5943d2940e9de7cf3c08a0e9147`),

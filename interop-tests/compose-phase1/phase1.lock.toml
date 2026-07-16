@@ -55,6 +55,24 @@ memory_mib = 24576
 vcpus = 8
 disk_gib = 40
 
+# Rootful Docker provider acceptance (basil-9tj.13). Runs the real Rust provider
+# against the pinned Docker Engine in the cgroup-v2 Ubuntu guest. The rootless
+# terminal is explicitly UNSUPPORTED until the offline artifact set pins the
+# rootless extras package; it must never be converted into a pass.
+[suites.docker-attestor-acceptance]
+required_tests = [
+  "docker.provider-core",
+  "docker.outage",
+  "docker.scale-bound",
+  "docker.userns-remap",
+  "docker.rootless-rejection",
+]
+
+[suites.docker-attestor-acceptance.vm]
+memory_mib = 8192
+vcpus = 4
+disk_gib = 32
+
 # Readiness-only capacity preflight (basil-ge9). Distinct from `[suites.capacity]`
 # above, which is the later basil-9tj.4 measurement suite. This suite qualifies
 # the two qualified VM environments for a serial 1,000-container ladder and

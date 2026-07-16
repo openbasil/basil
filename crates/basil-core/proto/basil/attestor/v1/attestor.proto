@@ -182,6 +182,10 @@ message MountFact {
   MountPropagation propagation = 5;
   optional uint64 tmpfs_size_bytes = 6;
   optional uint32 tmpfs_mode = 7;
+  bool tmpfs_nodev = 8;
+  bool tmpfs_nosuid = 9;
+  bool tmpfs_noexec = 10;
+  bool tmpfs_noswap = 11;
 }
 
 message ProjectScope {

@@ -90,6 +90,14 @@ elif [[ $SUITE == capacity ]]; then
     capacity.overload
     capacity.teardown
   )
+elif [[ $SUITE == docker-attestor-acceptance ]]; then
+  readonly REQUIRED_TESTS=(
+    docker.provider-core
+    docker.outage
+    docker.scale-bound
+    docker.userns-remap
+    docker.rootless-rejection
+  )
 else
   # The suite `ubuntu-2404-lane-smoke` must require exactly these test ids.
   readonly REQUIRED_TESTS=(
@@ -180,14 +188,14 @@ fail_infra() {
 QEMU_PID=""
 cleanup() {
   # Best-effort guest shutdown, then reap the recorded QEMU child by PID.
-  if [[ -n $QEMU_PID && -e /proc/$QEMU_PID/stat ]]; then
+  if [[ -n $QEMU_PID ]] && kill -0 "$QEMU_PID" 2>/dev/null; then
     kill -TERM "$QEMU_PID" 2>/dev/null || true
     local _i
     for _i in $(seq 1 30); do
-      [[ -e /proc/$QEMU_PID/stat ]] || break
+      kill -0 "$QEMU_PID" 2>/dev/null || break
       sleep 0.2
     done
-    [[ -e /proc/$QEMU_PID/stat ]] && kill -KILL "$QEMU_PID" 2>/dev/null || true
+    kill -0 "$QEMU_PID" 2>/dev/null && kill -KILL "$QEMU_PID" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -609,11 +617,210 @@ run_capacity_ladder() {
   done
 }
 
+# Run the real `basil-core` Docker-provider tests inside the pinned Ubuntu
+# cgroup-v2 guest. The companion host wrapper builds the current test binary and
+# records its exact dynamic closure in a private cache staging directory.
+run_docker_attestor_acceptance() {
+  local scratch=$1 cache=$2 workload=$3
+  local staging="$cache/docker-attestor-acceptance-staging"
+  local binary="$staging/basil-core-test" manifest="$staging/manifest.tsv"
+  local stores="$staging/store-paths.txt" expected actual interpreter rootlesskit newuidmap newgidmap
+  local store rc output
+  local -a closure=()
+  [[ -f $binary && ! -L $binary && -f $manifest && ! -L $manifest \
+    && -f $stores && ! -L $stores ]] || fail_infra DOCKER_ATTESTOR_STAGING_MISSING "$staging"
+  expected=$(awk -F $'\t' '$1=="binary_sha256"{print $2}' "$manifest")
+  actual=$(sha256sum -- "$binary" | cut -d ' ' -f 1)
+  [[ $expected =~ ^[0-9a-f]{64}$ && $actual == "$expected" ]] \
+    || fail_infra DOCKER_ATTESTOR_BINARY_UNVERIFIED ""
+  interpreter=$(awk -F $'\t' '$1=="interpreter"{print $2}' "$manifest")
+  [[ $interpreter =~ ^/nix/store/[0-9a-z]{32}-[a-zA-Z0-9+._?-]+/lib/ld-linux-x86-64.so.2$ ]] \
+    || fail_infra DOCKER_ATTESTOR_INTERPRETER_INVALID "$interpreter"
+  rootlesskit=$(awk -F $'\t' '$1=="rootlesskit"{print $2}' "$manifest")
+  [[ $rootlesskit =~ ^/nix/store/[0-9a-z]{32}-rootlesskit-[0-9.]+/bin/rootlesskit$ ]] \
+    || fail_infra DOCKER_ROOTLESSKIT_INVALID "$rootlesskit"
+  newuidmap=$(awk -F $'\t' '$1=="newuidmap"{print $2}' "$manifest")
+  newgidmap=$(awk -F $'\t' '$1=="newgidmap"{print $2}' "$manifest")
+  [[ $newuidmap =~ ^/nix/store/[0-9a-z]{32}-shadow-[0-9.]+/bin/newuidmap$ \
+    && $newgidmap =~ ^/nix/store/[0-9a-z]{32}-shadow-[0-9.]+/bin/newgidmap$ ]] \
+    || fail_infra DOCKER_UIDMAP_HELPERS_INVALID ""
+  while IFS= read -r store; do
+    [[ $store =~ ^/nix/store/[0-9a-z]{32}-[a-zA-Z0-9+._?-]+$ && -d $store && ! -L $store ]] \
+      || fail_infra DOCKER_ATTESTOR_CLOSURE_INVALID "$store"
+  done <"$stores"
+
+  "${scp_base[@]}" "$binary" "$SSH_USER@$SSH_HOST:/home/basil-ci/in/basil-core-test" \
+    >/dev/null 2>&1 || fail_infra DOCKER_ATTESTOR_BINARY_COPY_FAILED ""
+  "${scp_base[@]}" "$workload" "$SSH_USER@$SSH_HOST:/home/basil-ci/in/alpine-amd64.tar" \
+    >/dev/null 2>&1 || fail_infra DOCKER_ATTESTOR_WORKLOAD_COPY_FAILED ""
+  mapfile -t closure <"$stores"
+  (cd / && tar -cf - "${closure[@]#/}") | "${ssh_base[@]}" "$SSH_USER@$SSH_HOST" \
+    'sudo -n tar -C / -xf -' >/dev/null 2>&1 \
+    || fail_infra DOCKER_ATTESTOR_CLOSURE_COPY_FAILED ""
+
+  "${ssh_base[@]}" "$SSH_USER@$SSH_HOST" 'sudo -n bash -s' >/dev/null 2>&1 <<'GUEST_EOF' \
+    || fail_infra DOCKER_ATTESTOR_PROVISION_FAILED ""
+set -euo pipefail
+IN=/home/basil-ci/in
+if ! command -v docker >/dev/null 2>&1; then
+  dpkg -i "$IN"/debs/*.deb >/tmp/basil-dpkg.log 2>&1
+fi
+mkdir -p /etc/docker /etc/systemd/system/docker.service.d
+printf '%s\n' '{"features":{"containerd-snapshotter":true}}' >/etc/docker/daemon.json
+printf '[Service]\nLimitNOFILE=1048576\nLimitNPROC=1048576\nTasksMax=infinity\n' \
+  >/etc/systemd/system/docker.service.d/basil-attestor.conf
+systemctl daemon-reload
+systemctl restart docker
+for _ in $(seq 1 60); do docker info >/dev/null 2>&1 && break; sleep 1; done
+docker info >/dev/null
+docker load -i "$IN/alpine-amd64.tar" >/dev/null
+chmod 0755 "$IN/basil-core-test"
+GUEST_EOF
+
+  output=$("${ssh_base[@]}" "$SSH_USER@$SSH_HOST" \
+    "sudo -n ls -l $interpreter /home/basil-ci/in/basil-core-test; \
+     sudo -n $interpreter /home/basil-ci/in/basil-core-test --list >/tmp/basil-test-list 2>&1; \
+     printf 'test-list-rc=%s\\n' \$?; tail -20 /tmp/basil-test-list" 2>&1) || true
+  err "docker.test-binary-preflight $output"
+
+  output=$("${ssh_base[@]}" "$SSH_USER@$SSH_HOST" \
+    "sudo -n $interpreter /home/basil-ci/in/basil-core-test --ignored --exact runtime_attestor::docker::tests::live_rootful_docker_acceptance_matrix --nocapture" \
+    2>&1) && rc=0 || rc=$?
+  printf '%s\n' "$output" >"$scratch/docker-provider-core.log"
+  if (( rc == 0 )); then
+    set_verdict docker.provider-core PASS DOCKER_PROVIDER_REAL_MATRIX_PASS \
+      "replicas, exec, PID reuse, restart/churn, zero/multiple, and protected mounts"
+  else
+    err "docker.provider-core rc=$rc ${output: -2000}"
+    set_verdict docker.provider-core TEST_FAIL DOCKER_PROVIDER_REAL_MATRIX_FAILED "test_rc=$rc"
+  fi
+
+  output=$("${ssh_base[@]}" "$SSH_USER@$SSH_HOST" \
+    "sudo -n $interpreter /home/basil-ci/in/basil-core-test --ignored --exact runtime_attestor::docker::tests::live_docker_outage_is_typed_and_recovers --nocapture" \
+    2>&1) && rc=0 || rc=$?
+  printf '%s\n' "$output" >"$scratch/docker-outage.log"
+  if (( rc == 0 )); then
+    set_verdict docker.outage PASS DOCKER_OUTAGE_TYPED_AND_RECOVERED ""
+  else
+    err "docker.outage rc=$rc ${output: -2000}"
+    set_verdict docker.outage TEST_FAIL DOCKER_OUTAGE_TEST_FAILED "test_rc=$rc"
+  fi
+
+  output=$("${ssh_base[@]}" "$SSH_USER@$SSH_HOST" \
+    "sudo -n $interpreter /home/basil-ci/in/basil-core-test --ignored --exact runtime_attestor::docker::tests::live_rootful_docker_inventory_bound --nocapture" \
+    2>&1) && rc=0 || rc=$?
+  printf '%s\n' "$output" >"$scratch/docker-scale.log"
+  if (( rc == 0 )); then
+    set_verdict docker.scale-bound PASS DOCKER_1000_BOUND_REAL_PASS "1,000 accepted; 1,001 rejected"
+  else
+    err "docker.scale-bound rc=$rc ${output: -2000}"
+    set_verdict docker.scale-bound TEST_FAIL DOCKER_1000_BOUND_REAL_FAILED "test_rc=$rc"
+  fi
+
+  "${ssh_base[@]}" "$SSH_USER@$SSH_HOST" 'sudo -n bash -s' >/dev/null 2>&1 <<'GUEST_EOF' \
+    || fail_infra DOCKER_USERNS_REMAP_PROVISION_FAILED ""
+set -euo pipefail
+docker ps -aq --filter label=io.openbasil.attestor-acceptance | xargs -r docker rm -f >/dev/null
+printf '%s\n' '{"userns-remap":"default"}' >/etc/docker/daemon.json
+systemctl restart docker
+for _ in $(seq 1 60); do docker info >/dev/null 2>&1 && break; sleep 1; done
+docker info >/dev/null
+GUEST_EOF
+  output=$("${ssh_base[@]}" "$SSH_USER@$SSH_HOST" \
+    "sudo -n $interpreter /home/basil-ci/in/basil-core-test --ignored --exact runtime_attestor::docker::tests::live_docker_rejects_rootless_or_userns_remap --nocapture" \
+    2>&1) && rc=0 || rc=$?
+  printf '%s\n' "$output" >"$scratch/docker-userns-remap.log"
+  if (( rc == 0 )); then
+    set_verdict docker.userns-remap PASS DOCKER_USERNS_REMAP_REJECTED ""
+  else
+    err "docker.userns-remap rc=$rc ${output: -2000}"
+    set_verdict docker.userns-remap TEST_FAIL DOCKER_USERNS_REMAP_NOT_REJECTED "test_rc=$rc"
+  fi
+
+  output=$("${ssh_base[@]}" "$SSH_USER@$SSH_HOST" \
+    "sudo -n env ROOTLESSKIT=$rootlesskit NEWUIDMAP=$newuidmap NEWGIDMAP=$newgidmap \
+     INTERPRETER=$interpreter bash -s" \
+    2>&1 <<'GUEST_EOF'
+set -euo pipefail
+systemctl stop docker.socket docker.service >/dev/null 2>&1 || true
+install -o root -g root -m 04755 "$NEWUIDMAP" /usr/bin/newuidmap
+install -o root -g root -m 04755 "$NEWGIDMAP" /usr/bin/newgidmap
+printf 'basil-ci:100000:65536\n' >/etc/subuid
+printf 'basil-ci:100000:65536\n' >/etc/subgid
+# The rootful daemon loaded `docker-default` before it was stopped. The
+# rootless daemon cannot replace host policy from its user namespace, but that
+# best-effort load failure is non-fatal when no rootless container is started.
+grep -Fq 'docker-default' /sys/kernel/security/apparmor/profiles
+profile_name=${ROOTLESSKIT#/}
+profile_name=${profile_name//\//.}
+profile="/etc/apparmor.d/$profile_name"
+printf 'abi <abi/4.0>,\ninclude <tunables/global>\n\n%s flags=(unconfined) {\n  userns,\n}\n' \
+  "$ROOTLESSKIT" >"$profile"
+apparmor_parser -r "$profile"
+systemctl restart apparmor.service
+grep -Fq -- "$ROOTLESSKIT" /sys/kernel/security/apparmor/profiles
+# Moby hardcodes this Linux plugin socket root instead of deriving it from
+# `--exec-root`. Grant the test user traversal through its parent and keep only
+# the leaf writable.
+install -d -m 0750 -o root -g basil-ci /run/docker
+install -d -m 0700 -o basil-ci -g basil-ci /run/docker/plugins
+[[ $(stat -c '%U:%G:%a' /run/docker) == root:basil-ci:750 ]]
+[[ $(stat -c '%U:%G:%a' /run/docker/plugins) == basil-ci:basil-ci:700 ]]
+install -d -m 0700 -o basil-ci -g basil-ci /home/basil-ci/rootless /home/basil-ci/rootless/run \
+  /home/basil-ci/rootless/state /home/basil-ci/rootless/data /home/basil-ci/rootless/exec
+sudo -n -u basil-ci env HOME=/home/basil-ci XDG_RUNTIME_DIR=/home/basil-ci/rootless/run \
+  DOCKERD_ROOTLESS_ROOTLESSKIT_NET=host nohup "$ROOTLESSKIT" \
+  --state-dir=/home/basil-ci/rootless/state --net=host --copy-up=/etc --copy-up=/run \
+  --propagation=rslave \
+  /usr/bin/dockerd --rootless --host=unix:///home/basil-ci/rootless/docker.sock \
+  --data-root=/home/basil-ci/rootless/data --exec-root=/home/basil-ci/rootless/exec \
+  --pidfile=/home/basil-ci/rootless/dockerd.pid --storage-driver=vfs --bridge=none \
+  --iptables=false --ip6tables=false \
+  >/home/basil-ci/rootless/dockerd.log 2>&1 </dev/null &
+printf '%s\n' "$!" >/home/basil-ci/rootless/launcher.pid
+cleanup_rootless() {
+  local launcher
+  launcher=$(cat /home/basil-ci/rootless/launcher.pid 2>/dev/null || true)
+  [[ $launcher =~ ^[0-9]+$ ]] && kill "$launcher" 2>/dev/null || true
+}
+trap cleanup_rootless EXIT
+ready=false
+for _ in $(seq 1 60); do
+  if sudo -n -u basil-ci env DOCKER_HOST=unix:///home/basil-ci/rootless/docker.sock \
+    DOCKER_API_VERSION=1.48 docker info >/tmp/rootless-info 2>/dev/null; then
+    ready=true
+    break
+  fi
+  sleep 1
+done
+if [[ $ready != true ]]; then
+  printf 'ROOTLESS_BLOCKER: daemon did not become ready\n'
+  tail -80 /home/basil-ci/rootless/dockerd.log 2>/dev/null || true
+  exit 125
+fi
+cat /tmp/rootless-info
+sudo -n -u basil-ci env BASIL_DOCKER_SOCKET=/home/basil-ci/rootless/docker.sock \
+  "$INTERPRETER" /home/basil-ci/in/basil-core-test --ignored --exact \
+  runtime_attestor::docker::tests::live_docker_rejects_rootless_or_userns_remap \
+  --nocapture
+GUEST_EOF
+  ) && rc=0 || rc=$?
+  printf '%s\n' "$output" >"$scratch/docker-rootless.log"
+  if (( rc == 125 )); then
+    set_verdict docker.rootless-rejection UNSUPPORTED ROOTLESS_DAEMON_START_FAILED \
+      "RootlessKit/dockerd did not start; see retained docker-rootless.log"
+  elif (( rc == 0 )); then
+    set_verdict docker.rootless-rejection PASS DOCKER_ROOTLESS_REAL_REJECTED ""
+  else
+    set_verdict docker.rootless-rejection TEST_FAIL DOCKER_ROOTLESS_NOT_REJECTED "test_rc=$rc"
+  fi
+}
+
 main() {
   local scratch=${BASIL_DRIVER_SCRATCH:?BASIL_DRIVER_SCRATCH must be set by the runner}
   : "${BASIL_DRIVER_RESULT:?BASIL_DRIVER_RESULT must be set by the runner}"
   local tool
-  for tool in jq qemu-system-x86_64 qemu-img ssh scp sed awk getent; do
+  for tool in jq qemu-system-x86_64 qemu-img ssh scp sed awk getent tar; do
     command -v "$tool" >/dev/null 2>&1 || fail_infra HOST_TOOL_MISSING "$tool"
   done
 
@@ -724,7 +931,7 @@ main() {
       booted=yes
       break
     fi
-    [[ -e /proc/$QEMU_PID/stat ]] || break
+    kill -0 "$QEMU_PID" 2>/dev/null || break
     sleep 3
   done
   [[ $booted == yes ]] || fail_infra GUEST_BOOT_TIMEOUT ""
@@ -794,6 +1001,13 @@ main() {
   # plus the Alpine workload; run the ladder instead of lane smoke.
   if [[ $SUITE == capacity ]]; then
     run_capacity_ladder "$fixture_root" "$scratch" "$workload"
+    "${ssh_base[@]}" "$SSH_USER@$SSH_HOST" 'sudo -n poweroff' 2>/dev/null || true
+    write_result
+    return
+  fi
+
+  if [[ $SUITE == docker-attestor-acceptance ]]; then
+    run_docker_attestor_acceptance "$scratch" "$cache" "$workload"
     "${ssh_base[@]}" "$SSH_USER@$SSH_HOST" 'sudo -n poweroff' 2>/dev/null || true
     write_result
     return

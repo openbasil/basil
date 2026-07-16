@@ -50,6 +50,7 @@ pub mod core;
 pub mod demo;
 pub mod doctor;
 pub mod init;
+pub mod runtime_attestor;
 pub mod service;
 pub mod transport;
 pub mod unlock;
