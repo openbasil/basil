@@ -8,6 +8,7 @@ use std::future::Future;
 use std::io;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use basil_proto::broker::v1::admin_service_server::AdminServiceServer;
@@ -33,6 +34,93 @@ use crate::state::BrokerState;
 
 /// Default Unix socket mode: owner read/write only.
 pub const DEFAULT_SOCKET_MODE: u32 = 0o600;
+
+/// Maximum number of named Unix listeners accepted from one agent config.
+pub const MAX_LISTENERS: usize = 32;
+
+/// Closed listener types compiled into the broker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ListenerType {
+    /// Host and operator surface, including the Admin service.
+    Host,
+    /// Container workload surface, excluding the Admin service.
+    Container,
+}
+
+impl FromStr for ListenerType {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "host" => Ok(Self::Host),
+            "container" => Ok(Self::Container),
+            _ => Err("listener type must be `host` or `container`"),
+        }
+    }
+}
+
+/// Every gRPC service compiled into a Basil Unix listener.
+///
+/// Keep this enum exhaustive and update [`ListenerType::exposes`] whenever a
+/// service is added. The registry test prevents an existing service from being
+/// exposed accidentally while listener builders are assembled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrpcService {
+    /// Sealed invocation.
+    Invocation,
+    /// Signing and verification.
+    Signing,
+    /// Authenticated encryption.
+    Aead,
+    /// Secret storage and retrieval.
+    Secret,
+    /// Short-lived credential minting.
+    Minting,
+    /// NATS identity operations.
+    Nats,
+    /// Operator and control-plane operations.
+    Admin,
+    /// SPIFFE Workload API.
+    SpiffeWorkload,
+    /// Envoy Secret Discovery Service.
+    Sds,
+}
+
+/// Exhaustive list used by service-surface validation and diagnostics.
+pub const ALL_GRPC_SERVICES: [GrpcService; 9] = [
+    GrpcService::Invocation,
+    GrpcService::Signing,
+    GrpcService::Aead,
+    GrpcService::Secret,
+    GrpcService::Minting,
+    GrpcService::Nats,
+    GrpcService::Admin,
+    GrpcService::SpiffeWorkload,
+    GrpcService::Sds,
+];
+
+impl ListenerType {
+    /// Return whether this listener type exposes a compiled service.
+    #[must_use]
+    pub const fn exposes(self, service: GrpcService) -> bool {
+        match (self, service) {
+            (Self::Host, _) => true,
+            (Self::Container, GrpcService::Admin) => false,
+            (
+                Self::Container,
+                GrpcService::Invocation
+                | GrpcService::Signing
+                | GrpcService::Aead
+                | GrpcService::Secret
+                | GrpcService::Minting
+                | GrpcService::Nats
+                | GrpcService::SpiffeWorkload
+                | GrpcService::Sds,
+            ) => true,
+        }
+    }
+}
 
 /// Runtime configuration for the gRPC listener.
 #[derive(Debug, Clone)]
@@ -225,6 +313,26 @@ mod tests {
     use crate::backend::{Backend, BackendError, NewKey};
     use crate::catalog::load;
     use crate::manager::BackendManager;
+
+    #[test]
+    fn listener_service_registry_is_closed_and_admin_is_host_only() {
+        for service in ALL_GRPC_SERVICES {
+            assert!(ListenerType::Host.exposes(service));
+            assert_eq!(
+                ListenerType::Container.exposes(service),
+                service != GrpcService::Admin
+            );
+        }
+    }
+
+    #[test]
+    fn listener_type_parser_rejects_unknown_and_ambiguous_values() {
+        assert_eq!("host".parse(), Ok(ListenerType::Host));
+        assert_eq!("container".parse(), Ok(ListenerType::Container));
+        assert!("Host".parse::<ListenerType>().is_err());
+        assert!("workload".parse::<ListenerType>().is_err());
+        assert!("".parse::<ListenerType>().is_err());
+    }
 
     struct DummyBackend;
 
