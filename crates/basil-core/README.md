@@ -29,6 +29,7 @@ a structured audit record.
 | `core::process_evidence`                                                      | Pinned procfs identity, point-of-use credential refresh, caller/host ID mapping, and fail-closed domain resolution.              |
 | `core::attestor_realm`                                                        | Protected realm schema, serial attestor sessions, isolated readiness, and failure-atomic candidate qualification.               |
 | `core::oci_verification`                                                      | Repository-scoped Sigstore policy, isolated exact-path Cosign execution, and independent OCI digest-chain verification.         |
+| `core::oci_evidence_cache`                                                    | Private bounded OCI evidence persistence, current-generation local revalidation, refresh health, and preview-first pruning.     |
 | `core::backend`                                                               | Backend adapters (table below).                                                                                                 |
 | `core::audit`, `core::decision`                                               | Decision records: subject, action, target, outcome, policy generation.                                                          |
 | `core::seal`, `x25519_seal`, `ed25519_sign`, `ml_dsa_sign`, `ml_kem_envelope` | Local crypto used for sealed invocations and materialize-to-use operations.                                                     |

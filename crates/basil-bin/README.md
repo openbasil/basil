@@ -11,7 +11,7 @@ SPDX-License-Identifier: Apache-2.0
 > sealed local store), and every operation is audited.
 
 The unified `basil` binary: one signed binary is broker service (`basil agent`), the operator
-tools (`basil init`, `basil bundle`, `basil explain`, `basil doctor`) and the client used
+tools (`basil init`, `basil bundle`, `basil explain`, `basil doctor`, `basil cache`) and the client used
 to invoke the broker over its Unix socket (`basil sign`, `basil get`, and the other client commands).
 
 When used as a client, it attests as whatever Unix identity invoked it (`SO_PEERCRED`).
@@ -31,7 +31,12 @@ Online docs: **[CLI overview](https://docs.openbasil.org/cli/overview/)** and **
 | `basil bundle …` | Create and manage the sealed credential bundle (seal, verify, `set-backend`, …).                                                                                                                                                               |
 | `basil explain`  | Explain a policy decision offline from the catalog + policy files; `--live` asks the running broker instead.                                                                                                                                   |
 | `basil doctor`   | Preflight environment and deployment checks.                                                                                                                                                                                                   |
+| `basil cache …`  | Inspect the private OCI evidence cache or preview and confirm exact-ID/reference pruning.                                                                                                                                                       |
 | client commands  | `new-key`, `import`, `import-set`, `sign`, `verify`, `encrypt`, `decrypt`, `get`, `set`, `rotate`, `list`, `mint-jwt`, `mint-nats-user`, `sign-nats-jwt`, `issue-nats-creds`, `issue-cert`, `status`, `health`, `ready`, `reload`, `revoke`, … |
+
+`basil cache --check` is an integrity check as well as an inventory: it removes
+safely identified corrupt regular entries as cache misses. Use `basil doctor`
+when the cache must be inspected without repair.
 
 Client commands take the socket from `--socket` or `BASIL_SOCKET`. `basil --help` is the
 authoritative command reference; man pages are rendered from this crate's library surface
