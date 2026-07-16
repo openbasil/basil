@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use super::evidence::{AuthorizationDomain, EvidenceExpression};
 use super::glob::KeyGlob;
+use crate::core::oci_verification::OciSignerPolicy;
 
 /// A stable subject name from the policy subject registry.
 pub type SubjectName = String;
@@ -373,6 +374,8 @@ pub struct ResolvedRule {
 pub struct ResolvedPolicy {
     /// Validated subject registry.
     pub subjects: BTreeMap<SubjectName, SubjectDefinition>,
+    /// Named OCI signer policies available to `oci.signer` predicates.
+    pub oci_signer_policies: BTreeMap<String, OciSignerPolicy>,
     /// Resolved rules in declaration order.
     pub rules: Vec<ResolvedRule>,
 }

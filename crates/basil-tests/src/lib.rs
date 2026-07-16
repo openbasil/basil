@@ -823,14 +823,22 @@ pub fn boot_basil_bip39(tag: &str, engine: Engine, addr: &str) -> Harness {
     std::fs::write(
         &config,
         format!(
-            r#"catalog = "{}"
+            r#"schema = "agent"
+schemaVersion = 3
+capability-policy = "strict"
+socket = "{}"
+vault-addr = "{}"
+
+[import]
+catalog = "{}"
 policy = "{}"
 bundle = "{}"
-capability-policy = "strict"
 
 [unlock]
 bip39-phrase-file = "{}"
 "#,
+            socket.display(),
+            addr,
             catalog.display(),
             policy.display(),
             bundle.display(),
@@ -842,9 +850,6 @@ bip39-phrase-file = "{}"
         .arg("agent")
         .arg("--config")
         .arg(&config)
-        .args(["--vault-addr", &addr])
-        .arg("--socket")
-        .arg(&socket)
         .stdout(log.try_clone().expect("clone log handle"))
         .stderr(log)
         .spawn()
@@ -982,20 +987,28 @@ fn boot_basil_inner(tag: &str, engine: Engine, addr: &str, svid_ttl_secs: Option
     std::fs::write(
         &config,
         format!(
-            r#"catalog = "{}"
-policy = "{}"
-bundle = "{}"
+            r#"schema = "agent"
+schemaVersion = 3
 capability-policy = "strict"
 audit-log = "{}"
+socket = "{}"
+vault-addr = "{}"
 {svid_ttl_line}
+
+[import]
+catalog = "{}"
+policy = "{}"
+bundle = "{}"
 
 [unlock]
 unlock-passphrase-file = "{}"
 "#,
+            audit_log.display(),
+            socket.display(),
+            addr,
             catalog.display(),
             policy.display(),
             bundle.display(),
-            audit_log.display(),
             pass.display()
         ),
     )
@@ -1004,9 +1017,6 @@ unlock-passphrase-file = "{}"
         .arg("agent")
         .arg("--config")
         .arg(&config)
-        .args(["--vault-addr", &addr])
-        .arg("--socket")
-        .arg(&socket)
         .stdout(log.try_clone().expect("clone log handle"))
         .stderr(log)
         .spawn()
@@ -1125,22 +1135,30 @@ pub fn boot_basil_spiffe(
     std::fs::write(
         &config,
         format!(
-            r#"catalog = "{}"
-policy = "{}"
-bundle = "{}"
+            r#"schema = "agent"
+schemaVersion = 3
 capability-policy = "strict"
 jwt-auth-mount = "jwt"
 jwt-role = "basil-spiffe"
 jwt-audience = "{}"
 svid-ttl-secs = 300
+socket = "{}"
+vault-addr = "{}"
+
+[import]
+catalog = "{}"
+policy = "{}"
+bundle = "{}"
 
 [unlock]
 unlock-passphrase-file = "{}"
 {jwks_section}"#,
+            engine.prefill_name(),
+            socket.display(),
+            addr,
             catalog.display(),
             policy.display(),
             bundle.display(),
-            engine.prefill_name(),
             pass.display()
         ),
     )
@@ -1149,9 +1167,6 @@ unlock-passphrase-file = "{}"
         .arg("agent")
         .arg("--config")
         .arg(&config)
-        .args(["--vault-addr", &addr])
-        .arg("--socket")
-        .arg(&socket)
         .stdout(log.try_clone().expect("clone log handle"))
         .stderr(log)
         .spawn()

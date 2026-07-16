@@ -113,6 +113,22 @@ pub enum LoadError {
     )]
     LegacyPolicyV2,
 
+    /// A named OCI signer policy failed strict structural validation.
+    #[error("OCI signer policy `{name}` is invalid")]
+    InvalidOciSignerPolicy {
+        /// The offending policy name; signer material is never included.
+        name: String,
+    },
+
+    /// An `oci.signer` predicate names no configured signer policy.
+    #[error("subject `{subject}` references unknown OCI signer policy `{policy}`")]
+    UnknownOciSignerPolicy {
+        /// Subject carrying the predicate.
+        subject: String,
+        /// Missing policy name.
+        policy: String,
+    },
+
     /// A subject name is empty after trimming.
     #[error("subject name must not be empty")]
     EmptySubjectName,
@@ -477,6 +493,14 @@ pub struct RawPolicy {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub subjects: BTreeMap<SubjectName, RawSubjectDefinition>,
+    /// Named repository-scoped OCI signer policies.
+    #[serde(
+        default,
+        rename = "ociSignerPolicies",
+        deserialize_with = "deserialize_unique_btree_map",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub oci_signer_policies: BTreeMap<String, crate::core::oci_verification::OciSignerPolicy>,
     /// Named role → op-set table; an action `role:<name>` expands to its ops.
     #[serde(
         default,
@@ -714,11 +738,45 @@ pub fn load(
     let mut warnings = validate_catalog(&catalog)?;
     let (subjects, subject_warnings) = parse_subjects(raw_policy.subjects)?;
     warnings.extend(subject_warnings);
+    for (name, policy) in &raw_policy.oci_signer_policies {
+        crate::core::oci_verification::validate_signer_policy(name, policy)
+            .map_err(|_| LoadError::InvalidOciSignerPolicy { name: name.clone() })?;
+    }
+    validate_oci_signer_references(&subjects, &raw_policy.oci_signer_policies)?;
     let rules = parse_rules(raw_policy.rules, &subjects)?;
     validate_rule_roles(&rules, &raw_policy.roles)?;
-    let resolved = build_resolved(subjects, &rules, &raw_policy.roles);
+    let resolved = build_resolved(
+        subjects,
+        raw_policy.oci_signer_policies,
+        &rules,
+        &raw_policy.roles,
+    );
 
     Ok((catalog, resolved, raw_policy.config, warnings))
+}
+
+fn validate_oci_signer_references(
+    subjects: &BTreeMap<SubjectName, SubjectDefinition>,
+    policies: &BTreeMap<String, crate::core::oci_verification::OciSignerPolicy>,
+) -> Result<(), LoadError> {
+    for (subject, definition) in subjects {
+        let mut missing = None;
+        definition.match_.visit_leaves(&mut |predicate| {
+            if let EvidencePredicate::OciSigner(policy) = predicate
+                && !policies.contains_key(policy)
+                && missing.is_none()
+            {
+                missing = Some(policy.clone());
+            }
+        });
+        if let Some(policy) = missing {
+            return Err(LoadError::UnknownOciSignerPolicy {
+                subject: subject.clone(),
+                policy,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn classify_catalog_parse_error(raw: &str, source: serde_json::Error) -> LoadError {
@@ -2130,6 +2188,7 @@ fn expand_ops(
 
 fn build_resolved(
     subjects: BTreeMap<SubjectName, SubjectDefinition>,
+    oci_signer_policies: BTreeMap<String, crate::core::oci_verification::OciSignerPolicy>,
     rules: &[Rule],
     defined_roles: &BTreeMap<String, BTreeSet<Op>>,
 ) -> ResolvedPolicy {
@@ -2157,7 +2216,11 @@ fn build_resolved(
             }
         })
         .collect();
-    ResolvedPolicy { subjects, rules }
+    ResolvedPolicy {
+        subjects,
+        oci_signer_policies,
+        rules,
+    }
 }
 
 #[cfg(test)]
@@ -3520,6 +3583,53 @@ mod tests {
         assert!(matches!(
             parse_account_file("svc:x:not-a-number:7::/:/bin/false\n", 7, 2, "/etc/passwd"),
             Err(LoadError::LocalAccountDatabase { .. })
+        ));
+    }
+
+    #[test]
+    fn named_oci_signer_policies_are_strict_and_references_must_resolve() {
+        let policy = r#"{
+          "schema": "policy",
+          "ociSignerPolicies": {
+            "production": {
+              "repository": "registry.example/team/app",
+              "mode": "pinned-key",
+              "publicKey": "/nix/store/cosign.pub",
+              "transparency": "required"
+            }
+          },
+          "subjects": {
+            "container.web": {
+              "domain": "container",
+              "match": { "oci.signer": "production" }
+            }
+          }
+        }"#;
+        let (_, resolved, _, _) = load(&catalog_json(""), policy).expect("policy loads");
+        assert!(resolved.oci_signer_policies.contains_key("production"));
+
+        let unknown = policy.replace(": \"production\" }", ": \"missing\" }");
+        assert!(matches!(
+            load(&catalog_json(""), &unknown),
+            Err(LoadError::UnknownOciSignerPolicy { .. })
+        ));
+
+        let mutable = policy.replace(
+            "registry.example/team/app",
+            "registry.example/team/app:latest",
+        );
+        assert!(matches!(
+            load(&catalog_json(""), &mutable),
+            Err(LoadError::InvalidOciSignerPolicy { .. })
+        ));
+
+        let unknown_field = policy.replace(
+            "\"transparency\": \"required\"",
+            "\"transparency\": \"required\", \"trustMe\": true",
+        );
+        assert!(matches!(
+            load(&catalog_json(""), &unknown_field),
+            Err(LoadError::Json { .. })
         ));
     }
 }

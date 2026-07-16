@@ -887,6 +887,7 @@ fn build_policy(uid: u32) -> RawPolicy {
     RawPolicy {
         schema: crate::catalog::PolicySchema::Policy,
         subjects,
+        oci_signer_policies: BTreeMap::new(),
         roles,
         rules: vec![rule],
         config: Config { names, memberships },

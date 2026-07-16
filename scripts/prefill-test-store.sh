@@ -414,7 +414,7 @@ echo "-- step 4: writing fixtures (catalog.json, policy.json) to $FIXTURES"
 # one missing=generate signer left absent (reconcile must create it).
 cat >"$CATALOG" <<JSON
 {
-  "schemaVersion": 1,
+  "schema": "catalog",
   "backends": {
     "bao": {
       "kind": "vault", "addr": "$ADDR",
@@ -561,7 +561,7 @@ JSON
 # grants only the reload op and changes no other test's behavior.
 cat >"$POLICY" <<JSON
 {
-  "schemaVersion": 2,
+  "schema": "policy",
   "roles": {
     "signer":   ["sign", "verify", "get_public_key"],
     "reader":   ["get", "list", "get_public_key"],
@@ -705,11 +705,11 @@ else
 fi
 
 cat > "$AGENT_CONFIG" <<EOF
-catalog = "$CATALOG"
-policy = "$POLICY"
-bundle = "$BUNDLE"
+schema = "agent"
+schemaVersion = 3
 vault-addr = "$ADDR"
 capability-policy = "strict"
+socket = "$SOCKET"
 EOF
 if [ "$SPIFFE_BOOT" -eq 1 ]; then
   cat >> "$AGENT_CONFIG" <<EOF
@@ -720,6 +720,11 @@ svid-ttl-secs = 300
 EOF
 fi
 cat >> "$AGENT_CONFIG" <<EOF
+
+[import]
+catalog = "$CATALOG"
+policy = "$POLICY"
+bundle = "$BUNDLE"
 
 [unlock]
 unlock-passphrase-file = "$PASS_FILE"

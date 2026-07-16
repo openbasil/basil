@@ -400,6 +400,7 @@ mod tests {
     fn local_actor_resolves_exactly_one_subject() {
         let policy = ResolvedPolicy {
             subjects: BTreeMap::from([("svc.web".to_string(), host_subject(9001))]),
+            oci_signer_policies: BTreeMap::new(),
             rules: Vec::new(),
         };
         let actor = resolve_local_actor(&policy, &Config::default(), &peer(Some(9001)))
@@ -416,6 +417,7 @@ mod tests {
             .collect();
         let policy = ResolvedPolicy {
             subjects,
+            oci_signer_policies: BTreeMap::new(),
             rules: Vec::new(),
         };
         let error = resolve_local_actor(&policy, &Config::default(), &peer(Some(42)))
@@ -438,6 +440,7 @@ mod tests {
     fn missing_peer_credentials_never_resolve() {
         let policy = ResolvedPolicy {
             subjects: BTreeMap::from([("svc.web".to_string(), host_subject(9001))]),
+            oci_signer_policies: BTreeMap::new(),
             rules: Vec::new(),
         };
         assert_eq!(

@@ -52,7 +52,11 @@ use basil_nats_bridge::{BasilConfig, BridgeConfig, Config, NatsConfig};
 use basil_proto::broker::v1::invocation_service_server::{
     InvocationService, InvocationServiceServer,
 };
-use basil_proto::broker::v1::{SealedRequest, SealedResponse};
+use basil_proto::broker::v1::{SealedRequest, SealedResponse, SigningAlgorithm};
+use basil_proto::invocation::{
+    CONTENT_TYPE_SIGN_REQUEST, CONTENT_TYPE_SIGN_RESPONSE, InvocationStatus, SignInvocationRequest,
+    SignInvocationResponse,
+};
 use tonic::{Request, Response, Status};
 
 use basil_tests::{alloc_addr, on_path};
@@ -60,8 +64,7 @@ use basil_tests::{alloc_addr, on_path};
 const REQUEST_SUBJECT: &str = "basil.invoke.roundtrip";
 const REQUEST_BODY: &[u8] = b"sealed-cose round-trip request";
 const RESPONSE_BODY: &[u8] = b"sealed-cose round-trip response";
-const GO_REQUEST_CONTENT_TYPE: &str = "application/basil.go-nats-bridge-request";
-const GO_RESPONSE_CONTENT_TYPE: &str = "application/basil.go-nats-bridge-response";
+const TARGET_SIGNING_KEY_ID: &str = "workload.signing";
 
 /// A minimal Basil `InvocationService`: it replies with a pre-built sealed COSE
 /// response ONLY when the courier forwarded the exact sealed request bytes,
@@ -101,6 +104,7 @@ struct VerifyingInvocationService {
     client_verifier: Arc<Ed25519Verifier>,
     request_recipient: Arc<X25519Recipient>,
     broker_signer: Arc<Ed25519Signer>,
+    target_signer: Arc<Ed25519Signer>,
     response_recipient: X25519RecipientPublic,
     now: UnixTime,
 }
@@ -130,9 +134,9 @@ impl InvocationService for VerifyingInvocationService {
         )
         .await
         .map_err(|e| Status::invalid_argument(format!("go request verify failed: {e}")))?;
-        if verified.content_type.as_str() != GO_REQUEST_CONTENT_TYPE {
+        if verified.content_type.as_str() != CONTENT_TYPE_SIGN_REQUEST {
             return Err(Status::invalid_argument(format!(
-                "go request content type = {}, want {GO_REQUEST_CONTENT_TYPE}",
+                "go request content type = {}, want {CONTENT_TYPE_SIGN_REQUEST}",
                 verified.content_type.as_str()
             )));
         }
@@ -144,15 +148,30 @@ impl InvocationService for VerifyingInvocationService {
             )
             .await
             .map_err(|e| Status::invalid_argument(format!("go request open failed: {e}")))?;
-        if opened.plaintext.as_slice() != REQUEST_BODY {
+        let body = SignInvocationRequest::from_cbor_bytes(opened.plaintext.as_slice())
+            .map_err(|error| Status::invalid_argument(format!("invalid sign request: {error}")))?;
+        if body.key_id != TARGET_SIGNING_KEY_ID
+            || body.message != REQUEST_BODY
+            || body.algorithm != SigningAlgorithm::Ed25519 as i32
+        {
             return Err(Status::invalid_argument(
-                "go request plaintext did not match",
+                "go sign request fields did not match",
             ));
         }
+        let signature = self
+            .target_signer
+            .sign(&body.message)
+            .await
+            .map_err(|error| Status::internal(format!("target signing failed: {error}")))?;
+        let response = SignInvocationResponse {
+            status: InvocationStatus::ok(),
+            policy_generation: 1,
+            signature: Some(signature.as_bytes().to_vec()),
+        };
 
         let response_bytes = seal_with_content_type(
-            RESPONSE_BODY,
-            GO_RESPONSE_CONTENT_TYPE,
+            &response.to_cbor_bytes(),
+            CONTENT_TYPE_SIGN_RESPONSE,
             response_claims(
                 self.broker_signer.as_ref(),
                 verified.claims.message_id,
@@ -482,7 +501,8 @@ async fn go_client_round_trips_sealed_cose_through_nats_bridge() {
         .expect("client verifier"),
     );
     let broker_signer = Arc::new(signer("broker.signing", [9u8; 32]));
-    let request_recipient = Arc::new(recipient("request.sealing", [0x11u8; 32]));
+    let target_signer = Arc::new(signer(TARGET_SIGNING_KEY_ID, [0x44u8; 32]));
+    let request_recipient = Arc::new(recipient("broker.request", [0x11u8; 32]));
     let response_recipient = recipient("response.sealing", [0x22u8; 32]);
     let response_public = response_recipient.public();
 
@@ -501,6 +521,7 @@ async fn go_client_round_trips_sealed_cose_through_nats_bridge() {
         client_verifier,
         request_recipient: Arc::clone(&request_recipient),
         broker_signer: Arc::clone(&broker_signer),
+        target_signer: Arc::clone(&target_signer),
         response_recipient: response_public,
         now: now_unix(),
     };
@@ -544,6 +565,10 @@ async fn go_client_round_trips_sealed_cose_through_nats_bridge() {
             .env(
                 "BASIL_BROKER_SIGNING_PUBLIC_HEX",
                 hex(&broker_signer.public_key_bytes()),
+            )
+            .env(
+                "BASIL_TARGET_SIGNING_PUBLIC_HEX",
+                hex(&target_signer.public_key_bytes()),
             )
             .output()
             .expect("run go nats COSE courier example")

@@ -27,13 +27,17 @@ Full documentation lives at **[docs.openbasil.org](https://docs.openbasil.org)**
 
 Your service connects to a local Unix socket. Basil anchors the presenter in
 kernel evidence (`SO_PEERCRED`) and resolves one disjoint workload domain:
-`host-process`, `systemd-unit`, or `container`. A policy subject combines typed
-process, systemd, Compose, executable, runtime, OCI, and invocation-signature
-evidence through bounded recursive `all` and `any` expressions. Exactly one
-subject must match before any grant or public-class read is considered; missing
-or unavailable evidence never grants authority. When approved by policy, Basil
-performs the operation against the backend, where the key material stays put,
-and writes a structured audit record recording the decision.
+`host-process`, `systemd-unit`, or `container`. The process pin combines peer
+credentials with PID start time, caller/host ID maps, namespaces, cgroups, and
+the opened executable object; mutable credential predicates are reread at each
+authorization. Container signer evidence binds a named pinned-key or keyless
+Sigstore policy to the exact repository, platform, OCI index/manifest, and
+running config digest. A policy subject combines these typed facts through
+bounded recursive `all` and `any` expressions. Exactly one subject must match
+before any grant or public-class read is considered; missing or unavailable
+evidence never grants authority. When approved by policy, Basil performs the
+operation against the backend, where the key material stays put, and writes a
+structured audit record recording the decision.
 
 A service can sign a release, terminate TLS, mint a short-lived JWT, or decrypt
 a backup, while the private key never appears in its memory, its environment,
