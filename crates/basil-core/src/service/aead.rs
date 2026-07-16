@@ -362,7 +362,6 @@ mod tests {
     use crate::backend::{Backend, BackendError, KvValue, NewKey};
     use crate::catalog::load;
     use crate::manager::BackendManager;
-    use crate::peer::PeerInfo;
     use crate::state::BrokerState;
 
     /// In-memory backend that serves a pre-provisioned ML-KEM software-custody
@@ -594,12 +593,7 @@ mod tests {
     }
 
     fn request<T>(uid: u32, body: T) -> Request<T> {
-        let mut request = Request::new(body);
-        request.extensions_mut().insert(PeerInfo {
-            uid: Some(uid),
-            ..PeerInfo::default()
-        });
-        request
+        crate::service::shared::host_request(uid, body)
     }
 
     fn cose_backend() -> SealingBackend {
