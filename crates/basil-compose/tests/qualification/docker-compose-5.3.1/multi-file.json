@@ -1,0 +1,31 @@
+{
+  "name": "qualified-payments",
+  "networks": {
+    "default": {
+      "name": "qualified-payments_default",
+      "ipam": {}
+    }
+  },
+  "services": {
+    "api": {
+      "command": null,
+      "entrypoint": null,
+      "environment": {
+        "DATABASE_PASSWORD": "rendered-sensitive-value",
+        "LITERAL": "$${REMAINS_UNRESOLVED}"
+      },
+      "image": "registry.example/api:2026-07-16-prod",
+      "networks": {
+        "default": null
+      }
+    },
+    "prebuilt": {
+      "command": null,
+      "entrypoint": null,
+      "image": "registry.example/prebuilt@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "networks": {
+        "default": null
+      }
+    }
+  }
+}

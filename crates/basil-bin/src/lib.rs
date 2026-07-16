@@ -16,6 +16,8 @@ pub mod client_cli;
 #[cfg(feature = "keystore-backend")]
 use basil_core::demo;
 use basil_core::{agent_cli, bundle_cli, init};
+#[cfg(feature = "compose")]
+use clap::ValueEnum;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -57,6 +59,13 @@ pub enum Command {
     /// Manage the selected schema-3 configuration corpus.
     #[command(subcommand)]
     Config(ConfigCommand),
+    /// Inspect or generate Basil integration for a Compose project.
+    #[cfg(feature = "compose")]
+    #[command(subcommand)]
+    Compose(ComposeCommand),
+    /// Report how to install or build Compose integration support.
+    #[cfg(not(feature = "compose"))]
+    Compose(ComposeUnavailableArgs),
     /// Run a zero-dependency guided tour: scaffold a throwaway broker on the
     /// built-in keystore backend, start it, and drive a scripted
     /// sign → verify → denied read → explain → encrypt → mint sequence with
@@ -84,6 +93,63 @@ pub enum Command {
     Doctor(agent_cli::DoctorArgs),
     #[command(flatten)]
     Client(client_cli::Command),
+}
+
+/// Compose integration commands.
+#[cfg(feature = "compose")]
+#[derive(Debug, Subcommand)]
+pub enum ComposeCommand {
+    /// Render a bounded, secret-discarding effective-model projection.
+    Model(ComposeModelArgs),
+}
+
+/// Arguments accepted by a build which omits Compose integration.
+#[cfg(not(feature = "compose"))]
+#[derive(Debug, Args)]
+pub struct ComposeUnavailableArgs {
+    /// Uninterpreted Compose arguments, retained only so remediation can be shown.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub arguments: Vec<std::ffi::OsString>,
+}
+
+/// Compose frontend family used to render the effective model.
+#[cfg(feature = "compose")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ComposeFrontend {
+    /// Docker with the integrated Compose v2 plugin.
+    Docker,
+    /// Rootless Podman with an explicitly pinned Docker Compose v2 provider.
+    Podman,
+}
+
+/// Arguments for bounded effective-model projection.
+#[cfg(feature = "compose")]
+#[derive(Debug, Args)]
+pub struct ComposeModelArgs {
+    /// Selected frontend family.
+    #[arg(long, value_enum, default_value_t = ComposeFrontend::Docker)]
+    pub frontend: ComposeFrontend,
+    /// Absolute path to the selected Docker or Podman executable.
+    #[arg(long)]
+    pub frontend_path: PathBuf,
+    /// Absolute Docker Compose v2 provider path required with Podman.
+    #[arg(long, required_if_eq("frontend", "podman"))]
+    pub provider: Option<PathBuf>,
+    /// Compose file; repeat in workload-launch merge order.
+    #[arg(long = "file", short = 'f')]
+    pub files: Vec<PathBuf>,
+    /// Enabled profile; repeat in workload-launch order.
+    #[arg(long = "profile")]
+    pub profiles: Vec<String>,
+    /// Compose environment file; repeat in workload-launch precedence order.
+    #[arg(long = "env-file")]
+    pub environment_files: Vec<PathBuf>,
+    /// Explicit effective project name.
+    #[arg(long)]
+    pub project_name: Option<String>,
+    /// Explicit project directory for relative path resolution.
+    #[arg(long)]
+    pub project_directory: Option<PathBuf>,
 }
 
 /// Configuration-corpus maintenance commands.
@@ -169,6 +235,32 @@ mod tests {
                 || err.to_string().contains("invalid subcommand"),
             "{err}"
         );
+    }
+
+    #[cfg(feature = "compose")]
+    #[test]
+    fn compose_model_requires_pinned_provider_for_podman() {
+        let error = Cli::try_parse_from([
+            "basil",
+            "compose",
+            "model",
+            "--frontend",
+            "podman",
+            "--frontend-path",
+            "/usr/bin/podman",
+        ])
+        .expect_err("Podman must not resolve an arbitrary provider from PATH");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[cfg(not(feature = "compose"))]
+    #[test]
+    fn feature_off_build_accepts_compose_for_actionable_dispatch() {
+        let cli = parse(&["basil", "compose", "model", "--file", "compose.yaml"]);
+        assert!(matches!(cli.command, Command::Compose(_)));
     }
 
     #[test]

@@ -9,8 +9,12 @@
 
 use anyhow::Result;
 use basil_bin::{Cli, Command, ConfigCommand, client_cli};
+#[cfg(feature = "compose")]
+use basil_bin::{ComposeCommand, ComposeFrontend, ComposeModelArgs};
 use basil_core::agent_cli;
 use clap::Parser;
+#[cfg(feature = "compose")]
+use std::io::Write as _;
 
 // With `db-keystore` enabled, turso (its SQLite engine) already installs a
 // mimalloc `#[global_allocator]`, and a crate graph can only declare one; the
@@ -45,6 +49,12 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        #[cfg(feature = "compose")]
+        Command::Compose(ComposeCommand::Model(args)) => run_compose_model(args).await,
+        #[cfg(not(feature = "compose"))]
+        Command::Compose(_) => anyhow::bail!(
+            "Compose support is not included in this Basil build; install the standard Basil package or rebuild basil-bin with --features compose"
+        ),
         #[cfg(feature = "keystore-backend")]
         Command::Demo(args) => basil_core::demo::run(&args),
         Command::Completions(args) => {
@@ -69,6 +79,38 @@ async fn main() -> Result<()> {
             client_cli::run(cli.socket, command).await
         }
     }
+}
+
+#[cfg(feature = "compose")]
+async fn run_compose_model(args: ComposeModelArgs) -> Result<()> {
+    let frontend = match args.frontend {
+        ComposeFrontend::Docker => basil_compose::Frontend::Docker {
+            executable: args.frontend_path,
+        },
+        ComposeFrontend::Podman => basil_compose::Frontend::Podman {
+            executable: args.frontend_path,
+            provider: args.provider.ok_or_else(|| {
+                anyhow::anyhow!("the Podman frontend requires an explicit provider")
+            })?,
+        },
+    };
+    let invocation = basil_compose::Invocation {
+        files: args.files,
+        profiles: args.profiles,
+        environment_files: args.environment_files,
+        project_name: args.project_name,
+        project_directory: args.project_directory,
+    };
+    let command = basil_compose::command_spec(&frontend, &invocation)?;
+    {
+        let mut stderr = std::io::stderr().lock();
+        writeln!(stderr, "{}", command.display())?;
+    }
+    let model = basil_compose::project(&frontend, &invocation).await?;
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer(&mut stdout, &model)?;
+    writeln!(stdout)?;
+    Ok(())
 }
 
 /// Install the stderr `fmt` subscriber the over-socket client paths use (level

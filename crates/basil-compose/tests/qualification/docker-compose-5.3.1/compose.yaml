@@ -1,0 +1,17 @@
+name: source-default
+services:
+  api:
+    image: registry.example/api:${IMAGE_TAG}
+    environment:
+      DATABASE_PASSWORD: ${DATABASE_PASSWORD}
+      LITERAL: $${REMAINS_UNRESOLVED}
+  worker:
+    image: local-worker:${IMAGE_TAG}
+    build:
+      context: /opt/basil-compose-qualification/worker
+      dockerfile: Containerfile
+      args:
+        PRIVATE_BUILD_ARG: ${DATABASE_PASSWORD}
+    profiles: [prod]
+  prebuilt:
+    image: registry.example/prebuilt@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa

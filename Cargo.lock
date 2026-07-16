@@ -840,6 +840,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "basil",
+ "basil-compose",
  "basil-core",
  "basil-nats",
  "clap",
@@ -850,6 +851,18 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing-subscriber",
+ "zeroize",
+]
+
+[[package]]
+name = "basil-compose"
+version = "0.7.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tokio",
  "zeroize",
 ]
 

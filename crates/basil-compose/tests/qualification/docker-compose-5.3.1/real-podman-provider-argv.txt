@@ -1,0 +1,16 @@
+--file
+/home/user/project/basil/.work/loop_compose_model/crates/basil-compose/tests/qualification/docker-compose-5.3.1/compose.yaml
+--file
+/home/user/project/basil/.work/loop_compose_model/crates/basil-compose/tests/qualification/docker-compose-5.3.1/compose.prod.yaml
+--profile
+prod
+--env-file
+/home/user/project/basil/.work/loop_compose_model/crates/basil-compose/tests/qualification/docker-compose-5.3.1/prod.env
+--project-name
+qualified-payments
+--project-directory
+/home/user/project/basil/.work/loop_compose_model/crates/basil-compose/tests/qualification/docker-compose-5.3.1
+config
+--format
+json
+--no-env-resolution

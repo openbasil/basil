@@ -28,11 +28,13 @@ path = "src/main.rs"
 
 [features]
 default = [
+  "compose",
   "db-keystore",
   "onepassword",
   "unlock-age-yubikey",
   "unlock-bip39",
 ]
+compose = ["dep:basil-compose"]
 http = ["basil-core/http"]
 http-tls = ["http", "basil-core/http-tls"]
 keystore-backend = ["basil-core/keystore-backend"]
@@ -53,6 +55,7 @@ secure-alloc = ["mimalloc/secure"]
 
 [dependencies]
 basil = { workspace = true }
+basil-compose = { workspace = true, optional = true }
 basil-core = { workspace = true }
 basil-nats = { workspace = true }
 

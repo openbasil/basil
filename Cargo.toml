@@ -11,6 +11,7 @@ members = [
   "crates/basil-nats",
   "crates/basil-nats-bridge",
   "crates/basil-keystore-backend",
+  "crates/basil-compose",
   "crates/basil-core",
   "crates/basil-bin",
   "crates/basil-tests",
@@ -33,6 +34,7 @@ basil-proto = { version = "0.7.1", path = "crates/basil-proto" }
 basil-nats = { version = "0.7.1", path = "crates/basil-nats" }
 basil-nats-bridge = { version = "0.7.1", path = "crates/basil-nats-bridge" }
 basil-keystore-backend = { version = "0.7.1", path = "crates/basil-keystore-backend" }
+basil-compose = { version = "0.7.1", path = "crates/basil-compose" }
 basil-core = { version = "0.7.1", path = "crates/basil-core", default-features = false }
 basil-bin = { version = "0.7.1", path = "crates/basil-bin" }
 

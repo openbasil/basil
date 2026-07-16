@@ -27,6 +27,7 @@ Online docs: **[CLI overview](https://docs.openbasil.org/cli/overview/)** and **
 | ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `basil init`     | Scaffold a first-run starter set: config, catalog, policy.                                                                                                                                                                                     |
 | `basil agent`    | Run the broker daemon.                                                                                                                                                                                                                         |
+| `basil compose …` | Project a selected frontend's effective Compose model into bounded, secret-discarding JSON.                                                                                                                                                   |
 | `basil bundle …` | Create and manage the sealed credential bundle (seal, verify, `set-backend`, …).                                                                                                                                                               |
 | `basil explain`  | Explain a policy decision offline from the catalog + policy files; `--live` asks the running broker instead.                                                                                                                                   |
 | `basil doctor`   | Preflight environment and deployment checks.                                                                                                                                                                                                   |
@@ -39,9 +40,12 @@ authoritative command reference; man pages are rendered from this crate's librar
 ## Feature flags
 
 Features forward to `basil-core` and select which backends and unlock methods are compiled in.
+Builds without `compose` retain the `basil compose` command and report how to install the standard
+package or rebuild with the feature.
 
 | Feature               | Default | Adds                                                                       |
 | --------------------- | ------- | -------------------------------------------------------------------------- |
+| `compose`             | yes     | Bounded Docker Compose v2 effective-model projection.                      |
 | `db-keystore`         | yes     | Built-in encrypted keystore backend (SQLite via turso).                    |
 | `onepassword`         | yes     | 1Password materialize-to-use backend (`op` CLI).                           |
 | `unlock-age-yubikey`  | yes     | age/YubiKey bundle unlock (experimental).                                  |

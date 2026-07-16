@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "basil-compose"
+description = "Bounded, secret-discarding projection of Docker Compose v2 effective models for Basil."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/basil-compose"
+keywords = ["basil", "compose", "containers", "security"]
+categories = ["config", "command-line-utilities"]
+rust-version = "1.88"
+publish = true
+
+[dependencies]
+serde = { workspace = true, features = ["std"] }
+serde_json = { workspace = true, features = ["std"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["process"] }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+sha2 = { workspace = true }
+
+[lints]
+workspace = true

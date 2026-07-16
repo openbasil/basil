@@ -1,0 +1,60 @@
+{
+  "name": "qualified-payments",
+  "networks": {
+    "default": {
+      "name": "qualified-payments_default",
+      "ipam": {}
+    }
+  },
+  "services": {
+    "api": {
+      "command": null,
+      "entrypoint": null,
+      "environment": {
+        "DATABASE_PASSWORD": "rendered-sensitive-value",
+        "LITERAL": "$${REMAINS_UNRESOLVED}"
+      },
+      "image": "registry.example/api:2026-07-16-prod",
+      "networks": {
+        "default": null
+      }
+    },
+    "metrics": {
+      "profiles": [
+        "prod"
+      ],
+      "command": null,
+      "entrypoint": null,
+      "image": "registry.example/metrics:2026-07-16",
+      "networks": {
+        "default": null
+      }
+    },
+    "prebuilt": {
+      "command": null,
+      "entrypoint": null,
+      "image": "registry.example/prebuilt@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "networks": {
+        "default": null
+      }
+    },
+    "worker": {
+      "profiles": [
+        "prod"
+      ],
+      "build": {
+        "context": "/opt/basil-compose-qualification/worker",
+        "dockerfile": "Containerfile",
+        "args": {
+          "PRIVATE_BUILD_ARG": "rendered-sensitive-value"
+        }
+      },
+      "command": null,
+      "entrypoint": null,
+      "image": "local-worker:2026-07-16",
+      "networks": {
+        "default": null
+      }
+    }
+  }
+}
