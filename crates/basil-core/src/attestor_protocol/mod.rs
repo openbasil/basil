@@ -33,8 +33,9 @@ pub use limits::{
     ABSOLUTE_MAX_REQUEST_DEADLINE, ABSOLUTE_MAX_STRING_BYTES, LimitsError, ProtocolLimits,
 };
 pub use session::{
-    AttestorRequest, AttestorSession, BrokerSession, HealthResult, InventoryResult, ProtocolError,
-    QueryScope, ResolvePeerResult, SessionAuthentication,
+    AttestorRequest, AttestorSession, BrokerSession, HealthResult, InventoryResult,
+    MOUNT_SECURITY_CAPABILITY, ProtocolError, QueryScope, RequestBudget, ResolvePeerResult,
+    SessionAuthentication,
 };
 
 #[cfg(test)]
@@ -173,6 +174,10 @@ mod tests {
                 propagation: wire::MountPropagation::Private as i32,
                 tmpfs_size_bytes: None,
                 tmpfs_mode: None,
+                tmpfs_nodev: false,
+                tmpfs_nosuid: false,
+                tmpfs_noexec: false,
+                tmpfs_noswap: false,
             }],
             lifecycle: wire::LifecycleState::Running as i32,
             diagnostic_runtime_name: "example-api-1".to_string(),
@@ -602,10 +607,13 @@ mod tests {
         .unwrap();
         let server_task = tokio::spawn(async move {
             attestor.handshake().await.unwrap();
-            assert_eq!(
+            assert!(matches!(
                 attestor.receive().await.unwrap(),
-                AttestorRequest::QueryInstances(QueryScope::GlobalDoctor)
-            );
+                AttestorRequest::QueryInstances {
+                    scope: QueryScope::GlobalDoctor,
+                    ..
+                }
+            ));
             let stale = wire::SessionBinding {
                 session_nonce: vec![9; 32],
                 generation: 99,
@@ -639,6 +647,117 @@ mod tests {
         assert_eq!(first_binding.generation, auth().generation);
         assert_ne!(first_binding.session_nonce, vec![9; 32]);
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mount_security_fields_are_emitted_only_after_explicit_capability_opt_in() {
+        for enabled in [false, true] {
+            let limits = ProtocolLimits::default();
+            let (client, server) = tokio::io::duplex(16 * 1024);
+            let supported = [
+                "docker.rootful".to_string(),
+                MOUNT_SECURITY_CAPABILITY.to_string(),
+            ];
+            let mut attestor = AttestorSession::new(
+                FrameCodec::for_test(server, BROKER_BINDING, limits),
+                auth(),
+                supported,
+                limits,
+            )
+            .unwrap();
+            let server_task = tokio::spawn(async move {
+                attestor.handshake().await.unwrap();
+                assert!(matches!(
+                    attestor.receive().await.unwrap(),
+                    AttestorRequest::ResolvePeer { .. }
+                ));
+                let mut instance = fact(
+                    wire::SessionBinding {
+                        session_nonce: vec![9; 32],
+                        generation: 99,
+                        challenge: vec![9; 32],
+                    },
+                    "one",
+                );
+                let mount = &mut instance.mounts[0];
+                mount.kind = wire::MountKind::Tmpfs as i32;
+                mount.host_source.clear();
+                mount.tmpfs_nodev = true;
+                mount.tmpfs_nosuid = true;
+                mount.tmpfs_noexec = true;
+                mount.tmpfs_noswap = true;
+                attestor
+                    .respond_resolve_peer(ok(), Some(instance))
+                    .await
+                    .unwrap();
+            });
+            let required = if enabled {
+                vec![
+                    "docker.rootful".to_string(),
+                    MOUNT_SECURITY_CAPABILITY.to_string(),
+                ]
+            } else {
+                vec!["docker.rootful".to_string()]
+            };
+            let mut broker = BrokerSession::new(
+                FrameCodec::for_test(client, ATTESTOR_BINDING, limits),
+                auth(),
+                required,
+                limits,
+            )
+            .unwrap();
+            broker.handshake().await.unwrap();
+            let result = broker.resolve_peer(peer()).await.unwrap();
+            let mount = &result.instance.unwrap().mounts[0];
+            assert_eq!(mount.tmpfs_nodev, enabled);
+            assert_eq!(mount.tmpfs_nosuid, enabled);
+            assert_eq!(mount.tmpfs_noexec, enabled);
+            assert_eq!(mount.tmpfs_noswap, enabled);
+            server_task.await.unwrap();
+        }
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct OriginalMountFact {
+        #[prost(enumeration = "wire::MountKind", tag = "1")]
+        kind: i32,
+        #[prost(string, tag = "2")]
+        host_source: String,
+        #[prost(string, tag = "3")]
+        container_destination: String,
+        #[prost(bool, tag = "4")]
+        read_only: bool,
+        #[prost(enumeration = "wire::MountPropagation", tag = "5")]
+        propagation: i32,
+        #[prost(uint64, optional, tag = "6")]
+        tmpfs_size_bytes: Option<u64>,
+        #[prost(uint32, optional, tag = "7")]
+        tmpfs_mode: Option<u32>,
+    }
+
+    #[test]
+    fn capability_suppressed_mounts_are_canonical_for_the_original_schema() {
+        let mut instance = fact(
+            wire::SessionBinding {
+                session_nonce: vec![1; 32],
+                generation: 1,
+                challenge: vec![2; 32],
+            },
+            "one",
+        );
+        let mount = &mut instance.mounts[0];
+        mount.kind = wire::MountKind::Tmpfs as i32;
+        mount.host_source.clear();
+        mount.tmpfs_nodev = true;
+        mount.tmpfs_nosuid = true;
+        mount.tmpfs_nodev = false;
+        mount.tmpfs_nosuid = false;
+        mount.tmpfs_noexec = false;
+        mount.tmpfs_noswap = false;
+
+        let encoded = instance.mounts[0].encode_to_vec();
+        let original = OriginalMountFact::decode(encoded.as_slice()).unwrap();
+        assert_eq!(original.encode_to_vec(), encoded);
     }
 
     #[tokio::test]
@@ -676,7 +795,10 @@ mod tests {
             budget_millis: 100,
         }));
         broker.write_envelope(&request).await.unwrap();
-        assert_eq!(attestor.receive().await.unwrap(), AttestorRequest::Health);
+        assert!(matches!(
+            attestor.receive().await.unwrap(),
+            AttestorRequest::Health { .. }
+        ));
         attestor.respond_health(no_match(), None).await.unwrap();
         let _response = broker.read_envelope().await.unwrap();
         broker.write_envelope(&request).await.unwrap();

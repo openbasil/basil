@@ -23,6 +23,10 @@ use super::wire::query_instances_request::Scope;
 
 const BINDING_BYTES: usize = 32;
 
+/// Protocol-1 opt-in for tmpfs mount-security fields added after the original
+/// schema was deployed.
+pub const MOUNT_SECURITY_CAPABILITY: &str = "mount-security.v1";
+
 macro_rules! checked_response {
     ($session:expr, $result:expr) => {
         match $result {
@@ -298,6 +302,13 @@ where
         checked_response!(self, validate_outcome(response.outcome.as_ref()));
         if let Some(instance) = response.instance.as_ref() {
             checked_response!(self, validate_instance(instance, &binding));
+            checked_response!(
+                self,
+                validate_mount_security_negotiation(
+                    instance,
+                    capability_enabled(&self.required_capabilities, MOUNT_SECURITY_CAPABILITY),
+                )
+            );
         }
         checked_response!(
             self,
@@ -330,7 +341,10 @@ where
         }));
         self.write_or_close(&request).await?;
         let deadline = self.deadline();
-        let mut accumulator = InventoryAccumulator::new(self.limits);
+        let mut accumulator = InventoryAccumulator::new(
+            self.limits,
+            capability_enabled(&self.required_capabilities, MOUNT_SECURITY_CAPABILITY),
+        );
         loop {
             let response = self.read_or_close(deadline).await?;
             let body = checked_response!(self, take_body(response));
@@ -430,10 +444,44 @@ where
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AttestorRequest {
     /// Bounded diagnostic-only runtime health probe.
-    Health,
+    Health {
+        /// Original request deadline, shared with response framing.
+        budget: RequestBudget,
+    },
     /// Pinned broker-observed process constraints.
-    ResolvePeer(wire::PinnedPeer),
+    ResolvePeer {
+        /// Broker-observed constraints.
+        constraints: wire::PinnedPeer,
+        /// Original request deadline, shared with response framing.
+        budget: RequestBudget,
+    },
     /// Closed typed inventory scope.
+    QueryInstances {
+        /// Closed inventory selector.
+        scope: QueryScope,
+        /// Original request deadline, shared with response framing.
+        budget: RequestBudget,
+    },
+}
+
+/// Monotonic request deadline passed unchanged from protocol validation to a
+/// runtime provider.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RequestBudget {
+    deadline: Instant,
+}
+
+impl RequestBudget {
+    /// Return the duration remaining before the original broker deadline.
+    #[must_use]
+    pub fn remaining(self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+}
+
+enum RequestPayload {
+    Health,
+    ResolvePeer(wire::PinnedPeer),
     QueryInstances(QueryScope),
 }
 
@@ -455,6 +503,7 @@ pub struct AttestorSession<S> {
     authentication: SessionAuthentication,
     limits: ProtocolLimits,
     supported_capabilities: Vec<String>,
+    broker_capabilities: Vec<String>,
     session_nonce: Option<[u8; BINDING_BYTES]>,
     last_challenge: Option<[u8; BINDING_BYTES]>,
     phase: Phase,
@@ -483,6 +532,7 @@ where
             authentication,
             limits,
             supported_capabilities: normalize_capabilities(supported_capabilities)?,
+            broker_capabilities: Vec::new(),
             session_nonce: None,
             last_challenge: None,
             phase: Phase::New,
@@ -558,6 +608,7 @@ where
         if let Err(error) = self.write_until(deadline, &response).await {
             return self.close_with(error).await;
         }
+        self.broker_capabilities = required;
         self.session_nonce = Some(nonce);
         self.phase = Phase::Ready;
         Ok(())
@@ -582,7 +633,7 @@ where
                 Operation::Health,
                 request.binding,
                 request.budget_millis,
-                AttestorRequest::Health,
+                RequestPayload::Health,
             ),
             Body::ResolvePeerRequest(request) => {
                 let Some(constraints) = request.constraints else {
@@ -597,7 +648,7 @@ where
                     Operation::ResolvePeer,
                     request.binding,
                     request.budget_millis,
-                    AttestorRequest::ResolvePeer(constraints),
+                    RequestPayload::ResolvePeer(constraints),
                 )
             }
             Body::QueryInstancesRequest(request) => {
@@ -609,7 +660,7 @@ where
                     Operation::QueryInstances,
                     request.binding,
                     request.budget_millis,
-                    AttestorRequest::QueryInstances(scope),
+                    RequestPayload::QueryInstances(scope),
                 )
             }
             _ => return self.close_unexpected("request").await,
@@ -635,13 +686,24 @@ where
             return self.close_with(ProtocolError::DuplicateRequest).await;
         }
         self.last_challenge = Some(challenge);
+        let deadline = Instant::now() + budget;
+        let budget = RequestBudget { deadline };
         self.pending = Some(PendingResponse {
             operation,
             binding,
-            deadline: Instant::now() + budget,
+            deadline,
         });
         self.phase = Phase::Waiting(operation);
-        Ok(request)
+        Ok(match request {
+            RequestPayload::Health => AttestorRequest::Health { budget },
+            RequestPayload::ResolvePeer(constraints) => AttestorRequest::ResolvePeer {
+                constraints,
+                budget,
+            },
+            RequestPayload::QueryInstances(scope) => {
+                AttestorRequest::QueryInstances { scope, budget }
+            }
+        })
     }
 
     /// Send the complete health response for the pending request.
@@ -677,6 +739,10 @@ where
         require_success_payload(Some(&outcome), instance.is_some(), "instance")?;
         let pending = self.take_pending(Operation::ResolvePeer)?;
         if let Some(instance) = instance.as_mut() {
+            project_mount_security(
+                instance,
+                capability_enabled(&self.broker_capabilities, MOUNT_SECURITY_CAPABILITY),
+            );
             bind_instance(instance, &pending.binding)?;
             validate_instance(instance, &pending.binding)?;
         }
@@ -704,6 +770,10 @@ where
         }
         let pending = self.take_pending(Operation::QueryInstances)?;
         for instance in &mut instances {
+            project_mount_security(
+                instance,
+                capability_enabled(&self.broker_capabilities, MOUNT_SECURITY_CAPABILITY),
+            );
             bind_instance(instance, &pending.binding)?;
             validate_instance(instance, &pending.binding)?;
         }
@@ -1012,6 +1082,12 @@ fn normalize_capabilities(
     Ok(normalized.into_iter().collect())
 }
 
+fn capability_enabled(capabilities: &[String], capability: &str) -> bool {
+    capabilities
+        .binary_search_by(|candidate| candidate.as_str().cmp(capability))
+        .is_ok()
+}
+
 fn validate_capability(capability: &str) -> Result<(), ProtocolError> {
     if capability.is_empty() || capability.len() > ABSOLUTE_MAX_CAPABILITY_BYTES {
         return Err(invalid(
@@ -1282,11 +1358,45 @@ fn validate_mount(mount: &wire::MountFact) -> Result<(), ProtocolError> {
         ));
     }
     if kind != wire::MountKind::Tmpfs
-        && (mount.tmpfs_size_bytes.is_some() || mount.tmpfs_mode.is_some())
+        && (mount.tmpfs_size_bytes.is_some()
+            || mount.tmpfs_mode.is_some()
+            || mount.tmpfs_nodev
+            || mount.tmpfs_nosuid
+            || mount.tmpfs_noexec
+            || mount.tmpfs_noswap)
     {
         return Err(invalid(
             "instance.mount.tmpfs_options",
             "are valid only for tmpfs",
+        ));
+    }
+    Ok(())
+}
+
+fn project_mount_security(instance: &mut wire::InstanceFact, enabled: bool) {
+    if enabled {
+        return;
+    }
+    for mount in &mut instance.mounts {
+        mount.tmpfs_nodev = false;
+        mount.tmpfs_nosuid = false;
+        mount.tmpfs_noexec = false;
+        mount.tmpfs_noswap = false;
+    }
+}
+
+fn validate_mount_security_negotiation(
+    instance: &wire::InstanceFact,
+    enabled: bool,
+) -> Result<(), ProtocolError> {
+    if !enabled
+        && instance.mounts.iter().any(|mount| {
+            mount.tmpfs_nodev || mount.tmpfs_nosuid || mount.tmpfs_noexec || mount.tmpfs_noswap
+        })
+    {
+        return Err(invalid(
+            "instance.mount.tmpfs_security",
+            "requires the mount-security capability",
         ));
     }
     Ok(())
@@ -1339,6 +1449,7 @@ fn validate_string_limit(
 
 struct InventoryAccumulator {
     limits: ProtocolLimits,
+    mount_security_enabled: bool,
     next_chunk: usize,
     declared_chunks: Option<usize>,
     declared_count: Option<usize>,
@@ -1350,9 +1461,10 @@ struct InventoryAccumulator {
 }
 
 impl InventoryAccumulator {
-    fn new(limits: ProtocolLimits) -> Self {
+    fn new(limits: ProtocolLimits, mount_security_enabled: bool) -> Self {
         Self {
             limits,
+            mount_security_enabled,
             next_chunk: 0,
             declared_chunks: None,
             declared_count: None,
@@ -1425,6 +1537,7 @@ impl InventoryAccumulator {
         }
         for instance in &chunk.instances {
             validate_instance(instance, binding)?;
+            validate_mount_security_negotiation(instance, self.mount_security_enabled)?;
             let encoded_len = instance.encoded_len();
             self.encoded_bytes = self
                 .encoded_bytes
@@ -1593,4 +1706,49 @@ pub enum ProtocolError {
     /// Encoding a normalized fact into the inventory digest failed.
     #[error("could not encode attestor fact digest: {0}")]
     DigestEncoding(prost::EncodeError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProtocolError, validate_mount, wire};
+
+    fn mount(kind: wire::MountKind) -> wire::MountFact {
+        wire::MountFact {
+            kind: kind as i32,
+            host_source: if kind == wire::MountKind::Tmpfs {
+                String::new()
+            } else {
+                "/host".to_owned()
+            },
+            container_destination: "/run".to_owned(),
+            read_only: false,
+            propagation: wire::MountPropagation::Private as i32,
+            tmpfs_size_bytes: None,
+            tmpfs_mode: None,
+            tmpfs_nodev: false,
+            tmpfs_nosuid: false,
+            tmpfs_noexec: false,
+            tmpfs_noswap: false,
+        }
+    }
+
+    #[test]
+    fn tmpfs_security_projection_is_closed_by_mount_kind() {
+        let mut tmpfs = mount(wire::MountKind::Tmpfs);
+        tmpfs.tmpfs_nodev = true;
+        tmpfs.tmpfs_nosuid = true;
+        tmpfs.tmpfs_noexec = true;
+        tmpfs.tmpfs_noswap = true;
+        assert!(validate_mount(&tmpfs).is_ok());
+
+        let mut bind = mount(wire::MountKind::Bind);
+        bind.tmpfs_nodev = true;
+        assert!(matches!(
+            validate_mount(&bind),
+            Err(ProtocolError::InvalidField {
+                field: "instance.mount.tmpfs_options",
+                ..
+            })
+        ));
+    }
 }

@@ -498,6 +498,11 @@ collect_outputs() {
   copy_retained_file "$scratch/qemu.stderr.log" "$run/raw/qemu.stderr.log"
   copy_retained_file "$scratch/driver.stdout.log" "$run/raw/driver.stdout.log"
   copy_retained_file "$scratch/driver.stderr.log" "$run/raw/driver.stderr.log"
+  copy_retained_file "$scratch/docker-provider-core.log" "$run/raw/docker-provider-core.log"
+  copy_retained_file "$scratch/docker-outage.log" "$run/raw/docker-outage.log"
+  copy_retained_file "$scratch/docker-scale.log" "$run/raw/docker-scale.log"
+  copy_retained_file "$scratch/docker-userns-remap.log" "$run/raw/docker-userns-remap.log"
+  copy_retained_file "$scratch/docker-rootless.log" "$run/raw/docker-rootless.log"
   jq -S -c '{schema,schema_version,run_id,lane_id,seq,time,event,status,reason_code,test_id,message,details}' \
     "$run/sanitized/events.jsonl" >"$run/sanitized/events.canonical.jsonl"
   chmod 0600 "$run/sanitized/events.canonical.jsonl"

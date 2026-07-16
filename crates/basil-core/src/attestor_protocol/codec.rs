@@ -119,7 +119,7 @@ impl<S> FrameCodec<S> {
     }
 
     #[cfg(test)]
-    pub(super) const fn for_test(
+    pub(crate) const fn for_test(
         io: S,
         binding: VerifiedPeerBinding,
         limits: ProtocolLimits,
