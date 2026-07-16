@@ -13,10 +13,121 @@ use rustix::fs::{CWD, RenameFlags, renameat_with};
 use thiserror::Error;
 use tokio::net::UnixListener;
 
+use super::connection::ConnectionRegistry;
 use super::grpc_server::{apply_socket_permissions, bind_restricted};
-use super::listener::{ListenerConfig, MAX_UNIX_SOCKET_PATH_BYTES};
+use super::listener::{ListenerConfig, ListenerConfigSet, MAX_UNIX_SOCKET_PATH_BYTES};
 
 const MAX_STAGE_ATTEMPTS: usize = 8;
+
+/// Candidate listener transition classification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ListenerChangeKind {
+    /// A new listener is added without affecting existing accepts.
+    Add,
+    /// An existing listener is removed.
+    Remove,
+    /// Type, path, mode, or group changes under an existing name.
+    Reconfigure,
+}
+
+/// Bounded transition impact for one listener name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListenerImpact {
+    name: String,
+    kind: ListenerChangeKind,
+    active_connections: usize,
+}
+
+impl ListenerImpact {
+    /// Stable listener name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Candidate change classification.
+    #[must_use]
+    pub const fn kind(&self) -> ListenerChangeKind {
+        self.kind
+    }
+
+    /// Exact active-transport count at assessment time.
+    #[must_use]
+    pub const fn active_connections(&self) -> usize {
+        self.active_connections
+    }
+}
+
+/// A disruptive listener transition still has accepted transports.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[error("listener transition requires zero active connections")]
+pub struct ActiveListenerTransition {
+    impacts: Vec<ListenerImpact>,
+}
+
+impl ActiveListenerTransition {
+    /// Disruptive affected listeners that remain active.
+    #[must_use]
+    pub fn impacts(&self) -> &[ListenerImpact] {
+        &self.impacts
+    }
+}
+
+/// Assess listener changes without binding, gating accepts, or mutating state.
+#[must_use]
+pub fn assess_transition(
+    current: &ListenerConfigSet,
+    candidate: &ListenerConfigSet,
+    connections: &ConnectionRegistry,
+) -> Vec<ListenerImpact> {
+    let mut impacts = Vec::new();
+    for listener in current.iter() {
+        let kind = match candidate.get(listener.name()) {
+            None => Some(ListenerChangeKind::Remove),
+            Some(replacement) if replacement != listener => Some(ListenerChangeKind::Reconfigure),
+            Some(_) => None,
+        };
+        if let Some(kind) = kind {
+            impacts.push(ListenerImpact {
+                name: listener.name().to_string(),
+                kind,
+                active_connections: connections.active_for_listener(listener.name()),
+            });
+        }
+    }
+    for listener in candidate.iter() {
+        if current.get(listener.name()).is_none() {
+            impacts.push(ListenerImpact {
+                name: listener.name().to_string(),
+                kind: ListenerChangeKind::Add,
+                active_connections: 0,
+            });
+        }
+    }
+    impacts.sort_by(|left, right| left.name.cmp(&right.name));
+    impacts
+}
+
+/// Require every removal or reconfiguration to have zero active transports.
+///
+/// Adds never depend on connections through unchanged listeners.
+///
+/// # Errors
+///
+/// Returns the bounded active impact subset when the transition would disrupt
+/// an accepted transport.
+pub fn require_zero_active(impacts: &[ListenerImpact]) -> Result<(), ActiveListenerTransition> {
+    let blocking = impacts
+        .iter()
+        .filter(|impact| impact.kind != ListenerChangeKind::Add && impact.active_connections != 0)
+        .cloned()
+        .collect::<Vec<_>>();
+    if blocking.is_empty() {
+        Ok(())
+    } else {
+        Err(ActiveListenerTransition { impacts: blocking })
+    }
+}
 
 /// Listener preparation or publication failure.
 #[derive(Debug, Error)]
@@ -151,6 +262,65 @@ pub struct PreparedListener {
     listener: Option<UnixListener>,
     stage_path: PathBuf,
     identity: SocketIdentity,
+}
+
+/// All newly added listeners staged for one candidate transaction.
+pub struct PreparedListenerBatch {
+    listeners: Vec<PreparedListener>,
+}
+
+impl PreparedListenerBatch {
+    /// Qualify and bind every addition without publishing any final path.
+    ///
+    /// # Errors
+    ///
+    /// Any failure drops all earlier private stages before returning.
+    pub fn prepare<'a>(
+        additions: impl IntoIterator<Item = &'a ListenerConfig>,
+    ) -> Result<Self, ListenerManagerError> {
+        let mut listeners = Vec::new();
+        for config in additions {
+            listeners.push(QualifiedListener::validate(config)?.prepare()?);
+        }
+        Ok(Self { listeners })
+    }
+
+    /// Publish and permission every staged listener as one rollback unit.
+    ///
+    /// No listener is returned to an accept-loop owner until all publications
+    /// succeed. A later failure drops every earlier published inode.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first typed publication failure after complete rollback.
+    pub fn publish(self) -> Result<PublishedListenerBatch, ListenerManagerError> {
+        let mut published = Vec::new();
+        for listener in self.listeners {
+            published.push(listener.publish()?);
+        }
+        Ok(PublishedListenerBatch {
+            listeners: published,
+        })
+    }
+}
+
+/// Completely published candidate additions, none yet serving accepts.
+pub struct PublishedListenerBatch {
+    listeners: Vec<PublishedListener>,
+}
+
+impl PublishedListenerBatch {
+    /// Borrow the fully published additions in candidate order.
+    #[must_use]
+    pub fn listeners(&self) -> &[PublishedListener] {
+        &self.listeners
+    }
+
+    /// Transfer all published listeners to the accept-loop owner.
+    #[must_use]
+    pub fn into_listeners(self) -> Vec<PublishedListener> {
+        self.listeners
+    }
 }
 
 impl PreparedListener {
@@ -329,6 +499,7 @@ fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
+    use tokio::net::UnixStream;
 
     use super::*;
     use crate::transport::grpc_server::ListenerType;
@@ -374,6 +545,64 @@ mod tests {
         .get("host")
         .expect("host")
         .clone()
+    }
+
+    fn config_set(entries: &[(&str, ListenerType, &str, u32)]) -> ListenerConfigSet {
+        ListenerConfigSet::resolve(
+            entries
+                .iter()
+                .map(|(name, listener_type, path, mode)| {
+                    (
+                        (*name).to_string(),
+                        ListenerConfigInput {
+                            listener_type: *listener_type,
+                            path: PathBuf::from(path),
+                            mode: Some(*mode),
+                            group: None,
+                        },
+                    )
+                })
+                .collect(),
+            LegacyListenerConfig::default(),
+        )
+        .expect("listener set")
+    }
+
+    #[tokio::test]
+    async fn transition_impact_blocks_only_active_removal_or_reconfiguration() {
+        let current = config_set(&[("host", ListenerType::Host, "/run/basil/host.sock", 0o600)]);
+        let candidate = config_set(&[
+            ("host", ListenerType::Host, "/run/basil/control.sock", 0o660),
+            (
+                "workloads",
+                ListenerType::Container,
+                "/run/basil/workloads.sock",
+                0o666,
+            ),
+        ]);
+        let registry = ConnectionRegistry::new(4, 4).expect("registry");
+        let (stream, _peer) = UnixStream::pair().expect("stream pair");
+        let tracked = registry
+            .register(stream, "host", ListenerType::Host)
+            .expect("tracked host connection");
+
+        let impacts = assess_transition(&current, &candidate, &registry);
+        assert_eq!(impacts.len(), 2);
+        assert!(impacts.iter().any(|impact| {
+            impact.name() == "workloads"
+                && impact.kind() == ListenerChangeKind::Add
+                && impact.active_connections() == 0
+        }));
+        let error = require_zero_active(&impacts).expect_err("active reconfiguration blocks");
+        assert_eq!(error.impacts().len(), 1);
+        assert_eq!(
+            error.impacts().first().map(ListenerImpact::name),
+            Some("host")
+        );
+
+        drop(tracked);
+        let impacts = assess_transition(&current, &candidate, &registry);
+        require_zero_active(&impacts).expect("transition unblocks after actual Drop");
     }
 
     #[test]
@@ -449,5 +678,43 @@ mod tests {
         );
         drop(published);
         assert!(!final_path.exists());
+    }
+
+    #[tokio::test]
+    async fn batch_publication_rolls_back_every_earlier_socket() {
+        let directory = TestDirectory::new();
+        let first_path = directory.path().join("first.sock");
+        let second_path = directory.path().join("second.sock");
+        let configs = ListenerConfigSet::resolve(
+            std::collections::BTreeMap::from([
+                (
+                    "first".to_string(),
+                    ListenerConfigInput {
+                        listener_type: ListenerType::Host,
+                        path: first_path.clone(),
+                        mode: Some(0o600),
+                        group: None,
+                    },
+                ),
+                (
+                    "second".to_string(),
+                    ListenerConfigInput {
+                        listener_type: ListenerType::Host,
+                        path: second_path.clone(),
+                        mode: Some(0o600),
+                        group: Some("basil-definitely-missing-group".to_string()),
+                    },
+                ),
+            ]),
+            LegacyListenerConfig::default(),
+        )
+        .expect("batch config");
+        let first = configs.get("first").expect("first");
+        let second = configs.get("second").expect("second");
+
+        let prepared = PreparedListenerBatch::prepare([first, second]).expect("batch stages");
+        assert!(prepared.publish().is_err());
+        assert!(!first_path.exists());
+        assert!(!second_path.exists());
     }
 }
