@@ -123,8 +123,12 @@ root are refused before anything runs; there is no arbitrary-path execution.
 A driver runs under a read-only Bubblewrap view. The whole filesystem is bound
 read-only except a fresh `/dev`, a private `/tmp`, and one writable scratch
 directory that holds the result file. The sandbox starts from a cleared
-environment, joins fresh user/IPC/UTS/cgroup/network namespaces, dies with the
-runner, and is bounded by a timeout. `/dev`, `/tmp`, and driver scratch are
+environment, joins fresh user/IPC/UTS/cgroup/PID/network namespaces, dies with
+the runner, and is bounded by a timeout. The runner requires Bubblewrap
+lifecycle records that prove the PID and cgroup namespaces differ from its own
+and that the sandbox exit matches the foreground wrapper result. Missing or
+inconsistent lifecycle records finalize as
+`INCOMPLETE/SANDBOX_TEARDOWN_UNVERIFIED`. `/dev`, `/tmp`, and driver scratch are
 transient writable surfaces, not retained evidence; the runner copies required
 artifacts into `raw/` only after bounded size and SHA-256 verification.
 
@@ -412,8 +416,12 @@ requires all of:
 5. the marker contains the exact per-process random token.
 
 A mismatch refuses the signal and reports `INCOMPLETE`. Escalation rechecks the
-same identity before `SIGKILL`. Transient deletion requires the exact per-run
-owner marker and never removes the retained run directory or unrelated paths.
+same identity before `SIGKILL`. Bubblewrap owns the driver process tree through
+the sandbox PID namespace, so descendants are gone before a successful driver
+invocation returns. The distinct cgroup namespace isolates the driver's view;
+the harness creates no cgroup subtree and therefore claims no cgroup-deletion
+guarantee. Transient deletion requires the exact per-run owner marker and never
+removes the retained run directory or unrelated paths.
 
 ## Guest foundations
 

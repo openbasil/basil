@@ -31,7 +31,9 @@ readonly MAX_DRIVER_RESULT_BYTES=$((64 * 1024))
 readonly MAX_DRIVER_RESULTS=1024
 readonly MAX_GUEST_EVENTS_BYTES=$((16 * 1024 * 1024))
 readonly MAX_HOST_SNAPSHOT_BYTES=$((16 * 1024))
+readonly MAX_SANDBOX_STATUS_BYTES=$((16 * 1024))
 readonly DEFAULT_DRIVER_TIMEOUT_SECONDS=900
+readonly INVOKE_SANDBOX_UNVERIFIED=125
 
 readonly EXIT_PASS=0
 readonly EXIT_TEST_FAIL=10
@@ -820,11 +822,47 @@ resolve_driver() {
   printf '%s\n' "$canonical"
 }
 
+namespace_inode() {
+  local namespace=$1 link
+  link=$(readlink -- "/proc/self/ns/$namespace") || return "$EXIT_INFRA_ERROR"
+  [[ $link =~ ^[a-z]+:\[([0-9]+)\]$ ]] || return "$EXIT_INFRA_ERROR"
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+# Bubblewrap reports the child and exit lifecycle on a runner-owned descriptor.
+# Accept exactly one start and one exit report, require distinct PID and cgroup
+# namespaces, and bind the reported exit to the foreground wrapper result.
+validate_sandbox_status() {
+  local status_file=$1 wrapper_rc=$2 outer_pid_namespace=$3 outer_cgroup_namespace=$4 bytes
+  [[ -f $status_file && ! -L $status_file ]] || return 1
+  bytes=$(stat -c '%s' -- "$status_file" 2>/dev/null) || return 1
+  (( bytes > 0 && bytes <= MAX_SANDBOX_STATUS_BYTES )) || return 1
+  jq -e -s \
+    --argjson wrapper_rc "$wrapper_rc" \
+    --argjson outer_pid_namespace "$outer_pid_namespace" \
+    --argjson outer_cgroup_namespace "$outer_cgroup_namespace" '
+      (all(.[]; type == "object"))
+      and ([.[] | select(has("child-pid"))] as $starts
+        | ($starts | length) == 1
+        and ($starts[0]["child-pid"] | type == "number" and . > 0)
+        and ($starts[0]["pid-namespace"] | type == "number"
+          and . != $outer_pid_namespace)
+        and ($starts[0]["cgroup-namespace"] | type == "number"
+          and . != $outer_cgroup_namespace))
+      and ([.[] | select(has("exit-code"))] as $exits
+        | ($exits | length) == 1
+        and ($exits[0]["exit-code"] == $wrapper_rc))
+    ' "$status_file" >/dev/null 2>&1
+}
+
 # Execute a resolved driver under a read-only Bubblewrap view: only the driver
 # scratch directory (which holds the result file) is writable. The sandbox is
-# time-bounded, dies with the runner, and starts from a cleared environment.
+# time-bounded, owns its process tree through a PID namespace, dies with the
+# runner, and starts from a cleared environment. The cgroup namespace isolates
+# the view; this harness does not create or claim ownership of a cgroup subtree.
 invoke_driver() {
-  local run=$1 driver_path=$2 scratch=$3 run_id lane_id suite
+  local run=$1 driver_path=$2 scratch=$3 run_id lane_id suite wrapper_rc
+  local sandbox_status sandbox_verified outer_pid_namespace outer_cgroup_namespace
   local vm_memory_mib vm_vcpus vm_disk_gib snapshot_rel snapshot snapshot_bytes snapshot_sha256 snapshot_id
   run_id=$(run_metadata_field "$run" '.run_id') || return "$EXIT_INFRA_ERROR"
   lane_id=$(run_metadata_field "$run" '.lane_id') || return "$EXIT_INFRA_ERROR"
@@ -840,6 +878,12 @@ invoke_driver() {
   [[ -f $snapshot && ! -L $snapshot ]] || return "$EXIT_INFRA_ERROR"
   require_tool bwrap >/dev/null || return "$EXIT_INFRA_ERROR"
   require_tool timeout >/dev/null || return "$EXIT_INFRA_ERROR"
+  outer_pid_namespace=$(namespace_inode pid) || return "$EXIT_INFRA_ERROR"
+  outer_cgroup_namespace=$(namespace_inode cgroup) || return "$EXIT_INFRA_ERROR"
+  ensure_private_directory "$run/transient/driver"
+  sandbox_status="$run/transient/driver/sandbox-status.jsonl"
+  sandbox_verified="$run/transient/driver/sandbox-status.verified"
+  rm -f -- "$sandbox_status" "$sandbox_verified"
   local -a sandbox=(
     bwrap
     --ro-bind / /
@@ -855,7 +899,8 @@ invoke_driver() {
     --tmpfs /tmp
     --bind "$scratch" "$scratch"
     --chdir "$scratch"
-    --unshare-user --unshare-ipc --unshare-uts --unshare-cgroup --unshare-net
+    --unshare-user --unshare-ipc --unshare-uts --unshare-cgroup --unshare-pid --unshare-net
+    --json-status-fd 3
     --die-with-parent --new-session --clearenv
     --setenv PATH "$PATH"
     --setenv HOME "$scratch"
@@ -878,8 +923,20 @@ invoke_driver() {
     --
     "$driver_path"
   )
-  timeout --signal=TERM --kill-after=10 "$DEFAULT_DRIVER_TIMEOUT_SECONDS" \
-    "${sandbox[@]}" >"$scratch/driver.stdout.log" 2>"$scratch/driver.stderr.log"
+  if timeout --signal=TERM --kill-after=10 "$DEFAULT_DRIVER_TIMEOUT_SECONDS" \
+    "${sandbox[@]}" >"$scratch/driver.stdout.log" 2>"$scratch/driver.stderr.log" \
+    3>"$sandbox_status"; then
+    wrapper_rc=0
+  else
+    wrapper_rc=$?
+  fi
+  if ! validate_sandbox_status "$sandbox_status" "$wrapper_rc" \
+    "$outer_pid_namespace" "$outer_cgroup_namespace"; then
+    log "INCOMPLETE: sandbox PID/cgroup namespace teardown could not be verified"
+    return "$INVOKE_SANDBOX_UNVERIFIED"
+  fi
+  printf 'verified\n' >"$sandbox_verified"
+  return "$wrapper_rc"
 }
 
 retain_guest_events_artifact() {
@@ -971,9 +1028,10 @@ driver_run_outcome() {
 # Run one lane driver end to end and echo the run "STATUS REASON". Drivers speak
 # only through the bounded result file; the runner keeps sole event authority.
 execute_driver_lane() {
-  local run=$1 driver_path=$2 scratch result required rc
+  local run=$1 driver_path=$2 scratch result required rc sandbox_verified
   ensure_private_directory "$run/transient/driver"
   scratch="$run/transient/driver/scratch"
+  sandbox_verified="$run/transient/driver/sandbox-status.verified"
   ensure_private_directory "$scratch"
   result="$scratch/result.json"
   rm -f -- "$result"
@@ -981,6 +1039,11 @@ execute_driver_lane() {
   invoke_driver "$run" "$driver_path" "$scratch"
   rc=$?
   set -e
+  if [[ ! -f $sandbox_verified || -L $sandbox_verified \
+    || $(<"$sandbox_verified") != verified ]]; then
+    printf '%s %s\n' INCOMPLETE SANDBOX_TEARDOWN_UNVERIFIED
+    return 0
+  fi
   if (( rc != 0 )); then
     printf '%s %s\n' INFRA_ERROR DRIVER_EXECUTION_FAILED
     return 0

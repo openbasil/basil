@@ -252,10 +252,86 @@ if validate_driver_result "$driver_scratch/oversize.json" "$dev_required"; then
 fi
 pass "driver result contract rejects oversize, unlisted, and duplicate results"
 
+# Sandbox lifecycle validation requires one Bubblewrap start and exit record,
+# distinct PID/cgroup namespaces, and an exit code matching the foreground
+# wrapper. Missing lifecycle evidence degrades to a typed incomplete outcome.
+outer_pid_namespace=$(namespace_inode pid)
+outer_cgroup_namespace=$(namespace_inode cgroup)
+sandbox_status_fixture="$TEST_ROOT/sandbox-status.jsonl"
+printf '%s\n%s\n' \
+  "$(jq -n -c --argjson pid_namespace "$((outer_pid_namespace + 1))" \
+    --argjson cgroup_namespace "$((outer_cgroup_namespace + 1))" \
+    '{"child-pid":12345,"pid-namespace":$pid_namespace,"cgroup-namespace":$cgroup_namespace}')" \
+  '{"exit-code":0}' >"$sandbox_status_fixture"
+validate_sandbox_status "$sandbox_status_fixture" 0 \
+  "$outer_pid_namespace" "$outer_cgroup_namespace" \
+  || fail "valid sandbox lifecycle status was rejected"
+printf '%s\n%s\n' \
+  "$(jq -n -c --argjson pid_namespace "$outer_pid_namespace" \
+    --argjson cgroup_namespace "$outer_cgroup_namespace" \
+    '{"child-pid":12345,"pid-namespace":$pid_namespace,"cgroup-namespace":$cgroup_namespace}')" \
+  '{"exit-code":0}' >"$sandbox_status_fixture"
+if validate_sandbox_status "$sandbox_status_fixture" 0 \
+  "$outer_pid_namespace" "$outer_cgroup_namespace"; then
+  fail "sandbox lifecycle accepted the runner namespaces"
+fi
+printf '%s\n' '{"child-pid":12345,"pid-namespace":1,"cgroup-namespace":2}' \
+  >"$sandbox_status_fixture"
+if validate_sandbox_status "$sandbox_status_fixture" 0 \
+  "$outer_pid_namespace" "$outer_cgroup_namespace"; then
+  fail "sandbox lifecycle accepted a missing exit record"
+fi
+pass "sandbox lifecycle status binds distinct PID/cgroup namespaces to wrapper exit"
+
+# A driver child cannot escape when the driver exits. Bubblewrap's PID namespace
+# reaper removes the descendant before the foreground invocation is complete.
+namespace_id=$(prepare_dev_run)
+namespace_run="$TEST_ROOT/runs/$namespace_id"
+ensure_private_directory "$namespace_run/transient/driver"
+namespace_scratch="$namespace_run/transient/driver/scratch"
+ensure_private_directory "$namespace_scratch"
+namespace_driver="$namespace_scratch/probe.sh"
+cat >"$namespace_driver" <<'NAMESPACE_PROBE'
+#!/usr/bin/env bash
+set -euo pipefail
+(awk '/^NSpid:/{print $2}' /proc/self/status >"$BASIL_DRIVER_SCRATCH/descendant-pid"; exec sleep 120) &
+for _ in $(seq 1 100); do
+  [[ -s $BASIL_DRIVER_SCRATCH/descendant-pid ]] && exit 0
+  sleep 0.01
+done
+exit 2
+NAMESPACE_PROBE
+chmod 0700 "$namespace_driver"
+invoke_driver "$namespace_run" "$namespace_driver" "$namespace_scratch" \
+  || fail "PID namespace descendant probe failed"
+descendant_pid=$(<"$namespace_scratch/descendant-pid")
+[[ $descendant_pid =~ ^[1-9][0-9]*$ ]] || fail "descendant probe did not record an outer PID"
+[[ ! -e /proc/$descendant_pid/stat ]] || fail "driver descendant escaped sandbox teardown"
+pass "PID namespace teardown removes driver descendants before invocation returns"
+
+# A wrapper that emits no lifecycle status cannot establish teardown. This is
+# classified separately from an ordinary nonzero driver result.
+unverified_id=$(prepare_dev_run)
+unverified_run="$TEST_ROOT/runs/$unverified_id"
+fake_bwrap_bin="$TEST_ROOT/fake-bwrap-bin"
+mkdir -p "$fake_bwrap_bin"
+cat >"$fake_bwrap_bin/bwrap" <<'FAKE_BWRAP'
+#!/usr/bin/env bash
+exit 0
+FAKE_BWRAP
+chmod 0700 "$fake_bwrap_bin/bwrap"
+unverified_outcome=$(PATH="$fake_bwrap_bin:$PATH" \
+  execute_driver_lane "$unverified_run" /bin/true)
+[[ $unverified_outcome == "INCOMPLETE SANDBOX_TEARDOWN_UNVERIFIED" ]] \
+  || fail "missing sandbox lifecycle status was not incomplete: $unverified_outcome"
+pass "unverified sandbox teardown degrades to a typed incomplete outcome"
+
 # A nonzero driver exit degrades to an infrastructure error and never a pass.
 badexit_id=$(prepare_dev_run)
 badexit_run="$TEST_ROOT/runs/$badexit_id"
-bad_driver="$TEST_ROOT/bad-exit-driver.sh"
+ensure_private_directory "$badexit_run/transient/driver"
+ensure_private_directory "$badexit_run/transient/driver/scratch"
+bad_driver="$badexit_run/transient/driver/scratch/bad-exit-driver.sh"
 printf '#!/usr/bin/env bash\nexit 3\n' >"$bad_driver"
 chmod +x "$bad_driver"
 badexit_outcome=$(execute_driver_lane "$badexit_run" "$bad_driver")
