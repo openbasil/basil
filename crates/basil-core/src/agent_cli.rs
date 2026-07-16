@@ -571,6 +571,7 @@ pub(crate) struct AgentConfigFile {
     pub(crate) broker_identity: BrokerIdentityConfigFile,
     pub(crate) invocation: InvocationConfigFile,
     pub(crate) jwks: JwksConfigFile,
+    pub(crate) oci: OciConfigFile,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -618,6 +619,7 @@ impl Default for AgentConfigFile {
             broker_identity: BrokerIdentityConfigFile::default(),
             invocation: InvocationConfigFile::default(),
             jwks: JwksConfigFile::default(),
+            oci: OciConfigFile::default(),
         }
     }
 }
@@ -908,6 +910,53 @@ impl Default for JwksConfigFile {
     }
 }
 
+/// The opt-in packaged OCI verifier and private-registry startup configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub(crate) struct OciConfigFile {
+    /// Construct the production verifier during broker startup.
+    enable: bool,
+    /// Protected absolute packaged Cosign executable.
+    cosign_executable: PathBuf,
+    /// Service-owned mode-`0700` parent for private verifier views.
+    temp_parent: PathBuf,
+    /// Complete verifier deadline in seconds.
+    deadline_secs: u64,
+    /// One protected Docker authentication source.
+    registry_auth: RegistryAuthConfigFile,
+    /// Exact normalized authority to protected CA-bundle path.
+    registry_ca: BTreeMap<String, PathBuf>,
+}
+
+impl Default for OciConfigFile {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            cosign_executable: PathBuf::from("/usr/libexec/basil/cosign"),
+            temp_parent: PathBuf::from("/run/basil/cosign"),
+            deadline_secs: 30,
+            registry_auth: RegistryAuthConfigFile::default(),
+            registry_ca: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+struct RegistryAuthConfigFile {
+    source: RegistryAuthSourceKind,
+    credential: Option<String>,
+    file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum RegistryAuthSourceKind {
+    #[default]
+    SystemdCredential,
+    ProtectedFile,
+}
+
 /// Resolved JWKS HTTP-surface settings threaded into [`RunConfig`].
 #[cfg(feature = "http")]
 #[derive(Debug, Clone)]
@@ -961,6 +1010,7 @@ struct RunConfig {
     audit_log: Option<PathBuf>,
     no_reconcile: bool,
     invocation: InvocationRuntimeConfig,
+    oci_verifier: Option<crate::core::oci_verification::CosignVerifier>,
     #[cfg(feature = "http")]
     jwks: JwksConfig,
     setup: SetupArgs,
@@ -979,6 +1029,7 @@ fn load_run_config(overrides: &ConfigOverrides) -> Result<RunConfig> {
     let jwks = resolve_jwks_config(&file.jwks)?;
     #[cfg(not(feature = "http"))]
     reject_jwks_config(&file.jwks)?;
+    let oci_verifier = resolve_oci_config(&file.oci, None)?;
     Ok(RunConfig {
         socket: file.socket,
         socket_mode: file.socket_mode.map_or(DEFAULT_SOCKET_MODE, |mode| mode.0),
@@ -993,10 +1044,69 @@ fn load_run_config(overrides: &ConfigOverrides) -> Result<RunConfig> {
         audit_log: file.audit_log,
         no_reconcile: file.no_reconcile.unwrap_or(false),
         invocation: resolve_invocation_config(&file.broker_identity, &file.invocation)?,
+        oci_verifier,
         #[cfg(feature = "http")]
         jwks,
         setup,
     })
+}
+
+fn resolve_oci_config(
+    file: &OciConfigFile,
+    credentials_directory: Option<&Path>,
+) -> Result<Option<crate::core::oci_verification::CosignVerifier>> {
+    if !file.enable {
+        return Ok(None);
+    }
+    let source = match file.registry_auth.source {
+        RegistryAuthSourceKind::SystemdCredential => {
+            if file.registry_auth.file.is_some() {
+                bail!("oci.registry-auth.file is forbidden for a systemd credential source");
+            }
+            let name = file.registry_auth.credential.clone().unwrap_or_else(|| {
+                crate::core::registry_isolation::DEFAULT_REGISTRY_AUTH_CREDENTIAL.to_string()
+            });
+            crate::core::registry_isolation::RegistryAuthSource::SystemdCredential { name }
+        }
+        RegistryAuthSourceKind::ProtectedFile => {
+            if file.registry_auth.credential.is_some() {
+                bail!("oci.registry-auth.credential is forbidden for a protected-file source");
+            }
+            let path = file
+                .registry_auth
+                .file
+                .clone()
+                .context("oci.registry-auth.file is required for a protected-file source")?;
+            crate::core::registry_isolation::RegistryAuthSource::ProtectedFile(path)
+        }
+    };
+    let access = credentials_directory
+        .map_or_else(
+            || {
+                crate::core::registry_isolation::RegistryAccess::load(
+                    Some(&source),
+                    file.registry_ca.clone(),
+                )
+            },
+            |directory| {
+                crate::core::registry_isolation::RegistryAccess::load_with_credentials_directory(
+                    Some(&source),
+                    file.registry_ca.clone(),
+                    directory,
+                )
+            },
+        )
+        .context("loading protected OCI registry access")?;
+    let verifier = crate::core::oci_verification::CosignVerifier::new(
+        crate::core::oci_verification::CosignConfig {
+            executable: file.cosign_executable.clone(),
+            temp_parent: file.temp_parent.clone(),
+            deadline: Duration::from_secs(file.deadline_secs),
+        },
+        access,
+    )
+    .context("constructing packaged OCI verifier")?;
+    Ok(Some(verifier))
 }
 
 fn resolve_invocation_config(
@@ -1862,6 +1972,7 @@ async fn run_daemon(args: RunArgs, version: &'static str) -> Result<()> {
                 config_path: run_config.setup.config_path.clone(),
                 overrides: run_config.setup.startup_overrides.clone(),
             });
+    state = attach_oci_verifier(state, run_config.oci_verifier);
 
     // Optional JSONL audit sink (`vault-vq5`): open the append-only file ONCE at
     // startup so a permissions/path error fails closed here rather than per-op. A
@@ -1933,6 +2044,16 @@ async fn run_daemon(args: RunArgs, version: &'static str) -> Result<()> {
 
     grpc_result?;
     Ok(())
+}
+
+fn attach_oci_verifier(
+    state: BrokerState,
+    verifier: Option<crate::core::oci_verification::CosignVerifier>,
+) -> BrokerState {
+    match verifier {
+        Some(verifier) => state.with_oci_verifier(Arc::new(verifier)),
+        None => state,
+    }
 }
 
 /// Install the SIGHUP handler. SIGHUP is the operational "reload" signal: it
@@ -2588,6 +2709,7 @@ fn init_stderr_logging() -> Result<LoggingGuards> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -3297,6 +3419,152 @@ audience = ["basil://prod/us-east-1/agent-a"]
                 .contains("invocation.request-encryption-key-id is required")
         );
         std::fs::remove_file(config).expect("remove temp config");
+    }
+
+    #[test]
+    fn production_oci_schema_loads_default_systemd_credential() {
+        let root = std::env::temp_dir().join(format!(
+            "basil-oci-startup-systemd-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&root).expect("create root");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .expect("protect root");
+        let executable = root.join("cosign");
+        std::fs::write(&executable, "#!/usr/bin/env bash\nexit 1\n").expect("write cosign");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+            .expect("protect cosign");
+        let temp_parent = root.join("views");
+        std::fs::create_dir(&temp_parent).expect("create views");
+        std::fs::set_permissions(&temp_parent, std::fs::Permissions::from_mode(0o700))
+            .expect("protect views");
+        let credentials = root.join("credentials");
+        std::fs::create_dir(&credentials).expect("create credentials");
+        std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o700))
+            .expect("protect credentials");
+        let auth =
+            credentials.join(crate::core::registry_isolation::DEFAULT_REGISTRY_AUTH_CREDENTIAL);
+        std::fs::write(
+            &auth,
+            r#"{"auths":{"registry.example":{"identitytoken":"startup-token"}}}"#,
+        )
+        .expect("write auth");
+        std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600))
+            .expect("protect auth");
+        let config = temp_config(&format!(
+            r#"
+catalog = "/cfg/catalog.json"
+policy = "/cfg/policy.json"
+bundle = "/cfg/bundle.sealed"
+
+[oci]
+enable = true
+cosign-executable = "{}"
+temp-parent = "{}"
+"#,
+            executable.display(),
+            temp_parent.display()
+        ));
+        let file = load_config_file(&overrides_for(config.clone())).expect("parse OCI schema");
+        assert_eq!(
+            file.oci.registry_auth.source,
+            RegistryAuthSourceKind::SystemdCredential
+        );
+        assert!(
+            resolve_oci_config(&file.oci, Some(&credentials))
+                .expect("construct production verifier")
+                .is_some()
+        );
+        std::fs::remove_file(config).ok();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn production_oci_schema_loads_exact_file_and_ca_mapping() {
+        let root =
+            std::env::temp_dir().join(format!("basil-oci-startup-file-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).expect("create root");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .expect("protect root");
+        let executable = root.join("cosign");
+        std::fs::write(&executable, "#!/usr/bin/env bash\nexit 1\n").expect("write cosign");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+            .expect("protect cosign");
+        let temp_parent = root.join("views");
+        std::fs::create_dir(&temp_parent).expect("create views");
+        std::fs::set_permissions(&temp_parent, std::fs::Permissions::from_mode(0o700))
+            .expect("protect views");
+        let auth = root.join("auth.json");
+        std::fs::write(
+            &auth,
+            r#"{"auths":{"registry.example":{"auth":"dXNlcjpwYXNz"}}}"#,
+        )
+        .expect("write auth");
+        std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600))
+            .expect("protect auth");
+        let ca = root.join("ca.pem");
+        std::fs::write(&ca, include_str!("../testdata/jwks_tls_cert.pem")).expect("write CA");
+        std::fs::set_permissions(&ca, std::fs::Permissions::from_mode(0o600)).expect("protect CA");
+        let file: OciConfigFile = toml::from_str(&format!(
+            r#"
+enable = true
+cosign-executable = "{}"
+temp-parent = "{}"
+
+[registry-auth]
+source = "protected-file"
+file = "{}"
+
+[registry-ca]
+"registry.example" = "{}"
+"#,
+            executable.display(),
+            temp_parent.display(),
+            auth.display(),
+            ca.display()
+        ))
+        .expect("parse exact-file OCI schema");
+        assert!(
+            resolve_oci_config(&file, None)
+                .expect("construct production verifier")
+                .is_some()
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn production_oci_source_shapes_and_cli_overrides_fail_closed() {
+        let file: OciConfigFile = toml::from_str(
+            r#"
+enable = true
+[registry-auth]
+source = "protected-file"
+credential = "forbidden"
+file = "/run/credentials/auth.json"
+"#,
+        )
+        .expect("parse source shape");
+        assert!(resolve_oci_config(&file, None).is_err());
+
+        let config = temp_config(
+            r#"
+catalog = "/cfg/catalog.json"
+policy = "/cfg/policy.json"
+bundle = "/cfg/bundle.sealed"
+
+[oci.registry-auth]
+file = "/run/credentials/auth.json"
+"#,
+        );
+        let overrides = ConfigOverrides {
+            config: Some(config.clone()),
+            values: vec![
+                ConfigOverride::parse("oci.registry-auth.file=/tmp/auth.json")
+                    .expect("parse override"),
+            ],
+        };
+        assert!(load_config_file(&overrides).is_err());
+        std::fs::remove_file(config).ok();
     }
 
     #[test]

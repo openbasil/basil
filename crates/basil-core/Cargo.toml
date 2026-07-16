@@ -111,6 +111,7 @@ tracing-subscriber = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
 x25519-dalek = { workspace = true }
+x509-parser = { workspace = true }
 zero-secrets = { workspace = true }
 zeroize = { workspace = true }
 
@@ -122,6 +123,7 @@ minicbor = { workspace = true }
 nkeys = { workspace = true }
 proptest = { workspace = true }
 tower = { workspace = true }
+tokio-rustls = { workspace = true }
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }

@@ -23,6 +23,7 @@ pub mod oci_verification;
 pub mod peer;
 pub mod process_evidence;
 pub mod reconcile;
+pub mod registry_isolation;
 pub mod release_admission;
 pub mod reload;
 pub mod revocation;
