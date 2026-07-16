@@ -401,6 +401,16 @@ fn read_reload_inputs_with_observer_and_context(
     result
 }
 
+#[cfg(test)]
+fn read_reload_inputs_with_bootstrap_observer(
+    inputs: &ReloadInputs,
+    observer: impl FnOnce(),
+) -> Result<CorpusDocuments, ReloadError> {
+    let mut traces = Vec::new();
+    read_reload_inputs_with_observers_and_collector(inputs, observer, || {}, &mut traces)
+        .map(|(documents, _, _, _)| documents)
+}
+
 fn read_reload_inputs_with_observer_and_collector(
     inputs: &ReloadInputs,
     observer: impl FnOnce(),
@@ -414,14 +424,40 @@ fn read_reload_inputs_with_observer_and_collector(
     ),
     ReloadError,
 > {
+    read_reload_inputs_with_observers_and_collector(inputs, || {}, observer, traces)
+}
+
+fn read_reload_inputs_with_observers_and_collector(
+    inputs: &ReloadInputs,
+    bootstrap_observer: impl FnOnce(),
+    observer: impl FnOnce(),
+    traces: &mut Vec<ConfigurationSourceTrace>,
+) -> Result<
+    (
+        CorpusDocuments,
+        crate::agent_cli::OciConfigFile,
+        crate::transport::listener::ListenerConfigSet,
+        ReloadFingerprintSnapshot,
+    ),
+    ReloadError,
+> {
+    // Seed the snapshot before reading the bootstrap. Keeping this exact
+    // fingerprint through the final verification closes the gap where an atomic
+    // replacement after parsing could otherwise pair old listener/OCI values
+    // with newly discovered corpus inputs.
+    let mut snapshot = ReloadFingerprintSnapshot::capture([inputs.config_path.clone()])?;
     let bootstrap =
         load_bootstrap_with_trace_collector(Some(&inputs.config_path), &inputs.overrides, traces)?;
     let oci = crate::agent_cli::parse_reload_oci_config(&bootstrap.value)
         .map_err(|error| ReloadError::OciConfiguration(error.to_string()))?;
     let listeners = crate::agent_cli::parse_reload_listener_config(&bootstrap.value)
         .map_err(|error| ReloadError::ListenerConfiguration(error.to_string()))?;
+    // Verify immediately after every source and bootstrap-owned serving value is
+    // discovered. The final verification below protects the same fingerprint
+    // through candidate installation.
+    bootstrap_observer();
+    snapshot.verify_unchanged()?;
     let mut paths = vec![
-        inputs.config_path.clone(),
         bootstrap.sources.catalog.clone(),
         bootstrap.sources.policy.clone(),
     ];
@@ -429,7 +465,7 @@ fn read_reload_inputs_with_observer_and_collector(
     if oci.enabled() {
         paths.extend(oci.trusted_root_path().map(Path::to_path_buf));
     }
-    let mut snapshot = ReloadFingerprintSnapshot::capture(paths)?;
+    snapshot.extend(paths)?;
     let documents = load_documents_with_trace_collector(
         &bootstrap.sources,
         &bootstrap.document_overrides,
@@ -688,8 +724,8 @@ mod tests {
 
     use super::{
         ReloadError, ReloadInputs, check_reload, read_reload_inputs,
-        read_reload_inputs_with_observer, reload_generation,
-        validate_candidate_with_trace_collector,
+        read_reload_inputs_with_bootstrap_observer, read_reload_inputs_with_observer,
+        reload_generation, validate_candidate_with_trace_collector,
         validate_candidate_with_trace_collector_and_observer,
     };
     use crate::backend::{Backend, BackendError, NewKey};
@@ -1384,6 +1420,38 @@ mod tests {
             INITIAL_GENERATION_ID,
             "helper rejection leaves the serving generation untouched"
         );
+    }
+
+    #[test]
+    fn atomic_bootstrap_replacement_after_listener_parse_is_rejected() {
+        let (state, inputs) = state_with_files(&catalog_json(false), &policy_json(false));
+        let parent = inputs.config_path.parent().expect("config parent");
+        let replacement_policy = parent.join("policy.replacement.json");
+        let replacement_bootstrap = parent.join("config.replacement.toml");
+        std::fs::write(&replacement_policy, policy_json(true)).expect("stage replacement policy");
+        std::fs::write(
+            &replacement_bootstrap,
+            "schema = \"agent\"\nschemaVersion = 3\n[import]\ncatalog = \"catalog.json\"\npolicy = \"policy.json\"\nbundle = \"bundle.age\"\n[listeners.replaced]\ntype = \"host\"\npath = \"/tmp/basil-replaced.sock\"\n",
+        )
+        .expect("stage replacement bootstrap");
+
+        let error = read_reload_inputs_with_bootstrap_observer(&inputs, || {
+            std::fs::rename(&replacement_policy, parent.join("policy.json"))
+                .expect("atomically replace policy");
+            std::fs::rename(&replacement_bootstrap, &inputs.config_path)
+                .expect("atomically replace bootstrap after listener parse");
+        })
+        .expect_err("mixed bootstrap and corpus snapshot must be rejected");
+
+        assert!(matches!(
+            error,
+            ReloadError::TornSnapshot { ref path }
+                if path == &inputs.config_path.display().to_string()
+        ));
+        assert_eq!(state.active_generation_id(), INITIAL_GENERATION_ID);
+        let generation = state.load_generation();
+        assert!(generation.listeners().get("replaced").is_none());
+        assert_eq!(generation.policy().grant_count(), 0);
     }
 
     #[test]
