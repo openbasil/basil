@@ -1162,6 +1162,7 @@ fn apply_scalar_override(
         || path.starts_with("unlock.")
         || path.starts_with("broker-identity.")
         || path.starts_with("invocation.")
+        || path.starts_with("oci.")
         || path.starts_with("attestor.")
         || path == "jwks.tls.key-file"
         || matches!(path, "jwt-role" | "jwt-audience")

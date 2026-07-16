@@ -354,6 +354,8 @@ pub struct BrokerState {
     reload_inputs: Option<ReloadInputs>,
     /// Optional accepted runtime-attestor realm registry.
     realm_registry: Option<Arc<RealmRegistry>>,
+    /// Optional packaged OCI verifier with its startup registry-access snapshot.
+    oci_verifier: Option<Arc<crate::core::oci_verification::CosignVerifier>>,
     /// A short TTL cache of the last admin readiness probe (`basil-8nwy`), so a
     /// burst of ungated `Readiness` RPCs re-fans-out to the backend at most once
     /// per [`READINESS_CACHE_TTL`] instead of per call. Guarded by a `Mutex`; the
@@ -423,6 +425,7 @@ impl BrokerState {
             jwt_revocations: JwtRevocationStore::default(),
             reload_inputs: None,
             realm_registry: None,
+            oci_verifier: None,
             readiness_cache: Mutex::new(None),
             jwks_cache: Mutex::new(None),
             reload_lock: Mutex::new(()),
@@ -497,6 +500,24 @@ impl BrokerState {
     #[must_use]
     pub const fn realm_registry(&self) -> Option<&Arc<RealmRegistry>> {
         self.realm_registry.as_ref()
+    }
+
+    /// Attach the production packaged OCI verifier constructed at startup.
+    #[must_use]
+    pub fn with_oci_verifier(
+        mut self,
+        verifier: Arc<crate::core::oci_verification::CosignVerifier>,
+    ) -> Self {
+        self.oci_verifier = Some(verifier);
+        self
+    }
+
+    /// Return the packaged OCI verifier when the startup surface enabled it.
+    #[must_use]
+    pub const fn oci_verifier(
+        &self,
+    ) -> Option<&Arc<crate::core::oci_verification::CosignVerifier>> {
+        self.oci_verifier.as_ref()
     }
 
     /// The configured catalog/policy paths the reload engine re-reads, if any.
