@@ -62,7 +62,7 @@ fn qualification_hashes_and_frontend_provenance_are_pinned() {
     for line in sums.lines() {
         let (expected, name) = line.split_once("  ").unwrap();
         let bytes = artifact(name);
-        let actual = format!("{:x}", Sha256::digest(bytes));
+        let actual = hex::encode(Sha256::digest(bytes));
         assert_eq!(actual, expected, "hash mismatch for {name}");
         assert!(checked.insert(name));
     }

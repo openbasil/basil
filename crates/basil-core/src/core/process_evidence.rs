@@ -12,8 +12,9 @@
 //! rehashed after a genuine `execve`; a diagnostic pathname carries no
 //! authority.
 
+use std::fmt::Write as _;
 use std::fs::{self, File, Metadata};
-use std::io::{self, Read};
+use std::io::Read;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
@@ -713,8 +714,29 @@ fn read_executable(
         return Err(ProcessEvidenceError::unsupported("executable"));
     }
     let mut hasher = Sha256::new();
-    let copied = io::copy(&mut (&mut file).take(MAX_EXECUTABLE_BYTES + 1), &mut hasher)
-        .map_err(|_| ProcessEvidenceError::unavailable("executable"))?;
+    let copied = {
+        let mut reader = (&mut file).take(MAX_EXECUTABLE_BYTES + 1);
+        let mut buffer = [0_u8; 8 * 1024];
+        let mut copied = 0_u64;
+        loop {
+            let read = reader
+                .read(&mut buffer)
+                .map_err(|_| ProcessEvidenceError::unavailable("executable"))?;
+            if read == 0 {
+                break;
+            }
+            let chunk = buffer
+                .get(..read)
+                .ok_or_else(|| ProcessEvidenceError::unavailable("executable"))?;
+            hasher.update(chunk);
+            let read =
+                u64::try_from(read).map_err(|_| ProcessEvidenceError::unsupported("executable"))?;
+            copied = copied
+                .checked_add(read)
+                .ok_or_else(|| ProcessEvidenceError::unsupported("executable"))?;
+        }
+        copied
+    };
     if copied > MAX_EXECUTABLE_BYTES {
         return Err(ProcessEvidenceError::unsupported("executable"));
     }
@@ -726,7 +748,17 @@ fn read_executable(
     if before_id != after_id || copied != after.len() {
         return Err(ProcessEvidenceError::unavailable("executable"));
     }
-    Ok((format!("sha256:{:x}", hasher.finalize()), after_id, file))
+    let digest = lower_hex(&hasher.finalize())
+        .map_err(|_| ProcessEvidenceError::unavailable("executable"))?;
+    Ok((format!("sha256:{digest}"), after_id, file))
+}
+
+fn lower_hex(bytes: &[u8]) -> Result<String, std::fmt::Error> {
+    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        write!(&mut output, "{byte:02x}")?;
+    }
+    Ok(output)
 }
 
 fn systemd_from_cgroups(
@@ -999,7 +1031,10 @@ mod tests {
         procfs.revalidate(&mut pin).unwrap();
         assert_eq!(
             pin.process_evidence().executable_digest,
-            EvidenceValue::Available(format!("sha256:{:x}", Sha256::digest(b"first executable")))
+            EvidenceValue::Available(format!(
+                "sha256:{}",
+                lower_hex(&Sha256::digest(b"first executable")).unwrap()
+            ))
         );
         fs::remove_dir_all(root).unwrap();
     }

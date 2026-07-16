@@ -74,14 +74,22 @@ pub fn aead_seal(
         aad,
     };
     match alg {
-        ContentAlgorithm::A256Gcm => Aes256Gcm::new_from_slice(key.as_slice())
-            .map_err(|_| BuildError::SealFailed)?
-            .encrypt(aes_gcm::Nonce::from_slice(nonce), payload)
-            .map_err(|_| BuildError::SealFailed),
-        ContentAlgorithm::ChaCha20Poly1305 => ChaChaCipher::new_from_slice(key.as_slice())
-            .map_err(|_| BuildError::SealFailed)?
-            .encrypt(chacha20poly1305::Nonce::from_slice(nonce), payload)
-            .map_err(|_| BuildError::SealFailed),
+        ContentAlgorithm::A256Gcm => {
+            let nonce =
+                aes_gcm::Nonce::try_from(nonce.as_slice()).map_err(|_| BuildError::SealFailed)?;
+            Aes256Gcm::new_from_slice(key.as_slice())
+                .map_err(|_| BuildError::SealFailed)?
+                .encrypt(&nonce, payload)
+                .map_err(|_| BuildError::SealFailed)
+        }
+        ContentAlgorithm::ChaCha20Poly1305 => {
+            let nonce = chacha20poly1305::Nonce::try_from(nonce.as_slice())
+                .map_err(|_| BuildError::SealFailed)?;
+            ChaChaCipher::new_from_slice(key.as_slice())
+                .map_err(|_| BuildError::SealFailed)?
+                .encrypt(&nonce, payload)
+                .map_err(|_| BuildError::SealFailed)
+        }
     }
 }
 
@@ -99,14 +107,22 @@ pub fn aead_open(
         aad,
     };
     let plaintext = match alg {
-        ContentAlgorithm::A256Gcm => Aes256Gcm::new_from_slice(key.as_slice())
-            .map_err(|_| OpenError::OpenFailed)?
-            .decrypt(aes_gcm::Nonce::from_slice(nonce), payload)
-            .map_err(|_| OpenError::OpenFailed)?,
-        ContentAlgorithm::ChaCha20Poly1305 => ChaChaCipher::new_from_slice(key.as_slice())
-            .map_err(|_| OpenError::OpenFailed)?
-            .decrypt(chacha20poly1305::Nonce::from_slice(nonce), payload)
-            .map_err(|_| OpenError::OpenFailed)?,
+        ContentAlgorithm::A256Gcm => {
+            let nonce =
+                aes_gcm::Nonce::try_from(nonce.as_slice()).map_err(|_| OpenError::OpenFailed)?;
+            Aes256Gcm::new_from_slice(key.as_slice())
+                .map_err(|_| OpenError::OpenFailed)?
+                .decrypt(&nonce, payload)
+                .map_err(|_| OpenError::OpenFailed)?
+        }
+        ContentAlgorithm::ChaCha20Poly1305 => {
+            let nonce = chacha20poly1305::Nonce::try_from(nonce.as_slice())
+                .map_err(|_| OpenError::OpenFailed)?;
+            ChaChaCipher::new_from_slice(key.as_slice())
+                .map_err(|_| OpenError::OpenFailed)?
+                .decrypt(&nonce, payload)
+                .map_err(|_| OpenError::OpenFailed)?
+        }
     };
     Ok(Zeroizing::new(plaintext))
 }

@@ -40,9 +40,9 @@ basil-bin = { version = "0.7.1", path = "crates/basil-bin" }
 
 # `aes` is depended on directly (alongside aes-gcm's own `zeroize` feature, which
 # only scrubs the GHASH key) so its `zeroize` feature zeroizes AES round-key
-# schedules on drop; aes-gcm 0.10 does not forward it.
-aes = { version = "0.8", default-features = false, features = ["zeroize"] }
-aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc", "zeroize"] }
+# schedules on drop; `aes-gcm` does not forward it.
+aes = { version = "0.9.1", default-features = false, features = ["zeroize"] }
+aes-gcm = { version = "0.11.0", default-features = false, features = ["aes", "alloc", "zeroize"] }
 aes-kw = "0.3"
 age = { version = "0.11", features = ["plugin"] }
 anyhow = "1"
@@ -54,21 +54,21 @@ async-nats = { version = "0.49", default-features = false, features = ["nkeys", 
 # `aws-smithy-http-client/rustls-aws-lc`). The `rustls` feature instead routes to
 # `legacy-rustls-ring` (pure-Rust ring). Pinned to the version pair known to
 # resolve this way; older 1.x differ.
-aws-config = { version = "=1.8.18", default-features = false, features = ["rt-tokio"] }
-aws-sdk-kms = { version = "=1.111.0", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
+aws-config = { version = "=1.9.0", default-features = false, features = ["rt-tokio"] }
+aws-sdk-kms = { version = "=1.112.0", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 bip39 = "2"
 bytes = "1"
-# chacha20poly1305 0.10 zeroizes its cipher key material unconditionally (its
+# `chacha20poly1305` zeroizes its cipher key material unconditionally (its
 # `zeroize` dependency is non-optional), so no feature flag is needed.
-chacha20poly1305 = { version = "0.10", default-features = false }
+chacha20poly1305 = { version = "0.11.0", default-features = false }
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 crypto_secretbox = { version = "0.1.1", default-features = false, features = ["alloc", "salsa20"] }
 data-encoding = { version = "2", default-features = false, features = ["alloc"] }
 db-keystore = "0.4.4"
-ed25519-dalek = { version = "2", default-features = false, features = ["zeroize"] }
+ed25519-dalek = { version = "3.0.0", default-features = false, features = ["zeroize"] }
 futures = "0.3"
 getrandom = { version = "0.4.3", default-features = false }
 # GCP Cloud KMS transit backend (feature `gcp-kms`). yoshidan crate: gRPC/HTTP-2
@@ -79,7 +79,7 @@ google-cloud-kms = { version = "=0.6.0", default-features = false, features = ["
 # gRPC status/code types for the gcp-kms backend (matches google-cloud-kms 0.6).
 google-cloud-gax = "0.19.2"
 hex = "0.4"
-hkdf = { version = "0.12", default-features = false }
+hkdf = { version = "0.13.0", default-features = false }
 hyper = { version = "1.10.1", default-features = false, features = ["http1", "server"] }
 hyper-util = { version = "0.1.20", default-features = false, features = ["http1", "server-auto", "service", "tokio"] }
 # jsonwebtoken 10 requires selecting a crypto backend; `rust_crypto` uses the
@@ -118,7 +118,7 @@ reqwest = { version = "0.13.4", default-features = false, features = ["json", "r
 rsa = { version = "0.9", features = ["pem"] }
 rustix = { version = "1", features = ["fs", "process"] }
 rustls = { version = "0.23.41", default-features = false, features = ["ring", "std"] }
-salsa20 = { version = "0.10", features = ["zeroize"] }
+salsa20 = { version = "0.11.0", features = ["zeroize"] }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
 serde_bytes = "0.11"
 # `basil init --from-sops`: reads key NAMES out of an existing sops secrets
@@ -126,8 +126,11 @@ serde_bytes = "0.11"
 # stay encrypted and are never parsed as secrets.
 serde_yaml = "0.9"
 serde_json = { version = "1", default-features = false, features = ["alloc", "arbitrary_precision"] }
-sha2 = { version = "0.10", default-features = false }
-sha3 = { version = "0.10", default-features = false }
+sha2 = { version = "0.11.0", default-features = false }
+# `rsa` 0.9 still implements OAEP against `digest` 0.10. Keep this narrow alias
+# until the stable `rsa` 0.10 line is available.
+sha2-legacy = { package = "sha2", version = "0.10", default-features = false }
+sha3 = { version = "0.12.0", default-features = false }
 spiffe = { version = "0.16", features = ["x509-source", "jwt-source"] }
 spiffe-rustls = "0.7"
 thiserror = "2.0.18"
@@ -149,7 +152,7 @@ tracing-journald = "0.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.5"
 uuid = { version = "1", features = ["v4"] }
-x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
+x25519-dalek = { version = "3.0.0", default-features = false, features = ["static_secrets", "zeroize"] }
 x509-parser = "0.18"
 zero-secrets = "0.2.0"
 zeroize = { version = "1", default-features = false, features = ["derive", "alloc"] }

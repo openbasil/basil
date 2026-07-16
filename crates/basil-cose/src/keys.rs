@@ -13,7 +13,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use ed25519_dalek::{Signer as _, SigningKey, VerifyingKey};
-use p256::ecdsa::signature::Verifier as _;
+use p256::ecdsa::signature::{Signer as _, Verifier as _};
 use p256::ecdsa::{
     Signature as P256Signature, SigningKey as P256SigningKey, VerifyingKey as P256VerifyingKey,
 };

@@ -18,7 +18,7 @@ use rand::RngCore;
 use rsa::pkcs8::DecodePublicKey;
 use rsa::{Oaep, RsaPublicKey};
 use serde_json::{Value, json};
-use sha2::Sha256;
+use sha2_legacy::Sha256 as RsaSha256;
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -1092,7 +1092,7 @@ fn wrap_for_import(wrapping_pem: &str, target: &[u8]) -> Result<String, BackendE
 
     // RSA-OAEP-SHA256 wrap of the ephemeral AES key.
     let wrapped_aes = rsa_pub
-        .encrypt(&mut rand::thread_rng(), Oaep::new::<Sha256>(), &aes_key)
+        .encrypt(&mut rand::thread_rng(), Oaep::new::<RsaSha256>(), &aes_key)
         .map_err(|e| BackendError::Backend(format!("rsa-oaep wrap failed: {e}")))?;
     // The ephemeral wrapping key has done its job; scrub it.
     aes_key.zeroize();

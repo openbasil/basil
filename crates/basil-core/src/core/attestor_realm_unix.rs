@@ -801,7 +801,7 @@ capabilities = ["health", "query-instances", "resolve-peer"]
             .connect_realm(&name, &connector, admission.as_ref())
             .await
             .unwrap();
-        assert!(registry.readiness().ready == 1);
+        assert_eq!(registry.readiness().ready, 1);
     }
 
     #[test]

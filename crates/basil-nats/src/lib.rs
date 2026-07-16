@@ -475,9 +475,10 @@ fn box_crypt(
 
 #[allow(deprecated)]
 fn nats_box_key(shared: &Zeroizing<[u8; 32]>) -> Zeroizing<SecretboxKey> {
-    let input = crypto_secretbox::aead::generic_array::GenericArray::<u8, U16>::default();
-    let key = Zeroizing::new(SecretboxKey::clone_from_slice(shared.as_slice()));
-    Zeroizing::new(hsalsa::<U10>(&key, &input))
+    let input = salsa20::cipher::Array::<u8, U16>::default();
+    let key = Zeroizing::new(salsa20::Key::from(**shared));
+    let derived = Zeroizing::new(hsalsa::<U10>(&key, &input));
+    Zeroizing::new(SecretboxKey::clone_from_slice(derived.as_ref()))
 }
 
 // ---------------------------------------------------------------------------
