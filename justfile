@@ -70,13 +70,53 @@ gen-release-workflow:
 pin-actions:
     scripts/pin-github-actions.sh
 
-check:
+check-rust:
     cargo build  --workspace --all-features
     cargo clippy --workspace --all-targets --all-features -- -D warnings
-    cargo test   --workspace
+    cargo test  --workspace
     fd -e rs -x rustfmt --edition 2024
+
+# Go gates: lint, test, and format
+# TODO: add pinned golangci-lint
+# TODO: govulncheck
+check-go:
+    #!/usr/bin/env bash
+    go_modules=(
+      clients/go
+      crates/basil-tests/tests/cose_go_interop
+      crates/basil-tests/tests/oidc_verifier_go
+      interop-tests/go-spiffe
+    )
+    for module in "${go_modules[@]}"; do
+      echo "== Go gates: ${module}"
+      (
+          cd "$module"
+          go mod tidy -diff
+          go build ./...
+          go vet ./...
+          go test -count=1 ./...
+      )
+    done
+    unformatted="$(fd -e go -E vendor -x gofmt -l)"
+    if [[ -n "$unformatted" ]]; then
+      echo "Go files require formatting:"
+      printf '%s\n' "$unformatted"
+      exit 1
+    fi
+
+check-sh:
+    fd -e sh | xargs shellcheck
+
+check: (check-rust) (check-go) (check-sh)
     typos
 
+    
+# format all go sources
+format-go:
+    fd -e go -E vendor -x gofmt -w
+    
+
+   
 # Run all examples (every examples/*/run.sh, including web-service-axum and
 # python-grpc; python-grpc SKIPs cleanly when grpcio is not installed).
 # before running, either
@@ -99,18 +139,6 @@ st:
 clean:
     rm -rf target examples/*/target
     
-# Run the full default Rust test suite.
-test-rust:
-    cargo test --workspace
-
-# Run every checked-in Go module.
-test-go:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    for module in clients/go crates/basil-tests/tests/oidc_verifier_go interop-tests/go-spiffe; do
-      echo "== go test: $module"
-      (cd "$module" && go test ./...)
-    done
 
 # Run Cargo-discovered live OpenBao/Vault integration tests. These are excluded
 # from default package checks; they require `bao` and/or `vault` on PATH. `http`
@@ -132,11 +160,15 @@ test-stream-interop:
     echo "== go test -tags interop: clients/go/stream (BASIL_STREAM_RUST_CLI=$cli)"
     BASIL_STREAM_RUST_CLI="$cli" go test -C clients/go -tags interop ./stream/...
 
-# Run the full Rust-driven live interop/e2e suite.
-test-interop: cargo-live-e2e test-stream-interop
+# Run the Go client against a live backend and basil agent
+test-go-live-interop: 
+    clients/go/scripts/interop-agent.sh
+ 
+# Run all live and cross-language interop suites
+test-interop: cargo-live-e2e test-stream-interop test-go-live-interop
 
 # Run all local Rust, Go, and live interop suites.
-test-all: test-rust test-go test-interop
+test-all: check-rust check-go test-interop
 
 # Boot an emulated-TPM guest (qemu + swtpm) and drive the real TPM unlock slot
 # against it (basil-h8qq.1/.2/.3). Builds basil with --features unlock-tpm,
