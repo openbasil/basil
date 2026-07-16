@@ -29,7 +29,7 @@ a structured audit record.
 | `core::process_evidence`                                                      | Pinned procfs identity, point-of-use credential refresh, caller/host ID mapping, and fail-closed domain resolution.              |
 | `core::attestor_realm`                                                        | Protected realm schema, serial attestor sessions, isolated readiness, and failure-atomic candidate qualification.               |
 | `attestor_protocol`                                                           | Framed private protocol with bounded serial health, peer-resolution, and inventory operations.                                  |
-| `runtime_attestor`                                                            | Facts-only runtime providers; Compose 1.0 supports rootful Docker on cgroup v2 without user-namespace remapping.                 |
+| `runtime_attestor`                                                            | Facts-only runtime providers for rootful Docker and per-owner rootless Podman on cgroup v2.                                     |
 | `core::oci_verification`                                                      | Repository-scoped Sigstore policy, isolated exact-path Cosign execution, and independent OCI digest-chain verification.         |
 | `core::backend`                                                               | Backend adapters (table below).                                                                                                 |
 | `core::audit`, `core::decision`                                               | Decision records: subject, action, target, outcome, policy generation.                                                          |

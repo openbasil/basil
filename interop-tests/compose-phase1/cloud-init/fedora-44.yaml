@@ -23,6 +23,7 @@ users:
     gecos: Basil Phase 1 harness
     shell: /bin/bash
     lock_passwd: true
+    sudo: ALL=(ALL) NOPASSWD:ALL
     ssh_authorized_keys:
       - __BASIL_PHASE1_SSH_PUBLIC_KEY__
   - name: phase1-a

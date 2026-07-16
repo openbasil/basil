@@ -15,6 +15,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::attestor_protocol::{AttestorRequest, AttestorSession, ProtocolError, QueryScope, wire};
 
 pub mod docker;
+pub mod podman;
 mod procfs;
 
 /// One provider result with payload presence tied to the typed outcome.

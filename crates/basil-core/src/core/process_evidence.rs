@@ -294,6 +294,33 @@ impl PinnedProcess {
     pub const fn host_peer_uid(&self) -> u32 {
         self.peer.uid
     }
+
+    /// Kernel start-time pin for the connected process.
+    #[must_use]
+    pub const fn start_time_ticks(&self) -> u64 {
+        self.start_time_ticks
+    }
+
+    /// Digest of the currently pinned opened executable object.
+    #[must_use]
+    pub fn executable_digest(&self) -> Option<&str> {
+        match &self.process.executable_digest {
+            EvidenceValue::Available(value) => Some(value),
+            EvidenceValue::Unavailable => None,
+        }
+    }
+
+    /// Stable metadata identity of the pinned executable object.
+    #[must_use]
+    pub const fn executable_object(&self) -> ExecutableObjectId {
+        self.executable_object
+    }
+
+    /// Exact normalized cgroup membership captured by the pin.
+    #[must_use]
+    pub fn cgroups(&self) -> &[String] {
+        &self.cgroups
+    }
 }
 
 fn process_evidence(

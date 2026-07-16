@@ -106,6 +106,19 @@ elif [[ $SUITE == capacity ]]; then
     capacity.overload
     capacity.teardown
   )
+elif [[ $SUITE == podman-attestor-acceptance ]]; then
+  # Rootless Podman provider acceptance (basil-9tj.14): real provider calls in
+  # both owner realms under SELinux, lifecycle/outage recovery, the compiled
+  # inventory bound, and rejection of the rootful Podman mode.
+  readonly TESTS=(
+    podman.provider-core
+    podman.owner-isolation
+    podman.unit-trust
+    podman.lifecycle
+    podman.outage
+    podman.scale-bound
+    podman.rootful-rejection
+  )
 else
   # The 7 lane-smoke tests this driver owns (see [suites.fedora-smoke]).
   readonly TESTS=(
@@ -231,6 +244,7 @@ ssh_script() { local u=$1 envp=${2:-}; ssh "${ssh_base[@]}" "$u@127.0.0.1" "$env
 
 main() {
   : >"$GUEST_LOG"
+  guest_fact driver.started PASS "suite=$SUITE"
   for tool in qemu-system-x86_64 qemu-img ssh ssh-keygen jq; do
     command -v "$tool" >/dev/null 2>&1 || { fail_all TOOL_MISSING "missing $tool"; emit_result; return 0; }
   done
@@ -310,7 +324,9 @@ main() {
   # The structural network-isolation assertion (loopback-only user networking,
   # restrict=on, no host bridge/tap/fs share) is now proven for this boot.
   # Only the lane-smoke suite reports this terminal.
-  if [[ $SUITE != capacity-preflight && $SUITE != runtime-evidence && $SUITE != wrapper-feasibility && $SUITE != capacity ]]; then
+  if [[ $SUITE != capacity-preflight && $SUITE != runtime-evidence \
+    && $SUITE != wrapper-feasibility && $SUITE != capacity \
+    && $SUITE != podman-attestor-acceptance ]]; then
     set_res lane.network-isolation PASS NETWORK_LOOPBACK_ONLY "restrict=on loopback user-net"
   fi
 
@@ -373,6 +389,8 @@ main() {
     run_wrapper_feasibility
   elif [[ $SUITE == capacity ]]; then
     run_capacity_ladder "$wtag"
+  elif [[ $SUITE == podman-attestor-acceptance ]]; then
+    run_podman_attestor_acceptance "$cache" "$wtag"
   else
     run_checks "$wtag"
   fi
@@ -666,6 +684,335 @@ run_capacity_preflight() {
   else
     set_res preflight.stop-conditions TEST_FAIL STOP_CONDITIONS_MISSING \
       "derived stop thresholds or stop-condition categories missing"
+  fi
+}
+
+# Run the real Rust rootless Podman provider in both Fedora owner realms. The
+# host wrapper stages the test executable and its exact Nix runtime closure.
+run_podman_attestor_acceptance() {
+  local cache=$1 wtag=$2
+  local staging="$cache/podman-attestor-acceptance-staging"
+  local binary="$staging/basil-core-test" manifest="$staging/manifest.tsv"
+  local stores="$staging/store-paths.txt" expected actual interpreter store
+  local output rc foreign_a foreign_b core_a_ok=0 core_b_ok=0
+  local -a closure=()
+  [[ -f $binary && ! -L $binary && -f $manifest && ! -L $manifest \
+    && -f $stores && ! -L $stores ]] \
+    || { fail_all PODMAN_ATTESTOR_STAGING_MISSING "$staging"; return 0; }
+  expected=$(awk -F $'\t' '$1=="binary_sha256"{print $2}' "$manifest")
+  actual=$(sha256sum -- "$binary" | cut -d ' ' -f 1)
+  [[ $expected =~ ^[0-9a-f]{64}$ && $actual == "$expected" ]] \
+    || { fail_all PODMAN_ATTESTOR_BINARY_UNVERIFIED ""; return 0; }
+  interpreter=$(awk -F $'\t' '$1=="interpreter"{print $2}' "$manifest")
+  [[ $interpreter =~ ^/nix/store/[0-9a-z]{32}-[a-zA-Z0-9+._?-]+/lib/ld-linux-x86-64.so.2$ ]] \
+    || { fail_all PODMAN_ATTESTOR_INTERPRETER_INVALID "$interpreter"; return 0; }
+  while IFS= read -r store; do
+    [[ $store =~ ^/nix/store/[0-9a-z]{32}-[a-zA-Z0-9+._?-]+$ && -d $store && ! -L $store ]] \
+      || { fail_all PODMAN_ATTESTOR_CLOSURE_INVALID "$store"; return 0; }
+  done <"$stores"
+  mapfile -t closure <"$stores"
+
+  if ! ssh_user basil-ci 'cat >/tmp/basil-core-test' <"$binary" \
+    >"$SCRATCH/podman-stage-binary.log" 2>&1; then
+    fail_all PODMAN_ATTESTOR_BINARY_COPY_FAILED "see retained podman-stage-binary.log"
+    return 0
+  fi
+  if ! ssh_user basil-ci \
+    'sudo -n install -o root -g root -m 0755 /tmp/basil-core-test /opt/basil-core-test' \
+    >"$SCRATCH/podman-stage-install.log" 2>&1; then
+    fail_all PODMAN_ATTESTOR_BINARY_INSTALL_FAILED "see retained podman-stage-install.log"
+    return 0
+  fi
+  if ! (cd / && tar -cf - "${closure[@]#/}") \
+    | ssh_user basil-ci 'sudo -n tar -C / -xf -' \
+      >"$SCRATCH/podman-stage-closure.log" 2>&1; then
+    fail_all PODMAN_ATTESTOR_CLOSURE_COPY_FAILED "see retained podman-stage-closure.log"
+    return 0
+  fi
+
+  # The exact packaged user unit owns the per-user API socket. Both users have
+  # lingering enabled by cloud-init, and each loads the same pinned OCI image
+  # into an owner-private store.
+  for owner in phase1-a phase1-b; do
+    if ! ssh_script "$owner" <<'GUEST_EOF' >/dev/null 2>&1
+export XDG_RUNTIME_DIR=/run/user/$(id -u)
+systemctl --user enable --now podman.socket
+podman info >/dev/null
+podman load -i /run/basil-payload/payload/workload-alpine.tar >/dev/null
+GUEST_EOF
+    then
+      fail_all PODMAN_OWNER_PREP_FAILED "$owner"
+      return 0
+    fi
+  done
+
+  # The broker and rootless attestor run as distinct UIDs. The attestor-owned
+  # socket grants only the broker traversal/connect ACL. Exact user-unit trust
+  # is rechecked before protocol bytes on every connection.
+  local broker_uid attestor_uid extra_uid realm_unit wrong_unit ready unit_ok=0 wrong_ok=0 acl_ok=0
+  broker_uid=$(ssh_user phase1-b 'id -u')
+  attestor_uid=$(ssh_user phase1-a 'id -u')
+  extra_uid=$(ssh_user phase1-b 'id -u')
+  realm_unit=basil-attestor-owner-podman.service
+  wrong_unit=basil-attestor-wrong.service
+  ready=/run/user/$attestor_uid/basil/attestors/owner-podman/server.ready
+  ssh_user phase1-a "rm -f '$ready'; export XDG_RUNTIME_DIR=/run/user/$attestor_uid; \
+    systemd-run --user --unit=$realm_unit --collect \
+      --setenv=BASIL_REALM_BROKER_UID=$broker_uid \
+      --setenv=BASIL_REALM_ATTESTOR_UID=$attestor_uid \
+      --setenv=BASIL_REALM_EXPECTED_UNIT=$realm_unit \
+      --setenv=BASIL_REALM_READY=$ready \
+      --setenv=BASIL_REALM_SERVER_MODE=accept \
+      $interpreter /opt/basil-core-test --ignored --exact \
+      core::attestor_realm_unix::tests::live_unix_realm_systemd_server --nocapture" \
+    >/dev/null 2>&1 || true
+  for _ in $(seq 1 40); do
+    ssh_user phase1-a "test -f '$ready'" >/dev/null 2>&1 && break
+    sleep 1
+  done
+  local target_pid
+  target_pid=$(ssh_user phase1-a "cat '$ready'" 2>/dev/null || true)
+  if [[ $target_pid =~ ^[1-9][0-9]*$ ]]; then
+    ssh_user phase1-b \
+      "BASIL_REALM_TARGET_PID=$target_pid $interpreter /opt/basil-core-test --ignored --exact \
+       core::attestor_realm_unix::tests::live_cross_uid_kernel_diagnostic --nocapture" \
+      >>"$SCRATCH/podman-unit-trust.log" 2>&1 || true
+  fi
+  if output=$(ssh_user phase1-b \
+    "BASIL_REALM_BROKER_UID=$broker_uid BASIL_REALM_ATTESTOR_UID=$attestor_uid \
+     BASIL_REALM_EXPECTED_UNIT=$realm_unit BASIL_REALM_EXPECT_RESULT=accept \
+     $interpreter /opt/basil-core-test --ignored --exact \
+     core::attestor_realm_unix::tests::live_unix_realm_systemd_connector --nocapture" 2>&1); then
+    unit_ok=1
+  fi
+  printf '%s\n' "$output" >>"$SCRATCH/podman-unit-trust.log"
+  ssh_user phase1-a "export XDG_RUNTIME_DIR=/run/user/$attestor_uid; systemctl --user stop $realm_unit" \
+    >/dev/null 2>&1 || true
+
+  ssh_user phase1-a "rm -f '$ready'; export XDG_RUNTIME_DIR=/run/user/$attestor_uid; \
+    systemd-run --user --unit=$wrong_unit --collect \
+      --setenv=BASIL_REALM_BROKER_UID=$broker_uid \
+      --setenv=BASIL_REALM_ATTESTOR_UID=$attestor_uid \
+      --setenv=BASIL_REALM_EXPECTED_UNIT=$realm_unit \
+      --setenv=BASIL_REALM_READY=$ready \
+      --setenv=BASIL_REALM_SERVER_MODE=reject \
+      $interpreter /opt/basil-core-test --ignored --exact \
+      core::attestor_realm_unix::tests::live_unix_realm_systemd_server --nocapture" \
+    >/dev/null 2>&1 || true
+  for _ in $(seq 1 40); do
+    ssh_user phase1-a "test -f '$ready'" >/dev/null 2>&1 && break
+    sleep 1
+  done
+  if ssh_user phase1-b \
+    "BASIL_REALM_BROKER_UID=$broker_uid BASIL_REALM_ATTESTOR_UID=$attestor_uid \
+     BASIL_REALM_EXPECTED_UNIT=$realm_unit BASIL_REALM_EXPECT_RESULT=reject \
+     $interpreter /opt/basil-core-test --ignored --exact \
+     core::attestor_realm_unix::tests::live_unix_realm_systemd_connector --nocapture" \
+    >/dev/null 2>&1; then
+    sleep 1
+    if ssh_user phase1-a "export XDG_RUNTIME_DIR=/run/user/$attestor_uid; \
+      journalctl --user -u $wrong_unit --no-pager" 2>&1 \
+      | tee -a "$SCRATCH/podman-unit-trust.log" \
+      | grep -q BASIL_PRE_HANDSHAKE_REJECTION_CONFIRMED; then
+      wrong_ok=1
+    fi
+  fi
+  ssh_user phase1-a "export XDG_RUNTIME_DIR=/run/user/$attestor_uid; systemctl --user stop $wrong_unit" \
+    >/dev/null 2>&1 || true
+
+  # Reuse the wrong-unit server shape with an extra named socket ACL. The
+  # client must again reject before sending a handshake.
+  ssh_user phase1-a "rm -f '$ready'; export XDG_RUNTIME_DIR=/run/user/$attestor_uid; \
+    systemd-run --user --unit=$realm_unit --collect \
+      --setenv=BASIL_REALM_BROKER_UID=$broker_uid \
+      --setenv=BASIL_REALM_ATTESTOR_UID=$attestor_uid \
+      --setenv=BASIL_REALM_EXPECTED_UNIT=$realm_unit \
+      --setenv=BASIL_REALM_EXTRA_ACL_UID=$extra_uid \
+      --setenv=BASIL_REALM_READY=$ready \
+      --setenv=BASIL_REALM_SERVER_MODE=reject \
+      $interpreter /opt/basil-core-test --ignored --exact \
+      core::attestor_realm_unix::tests::live_unix_realm_systemd_server --nocapture" \
+    >/dev/null 2>&1 || true
+  for _ in $(seq 1 40); do
+    ssh_user phase1-a "test -f '$ready'" >/dev/null 2>&1 && break
+    sleep 1
+  done
+  if ssh_user phase1-b \
+    "BASIL_REALM_BROKER_UID=$broker_uid BASIL_REALM_ATTESTOR_UID=$attestor_uid \
+     BASIL_REALM_EXPECTED_UNIT=$realm_unit BASIL_REALM_EXPECT_RESULT=reject \
+     $interpreter /opt/basil-core-test --ignored --exact \
+     core::attestor_realm_unix::tests::live_unix_realm_systemd_connector --nocapture" \
+    >/dev/null 2>&1; then
+    sleep 1
+    if ssh_user phase1-a "export XDG_RUNTIME_DIR=/run/user/$attestor_uid; \
+      journalctl --user -u $realm_unit --no-pager" 2>&1 \
+      | tee -a "$SCRATCH/podman-unit-trust.log" \
+      | grep -q BASIL_PRE_HANDSHAKE_REJECTION_CONFIRMED; then
+      acl_ok=1
+    fi
+  fi
+  ssh_user phase1-a "export XDG_RUNTIME_DIR=/run/user/$attestor_uid; systemctl --user stop $realm_unit" \
+    >/dev/null 2>&1 || true
+  if (( unit_ok == 1 && wrong_ok == 1 && acl_ok == 1 )); then
+    set_res podman.unit-trust PASS PODMAN_SYSTEMD_USER_UNIT_TRUST_PASS \
+      "distinct UIDs; exact unit accepted twice; wrong unit and extra ACL rejected before handshake"
+  else
+    set_res podman.unit-trust TEST_FAIL PODMAN_SYSTEMD_USER_UNIT_TRUST_FAILED \
+      "accept=$unit_ok wrong_unit=$wrong_ok extra_acl=$acl_ok"
+  fi
+
+  foreign_b=$(ssh_script phase1-b "WTAG=$wtag" <<'GUEST_EOF'
+export XDG_RUNTIME_DIR=/run/user/$(id -u)
+podman rm -f basil-podman-attestor-foreign >/dev/null 2>&1 || true
+id=$(podman run -d --network none --name basil-podman-attestor-foreign \
+  --label io.openbasil.podman-attestor-acceptance=foreign "$WTAG" sleep 1200)
+podman inspect --format '{{.State.Pid}}' "$id"
+GUEST_EOF
+  ) || foreign_b=""
+  if [[ ! $foreign_b =~ ^[1-9][0-9]*$ ]]; then
+    set_res podman.provider-core INFRA_ERROR FOREIGN_OWNER_B_FAILED "could not start owner B probe"
+    set_res podman.owner-isolation INFRA_ERROR FOREIGN_OWNER_B_FAILED "could not start owner B probe"
+  else
+    output=$(ssh_user phase1-a \
+      "export XDG_RUNTIME_DIR=/run/user/\$(id -u); \
+       BASIL_PODMAN_IMAGE='$wtag' BASIL_FOREIGN_PID='$foreign_b' \
+       $interpreter /opt/basil-core-test --ignored --exact \
+       runtime_attestor::podman::tests::live_rootless_podman_acceptance_matrix --nocapture" \
+      2>&1) && rc=0 || rc=$?
+    printf '%s\n' "$output" >"$SCRATCH/podman-owner-a.log"
+    if (( rc != 0 )); then
+      log "owner A provider matrix failed rc=$rc ${output: -1600}"
+      set_res podman.provider-core TEST_FAIL PODMAN_OWNER_A_MATRIX_FAILED "test_rc=$rc"
+      set_res podman.owner-isolation TEST_FAIL PODMAN_CROSS_OWNER_A_FAILED "test_rc=$rc"
+    else
+      core_a_ok=1
+    fi
+  fi
+
+  foreign_a=$(ssh_script phase1-a "WTAG=$wtag" <<'GUEST_EOF'
+export XDG_RUNTIME_DIR=/run/user/$(id -u)
+podman rm -f basil-podman-attestor-foreign >/dev/null 2>&1 || true
+id=$(podman run -d --network none --name basil-podman-attestor-foreign \
+  --label io.openbasil.podman-attestor-acceptance=foreign "$WTAG" sleep 1200)
+podman inspect --format '{{.State.Pid}}' "$id"
+GUEST_EOF
+  ) || foreign_a=""
+  if [[ ! $foreign_a =~ ^[1-9][0-9]*$ ]]; then
+    set_res podman.provider-core INFRA_ERROR FOREIGN_OWNER_A_FAILED "could not start owner A probe"
+    set_res podman.owner-isolation INFRA_ERROR FOREIGN_OWNER_A_FAILED "could not start owner A probe"
+  else
+    output=$(ssh_user phase1-b \
+      "export XDG_RUNTIME_DIR=/run/user/\$(id -u); \
+       BASIL_PODMAN_IMAGE='$wtag' BASIL_FOREIGN_PID='$foreign_a' \
+       $interpreter /opt/basil-core-test --ignored --exact \
+       runtime_attestor::podman::tests::live_rootless_podman_acceptance_matrix --nocapture" \
+      2>&1) && rc=0 || rc=$?
+    printf '%s\n' "$output" >"$SCRATCH/podman-owner-b.log"
+    if (( rc != 0 )); then
+      log "owner B provider matrix failed rc=$rc ${output: -1600}"
+      set_res podman.provider-core TEST_FAIL PODMAN_OWNER_B_MATRIX_FAILED "test_rc=$rc"
+      set_res podman.owner-isolation TEST_FAIL PODMAN_CROSS_OWNER_B_FAILED "test_rc=$rc"
+    else
+      core_b_ok=1
+    fi
+  fi
+  if (( core_a_ok == 1 && core_b_ok == 1 )); then
+    set_res podman.provider-core PASS PODMAN_PROVIDER_REAL_MATRIX_PASS \
+      "both owners: replicas, exec, PID reuse, restart, OCI, Compose, mounts, SELinux"
+    set_res podman.owner-isolation PASS PODMAN_OWNER_REALMS_ISOLATED \
+      "same container UID 0 maps to distinct owners; cross-route is no-match and inventories stay local"
+  fi
+  # shellcheck disable=SC2016 # `id` expands in the guest shell.
+  ssh_user phase1-a 'export XDG_RUNTIME_DIR=/run/user/$(id -u); podman rm -f basil-podman-attestor-foreign >/dev/null 2>&1 || true' \
+    >/dev/null 2>&1 || true
+  # shellcheck disable=SC2016 # `id` expands in the guest shell.
+  ssh_user phase1-b 'export XDG_RUNTIME_DIR=/run/user/$(id -u); podman rm -f basil-podman-attestor-foreign >/dev/null 2>&1 || true' \
+    >/dev/null 2>&1 || true
+
+  output=$(ssh_user phase1-a \
+    "export XDG_RUNTIME_DIR=/run/user/\$(id -u); \
+     $interpreter /opt/basil-core-test --ignored --exact \
+     runtime_attestor::podman::tests::live_rootless_podman_outage_is_typed_and_recovers --nocapture" \
+    2>&1) && rc=0 || rc=$?
+  printf '%s\n' "$output" >"$SCRATCH/podman-outage.log"
+  if (( rc == 0 )); then
+    set_res podman.outage PASS PODMAN_OUTAGE_TYPED_AND_RECOVERED ""
+  else
+    set_res podman.outage TEST_FAIL PODMAN_OUTAGE_TEST_FAILED "test_rc=$rc"
+  fi
+
+  # A completed SSH command is a real logout. Linger must keep the user manager
+  # and Podman socket active afterward; a reboot must restore them without an
+  # interactive owner session.
+  # shellcheck disable=SC2016 # `id` expands in the guest shell.
+  if [[ $(ssh_user phase1-a 'loginctl show-user phase1-a -p Linger --value' 2>/dev/null || true) != yes ]] \
+    || ! ssh_user phase1-a 'export XDG_RUNTIME_DIR=/run/user/$(id -u); systemctl --user is-active --quiet podman.socket' \
+      >/dev/null 2>&1; then
+    set_res podman.lifecycle TEST_FAIL PODMAN_LINGER_NOT_ACTIVE "owner A did not retain its user socket after logout"
+  else
+    ssh_user basil-ci 'sudo -n reboot' >/dev/null 2>&1 || true
+    sleep 8
+    local recovered=0
+    for _ in $(seq 1 60); do
+      if ssh_user phase1-a \
+        "export XDG_RUNTIME_DIR=/run/user/\$(id -u); \
+         $interpreter /opt/basil-core-test --ignored --exact \
+         runtime_attestor::podman::tests::live_rootless_podman_health_uses_owner_socket_and_maps" \
+        >/dev/null 2>&1; then
+        recovered=1
+        break
+      fi
+      sleep 3
+    done
+    if (( recovered == 1 )); then
+      set_res podman.lifecycle PASS PODMAN_LINGER_REBOOT_RECOVERED \
+        "user socket survived logout and returned after reboot"
+    else
+      set_res podman.lifecycle TEST_FAIL PODMAN_REBOOT_RECOVERY_FAILED "health did not recover"
+    fi
+  fi
+
+  # Rootful Podman is a real reachable runtime here, but the provider must
+  # reject its unsupported owner/mode pair.
+  ssh_user basil-ci 'sudo -n systemctl enable --now podman.socket' >/dev/null 2>&1 || true
+  output=$(ssh_user basil-ci \
+    "sudo -n BASIL_PODMAN_SOCKET=/run/podman/podman.sock \
+     $interpreter /opt/basil-core-test --ignored --exact \
+     runtime_attestor::podman::tests::live_podman_rejects_rootful_runtime --nocapture" \
+    2>&1) && rc=0 || rc=$?
+  printf '%s\n' "$output" >"$SCRATCH/podman-rootful-rejection.log"
+  if (( rc == 0 )); then
+    set_res podman.rootful-rejection PASS PODMAN_ROOTFUL_REAL_REJECTED ""
+  else
+    set_res podman.rootful-rejection TEST_FAIL PODMAN_ROOTFUL_NOT_REJECTED "test_rc=$rc"
+  fi
+
+  # The earlier capacity finding measured default maxkeys=200 as the rootless
+  # density limit. This dedicated provider-bound run raises both guest quotas
+  # without lowering a larger operator value, then exercises 1,000 and 1,001.
+  if ! ssh_user basil-ci 'sudo -n bash -s' >/dev/null 2>&1 <<'GUEST_EOF'
+set -euo pipefail
+keys=$(cat /proc/sys/kernel/keys/maxkeys)
+bytes=$(cat /proc/sys/kernel/keys/maxbytes)
+(( keys >= 4096 )) || sysctl -q -w kernel.keys.maxkeys=4096
+(( bytes >= 16777216 )) || sysctl -q -w kernel.keys.maxbytes=16777216
+systemctl set-property user-1001.slice TasksMax=infinity
+GUEST_EOF
+  then
+    set_res podman.scale-bound INFRA_ERROR PODMAN_SCALE_PREREQUISITE_FAILED "could not raise guest-only density limits"
+  else
+    output=$(ssh_user phase1-a \
+      "export XDG_RUNTIME_DIR=/run/user/\$(id -u); ulimit -n \"\$(ulimit -Hn)\"; \
+       BASIL_PODMAN_IMAGE='$wtag' $interpreter /opt/basil-core-test --ignored --exact \
+       runtime_attestor::podman::tests::live_rootless_podman_inventory_bound --nocapture" \
+      2>&1) && rc=0 || rc=$?
+    printf '%s\n' "$output" >"$SCRATCH/podman-scale.log"
+    if (( rc == 0 )); then
+      set_res podman.scale-bound PASS PODMAN_1000_BOUND_REAL_PASS "1,000 accepted; 1,001 rejected"
+    else
+      log "podman scale failed rc=$rc ${output: -1600}"
+      set_res podman.scale-bound TEST_FAIL PODMAN_1000_BOUND_REAL_FAILED "test_rc=$rc"
+    fi
   fi
 }
 
