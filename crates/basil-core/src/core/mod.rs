@@ -6,6 +6,7 @@
 
 pub mod actor;
 pub mod attestor_realm;
+pub mod attestor_realm_unix;
 pub mod audit;
 pub mod backend;
 pub mod capability;

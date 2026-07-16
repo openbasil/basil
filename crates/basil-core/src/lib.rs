@@ -59,9 +59,9 @@ pub mod unlock;
 pub use core::identity;
 pub use core::ml_dsa_sign;
 pub use core::{
-    actor, attestor_realm, audit, backend, capability, catalog, configuration, decision,
-    ed25519_sign, event, manager, minter, ml_kem_envelope, peer, reconcile, release_admission,
-    reload, revocation, seal, state, x25519_seal,
+    actor, attestor_realm, attestor_realm_unix, audit, backend, capability, catalog, configuration,
+    decision, ed25519_sign, event, manager, minter, ml_kem_envelope, peer, reconcile,
+    release_admission, reload, revocation, seal, state, x25519_seal,
 };
 pub use service::broker as grpc;
 #[cfg(feature = "http")]

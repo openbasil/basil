@@ -73,6 +73,26 @@ memory_mib = 8192
 vcpus = 4
 disk_gib = 32
 
+# Rootless Podman provider acceptance (basil-9tj.14). Runs the real Rust
+# provider in both per-user realms in the SELinux-enforcing Fedora guest. The
+# larger guest and explicit non-lowering keyring quota raise let this dedicated
+# provider-bound test reach the compiled 1,000-instance ceiling.
+[suites.podman-attestor-acceptance]
+required_tests = [
+  "podman.provider-core",
+  "podman.owner-isolation",
+  "podman.unit-trust",
+  "podman.lifecycle",
+  "podman.outage",
+  "podman.scale-bound",
+  "podman.rootful-rejection",
+]
+
+[suites.podman-attestor-acceptance.vm]
+memory_mib = 24576
+vcpus = 8
+disk_gib = 40
+
 # Readiness-only capacity preflight (basil-ge9). Distinct from `[suites.capacity]`
 # above, which is the later basil-9tj.4 measurement suite. This suite qualifies
 # the two qualified VM environments for a serial 1,000-container ladder and

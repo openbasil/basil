@@ -309,6 +309,37 @@ If the guest still refuses the daemon, `docker.rootless-rejection` reports
 `UNSUPPORTED` with its daemon log retained.
 Only a provider rejection against a ready rootless daemon reports `PASS`.
 
+### Podman attestor acceptance
+
+Run `scripts/podman-attestor-e2e.sh` to stage the current `basil-core` test
+binary and execute `podman-attestor-acceptance` in the Fedora 44 guest. The
+suite keeps SELinux enforcing and runs the provider as both lingering rootless
+owners. It covers same-container UID collisions, cross-owner routing and
+inventory isolation, replicas, exec processes, stale PID evidence, restarts,
+protected mount facts and labels, runtime outage, logout and reboot recovery,
+and rejection of a real rootful Podman socket. The suite also exercises a
+distinct-UID broker against an exact transient `systemd --user` attestor unit
+through a broker-only traversal/connect ACL. The retained Fedora run referenced
+in `basil-9tj.14` passed six of seven terminals, including wrong-unit rejection,
+but did not prove cross-UID connector acceptance, exact unit trust, or rejection
+of an ACL granted to a distinct third UID. The broker cannot inspect the
+attestor's live executable and namespace links across UIDs on that host
+(`EACCES` before the protocol handshake). P1 design task `basil-ln84` therefore
+blocks this acceptance ticket; the harness remains fail-closed and retains
+PID-specific, bounded-wait rejection markers.
+
+Podman 5.8 rejects an explicit `noswap` option on rootless tmpfs mounts because
+that option is rootful-only. This suite therefore verifies the other protected
+tmpfs flags and leaves swap posture to the alternate assurance required by
+Phase 7.2 (`basil-9tj.29`). The provider still reports `noswap` when the runtime
+supplies that evidence.
+
+The scale terminal raises the guest's keyring quotas only when their current
+values are lower, then accepts exactly 1,000 owner-local containers and rejects
+1,001 with the compiled resource bound. Production hosts use the corresponding
+doctor readiness check and explicit operator remediation; the provider never
+changes host limits.
+
 Development lane-smoke evidence: run `20260714T070109Z-a6eb31d62fe947df`
 (status `PASS`, reason `DRIVER_TESTS_PASSED`, all six terminals `PASS`, manifest
 sha256 `9573c57ffb4b48c1561959c4def90e79f8f9b5943d2940e9de7cf3c08a0e9147`),

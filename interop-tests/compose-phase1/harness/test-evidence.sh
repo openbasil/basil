@@ -582,6 +582,26 @@ if retain_guest_events_artifact "$artifact_meta_run" "$guest_scratch"; then
 fi
 pass "raw capacity guest events are retained atomically and required fail closed"
 
+# Keep the Fedora Podman acceptance boundary honest without booting the long
+# capacity-sized guest. The live lane still supplies the behavioral evidence;
+# these source checks prevent its three-principal ACL and scoped foreign-owner
+# probes from silently regressing between retained runs.
+fedora_driver="$REPO_ROOT/interop-tests/compose-phase1/drivers/fedora-selinux-rootless.sh"
+grep -Fq "extra_uid=\$(ssh_user basil-ci 'id -u')" "$fedora_driver" \
+  || fail "Podman extra-ACL probe does not use the third guest UID"
+[[ $(grep -Fc 'wait_for_user_unit_rejection_marker phase1-a' "$fedora_driver") == 2 ]] \
+  || fail "Podman rejection markers are not boundedly checked for both negative probes"
+grep -Fq "BASIL_PRE_HANDSHAKE_REJECTION_CONFIRMED(_NO_CONNECT)? pid=\$pid" "$fedora_driver" \
+  || fail "Podman rejection marker is not bound to the current server PID"
+[[ $(grep -Fc -- '--label com.docker.compose.project=basil-podman-attestor' \
+  "$fedora_driver") == 2 \
+  && $(grep -Fc -- '--label com.docker.compose.service=api' "$fedora_driver") == 2 ]] \
+  || fail "foreign Podman probes do not match the queried Compose service"
+grep -Fq "owner_a_cross_route=\$foreign_outcome_a owner_b_cross_route=\$foreign_outcome_b" \
+  "$fedora_driver" \
+  || fail "Podman owner-isolation result does not retain the typed cross-route outcome"
+pass "Fedora Podman acceptance keeps third-UID, bounded-marker, and scoped foreign probes"
+
 # The shared unprivileged-QEMU helper enforces the documented VM boundary and
 # supplies every x86 lane with one short path inside the sandbox-private /tmp.
 # shellcheck source=/dev/null
