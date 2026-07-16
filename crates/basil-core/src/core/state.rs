@@ -46,6 +46,8 @@ use crate::event::EventSource;
 use crate::manager::{BackendManager, ManagerError};
 use crate::reload::ReloadInputs;
 use crate::revocation::JwtRevocationStore;
+use crate::transport::connection::ConnectionRegistry;
+use crate::transport::listener::ListenerConfigSet;
 
 /// The generation id assigned to the broker's first (startup) generation.
 ///
@@ -385,6 +387,9 @@ pub struct BrokerState {
     /// The active policy generation, swapped atomically on reload (`basil-y3e`).
     /// Every RPC loads exactly one snapshot of this and pins the whole op to it.
     generation: ArcSwap<Generation>,
+    /// Active typed listener configuration, separate from policy/OCI generation.
+    listeners: ArcSwap<ListenerConfigSet>,
+    connections: ConnectionRegistry,
     manager: BackendManager,
     /// A stable backend label reported in a `status` response. The manager does
     /// not expose its backend kinds, so the binary supplies one at construction
@@ -472,6 +477,8 @@ impl BrokerState {
         let generation = Generation::new(INITIAL_GENERATION_ID, catalog, policy, config);
         Self {
             generation: ArcSwap::from_pointee(generation),
+            listeners: ArcSwap::from_pointee(ListenerConfigSet::default()),
+            connections: ConnectionRegistry::with_defaults(),
             manager,
             backend_label: backend_label.into(),
             // Default to this crate's version; the binary overrides with its own
@@ -547,6 +554,30 @@ impl BrokerState {
     pub fn with_reload_inputs(mut self, inputs: ReloadInputs) -> Self {
         self.reload_inputs = Some(inputs);
         self
+    }
+
+    /// Attach the listener configuration installed at startup.
+    #[must_use]
+    pub fn with_listener_configs(self, listeners: ListenerConfigSet) -> Self {
+        self.listeners.store(Arc::new(listeners));
+        self
+    }
+
+    /// Snapshot the active listener configuration.
+    #[must_use]
+    pub fn load_listener_configs(&self) -> Guard<Arc<ListenerConfigSet>> {
+        self.listeners.load()
+    }
+
+    /// Install a fully committed listener configuration.
+    pub fn swap_listener_configs(&self, listeners: Arc<ListenerConfigSet>) {
+        self.listeners.store(listeners);
+    }
+
+    /// Broker-wide connection inventory and listener admission gate.
+    #[must_use]
+    pub const fn connections(&self) -> &ConnectionRegistry {
+        &self.connections
     }
 
     /// Attach the accepted runtime-attestor realm registry.

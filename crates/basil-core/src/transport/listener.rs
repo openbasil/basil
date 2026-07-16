@@ -114,6 +114,21 @@ impl ListenerConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ListenerConfigSet(BTreeMap<String, ListenerConfig>);
 
+impl Default for ListenerConfigSet {
+    fn default() -> Self {
+        Self(BTreeMap::from([(
+            "host".to_string(),
+            ListenerConfig {
+                name: "host".to_string(),
+                listener_type: ListenerType::Host,
+                path: PathBuf::from(crate::DEFAULT_SOCKET_PATH),
+                mode: DEFAULT_SOCKET_MODE,
+                group: None,
+            },
+        )]))
+    }
+}
+
 impl ListenerConfigSet {
     /// Validate named listeners or project the legacy top-level socket fields.
     ///

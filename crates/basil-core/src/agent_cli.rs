@@ -608,6 +608,7 @@ pub(crate) struct AgentConfigFile {
     pub(crate) socket: Option<String>,
     pub(crate) socket_mode: Option<SocketMode>,
     pub(crate) socket_group: Option<String>,
+    pub(crate) listeners: BTreeMap<String, ListenerConfigFile>,
     pub(crate) vault_addr: Option<String>,
     pub(crate) transit_mount: Option<String>,
     pub(crate) jwt_auth_mount: Option<String>,
@@ -656,6 +657,7 @@ impl Default for AgentConfigFile {
             socket: None,
             socket_mode: None,
             socket_group: None,
+            listeners: BTreeMap::new(),
             vault_addr: None,
             transit_mount: None,
             jwt_auth_mount: None,
@@ -686,6 +688,16 @@ impl Default for AgentConfigFile {
             oci: OciConfigFile::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub(crate) struct ListenerConfigFile {
+    #[serde(rename = "type")]
+    listener_type: crate::transport::grpc_server::ListenerType,
+    path: PathBuf,
+    mode: Option<SocketMode>,
+    group: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1020,6 +1032,16 @@ impl Default for OciConfigFile {
     }
 }
 
+impl OciConfigFile {
+    pub(crate) const fn enabled(&self) -> bool {
+        self.enable
+    }
+
+    pub(crate) fn trusted_root_path(&self) -> Option<&Path> {
+        self.trusted_root.as_deref()
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 struct RegistryAuthConfigFile {
@@ -1078,6 +1100,7 @@ struct SetupArgs {
 
 #[derive(Debug, Clone)]
 struct RunConfig {
+    listeners: crate::transport::listener::ListenerConfigSet,
     socket: Option<String>,
     socket_mode: u32,
     socket_group: Option<String>,
@@ -1113,7 +1136,9 @@ fn load_run_config(overrides: &ConfigOverrides) -> Result<RunConfig> {
     let oci_verifier = resolve_oci_config(&file.oci, None)?;
     let oci_cache = resolve_oci_cache(&file.oci)?;
     let oci_denied_subjects = resolve_oci_denylist(&file.oci)?;
+    let listeners = resolve_listener_configs(&file)?;
     Ok(RunConfig {
+        listeners,
         socket: file.socket,
         socket_mode: file.socket_mode.map_or(DEFAULT_SOCKET_MODE, |mode| mode.0),
         socket_group: file.socket_group,
@@ -1134,6 +1159,45 @@ fn load_run_config(overrides: &ConfigOverrides) -> Result<RunConfig> {
         jwks,
         setup,
     })
+}
+
+fn resolve_listener_configs(
+    file: &AgentConfigFile,
+) -> Result<crate::transport::listener::ListenerConfigSet> {
+    let named = file
+        .listeners
+        .iter()
+        .map(|(name, listener)| {
+            (
+                name.clone(),
+                crate::transport::listener::ListenerConfigInput {
+                    listener_type: listener.listener_type,
+                    path: listener.path.clone(),
+                    mode: listener.mode.map(|mode| mode.0),
+                    group: listener.group.clone(),
+                },
+            )
+        })
+        .collect();
+    crate::transport::listener::ListenerConfigSet::resolve(
+        named,
+        crate::transport::listener::LegacyListenerConfig {
+            path: file.socket.as_ref().map(PathBuf::from),
+            mode: file.socket_mode.map(|mode| mode.0),
+            group: file.socket_group.clone(),
+        },
+    )
+    .map_err(anyhow::Error::from)
+}
+
+pub(crate) fn parse_reload_listener_config(
+    value: &toml::Value,
+) -> Result<crate::transport::listener::ListenerConfigSet> {
+    let file = value
+        .clone()
+        .try_into::<AgentConfigFile>()
+        .context("parsing listener configuration")?;
+    resolve_listener_configs(&file)
 }
 
 fn resolve_oci_denylist(
@@ -2181,8 +2245,9 @@ async fn run_daemon(args: RunArgs, version: &'static str) -> Result<()> {
             .with_reload_inputs(ReloadInputs {
                 config_path: run_config.setup.config_path.clone(),
                 overrides: run_config.setup.startup_overrides.clone(),
-            });
-    let server_config = host_server_config(&run_config);
+            })
+            .with_listener_configs(run_config.listeners.clone());
+    let server_config = host_server_config(&run_config, state.connections().clone());
     state = attach_oci_runtime(
         state,
         run_config.oci_verifier,
@@ -2252,17 +2317,34 @@ async fn run_daemon(args: RunArgs, version: &'static str) -> Result<()> {
     Ok(())
 }
 
-fn host_server_config(run_config: &RunConfig) -> ServerConfig {
+fn host_server_config(
+    run_config: &RunConfig,
+    connections: crate::transport::connection::ConnectionRegistry,
+) -> ServerConfig {
+    let host = run_config.listeners.iter().find(|listener| {
+        listener.listener_type() == crate::transport::grpc_server::ListenerType::Host
+    });
     ServerConfig {
-        listener_name: "host".to_string(),
+        listener_name: host.map_or_else(|| "host".to_string(), |listener| listener.name().into()),
         listener_type: crate::transport::grpc_server::ListenerType::Host,
-        connections: crate::transport::connection::ConnectionRegistry::with_defaults(),
-        socket_path: run_config
-            .socket
-            .clone()
-            .unwrap_or_else(|| crate::DEFAULT_SOCKET_PATH.to_string()),
-        socket_mode: run_config.socket_mode,
-        socket_group: run_config.socket_group.clone(),
+        connections,
+        socket_path: host.map_or_else(
+            || {
+                run_config
+                    .socket
+                    .clone()
+                    .unwrap_or_else(|| crate::DEFAULT_SOCKET_PATH.to_string())
+            },
+            |listener| listener.path().to_string_lossy().into_owned(),
+        ),
+        socket_mode: host.map_or(
+            run_config.socket_mode,
+            crate::transport::listener::ListenerConfig::mode,
+        ),
+        socket_group: host.map_or_else(
+            || run_config.socket_group.clone(),
+            |listener| listener.group().map(str::to_string),
+        ),
         invocation: run_config.invocation.clone(),
     }
 }

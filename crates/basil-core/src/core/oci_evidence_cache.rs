@@ -11,13 +11,14 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{Read as _, Write as _};
+use std::io::{Read as _, Seek as _, Write as _};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use base64::Engine as _;
+use rustix::fs::{RenameFlags, renameat_with};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -39,6 +40,7 @@ pub const REFRESH_AFTER: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 const FORMAT_VERSION: u8 = 1;
 const ALGORITHM_DIRECTORY: &str = "sha256";
+const TOMBSTONE_DIRECTORY: &str = ".pruned";
 const MAX_SOURCE_CONTEXT_BYTES: usize = 1024;
 const MAX_REFERENCE_BYTES: usize = 1024;
 const MAX_REFERENCES: usize = 64;
@@ -376,6 +378,11 @@ struct TraversalBudget {
     remaining: usize,
 }
 
+struct LoadBudget {
+    remaining_entries: usize,
+    remaining_bytes: u64,
+}
+
 impl TraversalBudget {
     const fn new(limit: usize) -> Self {
         Self { remaining: limit }
@@ -385,6 +392,27 @@ impl TraversalBudget {
         self.remaining = self
             .remaining
             .checked_sub(1)
+            .ok_or(OciEvidenceCacheError::UnsafeLayout)?;
+        Ok(())
+    }
+}
+
+impl LoadBudget {
+    const fn new(maximum_entries: usize, maximum_bytes: u64) -> Self {
+        Self {
+            remaining_entries: maximum_entries,
+            remaining_bytes: maximum_bytes,
+        }
+    }
+
+    fn charge(&mut self, encoded_bytes: u64) -> Result<(), OciEvidenceCacheError> {
+        self.remaining_entries = self
+            .remaining_entries
+            .checked_sub(1)
+            .ok_or(OciEvidenceCacheError::UnsafeLayout)?;
+        self.remaining_bytes = self
+            .remaining_bytes
+            .checked_sub(encoded_bytes)
             .ok_or(OciEvidenceCacheError::UnsafeLayout)?;
         Ok(())
     }
@@ -518,7 +546,13 @@ impl OciEvidenceCache {
         }
 
         let directory = self.ensure_subject_directory(context.subject)?;
-        atomic_write(&directory, &format!("{}.json", id.as_str()), &encoded)?;
+        write_cache_entry_with_slot(
+            &self.config.root,
+            self.config.max_entries,
+            &directory,
+            &format!("{}.json", id.as_str()),
+            &encoded,
+        )?;
         Ok(CacheStoreOutcome::Stored(id))
     }
 
@@ -821,6 +855,14 @@ impl OciEvidenceCache {
         &self,
         plan: CachePrunePlan,
     ) -> Result<CachePruneResult, OciEvidenceCacheError> {
+        self.execute_prune_with_observer(plan, |_| {})
+    }
+
+    fn execute_prune_with_observer(
+        &self,
+        plan: CachePrunePlan,
+        mut observer: impl FnMut(&Path),
+    ) -> Result<CachePruneResult, OciEvidenceCacheError> {
         let _guard = self
             .lock
             .lock()
@@ -830,12 +872,14 @@ impl OciEvidenceCache {
         let mut removed = 0_usize;
         let mut skipped = 0_usize;
         for candidate in plan.candidates {
-            if file_matches_preview(
+            if retire_preview_candidate(
                 &candidate.path,
                 candidate.identity,
                 candidate.encoded_sha256,
-            )? && remove_if_identity(&candidate.path, candidate.identity)?
-            {
+                &self.config.root,
+                self.config.max_entries,
+                &mut observer,
+            )? {
                 removed += 1;
             } else {
                 skipped += 1;
@@ -882,6 +926,7 @@ impl OciEvidenceCache {
             .and_then(|limit| limit.checked_add(MAX_EXTRA_TRAVERSAL_NODES))
             .ok_or(OciEvidenceCacheError::InvalidInput)?;
         let mut budget = TraversalBudget::new(traversal_limit);
+        let mut load_budget = LoadBudget::new(self.config.max_entries, self.config.max_bytes);
         let directories = read_directory_budgeted(&algorithm_path, &mut budget)?;
         let mut entries = Vec::new();
         for directory in directories {
@@ -897,10 +942,8 @@ impl OciEvidenceCache {
                 corrupt_removed,
                 remove_corrupt,
                 &mut budget,
+                &mut load_budget,
             )?);
-            if entries.len() > self.config.max_entries {
-                return Err(OciEvidenceCacheError::UnsafeLayout);
-            }
         }
         Ok(entries)
     }
@@ -923,6 +966,7 @@ impl OciEvidenceCache {
             corrupt_removed,
             remove_corrupt,
             &mut TraversalBudget::new(limit),
+            &mut LoadBudget::new(self.config.max_entries, self.config.max_bytes),
         )
     }
 
@@ -932,6 +976,7 @@ impl OciEvidenceCache {
         corrupt_removed: &mut usize,
         remove_corrupt: bool,
         budget: &mut TraversalBudget,
+        load_budget: &mut LoadBudget,
     ) -> Result<Vec<LoadedEntry>, OciEvidenceCacheError> {
         let path = self.subject_directory(subject);
         let metadata = match fs::symlink_metadata(&path) {
@@ -977,7 +1022,16 @@ impl OciEvidenceCache {
             if !is_lower_hex(id) {
                 return Err(OciEvidenceCacheError::UnsafeLayout);
             }
-            match load_entry(&entry_path, subject) {
+            let metadata = fs::symlink_metadata(&entry_path)
+                .map_err(|_| OciEvidenceCacheError::Unavailable)?;
+            validate_cache_file_metadata(&metadata)?;
+            // Confirmed pruning exchanges the live entry with a zero-length
+            // slot. Retaining this reusable placeholder avoids a mutable-path
+            // unlink after the candidate descriptor has been validated.
+            if metadata.len() == 0 {
+                continue;
+            }
+            match load_entry_budgeted(&entry_path, subject, load_budget) {
                 Ok(entry) => loaded.push(entry),
                 Err(
                     error @ (OciEvidenceCacheError::UnsafeLayout
@@ -1212,6 +1266,27 @@ fn load_entry(
     path: &Path,
     expected_subject: OciDigest,
 ) -> Result<LoadedEntry, OciEvidenceCacheError> {
+    load_entry_budgeted(
+        path,
+        expected_subject,
+        &mut LoadBudget::new(1, MAX_ENCODED_ENTRY_BYTES),
+    )
+}
+
+fn load_entry_budgeted(
+    path: &Path,
+    expected_subject: OciDigest,
+    budget: &mut LoadBudget,
+) -> Result<LoadedEntry, OciEvidenceCacheError> {
+    load_entry_budgeted_with_observer(path, expected_subject, budget, |_| {})
+}
+
+fn load_entry_budgeted_with_observer(
+    path: &Path,
+    expected_subject: OciDigest,
+    budget: &mut LoadBudget,
+    mut observer: impl FnMut(&Path),
+) -> Result<LoadedEntry, OciEvidenceCacheError> {
     let mut file = open_absolute_file_no_follow(path)?;
     let metadata = file
         .metadata()
@@ -1220,17 +1295,52 @@ fn load_entry(
     if metadata.len() > MAX_ENCODED_ENTRY_BYTES {
         return Err(OciEvidenceCacheError::EntryTooLarge);
     }
+    // Reserve both global ceilings before allocating, reading, or decoding any
+    // attacker-controlled entry bytes. Charges are intentionally not refunded
+    // for corrupt entries: a hostile tree must not gain additional allocation
+    // attempts merely by failing validation late.
+    budget.charge(metadata.len())?;
     let identity = FileIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
     };
-    let mut encoded = Vec::new();
-    std::io::Read::by_ref(&mut file)
-        .take(MAX_ENCODED_ENTRY_BYTES + 1)
-        .read_to_end(&mut encoded)
+    let charged_bytes = metadata.len();
+    observer(path);
+
+    // Allocate exactly the bytes already charged to the aggregate budget, then
+    // read exactly that many bytes from the opened descriptor. A one-byte stack
+    // probe detects growth without permitting `read_to_end` to allocate past
+    // the charged ceiling.
+    let charged_length =
+        usize::try_from(charged_bytes).map_err(|_| OciEvidenceCacheError::EntryTooLarge)?;
+    let mut encoded = vec![0_u8; charged_length];
+    file.read_exact(&mut encoded)
+        .map_err(|_| OciEvidenceCacheError::UnsafeLayout)?;
+    let mut growth_probe = [0_u8; 1];
+    if file
+        .read(&mut growth_probe)
+        .map_err(|_| OciEvidenceCacheError::Unavailable)?
+        != 0
+    {
+        return Err(OciEvidenceCacheError::UnsafeLayout);
+    }
+    let after = file
+        .metadata()
         .map_err(|_| OciEvidenceCacheError::Unavailable)?;
-    if u64::try_from(encoded.len()).map_or(true, |size| size > MAX_ENCODED_ENTRY_BYTES) {
-        return Err(OciEvidenceCacheError::EntryTooLarge);
+    if after.dev() != identity.device
+        || after.ino() != identity.inode
+        || after.len() != charged_bytes
+        || validate_cache_file_metadata(&after).is_err()
+    {
+        return Err(OciEvidenceCacheError::UnsafeLayout);
+    }
+    let path_after = fs::symlink_metadata(path).map_err(|_| OciEvidenceCacheError::UnsafeLayout)?;
+    if path_after.dev() != identity.device
+        || path_after.ino() != identity.inode
+        || path_after.len() != charged_bytes
+        || validate_cache_file_metadata(&path_after).is_err()
+    {
+        return Err(OciEvidenceCacheError::UnsafeLayout);
     }
     let disk: DiskEntry =
         serde_json::from_slice(&encoded).map_err(|_| OciEvidenceCacheError::InvalidInput)?;
@@ -1260,13 +1370,19 @@ fn load_entry(
         evidence,
         path: path.to_owned(),
         identity,
-        encoded_bytes: u64::try_from(encoded.len())
-            .map_err(|_| OciEvidenceCacheError::EntryTooLarge)?,
+        encoded_bytes: charged_bytes,
         encoded_sha256: Sha256::digest(&encoded).into(),
     })
 }
 
 fn open_absolute_file_no_follow(path: &Path) -> Result<File, OciEvidenceCacheError> {
+    open_absolute_file_no_follow_with_flags(path, rustix::fs::OFlags::RDONLY)
+}
+
+fn open_absolute_file_no_follow_with_flags(
+    path: &Path,
+    access: rustix::fs::OFlags,
+) -> Result<File, OciEvidenceCacheError> {
     let name = path
         .file_name()
         .ok_or(OciEvidenceCacheError::InvalidInput)?;
@@ -1275,7 +1391,7 @@ fn open_absolute_file_no_follow(path: &Path) -> Result<File, OciEvidenceCacheErr
     let file = rustix::fs::openat(
         directory,
         name,
-        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+        access | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
         rustix::fs::Mode::empty(),
     )
     .map_err(|_| OciEvidenceCacheError::UnsafeLayout)?;
@@ -1342,6 +1458,218 @@ fn atomic_write(directory: &Path, name: &str, bytes: &[u8]) -> Result<(), OciEvi
     result
 }
 
+fn write_cache_entry_with_slot(
+    cache_root: &Path,
+    maximum_entries: usize,
+    directory: &Path,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), OciEvidenceCacheError> {
+    if u64::try_from(bytes.len()).map_or(true, |size| size > MAX_ENCODED_ENTRY_BYTES)
+        || name.contains('/')
+        || name.starts_with('.')
+    {
+        return Err(OciEvidenceCacheError::InvalidInput);
+    }
+    let target_path = directory.join(name);
+    let target = ensure_entry_placeholder(cache_root, maximum_entries, &target_path)?;
+    let target_metadata = target
+        .metadata()
+        .map_err(|_| OciEvidenceCacheError::Unavailable)?;
+    validate_cache_file_metadata(&target_metadata)?;
+
+    let (slot_path, slot_directory, slot_name, mut slot) =
+        prepare_tombstone_slot(cache_root, maximum_entries)?;
+    let slot_metadata = slot
+        .metadata()
+        .map_err(|_| OciEvidenceCacheError::Unavailable)?;
+    validate_cache_file_metadata(&slot_metadata)?;
+    if slot_metadata.len() != 0 {
+        return Err(OciEvidenceCacheError::UnsafeLayout);
+    }
+    slot.write_all(bytes)
+        .map_err(|_| OciEvidenceCacheError::Unavailable)?;
+    slot.sync_all()
+        .map_err(|_| OciEvidenceCacheError::Unavailable)?;
+    let written_metadata = slot
+        .metadata()
+        .map_err(|_| OciEvidenceCacheError::Unavailable)?;
+    if written_metadata.dev() != slot_metadata.dev()
+        || written_metadata.ino() != slot_metadata.ino()
+        || written_metadata.len() != u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+        || validate_cache_file_metadata(&written_metadata).is_err()
+    {
+        return Err(OciEvidenceCacheError::UnsafeLayout);
+    }
+
+    let target_directory = open_absolute_directory_no_follow(directory)?;
+    renameat_with(
+        &target_directory,
+        name,
+        &slot_directory,
+        slot_name.as_str(),
+        RenameFlags::EXCHANGE,
+    )
+    .map_err(|_| OciEvidenceCacheError::UnsafeLayout)?;
+    let installed =
+        fs::symlink_metadata(&target_path).map_err(|_| OciEvidenceCacheError::UnsafeLayout)?;
+    if installed.dev() != slot_metadata.dev()
+        || installed.ino() != slot_metadata.ino()
+        || installed.len() != u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+        || validate_cache_file_metadata(&installed).is_err()
+    {
+        exchange_tombstone(
+            &slot_directory,
+            &slot_name,
+            &target_directory,
+            std::ffi::OsStr::new(name),
+        )?;
+        return Err(OciEvidenceCacheError::UnsafeLayout);
+    }
+
+    // The previous live entry or zero placeholder is now the slot. Reclaim it
+    // only through its already-open descriptor; no mutable pathname is unlinked.
+    target
+        .set_len(0)
+        .map_err(|_| OciEvidenceCacheError::Unavailable)?;
+    target
+        .sync_all()
+        .map_err(|_| OciEvidenceCacheError::Unavailable)?;
+    target_directory
+        .sync_all()
+        .map_err(|_| OciEvidenceCacheError::Unavailable)?;
+    slot_directory
+        .sync_all()
+        .map_err(|_| OciEvidenceCacheError::Unavailable)?;
+    let _ = slot_path;
+    Ok(())
+}
+
+fn ensure_entry_placeholder(
+    cache_root: &Path,
+    maximum_entries: usize,
+    target: &Path,
+) -> Result<File, OciEvidenceCacheError> {
+    match open_absolute_file_no_follow_with_flags(target, rustix::fs::OFlags::RDWR) {
+        Ok(file) => return Ok(file),
+        Err(OciEvidenceCacheError::UnsafeLayout) if !target.exists() => {}
+        Err(error) => return Err(error),
+    }
+    if let Some(placeholder) = find_live_placeholder(cache_root, target, maximum_entries)? {
+        return relocate_placeholder(&placeholder, target);
+    }
+    let parent = target.parent().ok_or(OciEvidenceCacheError::UnsafeLayout)?;
+    let name = target
+        .file_name()
+        .ok_or(OciEvidenceCacheError::UnsafeLayout)?;
+    let directory = open_absolute_directory_no_follow(parent)?;
+    let file = rustix::fs::openat(
+        &directory,
+        name,
+        rustix::fs::OFlags::CREATE
+            | rustix::fs::OFlags::EXCL
+            | rustix::fs::OFlags::RDWR
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::from_raw_mode(0o600),
+    )
+    .map_err(|_| OciEvidenceCacheError::Unavailable)?;
+    directory
+        .sync_all()
+        .map_err(|_| OciEvidenceCacheError::Unavailable)?;
+    Ok(File::from(file))
+}
+
+fn find_live_placeholder(
+    cache_root: &Path,
+    target: &Path,
+    maximum_entries: usize,
+) -> Result<Option<PathBuf>, OciEvidenceCacheError> {
+    let algorithm = cache_root.join(ALGORITHM_DIRECTORY);
+    validate_private_directory(&algorithm)?;
+    let limit = maximum_entries
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(MAX_EXTRA_TRAVERSAL_NODES))
+        .ok_or(OciEvidenceCacheError::InvalidInput)?;
+    let mut budget = TraversalBudget::new(limit);
+    for subject in read_directory_budgeted(&algorithm, &mut budget)? {
+        validate_private_directory(&subject.path())?;
+        for entry in read_directory_budgeted(&subject.path(), &mut budget)? {
+            let path = entry.path();
+            if path == target {
+                continue;
+            }
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| OciEvidenceCacheError::UnsafeLayout)?;
+            if name.starts_with(".tmp-") {
+                continue;
+            }
+            let Some(id) = name.strip_suffix(".json") else {
+                return Err(OciEvidenceCacheError::UnsafeLayout);
+            };
+            if !is_lower_hex(id) {
+                return Err(OciEvidenceCacheError::UnsafeLayout);
+            }
+            let metadata =
+                fs::symlink_metadata(&path).map_err(|_| OciEvidenceCacheError::Unavailable)?;
+            validate_cache_file_metadata(&metadata)?;
+            if metadata.len() == 0 {
+                return Ok(Some(path));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn relocate_placeholder(source: &Path, target: &Path) -> Result<File, OciEvidenceCacheError> {
+    let file = open_absolute_file_no_follow_with_flags(source, rustix::fs::OFlags::RDWR)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| OciEvidenceCacheError::Unavailable)?;
+    validate_cache_file_metadata(&metadata)?;
+    if metadata.len() != 0 {
+        return Err(OciEvidenceCacheError::UnsafeLayout);
+    }
+    let source_parent = source.parent().ok_or(OciEvidenceCacheError::UnsafeLayout)?;
+    let source_name = source
+        .file_name()
+        .ok_or(OciEvidenceCacheError::UnsafeLayout)?;
+    let target_parent = target.parent().ok_or(OciEvidenceCacheError::UnsafeLayout)?;
+    let target_name = target
+        .file_name()
+        .ok_or(OciEvidenceCacheError::UnsafeLayout)?;
+    let source_directory = open_absolute_directory_no_follow(source_parent)?;
+    let target_directory = open_absolute_directory_no_follow(target_parent)?;
+    renameat_with(
+        &source_directory,
+        source_name,
+        &target_directory,
+        target_name,
+        RenameFlags::NOREPLACE,
+    )
+    .map_err(|_| OciEvidenceCacheError::UnsafeLayout)?;
+    let installed =
+        fs::symlink_metadata(target).map_err(|_| OciEvidenceCacheError::UnsafeLayout)?;
+    if installed.dev() != metadata.dev()
+        || installed.ino() != metadata.ino()
+        || installed.len() != 0
+        || validate_cache_file_metadata(&installed).is_err()
+    {
+        renameat_with(
+            &target_directory,
+            target_name,
+            &source_directory,
+            source_name,
+            RenameFlags::NOREPLACE,
+        )
+        .map_err(|_| OciEvidenceCacheError::UnsafeLayout)?;
+        return Err(OciEvidenceCacheError::UnsafeLayout);
+    }
+    Ok(file)
+}
+
 fn remove_safe_regular(path: &Path) -> Result<bool, OciEvidenceCacheError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -1360,10 +1688,13 @@ fn remove_safe_regular(path: &Path) -> Result<bool, OciEvidenceCacheError> {
     )
 }
 
-fn file_matches_preview(
+fn retire_preview_candidate(
     path: &Path,
     identity: FileIdentity,
     encoded_sha256: [u8; 32],
+    cache_root: &Path,
+    maximum_tombstones: usize,
+    observer: &mut impl FnMut(&Path),
 ) -> Result<bool, OciEvidenceCacheError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -1373,15 +1704,47 @@ fn file_matches_preview(
     if metadata.dev() != identity.device
         || metadata.ino() != identity.inode
         || validate_cache_file_metadata(&metadata).is_err()
-        || metadata.len() > MAX_ENCODED_ENTRY_BYTES
     {
         return Ok(false);
     }
-    let mut file = match open_absolute_file_no_follow(path) {
+    let mut file = match open_absolute_file_no_follow_with_flags(path, rustix::fs::OFlags::RDWR) {
         Ok(file) => file,
         Err(OciEvidenceCacheError::UnsafeLayout) => return Ok(false),
         Err(error) => return Err(error),
     };
+    let source_parent = path.parent().ok_or(OciEvidenceCacheError::UnsafeLayout)?;
+    let source_name = path
+        .file_name()
+        .ok_or(OciEvidenceCacheError::UnsafeLayout)?;
+    let source_directory = open_absolute_directory_no_follow(source_parent)?;
+    let (tombstone_directory_path, tombstone_directory, tombstone_name, _slot) =
+        prepare_tombstone_slot(cache_root, maximum_tombstones)?;
+    renameat_with(
+        &source_directory,
+        source_name,
+        &tombstone_directory,
+        tombstone_name.as_str(),
+        RenameFlags::EXCHANGE,
+    )
+    .map_err(|_| OciEvidenceCacheError::UnsafeLayout)?;
+    let tombstone_path = tombstone_directory_path.join(&tombstone_name);
+    let moved_metadata =
+        fs::symlink_metadata(&tombstone_path).map_err(|_| OciEvidenceCacheError::UnsafeLayout)?;
+    if moved_metadata.dev() != identity.device
+        || moved_metadata.ino() != identity.inode
+        || validate_cache_file_metadata(&moved_metadata).is_err()
+    {
+        exchange_tombstone(
+            &tombstone_directory,
+            &tombstone_name,
+            &source_directory,
+            source_name,
+        )?;
+        return Ok(false);
+    }
+
+    file.rewind()
+        .map_err(|_| OciEvidenceCacheError::Unavailable)?;
     let mut encoded = Vec::new();
     std::io::Read::by_ref(&mut file)
         .take(MAX_ENCODED_ENTRY_BYTES + 1)
@@ -1390,10 +1753,122 @@ fn file_matches_preview(
     let after = file
         .metadata()
         .map_err(|_| OciEvidenceCacheError::Unavailable)?;
-    Ok(after.dev() == identity.device
+    let matches_preview = after.dev() == identity.device
         && after.ino() == identity.inode
+        && validate_cache_file_metadata(&after).is_ok()
         && u64::try_from(encoded.len()).is_ok_and(|size| size <= MAX_ENCODED_ENTRY_BYTES)
-        && <[u8; 32]>::from(Sha256::digest(&encoded)) == encoded_sha256)
+        && <[u8; 32]>::from(Sha256::digest(&encoded)) == encoded_sha256;
+    if !matches_preview {
+        exchange_tombstone(
+            &tombstone_directory,
+            &tombstone_name,
+            &source_directory,
+            source_name,
+        )?;
+        return Ok(false);
+    }
+
+    // The adversarial test swaps this pathname here. Reclamation below is by
+    // the already-validated descriptor, so such a swap cannot redirect it.
+    observer(&tombstone_path);
+    file.set_len(0)
+        .map_err(|_| OciEvidenceCacheError::Unavailable)?;
+    file.sync_all()
+        .map_err(|_| OciEvidenceCacheError::Unavailable)?;
+    source_directory
+        .sync_all()
+        .map_err(|_| OciEvidenceCacheError::Unavailable)?;
+    tombstone_directory
+        .sync_all()
+        .map_err(|_| OciEvidenceCacheError::Unavailable)?;
+    Ok(true)
+}
+
+fn prepare_tombstone_slot(
+    cache_root: &Path,
+    maximum_tombstones: usize,
+) -> Result<(PathBuf, File, String, File), OciEvidenceCacheError> {
+    let path = cache_root.join(TOMBSTONE_DIRECTORY);
+    create_or_validate_private_directory(&path)?;
+    let mut tombstones = fs::read_dir(&path)
+        .map_err(|_| OciEvidenceCacheError::Unavailable)?
+        .take(maximum_tombstones.saturating_add(1))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| OciEvidenceCacheError::Unavailable)?;
+    if tombstones.len() > maximum_tombstones {
+        return Err(OciEvidenceCacheError::UnsafeLayout);
+    }
+    tombstones.sort_by_key(fs::DirEntry::file_name);
+    let mut reusable = None;
+    for tombstone in tombstones {
+        let metadata = fs::symlink_metadata(tombstone.path())
+            .map_err(|_| OciEvidenceCacheError::Unavailable)?;
+        validate_cache_file_metadata(&metadata)?;
+        if metadata.len() == 0 && reusable.is_none() {
+            let name = tombstone
+                .file_name()
+                .into_string()
+                .map_err(|_| OciEvidenceCacheError::UnsafeLayout)?;
+            reusable = Some(name);
+        }
+    }
+    let directory = open_absolute_directory_no_follow(&path)?;
+    let name = if let Some(name) = reusable {
+        name
+    } else {
+        if fs::read_dir(&path)
+            .map_err(|_| OciEvidenceCacheError::Unavailable)?
+            .count()
+            >= maximum_tombstones
+        {
+            return Err(OciEvidenceCacheError::UnsafeLayout);
+        }
+        let name = format!("{}.slot", uuid::Uuid::new_v4().as_simple());
+        let slot = rustix::fs::openat(
+            &directory,
+            name.as_str(),
+            rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::EXCL
+                | rustix::fs::OFlags::RDWR
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::from_raw_mode(0o600),
+        )
+        .map_err(|_| OciEvidenceCacheError::Unavailable)?;
+        File::from(slot)
+            .sync_all()
+            .map_err(|_| OciEvidenceCacheError::Unavailable)?;
+        directory
+            .sync_all()
+            .map_err(|_| OciEvidenceCacheError::Unavailable)?;
+        name
+    };
+    let slot_path = path.join(&name);
+    let slot = open_absolute_file_no_follow_with_flags(&slot_path, rustix::fs::OFlags::RDWR)?;
+    let metadata = slot
+        .metadata()
+        .map_err(|_| OciEvidenceCacheError::Unavailable)?;
+    validate_cache_file_metadata(&metadata)?;
+    if metadata.len() != 0 {
+        return Err(OciEvidenceCacheError::UnsafeLayout);
+    }
+    Ok((path, directory, name, slot))
+}
+
+fn exchange_tombstone(
+    tombstone_directory: &File,
+    tombstone_name: &str,
+    source_directory: &File,
+    source_name: &std::ffi::OsStr,
+) -> Result<(), OciEvidenceCacheError> {
+    renameat_with(
+        tombstone_directory,
+        tombstone_name,
+        source_directory,
+        source_name,
+        RenameFlags::EXCHANGE,
+    )
+    .map_err(|_| OciEvidenceCacheError::UnsafeLayout)
 }
 
 fn remove_if_identity(path: &Path, identity: FileIdentity) -> Result<bool, OciEvidenceCacheError> {
@@ -2085,6 +2560,163 @@ mod tests {
     }
 
     #[test]
+    fn prune_reclaims_only_the_opened_inode_across_same_uid_path_swap() {
+        let fixture = Fixture::new();
+        let cache = fixture.cache();
+        let context = context('e', "registry.example/team/app@sha256:prune-race");
+        let id = stored_id(cache.store(&context, b"expected", NOW).expect("store"));
+        let plan = cache
+            .plan_prune(&[PruneSelector::Id(id.clone())], NOW)
+            .expect("preview");
+        let entry_path = cache.entry_path(context.subject, &id);
+        let mut relocated = None;
+        let mut replacement = None;
+
+        let result = cache
+            .execute_prune_with_observer(plan, |tombstone| {
+                let moved = tombstone.with_extension("expected");
+                fs::rename(tombstone, &moved).expect("same-uid mutator relocates expected inode");
+                fs::write(tombstone, b"foreign replacement").expect("install raced replacement");
+                fs::set_permissions(tombstone, fs::Permissions::from_mode(0o600))
+                    .expect("protect raced replacement");
+                relocated = Some(moved);
+                replacement = Some(tombstone.to_path_buf());
+            })
+            .expect("descriptor-safe prune");
+        assert_eq!(
+            result,
+            CachePruneResult {
+                removed: 1,
+                skipped: 0
+            }
+        );
+        assert_eq!(
+            fs::metadata(&entry_path)
+                .expect("zero placeholder remains at pruned name")
+                .len(),
+            0
+        );
+        assert_eq!(
+            fs::read(relocated.expect("relocated expected path")).expect("read reclaimed inode"),
+            b""
+        );
+        assert_eq!(
+            fs::read(replacement.expect("replacement path")).expect("read foreign replacement"),
+            b"foreign replacement"
+        );
+        assert!(
+            cache
+                .check(NOW)
+                .expect("live scan ignores tombstones")
+                .entries
+                .is_empty()
+        );
+
+        drop(cache);
+        let reopened = fixture.cache();
+        assert!(
+            reopened
+                .check(NOW)
+                .expect("restart ignores retained tombstones")
+                .entries
+                .is_empty()
+        );
+        assert_eq!(
+            stored_id(
+                reopened
+                    .store(&context, b"expected", NOW + 1)
+                    .expect("restore exact entry")
+            ),
+            id
+        );
+        assert_eq!(
+            reopened
+                .check(NOW + 1)
+                .expect("restored scan")
+                .entries
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn one_tombstone_slot_supports_sequential_prunes_restart_and_reuse() {
+        let fixture = Fixture::new();
+        let cache = fixture.cache_with_limits(MAX_ENCODED_ENTRY_BYTES * 4, 4);
+        let contexts = [
+            context('a', "registry.example/team/app@sha256:slot-a"),
+            context('b', "registry.example/team/app@sha256:slot-b"),
+            context('c', "registry.example/team/app@sha256:slot-c"),
+            context('d', "registry.example/team/app@sha256:slot-d"),
+        ];
+        let ids = contexts
+            .iter()
+            .enumerate()
+            .map(|(index, context)| {
+                stored_id(
+                    cache
+                        .store(context, format!("evidence-{index}").as_bytes(), NOW)
+                        .expect("store entry"),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (offset, id) in ids.iter().enumerate() {
+            let plan = cache
+                .plan_prune(&[PruneSelector::Id(id.clone())], NOW)
+                .expect("preview entry");
+            assert_eq!(
+                cache.execute_prune(plan).expect("reuse fixed slot"),
+                CachePruneResult {
+                    removed: 1,
+                    skipped: 0,
+                },
+                "sequential prune {offset}"
+            );
+        }
+        assert!(
+            cache
+                .check(NOW)
+                .expect("all entries pruned")
+                .entries
+                .is_empty()
+        );
+        assert_eq!(
+            fs::read_dir(cache.config().root.join(TOMBSTONE_DIRECTORY))
+                .expect("tombstone directory")
+                .count(),
+            1,
+            "all sequential prunes reuse one slot"
+        );
+        drop(cache);
+
+        let reopened = fixture.cache_with_limits(MAX_ENCODED_ENTRY_BYTES * 4, 4);
+        for (index, context) in contexts.iter().enumerate() {
+            assert_eq!(
+                stored_id(
+                    reopened
+                        .store(context, format!("evidence-{index}").as_bytes(), NOW + 1)
+                        .expect("re-store through placeholder after restart")
+                ),
+                ids[index]
+            );
+        }
+        assert_eq!(
+            reopened
+                .check(NOW + 1)
+                .expect("all entries restored")
+                .entries
+                .len(),
+            4
+        );
+        assert_eq!(
+            fs::read_dir(reopened.config().root.join(TOMBSTONE_DIRECTORY))
+                .expect("reused tombstone directory")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn same_inode_content_change_is_skipped_after_prune_preview() {
         let fixture = Fixture::new();
         let cache = fixture.cache();
@@ -2126,6 +2758,78 @@ mod tests {
         }
 
         assert_eq!(cache.check(NOW), Err(OciEvidenceCacheError::UnsafeLayout));
+    }
+
+    #[test]
+    fn global_byte_budget_is_charged_before_untrusted_entry_decode() {
+        let fixture = Fixture::new();
+        let cache = fixture.cache();
+        let context = context('f', "registry.example/team/app@sha256:byte-budget");
+        let id = stored_id(cache.store(&context, b"evidence", NOW).expect("store"));
+        let path = cache.entry_path(context.subject, &id);
+        fs::write(&path, vec![b'{'; 1024]).expect("install malformed bounded entry");
+        drop(cache);
+
+        let bounded = fixture.cache_with_limits(512, 1);
+        assert_eq!(
+            bounded.check(NOW),
+            Err(OciEvidenceCacheError::UnsafeLayout),
+            "global byte exhaustion must reject before malformed JSON is decoded"
+        );
+    }
+
+    #[test]
+    fn entry_growth_after_stat_is_rejected_with_only_charged_allocation() {
+        let fixture = Fixture::new();
+        let cache = fixture.cache();
+        let context = context('f', "registry.example/team/app@sha256:grow-after-stat");
+        let id = stored_id(cache.store(&context, b"evidence", NOW).expect("store"));
+        let path = cache.entry_path(context.subject, &id);
+        let charged = fs::metadata(&path).expect("entry metadata").len();
+        let mut budget = LoadBudget::new(1, charged);
+
+        let result =
+            load_entry_budgeted_with_observer(&path, context.subject, &mut budget, |observed| {
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(observed)
+                    .expect("open observed entry")
+                    .write_all(b"x")
+                    .expect("grow after stat");
+            });
+        assert!(matches!(result, Err(OciEvidenceCacheError::UnsafeLayout)));
+        assert_eq!(budget.remaining_entries, 0);
+        assert_eq!(budget.remaining_bytes, 0);
+    }
+
+    #[test]
+    fn entry_path_replacement_after_stat_is_rejected_before_decode() {
+        let fixture = Fixture::new();
+        let cache = fixture.cache();
+        let context = context('f', "registry.example/team/app@sha256:replace-after-stat");
+        let id = stored_id(cache.store(&context, b"evidence", NOW).expect("store"));
+        let path = cache.entry_path(context.subject, &id);
+        let charged = fs::metadata(&path).expect("entry metadata").len();
+        let mut budget = LoadBudget::new(1, charged);
+        let mut moved = None;
+
+        let result =
+            load_entry_budgeted_with_observer(&path, context.subject, &mut budget, |observed| {
+                let replacement = observed.with_extension("replaced");
+                fs::rename(observed, &replacement).expect("relocate opened inode");
+                fs::write(
+                    observed,
+                    vec![b'x'; usize::try_from(charged).expect("bounded length")],
+                )
+                .expect("install same-length replacement");
+                fs::set_permissions(observed, fs::Permissions::from_mode(0o600))
+                    .expect("protect replacement");
+                moved = Some(replacement);
+            });
+        assert!(matches!(result, Err(OciEvidenceCacheError::UnsafeLayout)));
+        assert!(moved.expect("relocated opened entry").exists());
+        assert_eq!(budget.remaining_entries, 0);
+        assert_eq!(budget.remaining_bytes, 0);
     }
 
     #[test]
