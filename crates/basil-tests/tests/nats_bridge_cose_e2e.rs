@@ -549,9 +549,14 @@ async fn go_client_round_trips_sealed_cose_through_nats_bridge() {
     };
     let bridge = tokio::spawn(async move { basil_nats_bridge::run(config).await });
 
-    let go_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("clients/go");
+    let go_dir = std::env::var_os("BASIL_GO_CLIENT_DIR").map_or_else(
+        || {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join("clients/go")
+        },
+        PathBuf::from,
+    );
     let go_output = tokio::task::spawn_blocking(move || {
         Command::new("go")
             .args(["run", "./examples/nats-cose-courier"])

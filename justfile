@@ -145,7 +145,10 @@ clean:
 # opts the harness-built `basil` binary into the JWKS/OIDC HTTP surface required
 # by the JWKS/OIDC live lanes.
 cargo-live-e2e:
-    cargo test -p basil-tests --features live-e2e,http
+    #!/usr/bin/env bash
+    set -euo pipefail
+    go_client_dir="$(scripts/resolve-go-client-dir.sh)"
+    BASIL_GO_CLIENT_DIR="$go_client_dir" cargo test -p basil-tests --features live-e2e,http
 
 # Build the Rust `stream_cli` example and run the Go `//go:build interop`
 # cross-language stream tests against it. These prove the Go and Rust streaming
@@ -155,14 +158,30 @@ cargo-live-e2e:
 test-stream-interop:
     #!/usr/bin/env bash
     set -euo pipefail
+    go_client_dir="$(scripts/resolve-go-client-dir.sh)"
     cargo build -p basil --example stream_cli
     cli="$PWD/target/debug/examples/stream_cli"
     echo "== go test -tags interop: clients/go/stream (BASIL_STREAM_RUST_CLI=$cli)"
-    BASIL_STREAM_RUST_CLI="$cli" go test -C clients/go -tags interop ./stream/...
+    BASIL_STREAM_RUST_CLI="$cli" go test -C "$go_client_dir" -tags interop ./stream/...
 
 # Run the Go client against a live backend and basil agent
-test-go-live-interop: 
-    clients/go/scripts/interop-agent.sh
+test-go-live-interop:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    go_client_dir="$(scripts/resolve-go-client-dir.sh)"
+    if [[ $go_client_dir == "$PWD/clients/go" ]]; then
+      exec "$go_client_dir/scripts/interop-agent.sh"
+    fi
+    command -v bwrap >/dev/null || {
+      echo "bwrap is required to mount an external Go checkout read-only" >&2
+      exit 1
+    }
+    exec bwrap \
+      --die-with-parent \
+      --bind / / \
+      --ro-bind "$go_client_dir" "$PWD/clients/go" \
+      --chdir "$PWD" \
+      "$PWD/clients/go/scripts/interop-agent.sh"
  
 # Run all live and cross-language interop suites
 test-interop: cargo-live-e2e test-stream-interop test-go-live-interop
@@ -224,4 +243,3 @@ test-e2e engine="both":
     echo "===== e2e summary ====="
     for e in "${engines[@]}"; do printf '  %-8s %s\n' "$e" "${result[$e]}"; done
     exit "$rc"
-

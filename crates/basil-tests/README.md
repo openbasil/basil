@@ -38,3 +38,13 @@ binaries; then it runs `target/debug/basil run` on a temporary Unix socket.
 
 All are additive and on under `--all-features`. Run from the workspace root so the harness can
 find `scripts/` and the built binaries.
+
+## Jujutsu workspaces
+
+Fresh `jj` workspaces leave the `clients/go` Git submodule empty. The interop
+recipes reuse the populated main checkout through the workspace's
+`.beads/redirect`, while Rust binaries and fixtures still come from the active
+workspace. The Go checkout is mounted read-only for the live Go harness. Do not
+copy or force-track the ignored submodule. Set
+`BASIL_GO_CLIENT_DIR` to an absolute populated checkout only when using a
+different workspace layout.
