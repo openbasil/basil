@@ -43,7 +43,7 @@
 //! path beyond what startup reconcile already settled.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::catalog::loader::LoadError;
@@ -289,6 +289,49 @@ struct FileFingerprint {
     ctime_nsec: i64,
 }
 
+const MAX_RELOAD_FINGERPRINT_PATHS: usize = 2048;
+
+#[derive(Debug)]
+struct ReloadFingerprintSnapshot {
+    files: BTreeMap<PathBuf, FileFingerprint>,
+}
+
+impl ReloadFingerprintSnapshot {
+    fn capture(paths: impl IntoIterator<Item = PathBuf>) -> Result<Self, ReloadError> {
+        let mut snapshot = Self {
+            files: BTreeMap::new(),
+        };
+        snapshot.extend(paths)?;
+        Ok(snapshot)
+    }
+
+    fn extend(&mut self, paths: impl IntoIterator<Item = PathBuf>) -> Result<(), ReloadError> {
+        for path in paths {
+            if self.files.contains_key(&path) {
+                continue;
+            }
+            if self.files.len() >= MAX_RELOAD_FINGERPRINT_PATHS {
+                return Err(ReloadError::OciConfiguration(
+                    "reload input fingerprint set exceeds safety bound".to_owned(),
+                ));
+            }
+            self.files.insert(path.clone(), fingerprint(&path)?);
+        }
+        Ok(())
+    }
+
+    fn verify_unchanged(&self) -> Result<(), ReloadError> {
+        for (path, expected) in &self.files {
+            if expected != &fingerprint(path)? {
+                return Err(ReloadError::TornSnapshot {
+                    path: path.display().to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(unix)]
 fn file_fingerprint(path: &Path) -> std::io::Result<FileFingerprint> {
     use std::os::unix::fs::MetadataExt;
@@ -356,38 +399,24 @@ fn read_reload_inputs_with_observer_and_collector(
     (
         CorpusDocuments,
         crate::agent_cli::OciConfigFile,
-        FileFingerprint,
+        ReloadFingerprintSnapshot,
     ),
     ReloadError,
 > {
-    let config_before = fingerprint(&inputs.config_path)?;
     let bootstrap =
         load_bootstrap_with_trace_collector(Some(&inputs.config_path), &inputs.overrides, traces)?;
     let oci = crate::agent_cli::parse_reload_oci_config(&bootstrap.value)
         .map_err(|error| ReloadError::OciConfiguration(error.to_string()))?;
     let mut paths = vec![
+        inputs.config_path.clone(),
         bootstrap.sources.catalog.clone(),
         bootstrap.sources.policy.clone(),
     ];
     paths.extend(bootstrap.sources.compose.values().cloned());
-    let before = paths
-        .iter()
-        .map(|path| fingerprint(path).map(|value| (path.clone(), value)))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    observer();
-    if config_before != fingerprint(&inputs.config_path)? {
-        return Err(ReloadError::TornSnapshot {
-            path: inputs.config_path.display().to_string(),
-        });
+    if oci.enabled() {
+        paths.extend(oci.trusted_root_path().map(Path::to_path_buf));
     }
-    for (path, expected) in &before {
-        if expected != &fingerprint(path)? {
-            return Err(ReloadError::TornSnapshot {
-                path: path.display().to_string(),
-            });
-        }
-    }
+    let mut snapshot = ReloadFingerprintSnapshot::capture(paths)?;
     let documents = load_documents_with_trace_collector(
         &bootstrap.sources,
         &bootstrap.document_overrides,
@@ -398,20 +427,26 @@ fn read_reload_inputs_with_observer_and_collector(
         crate::configuration::ConfigurationError::Catalog(error) => ReloadError::Validate(error),
         other => ReloadError::Configuration(other),
     })?;
+    if oci.enabled() {
+        snapshot.extend(
+            documents
+                .policy
+                .oci_signer_policies
+                .values()
+                .filter_map(|policy| match &policy.signer {
+                    crate::core::oci_verification::OciSignerMode::PinnedKey {
+                        public_key, ..
+                    } => Some(public_key.clone()),
+                    crate::core::oci_verification::OciSignerMode::Keyless { .. } => None,
+                }),
+        )?;
+    }
 
-    if config_before != fingerprint(&inputs.config_path)? {
-        return Err(ReloadError::TornSnapshot {
-            path: inputs.config_path.display().to_string(),
-        });
-    }
-    for (path, expected) in before {
-        if expected != fingerprint(&path)? {
-            return Err(ReloadError::TornSnapshot {
-                path: path.display().to_string(),
-            });
-        }
-    }
-    Ok((documents, oci, config_before))
+    // The observer models a writer racing after every input has been identified
+    // and fingerprinted but before trust bytes are captured for the candidate.
+    observer();
+    snapshot.verify_unchanged()?;
+    Ok((documents, oci, snapshot))
 }
 
 fn fingerprint(path: &Path) -> Result<FileFingerprint, ReloadError> {
@@ -473,6 +508,14 @@ fn validate_candidate_with_trace_collector(
     state: &BrokerState,
     traces: &mut Vec<ConfigurationSourceTrace>,
 ) -> Result<ValidatedCandidate, ReloadError> {
+    validate_candidate_with_trace_collector_and_observer(state, traces, || {})
+}
+
+fn validate_candidate_with_trace_collector_and_observer(
+    state: &BrokerState,
+    traces: &mut Vec<ConfigurationSourceTrace>,
+    observer: impl FnOnce(),
+) -> Result<ValidatedCandidate, ReloadError> {
     let inputs = state.reload_inputs().ok_or(ReloadError::NoInputs)?;
     let (
         CorpusDocuments {
@@ -484,7 +527,7 @@ fn validate_candidate_with_trace_collector(
             overrides,
         },
         oci_config,
-        config_fingerprint,
+        input_snapshot,
     ) = read_reload_inputs_with_observer_and_collector(inputs, || {}, traces)?;
     for w in &warnings {
         tracing::warn!(warning = %w, "reload: catalog/policy load warning");
@@ -504,11 +547,8 @@ fn validate_candidate_with_trace_collector(
         &policy.oci_signer_policies,
     )
     .map_err(|error| ReloadError::OciConfiguration(error.to_string()))?;
-    if config_fingerprint != fingerprint(&inputs.config_path)? {
-        return Err(ReloadError::TornSnapshot {
-            path: inputs.config_path.display().to_string(),
-        });
-    }
+    observer();
+    input_snapshot.verify_unchanged()?;
     let outcome = ReloadOutcome {
         previous_generation,
         new_generation,
@@ -616,6 +656,7 @@ mod tests {
         ReloadError, ReloadInputs, check_reload, read_reload_inputs,
         read_reload_inputs_with_observer, reload_generation,
         validate_candidate_with_trace_collector,
+        validate_candidate_with_trace_collector_and_observer,
     };
     use crate::backend::{Backend, BackendError, NewKey};
     use crate::catalog::load;
@@ -1278,6 +1319,62 @@ mod tests {
             state.active_generation_id(),
             INITIAL_GENERATION_ID,
             "helper rejection leaves the serving generation untouched"
+        );
+    }
+
+    #[test]
+    fn trusted_root_change_during_reload_snapshot_is_rejected() {
+        let fixture = state_with_oci_files();
+        let error = read_reload_inputs_with_observer(&fixture.inputs, || {
+            std::fs::write(&fixture.root, b"root-raced").expect("race trusted root rewrite");
+        })
+        .expect_err("changed trusted-root fingerprint rejects torn generation");
+
+        assert!(matches!(error, ReloadError::TornSnapshot { .. }));
+        assert_eq!(error.audit_reason(), "inputs_changed_during_read");
+        assert_eq!(fixture.state.active_generation_id(), INITIAL_GENERATION_ID);
+    }
+
+    #[test]
+    fn pinned_key_change_during_reload_snapshot_is_rejected() {
+        let fixture = state_with_oci_files();
+        let error = read_reload_inputs_with_observer(&fixture.inputs, || {
+            std::fs::write(&fixture.key, b"key-raced").expect("race pinned key rewrite");
+        })
+        .expect_err("changed pinned-key fingerprint rejects torn generation");
+
+        assert!(matches!(error, ReloadError::TornSnapshot { .. }));
+        assert_eq!(error.audit_reason(), "inputs_changed_during_read");
+        assert_eq!(fixture.state.active_generation_id(), INITIAL_GENERATION_ID);
+    }
+
+    #[test]
+    fn trust_change_after_candidate_capture_is_rejected_before_generation_install() {
+        let fixture = state_with_oci_files();
+        let mut traces = Vec::new();
+        let result = validate_candidate_with_trace_collector_and_observer(
+            &fixture.state,
+            &mut traces,
+            || {
+                std::fs::write(&fixture.key, b"key-after-capture")
+                    .expect("race after protected key capture");
+            },
+        );
+        let Err(error) = result else {
+            panic!("post-capture fingerprint mismatch must reject candidate");
+        };
+
+        assert!(matches!(error, ReloadError::TornSnapshot { .. }));
+        assert_eq!(fixture.state.active_generation_id(), INITIAL_GENERATION_ID);
+        assert_eq!(
+            fixture
+                .state
+                .load_generation()
+                .oci()
+                .expect("serving OCI generation")
+                .verifier()
+                .pinned_key_snapshot(&fixture.key),
+            Some(b"key-v1".as_slice())
         );
     }
 

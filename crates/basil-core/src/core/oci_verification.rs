@@ -543,7 +543,7 @@ impl CosignConfig {
         if self.deadline.is_zero() || self.deadline > Duration::from_mins(5) {
             return Err(OciVerificationError::Configuration);
         }
-        validate_protected_file(&self.executable)?;
+        validate_protected_executable(&self.executable)?;
         Ok(())
     }
 }
@@ -973,7 +973,6 @@ impl CosignVerifier {
 
     /// Re-run cryptographic verification using only cached public bundles and
     /// the current protected key or trusted-root snapshot.
-    #[allow(clippy::too_many_lines)]
     pub async fn verify_offline(
         &self,
         policy_name: &str,
@@ -1000,84 +999,108 @@ impl CosignVerifier {
         {
             return Err(OciVerificationError::MalformedOutput);
         }
-        if matches!(policy.signer, OciSignerMode::Keyless { .. }) && self.trusted_root.is_none() {
+        let deadline = Instant::now() + self.config.deadline;
+        for record in &evidence.records {
+            validate_simple_signing_payload(
+                &record.signed_payload,
+                &chain.repository,
+                validated.subject,
+            )?;
+            if self
+                .verify_blob_evidence(
+                    policy,
+                    &record.signed_payload,
+                    &record.sigstore_bundle,
+                    deadline,
+                )
+                .await?
+            {
+                return Ok(OciVerificationEvidence {
+                    policy: policy_name.to_owned(),
+                    repository: chain.repository.clone(),
+                    signed_object: chain.signed_object,
+                    signed_digest: validated.subject,
+                    manifest_digest: validated.manifest,
+                    config_digest: validated.config,
+                    platform: chain.platform.clone(),
+                    offline_bundle: Some(evidence.clone()),
+                });
+            }
+        }
+        Err(OciVerificationError::Rejected)
+    }
+
+    async fn verify_blob_evidence(
+        &self,
+        policy: &OciSignerPolicy,
+        signed_payload: &[u8],
+        sigstore_bundle: &[u8],
+        deadline: Instant,
+    ) -> Result<bool, OciVerificationError> {
+        if u64::try_from(signed_payload.len()).map_or(true, |size| size > MAX_SIGSTORE_BUNDLE_BYTES)
+            || u64::try_from(sigstore_bundle.len())
+                .map_or(true, |size| size > MAX_SIGSTORE_BUNDLE_BYTES)
+            || (matches!(policy.signer, OciSignerMode::Keyless { .. })
+                && self.trusted_root.is_none())
+        {
             return Err(OciVerificationError::Configuration);
         }
-        let deadline = Instant::now() + self.config.deadline;
         let temp = PrivateTempDir::create(&self.config.temp_parent)?;
         let temp_path = temp.path()?.to_path_buf();
         let pinned_key = self.materialize_pinned_key(policy, &temp_path)?;
         let trusted_root = self.materialize_trusted_root(&temp_path)?;
         let result = async {
-            for (index, record) in evidence.records.iter().enumerate() {
-                validate_simple_signing_payload(
-                    &record.signed_payload,
-                    &chain.repository,
-                    validated.subject,
-                )?;
-                let signed_path = temp.path()?.join(format!("signed-payload-{index}"));
-                write_private_public_file(&signed_path, &record.signed_payload)?;
-                let bundle_path = temp.path()?.join(format!("bundle-{index}.json"));
-                write_private_public_file(&bundle_path, &record.sigstore_bundle)?;
-                let mut command = Command::new(&self.config.executable);
-                command
-                    .arg("verify-blob")
-                    .arg("--bundle")
-                    .arg(&bundle_path)
-                    .env_clear()
-                    .env("TMPDIR", temp.path()?)
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .kill_on_drop(true)
-                    .process_group(0);
-                match &policy.signer {
-                    OciSignerMode::PinnedKey { transparency, .. } => {
-                        command.arg("--key").arg(
-                            pinned_key
-                                .as_ref()
-                                .ok_or(OciVerificationError::Configuration)?,
-                        );
-                        if *transparency == TransparencyPolicy::Optional {
-                            command.arg("--insecure-ignore-tlog");
-                        }
-                    }
-                    OciSignerMode::Keyless { issuer, identity } => {
-                        let trusted_root = trusted_root
+            let signed_path = temp.path()?.join("signed-payload");
+            write_private_public_file(&signed_path, signed_payload)?;
+            let bundle_path = temp.path()?.join("bundle.json");
+            write_private_public_file(&bundle_path, sigstore_bundle)?;
+            let mut command = Command::new(&self.config.executable);
+            command
+                .arg("verify-blob")
+                .arg("--bundle")
+                .arg(&bundle_path)
+                .env_clear()
+                .env("TMPDIR", temp.path()?)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .process_group(0);
+            match &policy.signer {
+                OciSignerMode::PinnedKey { transparency, .. } => {
+                    command.arg("--key").arg(
+                        pinned_key
                             .as_ref()
-                            .ok_or(OciVerificationError::Configuration)?;
-                        command
-                            .arg("--trusted-root")
-                            .arg(trusted_root)
-                            .arg("--certificate-oidc-issuer")
-                            .arg(issuer)
-                            .arg("--certificate-identity")
-                            .arg(identity);
+                            .ok_or(OciVerificationError::Configuration)?,
+                    );
+                    if *transparency == TransparencyPolicy::Optional {
+                        command.arg("--insecure-ignore-tlog");
                     }
                 }
-                command.arg("--").arg(&signed_path);
-                let child = command
-                    .spawn()
-                    .map_err(|_| OciVerificationError::Unavailable)?;
-                let remaining = deadline
-                    .checked_duration_since(Instant::now())
-                    .filter(|duration| !duration.is_zero())
-                    .ok_or(OciVerificationError::Timeout)?;
-                let output = wait_bounded(child, remaining, MAX_COSIGN_STDOUT_BYTES).await?;
-                if output.status.success() {
-                    return Ok(OciVerificationEvidence {
-                        policy: policy_name.to_owned(),
-                        repository: chain.repository.clone(),
-                        signed_object: chain.signed_object,
-                        signed_digest: validated.subject,
-                        manifest_digest: validated.manifest,
-                        config_digest: validated.config,
-                        platform: chain.platform.clone(),
-                        offline_bundle: Some(evidence.clone()),
-                    });
+                OciSignerMode::Keyless { issuer, identity } => {
+                    let trusted_root = trusted_root
+                        .as_ref()
+                        .ok_or(OciVerificationError::Configuration)?;
+                    command
+                        .arg("--trusted-root")
+                        .arg(trusted_root)
+                        .arg("--certificate-oidc-issuer")
+                        .arg(issuer)
+                        .arg("--certificate-identity")
+                        .arg(identity);
                 }
             }
-            Err(OciVerificationError::Rejected)
+            command.arg("--").arg(&signed_path);
+            let child = command
+                .spawn()
+                .map_err(|_| OciVerificationError::Unavailable)?;
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|duration| !duration.is_zero())
+                .ok_or(OciVerificationError::Timeout)?;
+            wait_bounded(child, remaining, MAX_COSIGN_STDOUT_BYTES)
+                .await
+                .map(|output| output.status.success())
         }
         .await;
         temp.cleanup()?;
@@ -1462,6 +1485,28 @@ fn validate_protected_file(path: &Path) -> Result<(), OciVerificationError> {
         || (metadata.uid() != 0 && metadata.uid() != effective_uid)
         || metadata.permissions().mode() & 0o022 != 0
         || metadata.nlink() != 1
+    {
+        return Err(OciVerificationError::Configuration);
+    }
+    Ok(())
+}
+
+fn validate_protected_executable(path: &Path) -> Result<(), OciVerificationError> {
+    validate_absolute_path(path).map_err(|_| OciVerificationError::Configuration)?;
+    validate_protected_ancestors(path)?;
+    let metadata = fs::symlink_metadata(path).map_err(|_| OciVerificationError::Configuration)?;
+    let effective_uid = rustix::process::geteuid().as_raw();
+    let immutable_nix_store_hardlink = metadata.nlink() > 0
+        && metadata.uid() == 0
+        && path
+            .strip_prefix("/nix/store")
+            .ok()
+            .and_then(|relative| relative.components().next())
+            .is_some_and(|component| matches!(component, std::path::Component::Normal(_)));
+    if !metadata.file_type().is_file()
+        || (metadata.uid() != 0 && metadata.uid() != effective_uid)
+        || metadata.permissions().mode() & 0o022 != 0
+        || (metadata.nlink() != 1 && !immutable_nix_store_hardlink)
     {
         return Err(OciVerificationError::Configuration);
     }
@@ -2245,7 +2290,7 @@ fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2614,6 +2659,51 @@ mod tests {
                 sigstore_bundle: bundle.to_vec(),
             }],
         }
+    }
+
+    #[test]
+    fn protected_executable_accepts_nix_store_hardlinks_but_rejects_writable_files() {
+        let fixture = Fixture::new();
+        let writable = fixture.executable("exit 0");
+        fs::set_permissions(&writable, fs::Permissions::from_mode(0o720))
+            .expect("make executable group writable");
+        assert_eq!(
+            CosignConfig {
+                executable: writable,
+                temp_parent: fixture.root.clone(),
+                deadline: Duration::from_secs(2),
+            }
+            .validate(),
+            Err(OciVerificationError::Configuration)
+        );
+
+        let hardlink = fixture.root.join("hardlinked-cosign");
+        let source = fixture.executable("exit 0");
+        fs::hard_link(&source, &hardlink).expect("create non-store hardlink");
+        assert_eq!(
+            CosignConfig {
+                executable: hardlink,
+                temp_parent: fixture.root.clone(),
+                deadline: Duration::from_secs(2),
+            }
+            .validate(),
+            Err(OciVerificationError::Configuration)
+        );
+
+        let Ok(nix_cosign) = fs::canonicalize("/run/current-system/sw/bin/cosign") else {
+            return;
+        };
+        let metadata = fs::metadata(&nix_cosign).expect("Nix Cosign metadata");
+        if !nix_cosign.starts_with("/nix/store") || metadata.nlink() <= 1 {
+            return;
+        }
+        CosignConfig {
+            executable: nix_cosign,
+            temp_parent: fixture.root.clone(),
+            deadline: Duration::from_secs(2),
+        }
+        .validate()
+        .expect("immutable root-owned Nix-store executable hardlink is protected");
     }
 
     #[test]
@@ -3147,14 +3237,88 @@ esac"#,
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     #[ignore = "requires BASIL_COSIGN_3_1_1 pointing to the exact release binary"]
-    async fn real_cosign_3_1_1_pinned_fixture_passes_production_offline_verifier() {
-        let executable = std::env::var_os("BASIL_COSIGN_3_1_1")
+    async fn real_cosign_3_1_1_fixtures_pass_production_verifier_without_network() {
+        const CHILD_ENV: &str = "BASIL_COSIGN_OFFLINE_FIXTURE_CHILD";
+        let source_executable = std::env::var_os("BASIL_COSIGN_3_1_1")
             .map(PathBuf::from)
-            .expect("set BASIL_COSIGN_3_1_1 to the exact Cosign 3.1.1 binary");
+            .and_then(|path| fs::canonicalize(path).ok())
+            .expect("set BASIL_COSIGN_3_1_1 to an exact Cosign 3.1.1 binary");
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(Path::parent)
+                .expect("workspace root");
+            let output = std::process::Command::new("bwrap")
+                .args([
+                    "--unshare-user",
+                    "--unshare-net",
+                    "--uid",
+                    "0",
+                    "--gid",
+                    "0",
+                    "--tmpfs",
+                    "/",
+                    "--dir",
+                    "/nix",
+                    "--ro-bind",
+                    "/nix/store",
+                    "/nix/store",
+                    "--proc",
+                    "/proc",
+                    "--dev",
+                    "/dev",
+                    "--dir",
+                    "/tmp",
+                    "--dir",
+                    "/home",
+                    "--dir",
+                    "/home/user",
+                    "--dir",
+                    "/home/user/project",
+                    "--dir",
+                    "/home/user/project/basil",
+                    "--dir",
+                    "/home/user/project/basil/.work",
+                    "--ro-bind",
+                ])
+                .arg(workspace)
+                .arg(workspace)
+                .arg(std::env::current_exe().expect("current test executable"))
+                .args([
+                    "--exact",
+                    "core::oci_verification::tests::real_cosign_3_1_1_fixtures_pass_production_verifier_without_network",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .env("BASIL_COSIGN_3_1_1", &source_executable)
+                .output()
+                .expect("run real fixture test in isolated network namespace");
+            assert!(
+                output.status.success(),
+                "network-isolated fixture test failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
         let fixture = Fixture::new();
         let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../basil-tests/fixtures/release-manifest/v1/cosign-3.1.1-conformance");
+        let version = std::process::Command::new(&source_executable)
+            .arg("version")
+            .output()
+            .expect("query Cosign fixture verifier version");
+        assert!(version.status.success());
+        assert!(String::from_utf8_lossy(&version.stdout).contains("GitVersion:    v3.1.1"));
+        let executable_bytes = fs::read(&source_executable).expect("read exact Cosign executable");
+        let executable = fixture.root.join("cosign-3.1.1");
+        fs::write(&executable, executable_bytes).expect("copy protected Cosign executable");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+            .expect("protect Cosign executable");
         let public_key = fixture.root.join("pinned-cosign.pub");
         fs::write(
             &public_key,
@@ -3194,13 +3358,33 @@ esac"#,
                 transparency: TransparencyPolicy::Optional,
             },
         };
+        let keyless_root = fixture.root.join("trusted-root.json");
+        fs::write(
+            &keyless_root,
+            fs::read(directory.join("trusted-root.json")).expect("read trusted-root fixture"),
+        )
+        .expect("copy protected trusted root");
+        fs::set_permissions(&keyless_root, fs::Permissions::from_mode(0o600))
+            .expect("protect trusted root");
+        let keyless_policy = OciSignerPolicy {
+            repository: "registry.example/team/keyless-fixture".to_owned(),
+            signer: OciSignerMode::Keyless {
+                issuer: "https://token.actions.githubusercontent.com".to_owned(),
+                identity: "https://github.com/sigstore-conformance/extremely-dangerous-public-oidc-beacon/.github/workflows/extremely-dangerous-oidc-beacon.yml@refs/heads/main".to_owned(),
+            },
+        };
         let verifier = CosignVerifier::for_public_registries(CosignConfig {
             executable,
             temp_parent: fixture.root.clone(),
             deadline: Duration::from_secs(30),
         })
         .expect("construct real verifier")
-        .with_signer_policies(&BTreeMap::from([("production".to_owned(), policy.clone())]))
+        .with_trusted_root(&keyless_root)
+        .expect("snapshot conformance trusted root")
+        .with_signer_policies(&BTreeMap::from([
+            ("production".to_owned(), policy.clone()),
+            ("keyless".to_owned(), keyless_policy.clone()),
+        ]))
         .expect("snapshot conformance public key");
         let evidence = OciOfflineBundle {
             repository: chain.repository.clone(),
@@ -3223,6 +3407,18 @@ esac"#,
             .expect("real Cosign fixture admits");
         assert_eq!(admitted.signed_digest, chain.manifest.digest);
         assert_eq!(admitted.config_digest, chain.config.digest);
+        validate_signer_policy("keyless", &keyless_policy).expect("keyless policy validates");
+        assert!(
+            verifier
+                .verify_blob_evidence(
+                    &keyless_policy,
+                    &fs::read(directory.join("a.txt")).expect("read keyless payload"),
+                    &fs::read(directory.join("bundle.sigstore.json")).expect("read keyless bundle"),
+                    Instant::now() + Duration::from_secs(30),
+                )
+                .await
+                .expect("real keyless fixture admits")
+        );
     }
 
     #[tokio::test]

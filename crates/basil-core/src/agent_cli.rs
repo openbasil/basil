@@ -1020,6 +1020,16 @@ impl Default for OciConfigFile {
     }
 }
 
+impl OciConfigFile {
+    pub(crate) const fn enabled(&self) -> bool {
+        self.enable
+    }
+
+    pub(crate) fn trusted_root_path(&self) -> Option<&Path> {
+        self.trusted_root.as_deref()
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 struct RegistryAuthConfigFile {
