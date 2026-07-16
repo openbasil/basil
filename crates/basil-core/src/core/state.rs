@@ -28,6 +28,7 @@
 //! Today there is exactly one generation (id `1`); this iteration lands only the
 //! pinning plumbing: there is no reload trigger yet (`basil-y3e.2`).
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -52,6 +53,43 @@ use crate::revocation::JwtRevocationStore;
 /// `1` so `0` can never be mistaken for a live generation.
 pub const INITIAL_GENERATION_ID: u64 = 1;
 
+/// Immutable OCI verification authority pinned to one broker generation.
+///
+/// The verifier owns snapshots of every trusted-root and pinned-public-key byte;
+/// the deny-list is stored beside it so one request can never mix trust inputs
+/// from different reloads.
+#[derive(Debug)]
+pub struct OciVerificationGeneration {
+    verifier: Arc<crate::core::oci_verification::CosignVerifier>,
+    denied_subjects: BTreeSet<crate::core::oci_verification::OciDigest>,
+}
+
+impl OciVerificationGeneration {
+    /// Construct one already-validated immutable OCI authority snapshot.
+    #[must_use]
+    pub const fn new(
+        verifier: Arc<crate::core::oci_verification::CosignVerifier>,
+        denied_subjects: BTreeSet<crate::core::oci_verification::OciDigest>,
+    ) -> Self {
+        Self {
+            verifier,
+            denied_subjects,
+        }
+    }
+
+    /// Verifier holding this generation's immutable trust bytes.
+    #[must_use]
+    pub const fn verifier(&self) -> &Arc<crate::core::oci_verification::CosignVerifier> {
+        &self.verifier
+    }
+
+    /// Exact subject digests revoked by this generation.
+    #[must_use]
+    pub const fn denied_subjects(&self) -> &BTreeSet<crate::core::oci_verification::OciDigest> {
+        &self.denied_subjects
+    }
+}
+
 /// One coherent snapshot of the reloadable policy surface.
 ///
 /// A `Generation` bundles the [`Catalog`], [`ResolvedPolicy`] index, and
@@ -70,6 +108,7 @@ pub struct Generation {
     policy: ResolvedPolicy,
     config: Config,
     overrides: Vec<OverrideProvenance>,
+    oci: Option<Arc<OciVerificationGeneration>>,
 }
 
 impl Generation {
@@ -93,12 +132,26 @@ impl Generation {
         config: Config,
         overrides: Vec<OverrideProvenance>,
     ) -> Self {
+        Self::new_with_overrides_and_oci(id, catalog, policy, config, overrides, None)
+    }
+
+    /// Bundle all reloadable authorization and OCI trust inputs atomically.
+    #[must_use]
+    pub fn new_with_overrides_and_oci(
+        id: u64,
+        catalog: impl Into<Arc<Catalog>>,
+        policy: ResolvedPolicy,
+        config: Config,
+        overrides: Vec<OverrideProvenance>,
+        oci: Option<Arc<OciVerificationGeneration>>,
+    ) -> Self {
         Self {
             id,
             catalog: catalog.into(),
             policy,
             config,
             overrides,
+            oci,
         }
     }
 
@@ -144,6 +197,12 @@ impl Generation {
     #[must_use]
     pub fn override_provenance(&self) -> &[OverrideProvenance] {
         &self.overrides
+    }
+
+    /// OCI verification authority captured with this generation.
+    #[must_use]
+    pub const fn oci(&self) -> Option<&Arc<OciVerificationGeneration>> {
+        self.oci.as_ref()
     }
 }
 
@@ -354,8 +413,8 @@ pub struct BrokerState {
     reload_inputs: Option<ReloadInputs>,
     /// Optional accepted runtime-attestor realm registry.
     realm_registry: Option<Arc<RealmRegistry>>,
-    /// Optional packaged OCI verifier with its startup registry-access snapshot.
-    oci_verifier: Option<Arc<crate::core::oci_verification::CosignVerifier>>,
+    /// Optional private persistent OCI evidence cache.
+    oci_evidence_cache: Option<Arc<crate::core::oci_evidence_cache::OciEvidenceCache>>,
     /// A short TTL cache of the last admin readiness probe (`basil-8nwy`), so a
     /// burst of ungated `Readiness` RPCs re-fans-out to the backend at most once
     /// per [`READINESS_CACHE_TTL`] instead of per call. Guarded by a `Mutex`; the
@@ -425,7 +484,7 @@ impl BrokerState {
             jwt_revocations: JwtRevocationStore::default(),
             reload_inputs: None,
             realm_registry: None,
-            oci_verifier: None,
+            oci_evidence_cache: None,
             readiness_cache: Mutex::new(None),
             jwks_cache: Mutex::new(None),
             reload_lock: Mutex::new(()),
@@ -436,12 +495,13 @@ impl BrokerState {
     #[must_use]
     pub fn with_override_provenance(self, overrides: Vec<OverrideProvenance>) -> Self {
         let current = self.generation.load_full();
-        let generation = Generation::new_with_overrides(
+        let generation = Generation::new_with_overrides_and_oci(
             current.id,
             Arc::clone(&current.catalog),
             current.policy.clone(),
             current.config.clone(),
             overrides,
+            current.oci.clone(),
         );
         self.generation.store(Arc::new(generation));
         self
@@ -502,22 +562,43 @@ impl BrokerState {
         self.realm_registry.as_ref()
     }
 
-    /// Attach the production packaged OCI verifier constructed at startup.
+    /// Attach verifier trust bytes and the deny-list to the active generation.
     #[must_use]
-    pub fn with_oci_verifier(
-        mut self,
+    pub fn with_oci_verification(
+        self,
         verifier: Arc<crate::core::oci_verification::CosignVerifier>,
+        denied_subjects: BTreeSet<crate::core::oci_verification::OciDigest>,
     ) -> Self {
-        self.oci_verifier = Some(verifier);
+        let current = self.generation.load_full();
+        let oci = Arc::new(OciVerificationGeneration::new(verifier, denied_subjects));
+        let generation = Generation::new_with_overrides_and_oci(
+            current.id,
+            Arc::clone(&current.catalog),
+            current.policy.clone(),
+            current.config.clone(),
+            current.overrides.clone(),
+            Some(oci),
+        );
+        self.generation.store(Arc::new(generation));
         self
     }
 
-    /// Return the packaged OCI verifier when the startup surface enabled it.
+    /// Attach the private persistent OCI evidence cache opened at startup.
     #[must_use]
-    pub const fn oci_verifier(
+    pub fn with_oci_evidence_cache(
+        mut self,
+        cache: Arc<crate::core::oci_evidence_cache::OciEvidenceCache>,
+    ) -> Self {
+        self.oci_evidence_cache = Some(cache);
+        self
+    }
+
+    /// Return the persistent OCI evidence cache when OCI verification is enabled.
+    #[must_use]
+    pub const fn oci_evidence_cache(
         &self,
-    ) -> Option<&Arc<crate::core::oci_verification::CosignVerifier>> {
-        self.oci_verifier.as_ref()
+    ) -> Option<&Arc<crate::core::oci_evidence_cache::OciEvidenceCache>> {
+        self.oci_evidence_cache.as_ref()
     }
 
     /// The configured catalog/policy paths the reload engine re-reads, if any.

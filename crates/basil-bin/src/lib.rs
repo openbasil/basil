@@ -91,6 +91,8 @@ pub enum Command {
     Explain(agent_cli::ExplainArgs),
     /// Preflight environment and deployment checks.
     Doctor(agent_cli::DoctorArgs),
+    /// Inspect or prune the private persistent OCI evidence cache.
+    Cache(agent_cli::CacheArgs),
     #[command(flatten)]
     Client(client_cli::Command),
 }
@@ -309,5 +311,44 @@ mod tests {
                     .expect_err("out-of-range rootless container count must reject");
             assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
         }
+    }
+
+    #[test]
+    fn cache_check_and_preview_first_prune_are_user_facing() {
+        assert!(matches!(
+            parse(&["basil", "cache", "--check", "--age", "60d", "-q"]).command,
+            Command::Cache(_)
+        ));
+        assert!(matches!(
+            parse(&[
+                "basil",
+                "cache",
+                "prune",
+                "registry.example/team/app:stable"
+            ])
+            .command,
+            Command::Cache(_)
+        ));
+        assert!(matches!(
+            parse(&[
+                "basil",
+                "cache",
+                "prune",
+                "--force",
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            ])
+            .command,
+            Command::Cache(_)
+        ));
+    }
+
+    #[test]
+    fn cache_prune_rejects_empty_selector_input() {
+        let error = Cli::try_parse_from(["basil", "cache", "prune"])
+            .expect_err("empty prune selectors must fail closed");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
     }
 }

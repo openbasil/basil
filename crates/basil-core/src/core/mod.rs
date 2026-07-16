@@ -19,6 +19,7 @@ pub mod manager;
 pub mod minter;
 pub mod ml_dsa_sign;
 pub mod ml_kem_envelope;
+pub mod oci_evidence_cache;
 pub mod oci_verification;
 pub mod peer;
 pub mod process_evidence;

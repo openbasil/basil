@@ -74,6 +74,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Doctor(args) => agent_cli::run_doctor_command(args).await,
+        Command::Cache(args) => agent_cli::run_cache_command(args).await,
         Command::Client(command) => {
             init_client_tracing();
             client_cli::run(cli.socket, command).await
