@@ -450,8 +450,9 @@ impl PreparedListener {
 
     /// Atomically publish without replacing any final-path object.
     ///
-    /// The final ACL is applied only after the no-replace rename. Until then,
-    /// the staged socket remains owner-only and is never polled for accepts.
+    /// The configured ACL and inode identity were applied and verified through
+    /// the private staging directory descriptor before this no-replace rename.
+    /// The socket is never polled for accepts until publication succeeds.
     ///
     /// # Errors
     ///

@@ -154,9 +154,20 @@ fn enforce_listener_domain_extensions(
     key: &str,
 ) -> Result<(), Status> {
     let Some(listener) = extensions.get::<ListenerConnectInfo>() else {
-        // Direct in-crate service tests inject `PeerInfo` without constructing a
-        // transport. Every production accept path supplies listener context.
-        return Ok(());
+        state.record_decision(&DecisionRecord::from_actor_evidence_denial(
+            generation,
+            actor,
+            op,
+            key,
+            EvidenceState::Unavailable,
+            "listener_context_unavailable",
+        ));
+        return Err(broker_status(
+            Code::Unavailable,
+            "LISTENER_CONTEXT_UNAVAILABLE",
+            op_token(op),
+            "listener context unavailable",
+        ));
     };
     let admitted = match listener.listener_type() {
         grpc_server::ListenerType::Host => matches!(
@@ -399,10 +410,16 @@ mod tests {
 
     fn request_with_uid(uid: u32) -> Request<()> {
         let mut request = Request::new(());
-        request.extensions_mut().insert(PeerInfo {
-            uid: Some(uid),
-            ..PeerInfo::default()
-        });
+        request
+            .extensions_mut()
+            .insert(ListenerConnectInfo::for_test(
+                "host",
+                grpc_server::ListenerType::Host,
+                PeerInfo {
+                    uid: Some(uid),
+                    ..PeerInfo::default()
+                },
+            ));
         request
     }
 
@@ -477,6 +494,23 @@ mod tests {
         let request = Request::new(());
         let status = authorize(&state, &request, Op::Get, "app.secret").expect_err("no uid");
         assert_eq!(status.code(), Code::Unauthenticated);
+    }
+
+    #[test]
+    fn authorize_fails_closed_when_listener_context_is_missing() {
+        let state = state();
+        let mut request = Request::new(());
+        request.extensions_mut().insert(PeerInfo {
+            uid: Some(42),
+            ..PeerInfo::default()
+        });
+        let status = authorize(&state, &request, Op::Get, "app.secret")
+            .expect_err("missing listener context must fail closed");
+        assert_eq!(status.code(), Code::Unavailable);
+        let rpc = RpcStatus::decode(status.details()).expect("details decode");
+        let detail = rpc.details.first().expect("detail present");
+        let info = BrokerErrorInfo::decode(detail.value.as_slice()).expect("info decodes");
+        assert_eq!(info.reason, "LISTENER_CONTEXT_UNAVAILABLE");
     }
 
     #[test]
