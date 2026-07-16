@@ -180,6 +180,7 @@ test-go-live-interop:
       --die-with-parent \
       --bind / / \
       --dev-bind /dev /dev \
+      --ro-bind "$go_client_dir" "$go_client_dir" \
       --ro-bind "$go_client_dir" "$PWD/clients/go" \
       --chdir "$PWD" \
       "$PWD/clients/go/scripts/interop-agent.sh"

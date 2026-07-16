@@ -489,3 +489,22 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())
 }
+
+/// Build a unit-test request with explicit kernel-peer and host-listener context.
+#[cfg(test)]
+pub(super) fn host_request<T>(uid: u32, body: T) -> tonic::Request<T> {
+    let peer = crate::peer::PeerInfo {
+        uid: Some(uid),
+        ..crate::peer::PeerInfo::default()
+    };
+    let mut request = tonic::Request::new(body);
+    request.extensions_mut().insert(peer.clone());
+    request
+        .extensions_mut()
+        .insert(crate::transport::connection::ListenerConnectInfo::for_test(
+            "host",
+            crate::transport::grpc_server::ListenerType::Host,
+            peer,
+        ));
+    request
+}

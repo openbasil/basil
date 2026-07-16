@@ -195,7 +195,6 @@ mod tests {
     use crate::backend::{Backend, BackendError, KvValue, NewKey, PublicKey};
     use crate::catalog::load;
     use crate::manager::{BackendManager, ManagerError};
-    use crate::peer::PeerInfo;
     use crate::service::minting::nats_mint_status;
     use crate::service::shared::*;
     use crate::state::BrokerState;
@@ -582,12 +581,7 @@ mod tests {
     }
 
     fn authed_request<T>(body: T) -> Request<T> {
-        let mut request = Request::new(body);
-        request.extensions_mut().insert(PeerInfo {
-            uid: Some(42),
-            ..PeerInfo::default()
-        });
-        request
+        crate::service::shared::host_request(42, body)
     }
 
     fn ttl() -> Duration {
@@ -1156,19 +1150,18 @@ mod tests {
         let service = BrokerGrpc::new(mint_state());
         // uid 7 resolves to no policy subject: the RPC must fail closed at
         // entry, before the caller-supplied-nkey arm can run (finding 16).
-        let mut request = Request::new(pb::ValidateNatsJwtRequest {
-            jwt: "not-a-jwt".to_string(),
-            allowed_signers: vec![pb::AllowedNatsSigner {
-                signer: Some(pb::allowed_nats_signer::Signer::NatsPublicKey(
-                    KeyPair::new_account().public_key(),
-                )),
-            }],
-            expected_type: pb::NatsJwtType::Unspecified.into(),
-        });
-        request.extensions_mut().insert(PeerInfo {
-            uid: Some(7),
-            ..PeerInfo::default()
-        });
+        let request = crate::service::shared::host_request(
+            7,
+            pb::ValidateNatsJwtRequest {
+                jwt: "not-a-jwt".to_string(),
+                allowed_signers: vec![pb::AllowedNatsSigner {
+                    signer: Some(pb::allowed_nats_signer::Signer::NatsPublicKey(
+                        KeyPair::new_account().public_key(),
+                    )),
+                }],
+                expected_type: pb::NatsJwtType::Unspecified.into(),
+            },
+        );
         let status = service
             .validate_nats_jwt(request)
             .await
