@@ -99,8 +99,9 @@ impl OciVerificationGeneration {
 /// a monotonic [`id`](Generation::id) that names this snapshot in the audit trail.
 /// It is the unit that [`BrokerState`] swaps atomically on reload: an operation
 /// that pins one `Generation` sees an internally consistent
-/// `(catalog, policy, config)` triple for its entire lifetime, so a concurrent
-/// reload can never mix an old catalog with a new policy.
+/// `(catalog, policy, config, listeners)` snapshot for its entire lifetime, so a
+/// concurrent reload can never mix policy inputs or serving listener identity
+/// from different reloads.
 #[derive(Debug)]
 pub struct Generation {
     /// Monotonic generation id (starts at [`INITIAL_GENERATION_ID`], bumped on
@@ -111,6 +112,7 @@ pub struct Generation {
     config: Config,
     overrides: Vec<OverrideProvenance>,
     oci: Option<Arc<OciVerificationGeneration>>,
+    listeners: Arc<ListenerConfigSet>,
 }
 
 impl Generation {
@@ -147,6 +149,28 @@ impl Generation {
         overrides: Vec<OverrideProvenance>,
         oci: Option<Arc<OciVerificationGeneration>>,
     ) -> Self {
+        Self::new_with_overrides_oci_and_listeners(
+            id,
+            catalog,
+            policy,
+            config,
+            overrides,
+            oci,
+            Arc::new(ListenerConfigSet::default()),
+        )
+    }
+
+    /// Bundle all reloadable authorization, OCI trust, and listener inputs.
+    #[must_use]
+    pub fn new_with_overrides_oci_and_listeners(
+        id: u64,
+        catalog: impl Into<Arc<Catalog>>,
+        policy: ResolvedPolicy,
+        config: Config,
+        overrides: Vec<OverrideProvenance>,
+        oci: Option<Arc<OciVerificationGeneration>>,
+        listeners: impl Into<Arc<ListenerConfigSet>>,
+    ) -> Self {
         Self {
             id,
             catalog: catalog.into(),
@@ -154,6 +178,7 @@ impl Generation {
             config,
             overrides,
             oci,
+            listeners: listeners.into(),
         }
     }
 
@@ -205,6 +230,12 @@ impl Generation {
     #[must_use]
     pub const fn oci(&self) -> Option<&Arc<OciVerificationGeneration>> {
         self.oci.as_ref()
+    }
+
+    /// Typed listener configuration captured with this generation.
+    #[must_use]
+    pub fn listeners(&self) -> &ListenerConfigSet {
+        &self.listeners
     }
 }
 
@@ -387,8 +418,6 @@ pub struct BrokerState {
     /// The active policy generation, swapped atomically on reload (`basil-y3e`).
     /// Every RPC loads exactly one snapshot of this and pins the whole op to it.
     generation: ArcSwap<Generation>,
-    /// Active typed listener configuration, separate from policy/OCI generation.
-    listeners: ArcSwap<ListenerConfigSet>,
     connections: ConnectionRegistry,
     manager: BackendManager,
     /// A stable backend label reported in a `status` response. The manager does
@@ -477,7 +506,6 @@ impl BrokerState {
         let generation = Generation::new(INITIAL_GENERATION_ID, catalog, policy, config);
         Self {
             generation: ArcSwap::from_pointee(generation),
-            listeners: ArcSwap::from_pointee(ListenerConfigSet::default()),
             connections: ConnectionRegistry::with_defaults(),
             manager,
             backend_label: backend_label.into(),
@@ -502,13 +530,14 @@ impl BrokerState {
     #[must_use]
     pub fn with_override_provenance(self, overrides: Vec<OverrideProvenance>) -> Self {
         let current = self.generation.load_full();
-        let generation = Generation::new_with_overrides_and_oci(
+        let generation = Generation::new_with_overrides_oci_and_listeners(
             current.id,
             Arc::clone(&current.catalog),
             current.policy.clone(),
             current.config.clone(),
             overrides,
             current.oci.clone(),
+            Arc::clone(&current.listeners),
         );
         self.generation.store(Arc::new(generation));
         self
@@ -559,19 +588,18 @@ impl BrokerState {
     /// Attach the listener configuration installed at startup.
     #[must_use]
     pub fn with_listener_configs(self, listeners: ListenerConfigSet) -> Self {
-        self.listeners.store(Arc::new(listeners));
+        let current = self.generation.load_full();
+        let generation = Generation::new_with_overrides_oci_and_listeners(
+            current.id,
+            Arc::clone(&current.catalog),
+            current.policy.clone(),
+            current.config.clone(),
+            current.overrides.clone(),
+            current.oci.clone(),
+            Arc::new(listeners),
+        );
+        self.generation.store(Arc::new(generation));
         self
-    }
-
-    /// Snapshot the active listener configuration.
-    #[must_use]
-    pub fn load_listener_configs(&self) -> Guard<Arc<ListenerConfigSet>> {
-        self.listeners.load()
-    }
-
-    /// Install a fully committed listener configuration.
-    pub fn swap_listener_configs(&self, listeners: Arc<ListenerConfigSet>) {
-        self.listeners.store(listeners);
     }
 
     /// Broker-wide connection inventory and listener admission gate.
@@ -602,13 +630,14 @@ impl BrokerState {
     ) -> Self {
         let current = self.generation.load_full();
         let oci = Arc::new(OciVerificationGeneration::new(verifier, denied_subjects));
-        let generation = Generation::new_with_overrides_and_oci(
+        let generation = Generation::new_with_overrides_oci_and_listeners(
             current.id,
             Arc::clone(&current.catalog),
             current.policy.clone(),
             current.config.clone(),
             current.overrides.clone(),
             Some(oci),
+            Arc::clone(&current.listeners),
         );
         self.generation.store(Arc::new(generation));
         self

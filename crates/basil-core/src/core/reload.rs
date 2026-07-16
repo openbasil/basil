@@ -552,16 +552,13 @@ fn validate_candidate_with_trace_collector_and_observer(
     // and (b) read the previous id to bump from: one coherent snapshot.
     let current = state.load_generation();
     ensure_reloadable(current.catalog(), &catalog)?;
-    let current_listeners = state.load_listener_configs();
     let listener_impacts = crate::transport::listener_manager::assess_transition(
-        &current_listeners,
+        current.listeners(),
         &listeners,
         state.connections(),
     );
     crate::transport::listener_manager::require_zero_active(&listener_impacts)
         .map_err(|error| ReloadError::ListenerTransition(error.to_string()))?;
-    drop(current_listeners);
-
     let previous_generation = current.id();
     let new_generation = previous_generation.saturating_add(1);
     let bundle_changed_trust_domains = bundle_changed_trust_domains(current.catalog(), &catalog);
@@ -648,24 +645,24 @@ pub fn reload_generation(state: &BrokerState) -> Result<ReloadOutcome, ReloadErr
         bundle_changed_trust_domains,
     } = candidate;
 
-    let next = Generation::new_with_overrides_and_oci(
+    let current = state.load_generation();
+    let (_, listener_guard) = crate::transport::listener_manager::begin_transition(
+        current.listeners(),
+        &listeners,
+        state.connections(),
+    )
+    .map_err(|error| ReloadError::ListenerTransition(error.to_string()))?;
+    let next = Generation::new_with_overrides_oci_and_listeners(
         outcome.new_generation,
         Arc::new(catalog),
         policy,
         config,
         overrides,
         oci,
+        Arc::new(listeners),
     );
-    let current_listeners = state.load_listener_configs();
-    let (_, listener_guard) = crate::transport::listener_manager::begin_transition(
-        &current_listeners,
-        &listeners,
-        state.connections(),
-    )
-    .map_err(|error| ReloadError::ListenerTransition(error.to_string()))?;
-    drop(current_listeners);
+    drop(current);
     listener_guard.commit(|| {
-        state.swap_listener_configs(Arc::new(listeners));
         state.swap_generation(Arc::new(next));
         for trust_domain in bundle_changed_trust_domains {
             state.events().bundle_changed(trust_domain);
@@ -1061,15 +1058,20 @@ mod tests {
 
         let dry = check_reload(&state).expect("listener dry-run validates");
         assert_eq!(dry.previous_generation, INITIAL_GENERATION_ID);
-        assert!(state.load_listener_configs().get("control").is_none());
+        let pinned = state.load_generation();
+        assert_eq!(pinned.id(), INITIAL_GENERATION_ID);
+        assert!(pinned.listeners().get("control").is_none());
 
         reload_generation(&state).expect("listener candidate commits");
-        let listeners = state.load_listener_configs();
-        let control = listeners
+        let current = state.load_generation();
+        let control = current
+            .listeners()
             .get("control")
             .expect("control listener installed");
         assert_eq!(control.path(), std::path::Path::new(&socket));
-        assert_eq!(state.active_generation_id(), INITIAL_GENERATION_ID + 1);
+        assert_eq!(current.id(), INITIAL_GENERATION_ID + 1);
+        assert_eq!(pinned.id(), INITIAL_GENERATION_ID);
+        assert!(pinned.listeners().get("control").is_none());
     }
 
     #[test]
