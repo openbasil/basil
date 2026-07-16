@@ -22,7 +22,7 @@ if [[ $version != *'GitVersion:    v3.1.1'* ]]; then
   exit 65
 fi
 
-fixture_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+fixture_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 
 check_hash() {
   local expected=$1
@@ -51,4 +51,3 @@ exec "$cosign_bin" verify-blob \
   --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
   --timeout=30s \
   "$fixture_dir/a.txt"
-

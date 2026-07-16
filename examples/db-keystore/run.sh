@@ -6,6 +6,7 @@
 
 set -euo pipefail
 
+# shellcheck disable=SC2154
 trap 'st=$?; [[ $st -ne 0 ]] && echo "FAIL (exit $st)" >&2; exit $st' EXIT
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

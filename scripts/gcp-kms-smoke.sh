@@ -158,9 +158,7 @@ api() {
 
 kms_root="https://cloudkms.googleapis.com/v1/projects/$project/locations/$location"
 ring_url="$kms_root/keyRings"
-ring_resource="projects/$project/locations/$location/keyRings/$key_ring"
 ring_api="$kms_root/keyRings/$key_ring"
-key_resource="$ring_resource/cryptoKeys/$key_id"
 key_api="$ring_api/cryptoKeys/$key_id"
 version_api="$key_api/cryptoKeyVersions/1"
 

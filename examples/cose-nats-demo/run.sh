@@ -58,6 +58,7 @@ cleanup() {
     fi
   done
 }
+# shellcheck disable=SC2154
 trap 'st=$?; cleanup; [[ $st -ne 0 ]] && echo "FAIL (exit $st)" >&2; exit $st' EXIT
 
 wait_for_file_socket() {
