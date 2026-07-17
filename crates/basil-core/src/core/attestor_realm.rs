@@ -23,7 +23,7 @@ use tokio::sync::{Notify, watch};
 
 use crate::attestor_protocol::wire;
 use crate::attestor_protocol::{
-    InventoryResult, QueryScope, ResolvePeerResult, VerifiedPeerBinding,
+    InventoryResult, MOUNT_SECURITY_CAPABILITY, QueryScope, ResolvePeerResult, VerifiedPeerBinding,
 };
 use crate::release_admission::{
     ActiveArtifact, ArtifactRole, CapabilityId, CapabilitySet, ProtocolVersion, ReleaseAdmission,
@@ -38,8 +38,16 @@ pub const MAX_REALM_NAME_BYTES: usize = 63;
 pub const MAX_UNIT_NAME_BYTES: usize = 128;
 /// Linux `sockaddr_un.sun_path` payload limit, including the trailing NUL.
 pub const MAX_SOCKET_PATH_BYTES: usize = 107;
-/// Protocol 1's complete required capability vocabulary.
+/// Protocol 1 capabilities required by every configured realm.
 pub const REQUIRED_CAPABILITIES: [&str; 3] = ["health", "query-instances", "resolve-peer"];
+
+/// Complete closed capability vocabulary accepted in protocol 1 realm configuration.
+const KNOWN_CAPABILITIES: [&str; 4] = [
+    "health",
+    MOUNT_SECURITY_CAPABILITY,
+    "query-instances",
+    "resolve-peer",
+];
 
 const CONNECT_STEP_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIAL_RECONNECT_BACKOFF: Duration = Duration::from_millis(250);
@@ -345,7 +353,13 @@ impl RawRealmConfig {
             .iter()
             .map(CapabilityId::as_str)
             .collect::<Vec<_>>();
-        if actual != REQUIRED_CAPABILITIES {
+        let has_required = REQUIRED_CAPABILITIES
+            .iter()
+            .all(|required| actual.binary_search(required).is_ok());
+        let all_known = actual
+            .iter()
+            .all(|capability| KNOWN_CAPABILITIES.binary_search(capability).is_ok());
+        if !has_required || !all_known {
             return Err(RealmConfigError::Capabilities);
         }
         Ok(RealmConfig {
@@ -459,8 +473,8 @@ pub enum RealmConfigError {
     /// Protocol 1 is the only accepted protocol.
     #[error("unsupported attestor protocol `{0}`")]
     UnsupportedProtocol(u32),
-    /// Protocol 1 requires its exact complete capability vocabulary.
-    #[error("protocol 1 capabilities must contain exactly the required vocabulary")]
+    /// Protocol 1 requires its baseline capabilities and rejects unknown additions.
+    #[error("protocol 1 capabilities must contain every required value and only known additions")]
     Capabilities,
     /// A release-admission identity was invalid.
     #[error(transparent)]
@@ -1990,7 +2004,7 @@ capabilities = ["health", "query-instances", "resolve-peer"]
 
     fn admission() -> Arc<ReleaseAdmission> {
         let capabilities = CapabilitySet::try_from_iter(
-            REQUIRED_CAPABILITIES
+            KNOWN_CAPABILITIES
                 .iter()
                 .map(|value| CapabilityId::new(value).expect("valid capability")),
         )
@@ -2125,7 +2139,7 @@ capabilities = ["health", "query-instances", "resolve-peer"]
                     provider: config.provider,
                     mode: config.runtime_mode,
                     health_failure: matches!(self.plan, FakePlan::HealthFailed),
-                    capabilities: REQUIRED_CAPABILITIES.map(str::to_string).to_vec(),
+                    capabilities: KNOWN_CAPABILITIES.map(str::to_string).to_vec(),
                     closes: Arc::clone(&self.closes),
                 }),
                 active_artifact,
@@ -2204,6 +2218,22 @@ capabilities = ["health", "query-instances", "resolve-peer"]
             realms.validate_broker_uid(992),
             Err(RealmConfigError::BrokerUidMismatch)
         );
+        let mount_security = rootful().replace(
+            "[\"health\", \"query-instances\", \"resolve-peer\"]",
+            "[\"health\", \"mount-security.v1\", \"query-instances\", \"resolve-peer\"]",
+        );
+        let realms = RealmSet::from_bootstrap(&bootstrap(&mount_security))
+            .expect("valid additive capability");
+        let name = RealmName::new("production-docker").expect("valid realm name");
+        assert!(
+            realms
+                .get(&name)
+                .expect("configured realm")
+                .capabilities
+                .iter()
+                .any(|capability| capability.as_str() == MOUNT_SECURITY_CAPABILITY)
+        );
+
         let rootless = rootful()
             .replace("production-docker", "owner-podman")
             .replace("docker\"", "podman\"")
@@ -2231,9 +2261,32 @@ capabilities = ["health", "query-instances", "resolve-peer"]
                 "[\"health\", \"query-instances\", \"resolve-peer\"]",
                 "[\"health\", \"resolve-peer\"]",
             ),
+            rootful().replace(
+                "[\"health\", \"query-instances\", \"resolve-peer\"]",
+                "[\"health\", \"query-instances\", \"resolve-peer\", \"unknown.v1\"]",
+            ),
         ] {
             assert!(RealmSet::from_bootstrap(&bootstrap(&invalid)).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn additive_mount_security_capability_is_admitted_and_negotiated() {
+        let body = rootful().replace(
+            "[\"health\", \"query-instances\", \"resolve-peer\"]",
+            "[\"health\", \"mount-security.v1\", \"query-instances\", \"resolve-peer\"]",
+        );
+        let realms = RealmSet::from_bootstrap(&bootstrap(&body)).expect("valid realm");
+        let name = RealmName::new("production-docker").expect("valid realm");
+        let registry = RealmRegistry::new(&realms, 1).expect("valid registry");
+        let connector = FakeConnector::new([FakePlan::Success]);
+
+        registry
+            .connect_realm(&name, &connector, admission().as_ref())
+            .await
+            .expect("mount-security session connects");
+
+        assert_eq!(registry.statuses()[0].state, RealmState::Ready);
     }
 
     #[test]
