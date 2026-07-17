@@ -68,41 +68,42 @@ pub fn is_valid_service_unit(unit: &str) -> bool {
 
 /// Check the generation-qualifier binding of an identity or unit name.
 ///
-/// A qualifier token is a `g` followed by one or more decimal digits, where
-/// the `g` is preceded by a non-alphanumeric byte (`-`, `_`, `:`, `.`) or the
-/// start of the string and the digits end at a non-digit boundary. The name
-/// must embed at least one qualifier token, and every embedded token must
-/// equal the exact decimal `generation` with no leading zeros; a token naming
-/// any other generation fails closed.
+/// A qualifier token is a `g` followed by one or more decimal digits with no
+/// ASCII-alphanumeric byte on either side (delimited by `-`, `_`, `:`, `.`,
+/// or a string edge). The name must embed at least one qualifier token, and
+/// every embedded token must equal the exact decimal `generation` with no
+/// leading zeros; a token naming any other generation fails closed.
+///
+/// This mirrors the normative broker-loader grammar
+/// (`core::attestor_realm::generation_qualifiers`); the two scanners must
+/// stay behavior-identical so a helper policy identity is nameable by broker
+/// configuration exactly when the helper accepts it. Change both together.
 pub fn embeds_exact_generation(name: &str, generation: u64) -> bool {
-    let expected = generation.to_string();
+    let expected = format!("g{generation}");
     let bytes = name.as_bytes();
     let mut found = false;
     let mut previous: Option<u8> = None;
-    let mut index = 0usize;
+    let mut index = 0_usize;
     while let Some(&byte) = bytes.get(index) {
-        let boundary = previous.is_none_or(|p| !p.is_ascii_alphanumeric());
-        if byte == b'g' && boundary {
-            let digits_start = index + 1;
-            let mut digits_end = digits_start;
-            while bytes.get(digits_end).is_some_and(u8::is_ascii_digit) {
-                digits_end += 1;
+        if byte == b'g' && !previous.is_some_and(|before| before.is_ascii_alphanumeric()) {
+            let mut end = index.saturating_add(1);
+            while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+                end = end.saturating_add(1);
             }
-            if digits_end > digits_start {
-                let Some(digits) = name.get(digits_start..digits_end) else {
-                    return false;
-                };
-                if digits != expected {
+            let has_digits = end > index.saturating_add(1);
+            let delimited = !bytes.get(end).is_some_and(u8::is_ascii_alphanumeric);
+            if has_digits && delimited {
+                if name.get(index..end) != Some(expected.as_str()) {
                     return false;
                 }
                 found = true;
-                previous = bytes.get(digits_end - 1).copied();
-                index = digits_end;
+                previous = Some(b'0');
+                index = end;
                 continue;
             }
         }
         previous = Some(byte);
-        index += 1;
+        index = index.saturating_add(1);
     }
     found
 }
@@ -180,6 +181,15 @@ mod tests {
         // `g` embedded in a word is not a token.
         assert!(!embeds_exact_generation("config2", 2));
         assert!(embeds_exact_generation("cfg.g2", 2));
+        // Loader-grammar parity: digits glued to a trailing alphanumeric are
+        // not tokens, so these names carry no qualifier and fail closed.
+        assert!(!embeds_exact_generation("basil-measure-policy-g1a", 1));
+        assert!(!embeds_exact_generation("policy-g2x", 2));
+        assert!(!embeds_exact_generation("basil-g1g2-profile", 1));
+        assert!(!embeds_exact_generation("basil-g1g2-profile", 2));
+        // A glued run is invisible, exactly like the broker loader; only the
+        // delimited token binds.
+        assert!(embeds_exact_generation("basil-g3x-g2", 2));
     }
 
     #[test]

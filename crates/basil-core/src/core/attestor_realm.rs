@@ -11,6 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -37,6 +38,8 @@ pub const MAX_REALMS: usize = 64;
 pub const MAX_REALM_NAME_BYTES: usize = 63;
 /// Maximum byte length of one canonical service unit.
 pub const MAX_UNIT_NAME_BYTES: usize = 128;
+/// Maximum byte length of one canonical packaged policy or ACL identity.
+pub const MAX_IDENTITY_BYTES: usize = 128;
 /// Linux `sockaddr_un.sun_path` payload limit, including the trailing NUL.
 pub const MAX_SOCKET_PATH_BYTES: usize = 107;
 /// Protocol 1 capabilities required by every configured realm.
@@ -103,24 +106,10 @@ pub struct RealmUser {
 
 impl RealmUser {
     fn parse(field: &'static str, raw: &str) -> Result<Self, RealmConfigError> {
-        if raw.is_empty() || raw.len() > 10 || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(RealmConfigError::InvalidUid {
-                field,
-                value: raw.to_string(),
-            });
-        }
-        let uid = raw
-            .parse::<u32>()
-            .map_err(|_| RealmConfigError::InvalidUid {
-                field,
-                value: raw.to_string(),
-            })?;
-        if uid.to_string() != raw {
-            return Err(RealmConfigError::InvalidUid {
-                field,
-                value: raw.to_string(),
-            });
-        }
+        let uid = canonical_decimal_u32(raw).ok_or_else(|| RealmConfigError::InvalidUid {
+            field,
+            value: raw.to_string(),
+        })?;
         Ok(Self {
             spelling: raw.to_string(),
             uid,
@@ -138,6 +127,82 @@ impl RealmUser {
     pub fn spelling(&self) -> &str {
         &self.spelling
     }
+}
+
+/// One canonical decimal group identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RealmGroup {
+    spelling: String,
+    gid: u32,
+}
+
+impl RealmGroup {
+    fn parse(field: &'static str, raw: &str) -> Result<Self, RealmConfigError> {
+        let gid = canonical_decimal_u32(raw).ok_or_else(|| RealmConfigError::InvalidGid {
+            field,
+            value: raw.to_string(),
+        })?;
+        Ok(Self {
+            spelling: raw.to_string(),
+            gid,
+        })
+    }
+
+    /// Return the parsed group ID.
+    #[must_use]
+    pub const fn gid(&self) -> u32 {
+        self.gid
+    }
+
+    /// Borrow the protected canonical spelling.
+    #[must_use]
+    pub fn spelling(&self) -> &str {
+        &self.spelling
+    }
+}
+
+/// One exact four-digit octal permission mode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OctalMode {
+    spelling: String,
+    bits: u32,
+}
+
+impl OctalMode {
+    fn parse(field: &'static str, raw: &str) -> Result<Self, RealmConfigError> {
+        let canonical = raw.len() == 4 && raw.bytes().all(|byte| (b'0'..=b'7').contains(&byte));
+        let bits = canonical
+            .then(|| u32::from_str_radix(raw, 8).ok())
+            .flatten()
+            .ok_or_else(|| RealmConfigError::InvalidMode {
+                field,
+                value: raw.to_string(),
+            })?;
+        Ok(Self {
+            spelling: raw.to_string(),
+            bits,
+        })
+    }
+
+    /// Return the parsed permission bits.
+    #[must_use]
+    pub const fn bits(&self) -> u32 {
+        self.bits
+    }
+
+    /// Borrow the protected exact four-digit octal spelling.
+    #[must_use]
+    pub fn spelling(&self) -> &str {
+        &self.spelling
+    }
+}
+
+fn canonical_decimal_u32(raw: &str) -> Option<u32> {
+    if raw.is_empty() || raw.len() > 10 || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let value = raw.parse::<u32>().ok()?;
+    (value.to_string() == raw).then_some(value)
 }
 
 /// Closed runtime-attestor provider set.
@@ -165,7 +230,8 @@ impl RealmProvider {
 pub enum RealmMode {
     /// Dedicated host service managed by the system manager.
     RootfulHost,
-    /// Non-root runtime owner managed by that user's manager.
+    /// Non-root runtime owner whose generation-qualified attestor service is
+    /// still an administrator-owned system-manager unit.
     RootlessOwner,
 }
 
@@ -187,14 +253,10 @@ pub struct RealmConfig {
     pub runtime_mode: RealmMode,
     /// Exact broker account.
     pub broker_user: RealmUser,
-    /// Exact broker service unit.
+    /// Exact broker service unit, deliberately not generation-qualified.
     pub broker_unit: String,
-    /// Exact attestor account and rootless routing scope.
+    /// Exact attestor account (`attestorUid`) and rootless routing scope.
     pub attestor_user: RealmUser,
-    /// Exact attestor service unit.
-    pub attestor_unit: String,
-    /// Canonical private control socket.
-    pub socket_path: PathBuf,
     /// Required release artifact role.
     pub release_role: ArtifactRole,
     /// Required release target.
@@ -203,6 +265,61 @@ pub struct RealmConfig {
     pub protocol: ProtocolVersion,
     /// Sorted complete protocol capability set.
     pub capabilities: CapabilitySet,
+    /// Indivisible protected measurement authority for this realm.
+    pub measurement: MeasurementAuthority,
+}
+
+/// One indivisible protected measurement-authority block.
+///
+/// Every generation qualifier below is a checked binding pinned to the exact
+/// decimal [`Self::authority_generation`] (or, for the helper policy, to
+/// [`Self::helper_policy_generation`]) — never a naming convention. The same
+/// pinned values are revalidated by the authority-installation transaction and
+/// at live authentication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MeasurementAuthority {
+    /// Immutable nonzero authority installation generation for this realm.
+    pub authority_generation: NonZeroU64,
+    /// Exact canonical attestor system unit ending in
+    /// `-g<authorityGeneration>.service`.
+    pub service_unit: String,
+    /// The one shared packaged measurement-helper endpoint, deliberately not
+    /// generation-qualified.
+    pub helper_endpoint: PathBuf,
+    /// Exact packaged helper policy identity, generation-qualified by
+    /// [`Self::helper_policy_generation`].
+    pub helper_policy: String,
+    /// Nonzero helper policy generation, checked independently of the broker
+    /// configuration generation.
+    pub helper_policy_generation: NonZeroU64,
+    /// Exact packaged LSM profile identity.
+    pub lsm_profile: String,
+    /// Exact packaged LSM policy identity.
+    pub lsm_policy: String,
+    /// Exact packaged lockdown profile identity.
+    pub lockdown_profile: String,
+    /// Generation-qualified runtime directory whose final segment is exactly
+    /// `g<authorityGeneration>`.
+    pub runtime_directory: PathBuf,
+    /// Runtime directory owner.
+    pub runtime_directory_owner: RealmUser,
+    /// Runtime directory group.
+    pub runtime_directory_group: RealmGroup,
+    /// Runtime directory permission mode.
+    pub runtime_directory_mode: OctalMode,
+    /// Exact packaged runtime-directory ACL identity.
+    pub runtime_directory_acl: String,
+    /// Canonical private control socket directly beneath the runtime
+    /// directory.
+    pub socket_path: PathBuf,
+    /// Socket owner.
+    pub socket_owner: RealmUser,
+    /// Socket group.
+    pub socket_group: RealmGroup,
+    /// Socket permission mode.
+    pub socket_mode: OctalMode,
+    /// Exact packaged socket ACL identity.
+    pub socket_acl: String,
 }
 
 /// Bounded protected realm map in deterministic name order.
@@ -212,10 +329,16 @@ pub struct RealmSet(BTreeMap<RealmName, RealmConfig>);
 impl RealmSet {
     /// Parse the optional `attestor` object from one schema-3 bootstrap value.
     ///
+    /// Each realm must carry its complete nested `measurement` authority; the
+    /// block is parsed indivisibly and every embedded generation qualifier is
+    /// checked against the exact decimal pinned generations.
+    ///
     /// # Errors
     ///
     /// Returns [`RealmConfigError`] for unknown fields, invalid types, bounds,
-    /// identifiers, provider/mode combinations, or socket/account mismatch.
+    /// identifiers, provider/mode combinations, an absent or partial
+    /// `measurement` authority, a generation-binding violation, or
+    /// socket/account mismatch.
     pub fn from_bootstrap(value: &toml::Value) -> Result<Self, RealmConfigError> {
         let Some(raw) = value.get("attestor") else {
             return Ok(Self::default());
@@ -295,13 +418,35 @@ struct RawRealmConfig {
     runtime_mode: RealmMode,
     broker_user: String,
     broker_unit: String,
-    attestor_user: String,
-    attestor_unit: String,
-    socket_path: String,
+    attestor_uid: String,
     release_role: String,
     target: String,
     protocol: u32,
     capabilities: Vec<String>,
+    measurement: Option<RawMeasurement>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RawMeasurement {
+    authority_generation: u64,
+    service_unit: String,
+    helper_endpoint: String,
+    helper_policy: String,
+    helper_policy_generation: u64,
+    lsm_profile: String,
+    lsm_policy: String,
+    lockdown_profile: String,
+    runtime_directory: String,
+    runtime_directory_owner: String,
+    runtime_directory_group: String,
+    runtime_directory_mode: String,
+    runtime_directory_acl: String,
+    socket_path: String,
+    socket_owner: String,
+    socket_group: String,
+    socket_mode: String,
+    socket_acl: String,
 }
 
 impl RawRealmConfig {
@@ -317,30 +462,17 @@ impl RawRealmConfig {
             });
         }
         let broker_user = RealmUser::parse("brokerUser", &self.broker_user)?;
-        let attestor_user = RealmUser::parse("attestorUser", &self.attestor_user)?;
+        let attestor_user = RealmUser::parse("attestorUid", &self.attestor_uid)?;
         validate_unit("brokerUnit", &self.broker_unit)?;
-        validate_unit("attestorUnit", &self.attestor_unit)?;
         if self.runtime_mode == RealmMode::RootlessOwner && attestor_user.uid() == 0 {
             return Err(RealmConfigError::RootlessRoot);
         }
-        let expected_socket = match self.runtime_mode {
-            RealmMode::RootfulHost => PathBuf::from(format!(
-                "/run/basil/attestors/{}/control.sock",
-                name.as_str()
-            )),
-            RealmMode::RootlessOwner => PathBuf::from(format!(
-                "/run/user/{}/basil/attestors/{}/control.sock",
-                attestor_user.uid(),
-                name.as_str()
-            )),
-        };
-        validate_socket_path(&self.socket_path)?;
-        let socket_path = PathBuf::from(&self.socket_path);
-        if socket_path != expected_socket {
-            return Err(RealmConfigError::SocketScope {
-                expected: expected_socket,
-            });
-        }
+        let measurement = self
+            .measurement
+            .ok_or_else(|| RealmConfigError::MissingMeasurement {
+                realm: name.as_str().to_string(),
+            })?
+            .validate(name)?;
         if self.protocol != 1 {
             return Err(RealmConfigError::UnsupportedProtocol(self.protocol));
         }
@@ -369,12 +501,121 @@ impl RawRealmConfig {
             broker_user,
             broker_unit: self.broker_unit,
             attestor_user,
-            attestor_unit: self.attestor_unit,
-            socket_path,
             release_role: ArtifactRole::new(&self.release_role)?,
             target: TargetTriple::new(&self.target)?,
             protocol: ProtocolVersion::new(self.protocol)?,
             capabilities,
+            measurement,
+        })
+    }
+}
+
+impl RawMeasurement {
+    /// Validate one indivisible measurement block, pinning every generation
+    /// qualifier to the exact decimal authority and helper-policy generations.
+    fn validate(self, name: &RealmName) -> Result<MeasurementAuthority, RealmConfigError> {
+        let authority_generation =
+            NonZeroU64::new(self.authority_generation).ok_or(RealmConfigError::GenerationZero {
+                field: "measurement.authorityGeneration",
+            })?;
+        let helper_policy_generation = NonZeroU64::new(self.helper_policy_generation).ok_or(
+            RealmConfigError::GenerationZero {
+                field: "measurement.helperPolicyGeneration",
+            },
+        )?;
+
+        validate_unit("measurement.serviceUnit", &self.service_unit)?;
+        validate_generation_binding(
+            "measurement.serviceUnit",
+            &self.service_unit,
+            authority_generation,
+        )?;
+        let unit_qualifier = format!("-g{authority_generation}.service");
+        if !self.service_unit.ends_with(&unit_qualifier) {
+            return Err(RealmConfigError::GenerationQualifierMissing {
+                field: "measurement.serviceUnit",
+            });
+        }
+
+        validate_authority_path("measurement.helperEndpoint", &self.helper_endpoint)?;
+
+        for (field, value) in [
+            ("measurement.lsmProfile", &self.lsm_profile),
+            ("measurement.lsmPolicy", &self.lsm_policy),
+            ("measurement.lockdownProfile", &self.lockdown_profile),
+            (
+                "measurement.runtimeDirectoryAcl",
+                &self.runtime_directory_acl,
+            ),
+            ("measurement.socketAcl", &self.socket_acl),
+        ] {
+            validate_identity(field, value)?;
+            validate_generation_binding(field, value, authority_generation)?;
+        }
+        validate_identity("measurement.helperPolicy", &self.helper_policy)?;
+        validate_generation_binding(
+            "measurement.helperPolicy",
+            &self.helper_policy,
+            helper_policy_generation,
+        )?;
+
+        validate_authority_path("measurement.runtimeDirectory", &self.runtime_directory)?;
+        validate_generation_binding(
+            "measurement.runtimeDirectory",
+            &self.runtime_directory,
+            authority_generation,
+        )?;
+        let expected_directory = format!(
+            "/run/basil/attestors/{}/g{authority_generation}",
+            name.as_str()
+        );
+        if self.runtime_directory != expected_directory {
+            return Err(RealmConfigError::RuntimeDirectoryScope {
+                expected: PathBuf::from(expected_directory),
+            });
+        }
+
+        validate_authority_path("measurement.socketPath", &self.socket_path)?;
+        validate_generation_binding(
+            "measurement.socketPath",
+            &self.socket_path,
+            authority_generation,
+        )?;
+        let expected_socket = format!("{expected_directory}/control.sock");
+        if self.socket_path != expected_socket {
+            return Err(RealmConfigError::SocketScope {
+                expected: PathBuf::from(expected_socket),
+            });
+        }
+
+        Ok(MeasurementAuthority {
+            authority_generation,
+            service_unit: self.service_unit,
+            helper_endpoint: PathBuf::from(self.helper_endpoint),
+            helper_policy: self.helper_policy,
+            helper_policy_generation,
+            lsm_profile: self.lsm_profile,
+            lsm_policy: self.lsm_policy,
+            lockdown_profile: self.lockdown_profile,
+            runtime_directory: PathBuf::from(self.runtime_directory),
+            runtime_directory_owner: RealmUser::parse(
+                "measurement.runtimeDirectoryOwner",
+                &self.runtime_directory_owner,
+            )?,
+            runtime_directory_group: RealmGroup::parse(
+                "measurement.runtimeDirectoryGroup",
+                &self.runtime_directory_group,
+            )?,
+            runtime_directory_mode: OctalMode::parse(
+                "measurement.runtimeDirectoryMode",
+                &self.runtime_directory_mode,
+            )?,
+            runtime_directory_acl: self.runtime_directory_acl,
+            socket_path: PathBuf::from(self.socket_path),
+            socket_owner: RealmUser::parse("measurement.socketOwner", &self.socket_owner)?,
+            socket_group: RealmGroup::parse("measurement.socketGroup", &self.socket_group)?,
+            socket_mode: OctalMode::parse("measurement.socketMode", &self.socket_mode)?,
+            socket_acl: self.socket_acl,
         })
     }
 }
@@ -398,10 +639,30 @@ fn validate_unit(field: &'static str, unit: &str) -> Result<(), RealmConfigError
     }
 }
 
-fn validate_socket_path(path: &str) -> Result<(), RealmConfigError> {
-    let valid = !path.is_empty()
+fn validate_identity(field: &'static str, value: &str) -> Result<(), RealmConfigError> {
+    let bytes = value.as_bytes();
+    let valid_edge = |byte: u8| byte.is_ascii_alphanumeric();
+    let valid_inner = |byte: u8| valid_edge(byte) || matches!(byte, b'.' | b'_' | b':' | b'-');
+    let valid = !bytes.is_empty()
+        && bytes.len() <= MAX_IDENTITY_BYTES
+        && bytes.first().copied().is_some_and(valid_edge)
+        && bytes.last().copied().is_some_and(valid_edge)
+        && bytes.iter().copied().all(valid_inner);
+    if valid {
+        Ok(())
+    } else {
+        Err(RealmConfigError::InvalidIdentity {
+            field,
+            value: value.to_string(),
+        })
+    }
+}
+
+fn validate_authority_path(field: &'static str, path: &str) -> Result<(), RealmConfigError> {
+    let valid = path.len() > 1
         && path.len() <= MAX_SOCKET_PATH_BYTES
         && path.starts_with('/')
+        && !path.ends_with('/')
         && !path.contains('\0')
         && !path.contains("//")
         && Path::new(path).components().all(|component| {
@@ -413,8 +674,65 @@ fn validate_socket_path(path: &str) -> Result<(), RealmConfigError> {
     if valid {
         Ok(())
     } else {
-        Err(RealmConfigError::InvalidSocketPath)
+        Err(RealmConfigError::InvalidAuthorityPath { field })
     }
+}
+
+/// Return every delimited `g<digits>` generation qualifier embedded in
+/// `value`. A qualifier is a `g` immediately followed by one or more ASCII
+/// digits, with no ASCII-alphanumeric byte on either side.
+///
+/// This is the normative checked-binding grammar. The helper-side scanner
+/// `crate::attestor_protocol::helper::ident::embeds_exact_generation` must
+/// stay behavior-identical; change both together.
+fn generation_qualifiers(value: &str) -> Vec<&str> {
+    let bytes = value.as_bytes();
+    let mut qualifiers = Vec::new();
+    let mut previous: Option<u8> = None;
+    let mut index = 0_usize;
+    while let Some(&byte) = bytes.get(index) {
+        if byte == b'g' && !previous.is_some_and(|before| before.is_ascii_alphanumeric()) {
+            let mut end = index.saturating_add(1);
+            while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+                end = end.saturating_add(1);
+            }
+            let has_digits = end > index.saturating_add(1);
+            let delimited = !bytes.get(end).is_some_and(u8::is_ascii_alphanumeric);
+            if has_digits && delimited {
+                if let Some(qualifier) = value.get(index..end) {
+                    qualifiers.push(qualifier);
+                }
+                previous = Some(b'0');
+                index = end;
+                continue;
+            }
+        }
+        previous = Some(byte);
+        index = index.saturating_add(1);
+    }
+    qualifiers
+}
+
+/// Enforce the checked generation binding: `value` must embed at least one
+/// generation qualifier, and every embedded qualifier must equal the exact
+/// decimal `expected` generation.
+fn validate_generation_binding(
+    field: &'static str,
+    value: &str,
+    expected: NonZeroU64,
+) -> Result<(), RealmConfigError> {
+    let expected_qualifier = format!("g{expected}");
+    let qualifiers = generation_qualifiers(value);
+    if qualifiers.is_empty() {
+        return Err(RealmConfigError::GenerationQualifierMissing { field });
+    }
+    if qualifiers
+        .iter()
+        .any(|qualifier| *qualifier != expected_qualifier)
+    {
+        return Err(RealmConfigError::GenerationQualifierMismatch { field });
+    }
+    Ok(())
 }
 
 /// Typed strict realm-configuration failure.
@@ -440,6 +758,60 @@ pub enum RealmConfigError {
         /// Rejected value, retained only in the local typed error.
         value: String,
     },
+    /// A GID field did not use canonical decimal form.
+    #[error("`{field}` is not a canonical decimal GID")]
+    InvalidGid {
+        /// Schema field.
+        field: &'static str,
+        /// Rejected value, retained only in the local typed error.
+        value: String,
+    },
+    /// A mode field was not an exact four-digit octal mode.
+    #[error("`{field}` is not an exact four-digit octal mode")]
+    InvalidMode {
+        /// Schema field.
+        field: &'static str,
+        /// Rejected value, retained only in the local typed error.
+        value: String,
+    },
+    /// A policy, profile, or ACL identity was not a canonical ASCII
+    /// identifier.
+    #[error("`{field}` is not a canonical packaged identity")]
+    InvalidIdentity {
+        /// Schema field.
+        field: &'static str,
+        /// Rejected value, retained only in the local typed error.
+        value: String,
+    },
+    /// An older schema-3 realm predates the protected measurement authority.
+    #[error(
+        "realm `{realm}` lacks the `measurement` authority required since revision 1.2; \
+         stage a complete generation-qualified `measurement` block as a new immutable \
+         authority generation and promote it atomically"
+    )]
+    MissingMeasurement {
+        /// Realm that must be migrated.
+        realm: String,
+    },
+    /// A generation field was zero.
+    #[error("`{field}` must be a nonzero generation")]
+    GenerationZero {
+        /// Schema field.
+        field: &'static str,
+    },
+    /// A generation-qualified field carried no embedded generation qualifier.
+    #[error("`{field}` lacks its required embedded generation qualifier")]
+    GenerationQualifierMissing {
+        /// Schema field.
+        field: &'static str,
+    },
+    /// A field embedded a generation other than the exact pinned decimal
+    /// generation.
+    #[error("`{field}` embeds a generation qualifier that differs from the pinned generation")]
+    GenerationQualifierMismatch {
+        /// Schema field.
+        field: &'static str,
+    },
     /// A service unit was not canonical.
     #[error("`{field}` is not a canonical systemd service unit")]
     InvalidUnit {
@@ -462,10 +834,21 @@ pub enum RealmConfigError {
     /// A realm names a broker account other than the pinned process account.
     #[error("configured broker UID does not match the pinned effective UID")]
     BrokerUidMismatch,
-    /// The socket path was not absolute and normalized.
-    #[error("socket path is not absolute, normalized, and within the Linux bound")]
-    InvalidSocketPath,
-    /// The socket did not match the account scope and realm.
+    /// An authority path was not absolute, normalized, and bounded.
+    #[error("`{field}` is not an absolute, normalized path within the Linux socket bound")]
+    InvalidAuthorityPath {
+        /// Schema field.
+        field: &'static str,
+    },
+    /// The runtime directory did not match the protected realm authority
+    /// scope.
+    #[error("runtime directory does not match the protected realm authority scope")]
+    RuntimeDirectoryScope {
+        /// Required path, retained for trusted configuration diagnostics.
+        expected: PathBuf,
+    },
+    /// The socket did not sit directly beneath the runtime directory at the
+    /// protected realm scope.
     #[error("socket path does not match the protected realm scope")]
     SocketScope {
         /// Required path, retained for trusted configuration diagnostics.
@@ -494,6 +877,8 @@ pub struct SocketIdentity {
     pub inode: u64,
     /// Socket owner.
     pub owner: u32,
+    /// Socket group.
+    pub group: u32,
     /// Permission bits.
     pub mode: u32,
 }
@@ -1135,10 +1520,9 @@ impl RealmRegistry {
                 && changes.iter().any(|change| {
                     matches!(change.kind, ChangeKind::Changed)
                         && change.old_config.as_ref().is_some_and(|old| {
-                            change
-                                .new_config
-                                .as_ref()
-                                .is_some_and(|new| old.socket_path == new.socket_path)
+                            change.new_config.as_ref().is_some_and(|new| {
+                                old.measurement.socket_path == new.measurement.socket_path
+                            })
                         })
                 })
             {
@@ -1196,7 +1580,7 @@ impl RealmRegistry {
             let same_socket = change
                 .old_config
                 .as_ref()
-                .is_some_and(|old| old.socket_path == config.socket_path);
+                .is_some_and(|old| old.measurement.socket_path == config.measurement.socket_path);
             if same_socket {
                 if let Some(old_config) = change.old_config.clone() {
                     preparation
@@ -1997,39 +2381,69 @@ mod tests {
         toml::from_str(&raw).expect("valid test TOML")
     }
 
-    fn rootful() -> &'static str {
-        r#"
-[attestor.realms.production-docker]
-provider = "docker"
-runtimeMode = "rootful-host"
-brokerUser = "991"
-brokerUnit = "basil-agent.service"
-attestorUser = "992"
-attestorUnit = "basil-attestor-production-docker.service"
-socketPath = "/run/basil/attestors/production-docker/control.sock"
-releaseRole = "docker-attestor"
-target = "x86_64-unknown-linux-gnu"
-protocol = 1
-capabilities = ["health", "query-instances", "resolve-peer"]
-"#
-    }
-
-    fn rootless(uid: u32) -> String {
+    fn realm_body(
+        realm: &str,
+        provider: &str,
+        mode: &str,
+        uid: u32,
+        role: &str,
+        generation: u64,
+    ) -> String {
         format!(
             r#"
-[attestor.realms.owner-podman]
-provider = "podman"
-runtimeMode = "rootless-owner"
+[attestor.realms.{realm}]
+provider = "{provider}"
+runtimeMode = "{mode}"
 brokerUser = "991"
 brokerUnit = "basil-agent.service"
-attestorUser = "{uid}"
-attestorUnit = "basil-attestor-owner-podman.service"
-socketPath = "/run/user/{uid}/basil/attestors/owner-podman/control.sock"
-releaseRole = "podman-attestor"
+attestorUid = "{uid}"
+releaseRole = "{role}"
 target = "x86_64-unknown-linux-gnu"
 protocol = 1
 capabilities = ["health", "query-instances", "resolve-peer"]
+
+[attestor.realms.{realm}.measurement]
+authorityGeneration = {generation}
+serviceUnit = "basil-attestor-{realm}-g{generation}.service"
+helperEndpoint = "/run/basil/measure/control.sock"
+helperPolicy = "basil-measure-policy-g{generation}"
+helperPolicyGeneration = {generation}
+lsmProfile = "selinux:basil_attestor_g{generation}_t"
+lsmPolicy = "basil-attestor-policy-g{generation}"
+lockdownProfile = "basil-attestor-lockdown-g{generation}"
+runtimeDirectory = "/run/basil/attestors/{realm}/g{generation}"
+runtimeDirectoryOwner = "0"
+runtimeDirectoryGroup = "993"
+runtimeDirectoryMode = "0770"
+runtimeDirectoryAcl = "basil-attestor-bind-g{generation}"
+socketPath = "/run/basil/attestors/{realm}/g{generation}/control.sock"
+socketOwner = "{uid}"
+socketGroup = "994"
+socketMode = "0660"
+socketAcl = "basil-attestor-control-g{generation}"
 "#
+        )
+    }
+
+    fn rootful() -> String {
+        realm_body(
+            "production-docker",
+            "docker",
+            "rootful-host",
+            992,
+            "docker-attestor",
+            1,
+        )
+    }
+
+    fn rootless(uid: u32, generation: u64) -> String {
+        realm_body(
+            "owner-podman",
+            "podman",
+            "rootless-owner",
+            uid,
+            "podman-attestor",
+            generation,
         )
     }
 
@@ -2183,6 +2597,7 @@ capabilities = ["health", "query-instances", "resolve-peer"]
                     device: 1,
                     inode: epoch,
                     owner: config.attestor_user.uid(),
+                    group: config.attestor_user.uid(),
                     mode: 0o140_600,
                 },
                 VerifiedPeerBinding::from_authenticator(Sha256::digest(epoch.to_be_bytes()).into()),
@@ -2262,7 +2677,7 @@ capabilities = ["health", "query-instances", "resolve-peer"]
 
     #[test]
     fn strict_schema_accepts_closed_rootful_and_rootless_matrix() {
-        let realms = RealmSet::from_bootstrap(&bootstrap(rootful())).expect("valid realms");
+        let realms = RealmSet::from_bootstrap(&bootstrap(&rootful())).expect("valid realms");
         assert_eq!(realms.len(), 1);
         assert!(realms.validate_broker_uid(991).is_ok());
         assert_eq!(
@@ -2285,17 +2700,473 @@ capabilities = ["health", "query-instances", "resolve-peer"]
                 .any(|capability| capability.as_str() == MOUNT_SECURITY_CAPABILITY)
         );
 
-        let rootless = rootful()
-            .replace("production-docker", "owner-podman")
-            .replace("docker\"", "podman\"")
-            .replace("rootful-host", "rootless-owner")
-            .replace("attestorUser = \"992\"", "attestorUser = \"1000\"")
-            .replace(
-                "/run/basil/attestors/owner-podman/control.sock",
-                "/run/user/1000/basil/attestors/owner-podman/control.sock",
-            );
-        let realms = RealmSet::from_bootstrap(&bootstrap(&rootless)).expect("valid rootless realm");
+        let realms =
+            RealmSet::from_bootstrap(&bootstrap(&rootless(1000, 1))).expect("valid rootless realm");
         assert_eq!(realms.len(), 1);
+    }
+
+    fn parse(body: &str) -> Result<RealmSet, RealmConfigError> {
+        RealmSet::from_bootstrap(&bootstrap(body))
+    }
+
+    #[test]
+    fn measurement_authority_pins_typed_generations_and_identities() {
+        let realms = parse(&rootful()).expect("valid realm");
+        let name = RealmName::new("production-docker").expect("valid realm name");
+        let config = realms.get(&name).expect("configured realm");
+        let measurement = &config.measurement;
+        assert_eq!(measurement.authority_generation.get(), 1);
+        assert_eq!(measurement.helper_policy_generation.get(), 1);
+        assert_eq!(
+            measurement.service_unit,
+            "basil-attestor-production-docker-g1.service"
+        );
+        assert_eq!(
+            measurement.helper_endpoint,
+            Path::new("/run/basil/measure/control.sock")
+        );
+        assert_eq!(
+            measurement.runtime_directory,
+            Path::new("/run/basil/attestors/production-docker/g1")
+        );
+        assert_eq!(
+            measurement.socket_path,
+            Path::new("/run/basil/attestors/production-docker/g1/control.sock")
+        );
+        assert_eq!(measurement.runtime_directory_owner.uid(), 0);
+        assert_eq!(measurement.runtime_directory_group.gid(), 993);
+        assert_eq!(measurement.runtime_directory_mode.bits(), 0o770);
+        assert_eq!(measurement.runtime_directory_mode.spelling(), "0770");
+        assert_eq!(measurement.socket_owner.uid(), 992);
+        assert_eq!(measurement.socket_owner.spelling(), "992");
+        assert_eq!(measurement.socket_group.gid(), 994);
+        assert_eq!(measurement.socket_mode.bits(), 0o660);
+        assert_eq!(measurement.lsm_profile, "selinux:basil_attestor_g1_t");
+        assert_eq!(measurement.socket_acl, "basil-attestor-control-g1");
+    }
+
+    #[test]
+    fn helper_policy_generation_is_independent_of_authority_generation() {
+        let body = rootful()
+            .replace("helperPolicyGeneration = 1", "helperPolicyGeneration = 7")
+            .replace(
+                "helperPolicy = \"basil-measure-policy-g1\"",
+                "helperPolicy = \"basil-measure-policy-g7\"",
+            );
+        let realms = parse(&body).expect("independent helper policy generation");
+        let name = RealmName::new("production-docker").expect("valid realm name");
+        let measurement = &realms.get(&name).expect("configured realm").measurement;
+        assert_eq!(measurement.authority_generation.get(), 1);
+        assert_eq!(measurement.helper_policy_generation.get(), 7);
+    }
+
+    #[test]
+    fn missing_measurement_rejects_with_migration_diagnostic() {
+        let start = rootful();
+        let legacy = start
+            .split("\n[attestor.realms.production-docker.measurement]")
+            .next()
+            .expect("realm body prefix")
+            .to_string();
+        let error = parse(&legacy).expect_err("older schema-3 realm rejects");
+        assert_eq!(
+            error,
+            RealmConfigError::MissingMeasurement {
+                realm: "production-docker".to_string(),
+            }
+        );
+        assert!(error.to_string().contains("measurement"));
+    }
+
+    #[test]
+    fn measurement_block_is_indivisible() {
+        // A socket unit, unknown fields, a missing identity, and partial
+        // legacy top-level shapes all reject the complete candidate.
+        for (case, invalid) in [
+            ("socketUnit", format!("{}socketUnit = \"x.socket\"\n", rootful())),
+            ("unknown field", format!("{}extra = \"y\"\n", rootful())),
+            (
+                "missing identity",
+                rootful().replace("lsmPolicy = \"basil-attestor-policy-g1\"\n", ""),
+            ),
+            (
+                "legacy attestorUnit",
+                rootful().replace(
+                    "protocol = 1",
+                    "protocol = 1\nattestorUnit = \"basil-attestor-production-docker.service\"",
+                ),
+            ),
+            (
+                "legacy top-level socketPath",
+                rootful().replace(
+                    "protocol = 1",
+                    "protocol = 1\nsocketPath = \"/run/basil/attestors/production-docker/control.sock\"",
+                ),
+            ),
+            (
+                "legacy attestorUser spelling",
+                rootful().replace("attestorUid = \"992\"", "attestorUser = \"992\""),
+            ),
+            (
+                "missing attestorUid",
+                rootful().replace("attestorUid = \"992\"\n", ""),
+            ),
+        ] {
+            assert!(
+                matches!(parse(&invalid), Err(RealmConfigError::Schema(_))),
+                "case `{case}` must reject as a strict schema failure"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_measurement_keys_reject_at_parse_time() {
+        let raw = format!(
+            "schema = \"agent\"\nschemaVersion = 3\n{}",
+            rootful().replace(
+                "authorityGeneration = 1",
+                "authorityGeneration = 1\nauthorityGeneration = 1",
+            )
+        );
+        assert!(toml::from_str::<toml::Value>(&raw).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn generation_qualifiers_are_checked_bindings() {
+        for (case, from, to, expected) in [
+            (
+                "unqualified service unit",
+                "serviceUnit = \"basil-attestor-production-docker-g1.service\"",
+                "serviceUnit = \"basil-attestor-production-docker.service\"",
+                RealmConfigError::GenerationQualifierMissing {
+                    field: "measurement.serviceUnit",
+                },
+            ),
+            (
+                "service unit bound to a foreign generation",
+                "serviceUnit = \"basil-attestor-production-docker-g1.service\"",
+                "serviceUnit = \"basil-attestor-production-docker-g2.service\"",
+                RealmConfigError::GenerationQualifierMismatch {
+                    field: "measurement.serviceUnit",
+                },
+            ),
+            (
+                "service unit with an extra foreign qualifier",
+                "serviceUnit = \"basil-attestor-production-docker-g1.service\"",
+                "serviceUnit = \"basil-attestor-production-docker-g2-g1.service\"",
+                RealmConfigError::GenerationQualifierMismatch {
+                    field: "measurement.serviceUnit",
+                },
+            ),
+            (
+                "service unit with a zero-padded qualifier",
+                "serviceUnit = \"basil-attestor-production-docker-g1.service\"",
+                "serviceUnit = \"basil-attestor-production-docker-g01.service\"",
+                RealmConfigError::GenerationQualifierMismatch {
+                    field: "measurement.serviceUnit",
+                },
+            ),
+            (
+                "qualifier in the right unit but wrong position",
+                "serviceUnit = \"basil-attestor-production-docker-g1.service\"",
+                "serviceUnit = \"basil-g1-attestor-production-docker.service\"",
+                RealmConfigError::GenerationQualifierMissing {
+                    field: "measurement.serviceUnit",
+                },
+            ),
+            (
+                "LSM profile bound to a foreign generation",
+                "lsmProfile = \"selinux:basil_attestor_g1_t\"",
+                "lsmProfile = \"selinux:basil_attestor_g2_t\"",
+                RealmConfigError::GenerationQualifierMismatch {
+                    field: "measurement.lsmProfile",
+                },
+            ),
+            (
+                "unqualified LSM policy",
+                "lsmPolicy = \"basil-attestor-policy-g1\"",
+                "lsmPolicy = \"basil-attestor-policy\"",
+                RealmConfigError::GenerationQualifierMissing {
+                    field: "measurement.lsmPolicy",
+                },
+            ),
+            (
+                "lockdown profile bound to a foreign generation",
+                "lockdownProfile = \"basil-attestor-lockdown-g1\"",
+                "lockdownProfile = \"basil-attestor-lockdown-g2\"",
+                RealmConfigError::GenerationQualifierMismatch {
+                    field: "measurement.lockdownProfile",
+                },
+            ),
+            (
+                "helper policy bound to the authority generation",
+                "helperPolicyGeneration = 1",
+                "helperPolicyGeneration = 2",
+                RealmConfigError::GenerationQualifierMismatch {
+                    field: "measurement.helperPolicy",
+                },
+            ),
+            (
+                "runtime directory bound to a foreign generation",
+                "runtimeDirectory = \"/run/basil/attestors/production-docker/g1\"",
+                "runtimeDirectory = \"/run/basil/attestors/production-docker/g2\"",
+                RealmConfigError::GenerationQualifierMismatch {
+                    field: "measurement.runtimeDirectory",
+                },
+            ),
+            (
+                "socket basename bound to a foreign generation",
+                "socketPath = \"/run/basil/attestors/production-docker/g1/control.sock\"",
+                "socketPath = \"/run/basil/attestors/production-docker/g1/control-g2.sock\"",
+                RealmConfigError::GenerationQualifierMismatch {
+                    field: "measurement.socketPath",
+                },
+            ),
+            (
+                "unqualified runtime directory ACL",
+                "runtimeDirectoryAcl = \"basil-attestor-bind-g1\"",
+                "runtimeDirectoryAcl = \"basil-attestor-bind\"",
+                RealmConfigError::GenerationQualifierMissing {
+                    field: "measurement.runtimeDirectoryAcl",
+                },
+            ),
+            (
+                "socket ACL bound to a foreign generation",
+                "socketAcl = \"basil-attestor-control-g1\"",
+                "socketAcl = \"basil-attestor-control-g2\"",
+                RealmConfigError::GenerationQualifierMismatch {
+                    field: "measurement.socketAcl",
+                },
+            ),
+        ] {
+            let body = rootful().replace(from, to);
+            assert_ne!(body, rootful(), "case `{case}` must change the fixture");
+            assert_eq!(parse(&body).expect_err(case), expected, "{case}");
+        }
+    }
+
+    #[test]
+    fn zero_generations_reject() {
+        for (from, to, field) in [
+            (
+                "authorityGeneration = 1",
+                "authorityGeneration = 0",
+                "measurement.authorityGeneration",
+            ),
+            (
+                "helperPolicyGeneration = 1",
+                "helperPolicyGeneration = 0",
+                "measurement.helperPolicyGeneration",
+            ),
+        ] {
+            assert_eq!(
+                parse(&rootful().replace(from, to)),
+                Err(RealmConfigError::GenerationZero { field })
+            );
+        }
+        assert!(matches!(
+            parse(&rootful().replace("authorityGeneration = 1", "authorityGeneration = -1")),
+            Err(RealmConfigError::Schema(_))
+        ));
+    }
+
+    #[test]
+    fn authority_paths_and_scopes_reject_normalization_edges() {
+        for (case, from, to, expected) in [
+            (
+                "trailing slash",
+                "runtimeDirectory = \"/run/basil/attestors/production-docker/g1\"",
+                "runtimeDirectory = \"/run/basil/attestors/production-docker/g1/\"",
+                RealmConfigError::InvalidAuthorityPath {
+                    field: "measurement.runtimeDirectory",
+                },
+            ),
+            (
+                "parent traversal",
+                "runtimeDirectory = \"/run/basil/attestors/production-docker/g1\"",
+                "runtimeDirectory = \"/run/basil/attestors/production-docker/x/../g1\"",
+                RealmConfigError::InvalidAuthorityPath {
+                    field: "measurement.runtimeDirectory",
+                },
+            ),
+            (
+                "relative helper endpoint",
+                "helperEndpoint = \"/run/basil/measure/control.sock\"",
+                "helperEndpoint = \"run/basil/measure/control.sock\"",
+                RealmConfigError::InvalidAuthorityPath {
+                    field: "measurement.helperEndpoint",
+                },
+            ),
+            (
+                "repeated separator",
+                "helperEndpoint = \"/run/basil/measure/control.sock\"",
+                "helperEndpoint = \"/run//basil/measure/control.sock\"",
+                RealmConfigError::InvalidAuthorityPath {
+                    field: "measurement.helperEndpoint",
+                },
+            ),
+            (
+                "runtime directory outside the realm scope",
+                "runtimeDirectory = \"/run/basil/attestors/production-docker/g1\"",
+                "runtimeDirectory = \"/run/basil/attestors/other-realm/g1\"",
+                RealmConfigError::RuntimeDirectoryScope {
+                    expected: PathBuf::from("/run/basil/attestors/production-docker/g1"),
+                },
+            ),
+            (
+                "socket not directly beneath the runtime directory",
+                "socketPath = \"/run/basil/attestors/production-docker/g1/control.sock\"",
+                "socketPath = \"/run/basil/attestors/production-docker/g1/nested/control.sock\"",
+                RealmConfigError::SocketScope {
+                    expected: PathBuf::from(
+                        "/run/basil/attestors/production-docker/g1/control.sock",
+                    ),
+                },
+            ),
+        ] {
+            let body = rootful().replace(from, to);
+            assert_ne!(body, rootful(), "case `{case}` must change the fixture");
+            assert_eq!(parse(&body).expect_err(case), expected, "{case}");
+        }
+    }
+
+    #[test]
+    fn socket_path_byte_ceiling_is_enforced() {
+        let long_realm = format!("a{}", "b".repeat(62));
+        let body = realm_body(
+            &long_realm,
+            "docker",
+            "rootful-host",
+            992,
+            "docker-attestor",
+            1_099_511_627_776,
+        );
+        assert_eq!(
+            parse(&body),
+            Err(RealmConfigError::InvalidAuthorityPath {
+                field: "measurement.socketPath",
+            })
+        );
+    }
+
+    #[test]
+    fn realm_name_embedding_a_foreign_qualifier_fails_closed() {
+        // A realm literally named with a delimited foreign `g<digits>` token
+        // makes every derived generation-qualified value ambiguous; the
+        // checked binding rejects it rather than guessing.
+        let body = realm_body(
+            "app-g2",
+            "docker",
+            "rootful-host",
+            992,
+            "docker-attestor",
+            1,
+        );
+        assert_eq!(
+            parse(&body),
+            Err(RealmConfigError::GenerationQualifierMismatch {
+                field: "measurement.serviceUnit",
+            })
+        );
+    }
+
+    #[test]
+    fn ownership_and_mode_fields_require_canonical_spellings() {
+        for (case, from, to) in [
+            (
+                "zero-padded runtime directory owner",
+                "runtimeDirectoryOwner = \"0\"",
+                "runtimeDirectoryOwner = \"00\"",
+            ),
+            (
+                "named runtime directory group",
+                "runtimeDirectoryGroup = \"993\"",
+                "runtimeDirectoryGroup = \"basil\"",
+            ),
+            (
+                "three-digit mode",
+                "runtimeDirectoryMode = \"0770\"",
+                "runtimeDirectoryMode = \"770\"",
+            ),
+            (
+                "non-octal socket mode",
+                "socketMode = \"0660\"",
+                "socketMode = \"0668\"",
+            ),
+            (
+                "five-digit socket mode",
+                "socketMode = \"0660\"",
+                "socketMode = \"00660\"",
+            ),
+            (
+                "socket owner above the UID ceiling",
+                "socketOwner = \"992\"",
+                "socketOwner = \"4294967296\"",
+            ),
+            (
+                "zero-padded socket group",
+                "socketGroup = \"994\"",
+                "socketGroup = \"0994\"",
+            ),
+        ] {
+            let body = rootful().replace(from, to);
+            assert_ne!(body, rootful(), "case `{case}` must change the fixture");
+            assert!(parse(&body).is_err(), "{case}");
+        }
+        let ceiling = rootful().replace("socketOwner = \"992\"", "socketOwner = \"4294967295\"");
+        assert!(parse(&ceiling).is_ok(), "exact u32 ceiling is canonical");
+    }
+
+    #[test]
+    fn qualifier_scanner_extracts_only_delimited_tokens() {
+        assert_eq!(
+            generation_qualifiers("basil-attestor-g12.service"),
+            vec!["g12"]
+        );
+        assert_eq!(
+            generation_qualifiers("selinux:basil_attestor_g1_t"),
+            vec!["g1"]
+        );
+        assert_eq!(generation_qualifiers("g1"), vec!["g1"]);
+        assert_eq!(generation_qualifiers("/run/x/g7/control.sock"), vec!["g7"]);
+        assert_eq!(generation_qualifiers("a-g2-g1"), vec!["g2", "g1"]);
+        assert!(generation_qualifiers("cgroup2").is_empty());
+        assert!(generation_qualifiers("gen1").is_empty());
+        assert!(generation_qualifiers("g1a").is_empty());
+        assert!(generation_qualifiers("x1g2").is_empty());
+        assert!(generation_qualifiers("g1g2").is_empty());
+        assert!(generation_qualifiers("").is_empty());
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn any_pinned_generation_accepts_and_any_foreign_qualifier_rejects(
+            generation in 1_u64..=9_223_372_036_854_775_807_u64,
+            foreign in 1_u64..=9_223_372_036_854_775_807_u64,
+        ) {
+            let body = realm_body(
+                "production-docker",
+                "docker",
+                "rootful-host",
+                992,
+                "docker-attestor",
+                generation,
+            );
+            proptest::prop_assert!(parse(&body).is_ok());
+            if foreign != generation {
+                let mismatched = body.replace(
+                    &format!("lsmPolicy = \"basil-attestor-policy-g{generation}\""),
+                    &format!("lsmPolicy = \"basil-attestor-policy-g{foreign}\""),
+                );
+                proptest::prop_assert_eq!(
+                    parse(&mismatched),
+                    Err(RealmConfigError::GenerationQualifierMismatch {
+                        field: "measurement.lsmPolicy",
+                    })
+                );
+            }
+        }
     }
 
     #[test]
@@ -2305,8 +3176,8 @@ capabilities = ["health", "query-instances", "resolve-peer"]
             rootful().replace("rootful-host", "rootless-owner"),
             rootful().replace("brokerUser = \"991\"", "brokerUser = \"0991\""),
             rootful().replace(
-                "/run/basil/attestors/production-docker/control.sock",
-                "/tmp/control.sock",
+                "socketPath = \"/run/basil/attestors/production-docker/g1/control.sock\"",
+                "socketPath = \"/tmp/control.sock\"",
             ),
             rootful().replace(
                 "[\"health\", \"query-instances\", \"resolve-peer\"]",
@@ -2342,7 +3213,7 @@ capabilities = ["health", "query-instances", "resolve-peer"]
 
     #[test]
     fn absent_realms_are_isolated_and_partition_readiness() {
-        let realms = RealmSet::from_bootstrap(&bootstrap(rootful())).expect("valid realms");
+        let realms = RealmSet::from_bootstrap(&bootstrap(&rootful())).expect("valid realms");
         let registry = RealmRegistry::new(&realms, 1).expect("valid generation");
         assert_eq!(
             registry.readiness(),
@@ -2358,7 +3229,7 @@ capabilities = ["health", "query-instances", "resolve-peer"]
 
     #[tokio::test]
     async fn reconnect_repeats_authentication_and_spans_guard_lifetime() {
-        let realms = RealmSet::from_bootstrap(&bootstrap(rootful())).expect("valid realms");
+        let realms = RealmSet::from_bootstrap(&bootstrap(&rootful())).expect("valid realms");
         let name = RealmName::new("production-docker").expect("valid realm");
         let registry = RealmRegistry::new(&realms, 1).expect("valid registry");
         let connector = FakeConnector::new([FakePlan::Success, FakePlan::Success]);
@@ -2383,7 +3254,7 @@ capabilities = ["health", "query-instances", "resolve-peer"]
 
     #[tokio::test]
     async fn dispatch_passes_caller_budget_through_the_serial_session() {
-        let realms = RealmSet::from_bootstrap(&bootstrap(rootful())).expect("valid realms");
+        let realms = RealmSet::from_bootstrap(&bootstrap(&rootful())).expect("valid realms");
         let name = RealmName::new("production-docker").expect("valid realm");
         let registry = RealmRegistry::new(&realms, 1).expect("valid registry");
         let connector = FakeConnector::new([FakePlan::Success]);
@@ -2429,7 +3300,7 @@ capabilities = ["health", "query-instances", "resolve-peer"]
 
     #[tokio::test]
     async fn realm_failure_is_isolated() {
-        let body = format!("{}{}", rootful(), rootless(1000));
+        let body = format!("{}{}", rootful(), rootless(1000, 1));
         let realms = RealmSet::from_bootstrap(&bootstrap(&body)).expect("valid realms");
         let registry = RealmRegistry::new(&realms, 1).expect("valid registry");
         let connector = FakeConnector::new([FakePlan::Success, FakePlan::SocketAbsent]);
@@ -2459,7 +3330,7 @@ capabilities = ["health", "query-instances", "resolve-peer"]
 
     #[tokio::test]
     async fn authentication_failure_degrades_only_the_reconnecting_realm() {
-        let realms = RealmSet::from_bootstrap(&bootstrap(rootful())).expect("valid realms");
+        let realms = RealmSet::from_bootstrap(&bootstrap(&rootful())).expect("valid realms");
         let name = RealmName::new("production-docker").expect("valid realm");
         let registry = RealmRegistry::new(&realms, 1).expect("valid registry");
         let connector = FakeConnector::new([FakePlan::Success, FakePlan::AuthenticationFailed]);
@@ -2480,7 +3351,7 @@ capabilities = ["health", "query-instances", "resolve-peer"]
 
     #[tokio::test]
     async fn same_socket_failure_restores_accepted_generation() {
-        let realms = RealmSet::from_bootstrap(&bootstrap(rootful())).expect("valid realms");
+        let realms = RealmSet::from_bootstrap(&bootstrap(&rootful())).expect("valid realms");
         let name = RealmName::new("production-docker").expect("valid realm");
         let registry = RealmRegistry::new(&realms, 1).expect("valid registry");
         let connector = Arc::new(FakeConnector::new([
@@ -2494,10 +3365,7 @@ capabilities = ["health", "query-instances", "resolve-peer"]
             .await
             .expect("initial connection");
 
-        let changed = rootful().replace(
-            "basil-attestor-production-docker.service",
-            "basil-attestor-production-docker-v2.service",
-        );
+        let changed = rootful().replace("socketGroup = \"994\"", "socketGroup = \"995\"");
         let candidate = RealmSet::from_bootstrap(&bootstrap(&changed)).expect("valid candidate");
         assert_eq!(
             registry
@@ -2513,7 +3381,8 @@ capabilities = ["health", "query-instances", "resolve-peer"]
 
     #[tokio::test]
     async fn staged_candidate_never_serves_early_and_commit_is_atomic() {
-        let realms = RealmSet::from_bootstrap(&bootstrap(&rootless(1000))).expect("valid realms");
+        let realms =
+            RealmSet::from_bootstrap(&bootstrap(&rootless(1000, 1))).expect("valid realms");
         let name = RealmName::new("owner-podman").expect("valid realm");
         let registry = RealmRegistry::new(&realms, 1).expect("valid registry");
         let connector = Arc::new(FakeConnector::new([FakePlan::Success, FakePlan::Success]));
@@ -2524,7 +3393,7 @@ capabilities = ["health", "query-instances", "resolve-peer"]
             .expect("initial connection");
 
         let candidate =
-            RealmSet::from_bootstrap(&bootstrap(&rootless(1001))).expect("valid candidate");
+            RealmSet::from_bootstrap(&bootstrap(&rootless(1000, 2))).expect("valid candidate");
         let prepared = registry
             .prepare_reload(candidate, connector, Arc::clone(&admission), false)
             .await
@@ -2542,7 +3411,8 @@ capabilities = ["health", "query-instances", "resolve-peer"]
 
     #[tokio::test]
     async fn dropped_prepare_cleans_candidate_and_retains_authority() {
-        let realms = RealmSet::from_bootstrap(&bootstrap(&rootless(1000))).expect("valid realms");
+        let realms =
+            RealmSet::from_bootstrap(&bootstrap(&rootless(1000, 1))).expect("valid realms");
         let name = RealmName::new("owner-podman").expect("valid realm");
         let registry = RealmRegistry::new(&realms, 1).expect("valid registry");
         let connector = Arc::new(FakeConnector::new([FakePlan::Success, FakePlan::Success]));
@@ -2552,7 +3422,7 @@ capabilities = ["health", "query-instances", "resolve-peer"]
             .await
             .expect("initial connection");
         let candidate =
-            RealmSet::from_bootstrap(&bootstrap(&rootless(1001))).expect("valid candidate");
+            RealmSet::from_bootstrap(&bootstrap(&rootless(1000, 2))).expect("valid candidate");
         let prepared = registry
             .prepare_reload(candidate, connector, Arc::clone(&admission), false)
             .await
@@ -2566,7 +3436,7 @@ capabilities = ["health", "query-instances", "resolve-peer"]
 
     #[tokio::test]
     async fn cancelled_same_socket_prepare_restores_before_releasing_lease() {
-        let realms = RealmSet::from_bootstrap(&bootstrap(rootful())).expect("valid realms");
+        let realms = RealmSet::from_bootstrap(&bootstrap(&rootful())).expect("valid realms");
         let name = RealmName::new("production-docker").expect("valid realm");
         let registry = RealmRegistry::new(&realms, 1).expect("valid registry");
         let connector = Arc::new(FakeConnector::new([
@@ -2579,10 +3449,7 @@ capabilities = ["health", "query-instances", "resolve-peer"]
             .connect_realm(&name, connector.as_ref(), admission.as_ref())
             .await
             .expect("initial connection");
-        let changed = rootful().replace(
-            "basil-attestor-production-docker.service",
-            "basil-attestor-production-docker-v2.service",
-        );
+        let changed = rootful().replace("socketGroup = \"994\"", "socketGroup = \"995\"");
         let candidate = RealmSet::from_bootstrap(&bootstrap(&changed)).expect("valid candidate");
         let task_registry = registry.clone();
         let task_connector = Arc::clone(&connector);
@@ -2611,7 +3478,8 @@ capabilities = ["health", "query-instances", "resolve-peer"]
 
     #[tokio::test]
     async fn stale_revalidation_rejects_without_publishing_candidate() {
-        let realms = RealmSet::from_bootstrap(&bootstrap(&rootless(1000))).expect("valid realms");
+        let realms =
+            RealmSet::from_bootstrap(&bootstrap(&rootless(1000, 1))).expect("valid realms");
         let name = RealmName::new("owner-podman").expect("valid realm");
         let registry = RealmRegistry::new(&realms, 1).expect("valid registry");
         let connector = Arc::new(FakeConnector::new([FakePlan::Success, FakePlan::Success]));
@@ -2621,7 +3489,7 @@ capabilities = ["health", "query-instances", "resolve-peer"]
             .await
             .expect("initial connection");
         let candidate =
-            RealmSet::from_bootstrap(&bootstrap(&rootless(1001))).expect("valid candidate");
+            RealmSet::from_bootstrap(&bootstrap(&rootless(1000, 2))).expect("valid candidate");
         let prepared = registry
             .prepare_reload(
                 candidate,
@@ -2644,7 +3512,7 @@ capabilities = ["health", "query-instances", "resolve-peer"]
 
     #[test]
     fn poisoned_registry_lock_is_recovered() {
-        let realms = RealmSet::from_bootstrap(&bootstrap(rootful())).expect("valid realms");
+        let realms = RealmSet::from_bootstrap(&bootstrap(&rootful())).expect("valid realms");
         let registry = RealmRegistry::new(&realms, 1).expect("valid registry");
         let inner = Arc::clone(&registry.inner);
         let _ = std::thread::spawn(move || {
@@ -2668,7 +3536,8 @@ capabilities = ["health", "query-instances", "resolve-peer"]
 
     #[tokio::test]
     async fn remove_readd_uses_tombstone_revision() {
-        let realms = RealmSet::from_bootstrap(&bootstrap(&rootless(1000))).expect("valid realms");
+        let realms =
+            RealmSet::from_bootstrap(&bootstrap(&rootless(1000, 1))).expect("valid realms");
         let name = RealmName::new("owner-podman").expect("valid realm");
         let registry = RealmRegistry::new(&realms, 1).expect("valid registry");
         let connector = Arc::new(FakeConnector::new([FakePlan::Success, FakePlan::Success]));

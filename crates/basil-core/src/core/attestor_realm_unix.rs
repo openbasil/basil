@@ -71,7 +71,7 @@ struct UnixRealmConnection {
 impl RealmConnector for UnixRealmConnector {
     async fn connect(&self, config: &RealmConfig) -> Result<Box<dyn RealmConnection>, RealmError> {
         let before = authenticate_socket_path(config)?;
-        let stream = UnixStream::connect(&config.socket_path)
+        let stream = UnixStream::connect(&config.measurement.socket_path)
             .await
             .map_err(|error| {
                 if error.kind() == std::io::ErrorKind::NotFound {
@@ -88,7 +88,7 @@ impl RealmConnector for UnixRealmConnector {
             CapturedUnixStream::capture(stream).map_err(|_| RealmError::Authentication)?;
         Ok(Box::new(UnixRealmConnection {
             captured,
-            path: config.socket_path.clone(),
+            path: config.measurement.socket_path.clone(),
             path_identity: before,
             broker_binding: self.broker_binding,
             limits: self.limits,
@@ -118,7 +118,7 @@ impl RealmConnection for UnixRealmConnection {
         epoch: u64,
         admission: &ReleaseAdmission,
     ) -> Result<AuthenticatedRealmSession, RealmError> {
-        if self.path != config.socket_path
+        if self.path != config.measurement.socket_path
             || authenticate_socket_path(config)? != self.path_identity
         {
             return Err(RealmError::Authentication);
@@ -268,9 +268,26 @@ const fn protocol_error(error: &ProtocolError) -> RealmError {
     }
 }
 
+/// Where one authenticated component sits on the protected socket path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PathPosition {
+    /// A directory above the declared runtime directory.
+    Ancestor,
+    /// The declared generation-qualified runtime directory itself.
+    RuntimeDirectory,
+    /// The declared control-socket leaf.
+    Socket,
+}
+
+/// Authenticate every component of the configured socket path against the
+/// protected [`MeasurementAuthority`](super::attestor_realm::MeasurementAuthority):
+/// the runtime directory and socket leaf must carry exactly the declared
+/// owner, group, mode, and derived access-ACL profile; ancestors must be
+/// unwritable to group/other and carry only the expected traverse profile.
 fn authenticate_socket_path(config: &RealmConfig) -> Result<SocketIdentity, RealmError> {
+    let measurement = &config.measurement;
     let mut current = PathBuf::from("/");
-    for component in config.socket_path.components().skip(1) {
+    for component in measurement.socket_path.components().skip(1) {
         current.push(component.as_os_str());
         let metadata = fs::symlink_metadata(&current).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
@@ -282,31 +299,42 @@ fn authenticate_socket_path(config: &RealmConfig) -> Result<SocketIdentity, Real
         if metadata.file_type().is_symlink() {
             return Err(RealmError::Authentication);
         }
-        let is_socket = current == config.socket_path;
-        if is_socket {
-            let expected_mode = if config.broker_user.uid() == config.attestor_user.uid() {
-                0o600
-            } else {
-                0o660
-            };
-            if !metadata.file_type().is_socket()
-                || metadata.uid() != config.attestor_user.uid()
-                || metadata.mode() & 0o777 != expected_mode
-            {
-                return Err(RealmError::Authentication);
+        let position = if current == measurement.socket_path {
+            PathPosition::Socket
+        } else if current == measurement.runtime_directory {
+            PathPosition::RuntimeDirectory
+        } else {
+            PathPosition::Ancestor
+        };
+        let authentic = match position {
+            PathPosition::Socket => {
+                metadata.file_type().is_socket()
+                    && metadata.uid() == measurement.socket_owner.uid()
+                    && metadata.gid() == measurement.socket_group.gid()
+                    && metadata.mode() & 0o7777 == measurement.socket_mode.bits()
             }
-        } else if !metadata.file_type().is_dir()
-            || (metadata.uid() != 0 && metadata.uid() != config.attestor_user.uid())
-            || metadata.mode() & 0o022 != 0
-        {
+            PathPosition::RuntimeDirectory => {
+                metadata.file_type().is_dir()
+                    && metadata.uid() == measurement.runtime_directory_owner.uid()
+                    && metadata.gid() == measurement.runtime_directory_group.gid()
+                    && metadata.mode() & 0o7777 == measurement.runtime_directory_mode.bits()
+            }
+            PathPosition::Ancestor => {
+                metadata.file_type().is_dir()
+                    && (metadata.uid() == 0 || metadata.uid() == config.attestor_user.uid())
+                    && metadata.mode() & 0o022 == 0
+            }
+        };
+        if !authentic {
             return Err(RealmError::Authentication);
         }
-        authenticate_acl(&current, &metadata, config, is_socket)?;
-        if is_socket {
+        authenticate_acl(&current, &metadata, config, position)?;
+        if position == PathPosition::Socket {
             return Ok(SocketIdentity {
                 device: metadata.dev(),
                 inode: metadata.ino(),
                 owner: metadata.uid(),
+                group: metadata.gid(),
                 mode: metadata.mode(),
             });
         }
@@ -318,44 +346,72 @@ fn authenticate_acl(
     path: &Path,
     metadata: &fs::Metadata,
     config: &RealmConfig,
-    socket: bool,
+    position: PathPosition,
 ) -> Result<(), RealmError> {
     if read_acl(path, ACL_DEFAULT)?.is_some() {
         return Err(RealmError::Authentication);
     }
-    let access = read_acl(path, ACL_ACCESS)?;
-    if metadata.uid() == 0 || config.broker_user.uid() == config.attestor_user.uid() {
-        return if access.is_none() {
-            Ok(())
-        } else {
-            Err(RealmError::Authentication)
-        };
-    }
-    if metadata.uid() != config.attestor_user.uid() {
-        return Err(RealmError::Authentication);
-    }
-    let expected = if socket {
-        [
-            AclEntry::base(ACL_USER_OBJ, 0o6),
-            AclEntry::named_user(config.broker_user.uid(), 0o6),
-            AclEntry::base(ACL_GROUP_OBJ, 0),
-            AclEntry::base(ACL_MASK, 0o6),
-            AclEntry::base(ACL_OTHER, 0),
-        ]
-    } else {
-        [
-            AclEntry::base(ACL_USER_OBJ, 0o7),
-            AclEntry::named_user(config.broker_user.uid(), 0o1),
-            AclEntry::base(ACL_GROUP_OBJ, 0),
-            AclEntry::base(ACL_MASK, 0o1),
-            AclEntry::base(ACL_OTHER, 0),
-        ]
-    };
-    if access.as_deref() == Some(expected.as_slice()) {
+    if read_acl(path, ACL_ACCESS)? == expected_access_acl(config, metadata.uid(), position) {
         Ok(())
     } else {
         Err(RealmError::Authentication)
     }
+}
+
+/// Return the exact access-ACL profile one authenticated component must
+/// carry, or `None` when it must carry no access ACL.
+///
+/// With distinct broker and attestor accounts the runtime directory and
+/// socket always carry the enrollment-installed profile derived from their
+/// declared modes plus the broker's traverse/connect entry; a root-owned
+/// ancestor must stay ACL-free while an attestor-owned ancestor carries only
+/// the broker traverse profile. With one shared account no named entry is
+/// needed and any access ACL rejects.
+fn expected_access_acl(
+    config: &RealmConfig,
+    owner: u32,
+    position: PathPosition,
+) -> Option<Vec<AclEntry>> {
+    let broker = config.broker_user.uid();
+    if broker == config.attestor_user.uid() {
+        return None;
+    }
+    match position {
+        PathPosition::Ancestor => (owner != 0).then(|| {
+            vec![
+                AclEntry::base(ACL_USER_OBJ, 0o7),
+                AclEntry::named_user(broker, 0o1),
+                AclEntry::base(ACL_GROUP_OBJ, 0),
+                AclEntry::base(ACL_MASK, 0o1),
+                AclEntry::base(ACL_OTHER, 0),
+            ]
+        }),
+        PathPosition::RuntimeDirectory => Some(mode_bound_acl(
+            config.measurement.runtime_directory_mode.bits(),
+            broker,
+            0o1,
+        )),
+        PathPosition::Socket => Some(mode_bound_acl(
+            config.measurement.socket_mode.bits(),
+            broker,
+            0o6,
+        )),
+    }
+}
+
+/// Exact access-ACL entries consistent with one declared octal mode plus one
+/// named broker entry: the owner triad is `USER_OBJ`, the declared group
+/// triad is both `GROUP_OBJ` (the protected bind group) and `MASK` (which the
+/// kernel mirrors into the group mode bits), and the other triad is `OTHER`.
+fn mode_bound_acl(mode: u32, broker: u32, broker_permissions: u16) -> Vec<AclEntry> {
+    let triad = |shift: u32| u16::try_from((mode >> shift) & 0o7).unwrap_or(0);
+    vec![
+        AclEntry::base(ACL_USER_OBJ, triad(6)),
+        AclEntry::named_user(broker, broker_permissions),
+        AclEntry::base(ACL_GROUP_OBJ, triad(3)),
+        AclEntry::base(ACL_MASK, triad(3)),
+        AclEntry::base(ACL_OTHER, triad(0)),
+    ]
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -426,9 +482,9 @@ fn parse_acl(bytes: &[u8]) -> Result<Vec<AclEntry>, RealmError> {
 
 fn verify_unit(config: &RealmConfig, pin: &PinnedProcess) -> Result<(), RealmError> {
     let expected = SystemdEvidence {
-        unit: config.attestor_unit.clone(),
-        template: config.attestor_unit.find('@').map(|at| {
-            let mut value = config.attestor_unit.clone();
+        unit: config.measurement.service_unit.clone(),
+        template: config.measurement.service_unit.find('@').map(|at| {
+            let mut value = config.measurement.service_unit.clone();
             value.replace_range(at + 1..value.len() - ".service".len(), "");
             value
         }),
@@ -500,6 +556,7 @@ fn binding(
         socket.device,
         socket.inode,
         u64::from(socket.owner),
+        u64::from(socket.group),
         u64::from(socket.mode),
         executable.device,
         executable.inode,
@@ -510,7 +567,7 @@ fn binding(
         digest.update(value.to_be_bytes());
     }
     for value in [
-        config.attestor_unit.as_bytes(),
+        config.measurement.service_unit.as_bytes(),
         pin.executable_digest().unwrap_or_default().as_bytes(),
         active.release().product().as_str().as_bytes(),
         active.release().release().as_str().as_bytes(),
@@ -547,8 +604,19 @@ mod tests {
             .ok()
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or_else(|| rustix::process::geteuid().as_raw());
+        // Both the server and the connector must derive identical declared
+        // values, so the default follows the Fedora user-private-group
+        // convention (gid == uid) rather than either process's own egid.
+        let declared_gid = std::env::var("BASIL_REALM_ATTESTOR_GID")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(attestor_uid);
         let unit = std::env::var("BASIL_REALM_EXPECTED_UNIT")
-            .unwrap_or_else(|_| "basil-attestor-owner-podman.service".to_string());
+            .unwrap_or_else(|_| "basil-attestor-owner-podman-g1.service".to_string());
+        fixture_body(broker_uid, attestor_uid, declared_gid, &unit)
+    }
+
+    fn fixture_body(broker_uid: u32, attestor_uid: u32, declared_gid: u32, unit: &str) -> String {
         format!(
             r#"
 schema = "agent"
@@ -562,13 +630,30 @@ provider = "podman"
 runtimeMode = "rootless-owner"
 brokerUser = "{broker_uid}"
 brokerUnit = "basil-agent.service"
-attestorUser = "{attestor_uid}"
-attestorUnit = "{unit}"
-socketPath = "/run/user/{attestor_uid}/basil/attestors/owner-podman/control.sock"
+attestorUid = "{attestor_uid}"
 releaseRole = "podman-attestor"
 target = "x86_64-unknown-linux-gnu"
 protocol = 1
 capabilities = ["health", "query-instances", "resolve-peer"]
+[attestor.realms.owner-podman.measurement]
+authorityGeneration = 1
+serviceUnit = "{unit}"
+helperEndpoint = "/run/basil/measure/control.sock"
+helperPolicy = "basil-measure-policy-g1"
+helperPolicyGeneration = 1
+lsmProfile = "selinux:basil_attestor_g1_t"
+lsmPolicy = "basil-attestor-policy-g1"
+lockdownProfile = "basil-attestor-lockdown-g1"
+runtimeDirectory = "/run/basil/attestors/owner-podman/g1"
+runtimeDirectoryOwner = "{attestor_uid}"
+runtimeDirectoryGroup = "{declared_gid}"
+runtimeDirectoryMode = "0770"
+runtimeDirectoryAcl = "basil-attestor-bind-g1"
+socketPath = "/run/basil/attestors/owner-podman/g1/control.sock"
+socketOwner = "{attestor_uid}"
+socketGroup = "{declared_gid}"
+socketMode = "0660"
+socketAcl = "basil-attestor-control-g1"
 "#
         )
     }
@@ -624,48 +709,72 @@ capabilities = ["health", "query-instances", "resolve-peer"]
         bytes
     }
 
+    /// Install the runtime directory, socket, and declared modes exactly as
+    /// the measurement authority describes them, then the enrollment ACLs.
+    fn install_live_socket(config: &RealmConfig) -> UnixListener {
+        let parent = config.measurement.socket_path.parent().unwrap();
+        fs::create_dir_all(parent).unwrap();
+        fs::set_permissions(
+            parent,
+            std::os::unix::fs::PermissionsExt::from_mode(
+                config.measurement.runtime_directory_mode.bits(),
+            ),
+        )
+        .unwrap();
+        let _ = fs::remove_file(&config.measurement.socket_path);
+        let listener = UnixListener::bind(&config.measurement.socket_path).unwrap();
+        fs::set_permissions(
+            &config.measurement.socket_path,
+            std::os::unix::fs::PermissionsExt::from_mode(config.measurement.socket_mode.bits()),
+        )
+        .unwrap();
+        install_live_acl(config);
+        listener
+    }
+
+    /// Install the exact enrollment ACL profiles the connector authenticates,
+    /// derived from `expected_access_acl` so test installation cannot drift
+    /// from the production expectation. Setting the access ACL also syncs the
+    /// group mode bits to the profile mask, matching the declared modes.
     fn install_live_acl(config: &RealmConfig) {
-        let directory_acl = encoded_acl(&[
-            AclEntry::base(ACL_USER_OBJ, 0o7),
-            AclEntry::named_user(config.broker_user.uid(), 0o1),
-            AclEntry::base(ACL_GROUP_OBJ, 0),
-            AclEntry::base(ACL_MASK, 0o1),
-            AclEntry::base(ACL_OTHER, 0),
-        ]);
-        let mut socket_entries = vec![
-            AclEntry::base(ACL_USER_OBJ, 0o6),
-            AclEntry::named_user(config.broker_user.uid(), 0o6),
-            AclEntry::base(ACL_GROUP_OBJ, 0),
-            AclEntry::base(ACL_MASK, 0o6),
-            AclEntry::base(ACL_OTHER, 0),
-        ];
+        if config.broker_user.uid() == config.attestor_user.uid() {
+            return;
+        }
+        let owner = rustix::process::geteuid().as_raw();
+        let runtime = PathBuf::from("/run/basil/attestors");
+        let parent = config.measurement.socket_path.parent().unwrap();
+        for ancestor in parent
+            .ancestors()
+            .take_while(|path| *path != Path::new("/run/basil/attestors"))
+        {
+            if !ancestor.starts_with(&runtime) {
+                continue;
+            }
+            let position = if *ancestor == config.measurement.runtime_directory {
+                PathPosition::RuntimeDirectory
+            } else {
+                PathPosition::Ancestor
+            };
+            let entries = expected_access_acl(config, owner, position).unwrap();
+            rustix::fs::lsetxattr(
+                ancestor,
+                ACL_ACCESS,
+                &encoded_acl(&entries),
+                rustix::fs::XattrFlags::empty(),
+            )
+            .unwrap();
+        }
+        let mut socket_entries = expected_access_acl(config, owner, PathPosition::Socket).unwrap();
         if let Ok(value) = std::env::var("BASIL_REALM_EXTRA_ACL_UID")
             && let Ok(uid) = value.parse::<u32>()
         {
             let position = if uid < config.broker_user.uid() { 1 } else { 2 };
             socket_entries.insert(position, AclEntry::named_user(uid, 0o6));
         }
-        let socket_acl = encoded_acl(&socket_entries);
-        let runtime = PathBuf::from(format!("/run/user/{}", config.attestor_user.uid()));
-        let parent = config.socket_path.parent().unwrap();
-        for ancestor in parent
-            .ancestors()
-            .take_while(|path| *path != Path::new("/run/user"))
-        {
-            if ancestor.starts_with(&runtime) {
-                rustix::fs::lsetxattr(
-                    ancestor,
-                    ACL_ACCESS,
-                    &directory_acl,
-                    rustix::fs::XattrFlags::empty(),
-                )
-                .unwrap();
-            }
-        }
         rustix::fs::lsetxattr(
-            &config.socket_path,
+            &config.measurement.socket_path,
             ACL_ACCESS,
-            &socket_acl,
+            &encoded_acl(&socket_entries),
             rustix::fs::XattrFlags::empty(),
         )
         .unwrap();
@@ -694,6 +803,79 @@ capabilities = ["health", "query-instances", "resolve-peer"]
         assert_eq!(parse_digest("sha256:aa"), Err(RealmError::Authentication));
     }
 
+    fn fixture_config(broker_uid: u32, attestor_uid: u32) -> RealmConfig {
+        let body = fixture_body(
+            broker_uid,
+            attestor_uid,
+            attestor_uid,
+            "basil-attestor-owner-podman-g1.service",
+        );
+        let value: toml::Value = toml::from_str(&body).unwrap();
+        let realms = RealmSet::from_bootstrap(&value).unwrap();
+        realms
+            .get(&RealmName::new("owner-podman").unwrap())
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn expected_acl_profiles_follow_the_declared_authority() {
+        let config = fixture_config(100, 200);
+        // A root-owned ancestor must stay ACL-free; an attestor-owned
+        // ancestor carries only the broker traverse profile.
+        assert_eq!(
+            expected_access_acl(&config, 0, PathPosition::Ancestor),
+            None
+        );
+        assert_eq!(
+            expected_access_acl(&config, 200, PathPosition::Ancestor),
+            Some(vec![
+                AclEntry::base(ACL_USER_OBJ, 0o7),
+                AclEntry::named_user(100, 0o1),
+                AclEntry::base(ACL_GROUP_OBJ, 0),
+                AclEntry::base(ACL_MASK, 0o1),
+                AclEntry::base(ACL_OTHER, 0),
+            ])
+        );
+        // The runtime directory profile mirrors the declared 0770 mode plus
+        // the broker traverse entry, regardless of component owner.
+        assert_eq!(
+            expected_access_acl(&config, 0, PathPosition::RuntimeDirectory),
+            Some(vec![
+                AclEntry::base(ACL_USER_OBJ, 0o7),
+                AclEntry::named_user(100, 0o1),
+                AclEntry::base(ACL_GROUP_OBJ, 0o7),
+                AclEntry::base(ACL_MASK, 0o7),
+                AclEntry::base(ACL_OTHER, 0),
+            ])
+        );
+        // The socket profile mirrors the declared 0660 mode plus the broker
+        // connect entry.
+        assert_eq!(
+            expected_access_acl(&config, 200, PathPosition::Socket),
+            Some(vec![
+                AclEntry::base(ACL_USER_OBJ, 0o6),
+                AclEntry::named_user(100, 0o6),
+                AclEntry::base(ACL_GROUP_OBJ, 0o6),
+                AclEntry::base(ACL_MASK, 0o6),
+                AclEntry::base(ACL_OTHER, 0),
+            ])
+        );
+    }
+
+    #[test]
+    fn shared_broker_and_attestor_account_forbids_every_access_acl() {
+        let config = fixture_config(300, 300);
+        for position in [
+            PathPosition::Ancestor,
+            PathPosition::RuntimeDirectory,
+            PathPosition::Socket,
+        ] {
+            assert_eq!(expected_access_acl(&config, 300, position), None);
+            assert_eq!(expected_access_acl(&config, 0, position), None);
+        }
+    }
+
     #[test]
     fn exact_acl_parser_accepts_bounded_profile_and_preserves_named_user() {
         let expected = vec![
@@ -711,15 +893,7 @@ capabilities = ["health", "query-instances", "resolve-peer"]
     #[ignore = "requires a transient systemd --user service"]
     async fn live_unix_realm_systemd_server() {
         let config = live_config();
-        fs::create_dir_all(config.socket_path.parent().unwrap()).unwrap();
-        fs::set_permissions(
-            config.socket_path.parent().unwrap(),
-            std::os::unix::fs::PermissionsExt::from_mode(0o700),
-        )
-        .unwrap();
-        let _ = fs::remove_file(&config.socket_path);
-        let listener = UnixListener::bind(&config.socket_path).unwrap();
-        install_live_acl(&config);
+        let listener = install_live_socket(&config);
         let ready = std::env::var("BASIL_REALM_READY").unwrap();
         let server_pid = rustix::process::getpid().as_raw_nonzero().get();
         fs::write(&ready, format!("{server_pid}\n")).unwrap();
