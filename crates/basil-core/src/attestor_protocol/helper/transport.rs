@@ -1,0 +1,436 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+//! Broker-only `SOCK_SEQPACKET` transport for the measurement helper.
+//!
+//! `SOCK_SEQPACKET` gives connection-oriented, record-preserving datagrams:
+//! one request record maps to exactly one `recvmsg` and its ancillary
+//! `SCM_RIGHTS` payload, so descriptor association is unambiguous and both
+//! kernel truncation flags (`MSG_TRUNC`, `MSG_CTRUNC`) are surfaced to the
+//! service for fail-closed rejection.
+//!
+//! The transport is deliberately synchronous and serial: the helper is a tiny
+//! root-owned service with exactly one authorized client (the broker), and a
+//! blocking accept/serve loop keeps the privileged code path small.
+
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::path::Path;
+
+use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+use rustix::net::{
+    AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags,
+    SendAncillaryBuffer, SendAncillaryMessage, SendFlags, SocketAddrUnix, SocketFlags, SocketType,
+};
+use thiserror::Error;
+
+use super::wire::MAX_RESPONSE_BYTES;
+
+/// Maximum descriptors for which ancillary space is reserved on receive.
+///
+/// A valid request carries exactly one descriptor; reserving room for a few
+/// more lets the service distinguish a surplus-descriptor request (typed
+/// rejection) from kernel ancillary truncation (also a typed rejection).
+pub const MAX_RECEIVED_DESCRIPTORS: usize = 4;
+
+/// Typed transport failure.
+#[derive(Debug, Error)]
+pub enum TransportError {
+    /// The endpoint parent directory failed its trust checks.
+    #[error("helper endpoint parent directory is not trustworthy")]
+    UntrustedParent,
+    /// The endpoint path is occupied by a non-socket object.
+    #[error("helper endpoint path is occupied by a non-socket object")]
+    PathOccupied,
+    /// The endpoint path has no parent directory or is not absolute-safe.
+    #[error("helper endpoint path is invalid")]
+    InvalidPath,
+    /// An underlying socket or filesystem operation failed.
+    #[error("helper transport I/O failure: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+impl From<rustix::io::Errno> for TransportError {
+    fn from(errno: rustix::io::Errno) -> Self {
+        Self::Io(errno.into())
+    }
+}
+
+/// Set a `0o077` process umask so nothing the helper creates is ever group
+/// or other accessible before its explicit chmod.
+///
+/// The umask is process-global; the helper binary calls this once at startup
+/// before binding its endpoint.
+pub fn set_restrictive_umask() {
+    let _previous = rustix::process::umask(Mode::from_bits_truncate(0o077));
+}
+
+/// Bind-time options for the helper endpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HelperEndpointOptions {
+    /// Exact owner UID required for the endpoint's parent directory.
+    pub required_parent_owner_uid: u32,
+    /// Mode bits applied to the bound socket (for example `0o660`).
+    pub socket_mode: u32,
+}
+
+/// A bound helper endpoint listener.
+#[derive(Debug)]
+pub struct HelperListener {
+    fd: OwnedFd,
+}
+
+/// One accepted (or connected) helper transport connection.
+#[derive(Debug)]
+pub struct HelperConnection {
+    fd: OwnedFd,
+}
+
+/// One received request datagram with its descriptors and kernel flags.
+#[derive(Debug)]
+pub struct ReceivedDatagram {
+    /// Datagram payload bytes (possibly clipped when `oversized`).
+    pub bytes: Vec<u8>,
+    /// Descriptors carried by `SCM_RIGHTS` ancillary data.
+    pub descriptors: Vec<OwnedFd>,
+    /// The kernel reported `MSG_TRUNC`: the datagram exceeded the bound.
+    pub oversized: bool,
+    /// The kernel reported `MSG_CTRUNC`: ancillary data was dropped.
+    pub ancillary_truncated: bool,
+}
+
+impl HelperListener {
+    /// Bind the single shared helper endpoint.
+    ///
+    /// The parent directory is opened without following symlinks and must be
+    /// owned by `options.required_parent_owner_uid` with no group or other
+    /// write bit. A stale leftover socket at the path is unlinked; any other
+    /// object at the path rejects. The bound socket is chmodded to
+    /// `options.socket_mode` before `listen`, so the endpoint is never
+    /// observable with wider permissions (callers should also run with a
+    /// restrictive umask).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError`] on trust-check or socket failures.
+    pub fn bind(path: &Path, options: &HelperEndpointOptions) -> Result<Self, TransportError> {
+        let parent = path.parent().ok_or(TransportError::InvalidPath)?;
+        let name = path.file_name().ok_or(TransportError::InvalidPath)?;
+        let parent_fd = rustix::fs::open(
+            parent,
+            OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::RDONLY,
+            Mode::empty(),
+        )?;
+        let parent_stat = rustix::fs::fstat(&parent_fd)?;
+        let group_or_other_write = 0o022;
+        if parent_stat.st_uid != options.required_parent_owner_uid
+            || (parent_stat.st_mode & group_or_other_write) != 0
+        {
+            return Err(TransportError::UntrustedParent);
+        }
+
+        // Remove only a verified stale socket; never any other object.
+        match rustix::fs::statat(&parent_fd, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => {
+                if FileType::from_raw_mode(stat.st_mode) != FileType::Socket {
+                    return Err(TransportError::PathOccupied);
+                }
+                rustix::fs::unlinkat(&parent_fd, name, AtFlags::empty())?;
+            }
+            Err(rustix::io::Errno::NOENT) => {}
+            Err(errno) => return Err(errno.into()),
+        }
+
+        let fd = rustix::net::socket_with(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC,
+            None,
+        )?;
+        let address = SocketAddrUnix::new(path)?;
+        rustix::net::bind(&fd, &address)?;
+        rustix::fs::chmodat(
+            &parent_fd,
+            name,
+            Mode::from_bits_truncate(options.socket_mode),
+            AtFlags::empty(),
+        )?;
+        rustix::net::listen(&fd, 8)?;
+        Ok(Self { fd })
+    }
+
+    /// Accept one connection, blocking until a client arrives.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::Io`] when `accept` fails.
+    pub fn accept(&self) -> Result<HelperConnection, TransportError> {
+        let fd = rustix::net::accept_with(&self.fd, SocketFlags::CLOEXEC)?;
+        Ok(HelperConnection { fd })
+    }
+}
+
+impl HelperConnection {
+    /// Connect to a helper endpoint (broker/conformance-test side).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError`] when the endpoint is absent or refuses.
+    pub fn connect(path: &Path) -> Result<Self, TransportError> {
+        let fd = rustix::net::socket_with(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC,
+            None,
+        )?;
+        let address = SocketAddrUnix::new(path)?;
+        rustix::net::connect(&fd, &address)?;
+        Ok(Self { fd })
+    }
+
+    /// Build a connected pair (conformance tests).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::Io`] when `socketpair` fails.
+    pub fn pair() -> Result<(Self, Self), TransportError> {
+        let (a, b) = rustix::net::socketpair(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC,
+            None,
+        )?;
+        Ok((Self { fd: a }, Self { fd: b }))
+    }
+
+    /// Receive one datagram of at most `max_bytes` payload bytes.
+    ///
+    /// Returns `Ok(None)` on orderly end-of-stream. Kernel truncation is
+    /// reported through the returned flags rather than as an error so the
+    /// service can answer with a typed rejection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::Io`] when `recvmsg` fails.
+    pub fn recv(&self, max_bytes: usize) -> Result<Option<ReceivedDatagram>, TransportError> {
+        let mut buffer = vec![0u8; max_bytes];
+        let mut space = [std::mem::MaybeUninit::uninit();
+            rustix::cmsg_space!(ScmRights(MAX_RECEIVED_DESCRIPTORS))];
+        let mut ancillary = RecvAncillaryBuffer::new(&mut space);
+        let mut iov = [std::io::IoSliceMut::new(&mut buffer)];
+        let message =
+            rustix::net::recvmsg(&self.fd, &mut iov, &mut ancillary, RecvFlags::CMSG_CLOEXEC)?;
+        let mut descriptors = Vec::new();
+        for received in ancillary.drain() {
+            if let RecvAncillaryMessage::ScmRights(fds) = received {
+                descriptors.extend(fds);
+            }
+        }
+        let oversized = message.flags.contains(ReturnFlags::TRUNC);
+        let ancillary_truncated = message.flags.contains(ReturnFlags::CTRUNC);
+        if message.bytes == 0 && descriptors.is_empty() && !oversized && !ancillary_truncated {
+            return Ok(None);
+        }
+        buffer.truncate(message.bytes.min(max_bytes));
+        Ok(Some(ReceivedDatagram {
+            bytes: buffer,
+            descriptors,
+            oversized,
+            ancillary_truncated,
+        }))
+    }
+
+    /// Send one datagram with optional `SCM_RIGHTS` descriptors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::Io`] when `sendmsg` fails or the payload is
+    /// not sent as one record.
+    pub fn send(&self, bytes: &[u8], descriptors: &[BorrowedFd<'_>]) -> Result<(), TransportError> {
+        let mut space = [std::mem::MaybeUninit::uninit();
+            rustix::cmsg_space!(ScmRights(MAX_RECEIVED_DESCRIPTORS))];
+        let mut ancillary = SendAncillaryBuffer::new(&mut space);
+        if !descriptors.is_empty() && !ancillary.push(SendAncillaryMessage::ScmRights(descriptors))
+        {
+            return Err(TransportError::Io(std::io::Error::other(
+                "ancillary descriptor space exhausted",
+            )));
+        }
+        let iov = [std::io::IoSlice::new(bytes)];
+        let sent = rustix::net::sendmsg(&self.fd, &iov, &mut ancillary, SendFlags::NOSIGNAL)?;
+        if sent != bytes.len() {
+            return Err(TransportError::Io(std::io::Error::other(
+                "short seqpacket send",
+            )));
+        }
+        Ok(())
+    }
+
+    /// Receive one bounded response datagram (broker/conformance-test side).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::Io`] when `recvmsg` fails.
+    pub fn recv_response(&self) -> Result<Option<ReceivedDatagram>, TransportError> {
+        self.recv(MAX_RESPONSE_BYTES)
+    }
+}
+
+impl AsFd for HelperConnection {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::AsFd as _;
+
+    use super::super::wire::MAX_REQUEST_BYTES;
+    use super::*;
+
+    #[test]
+    fn round_trips_one_datagram_with_one_descriptor() {
+        let (client, server) = HelperConnection::pair().expect("pair");
+        let (stream_a, _stream_b) = rustix::net::socketpair(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .expect("stream pair");
+        client.send(b"hello", &[stream_a.as_fd()]).expect("send");
+        let received = server
+            .recv(MAX_REQUEST_BYTES)
+            .expect("recv")
+            .expect("datagram");
+        assert_eq!(received.bytes, b"hello");
+        assert_eq!(received.descriptors.len(), 1);
+        assert!(!received.oversized);
+        assert!(!received.ancillary_truncated);
+    }
+
+    #[test]
+    fn flags_oversized_datagrams() {
+        let (client, server) = HelperConnection::pair().expect("pair");
+        let big = vec![0xAAu8; MAX_REQUEST_BYTES + 100];
+        client.send(&big, &[]).expect("send");
+        let received = server
+            .recv(MAX_REQUEST_BYTES)
+            .expect("recv")
+            .expect("datagram");
+        assert!(received.oversized);
+        assert_eq!(received.bytes.len(), MAX_REQUEST_BYTES);
+    }
+
+    #[test]
+    fn flags_ancillary_truncation() {
+        let (client, server) = HelperConnection::pair().expect("pair");
+        // Twelve descriptors exceed the reserved space for four (the space
+        // macro pads for alignment, so a small excess can still fit): CTRUNC.
+        let pairs: Vec<_> = (0..6)
+            .map(|_| {
+                rustix::net::socketpair(
+                    AddressFamily::UNIX,
+                    SocketType::STREAM,
+                    SocketFlags::CLOEXEC,
+                    None,
+                )
+                .expect("stream pair")
+            })
+            .collect();
+        let fds: Vec<_> = pairs
+            .iter()
+            .flat_map(|(a, b)| [a.as_fd(), b.as_fd()])
+            .collect();
+        // Send with our own larger buffer, bypassing `send`'s bound.
+        let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(12))];
+        let mut ancillary = SendAncillaryBuffer::new(&mut space);
+        assert!(ancillary.push(SendAncillaryMessage::ScmRights(&fds)));
+        let iov = [std::io::IoSlice::new(b"x")];
+        rustix::net::sendmsg(client.as_fd(), &iov, &mut ancillary, SendFlags::NOSIGNAL)
+            .expect("sendmsg");
+        let received = server
+            .recv(MAX_REQUEST_BYTES)
+            .expect("recv")
+            .expect("datagram");
+        assert!(received.ancillary_truncated);
+    }
+
+    #[test]
+    fn reports_end_of_stream_as_none() {
+        let (client, server) = HelperConnection::pair().expect("pair");
+        drop(client);
+        assert!(server.recv(MAX_REQUEST_BYTES).expect("recv").is_none());
+    }
+
+    #[test]
+    fn binds_accepts_and_survives_restart_with_a_stale_socket() {
+        let base = std::env::temp_dir().join(format!(
+            "basil-helper-endpoint-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).expect("create dir");
+        let path = base.join("control.sock");
+        let options = HelperEndpointOptions {
+            required_parent_owner_uid: rustix::process::getuid().as_raw(),
+            socket_mode: 0o600,
+        };
+
+        let listener = HelperListener::bind(&path, &options).expect("bind");
+        let client = HelperConnection::connect(&path).expect("connect");
+        let server = listener.accept().expect("accept");
+        client.send(b"ping", &[]).expect("send");
+        assert_eq!(
+            server
+                .recv(MAX_REQUEST_BYTES)
+                .expect("recv")
+                .expect("datagram")
+                .bytes,
+            b"ping"
+        );
+
+        // Outage: with the listener gone, connect fails.
+        drop(listener);
+        drop(server);
+        assert!(HelperConnection::connect(&path).is_err());
+
+        // Restart: the stale socket file is unlinked and rebinding works.
+        let listener = HelperListener::bind(&path, &options).expect("rebind");
+        let client2 = HelperConnection::connect(&path).expect("reconnect");
+        let server2 = listener.accept().expect("accept");
+        client2.send(b"pong", &[]).expect("send");
+        assert_eq!(
+            server2
+                .recv(MAX_REQUEST_BYTES)
+                .expect("recv")
+                .expect("datagram")
+                .bytes,
+            b"pong"
+        );
+        drop(client);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn refuses_a_non_socket_object_at_the_endpoint_path() {
+        let base =
+            std::env::temp_dir().join(format!("basil-helper-occupied-{}", std::process::id()));
+        std::fs::create_dir_all(&base).expect("create dir");
+        let path = base.join("control.sock");
+        std::fs::write(&path, b"not a socket").expect("write");
+        let options = HelperEndpointOptions {
+            required_parent_owner_uid: rustix::process::getuid().as_raw(),
+            socket_mode: 0o600,
+        };
+        assert!(matches!(
+            HelperListener::bind(&path, &options),
+            Err(TransportError::PathOccupied)
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}

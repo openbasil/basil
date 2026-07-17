@@ -16,6 +16,7 @@
 //! supplies the opaque [`VerifiedPeerBinding`] used by the handshake.
 
 mod codec;
+pub mod helper;
 mod limits;
 mod session;
 

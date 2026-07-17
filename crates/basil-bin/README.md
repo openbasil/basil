@@ -42,6 +42,15 @@ Client commands take the socket from `--socket` or `BASIL_SOCKET`. `basil --help
 authoritative command reference; man pages are rendered from this crate's library surface
 ([`cli()`]) by the workspace `xtask`, so the shipped documentation should always be in sync with the parser.
 
+## basil-measure-helper
+
+This crate also builds `basil-measure-helper`, the root-owned, capability-minimized
+measurement helper for attestor realms (one per host, on a single shared
+`SOCK_SEQPACKET` endpoint). It serves broker measurement requests under a root-owned,
+generation-versioned allowlist and holds no runtime API, key, or policy authority; see
+`docs/attestor-realm-contract/` for the protocol contract. It is installed and confined
+by enrollment/packaging, not run by hand.
+
 ## Feature flags
 
 Features forward to `basil-core` and select which backends and unlock methods are compiled in.
