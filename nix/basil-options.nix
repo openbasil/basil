@@ -97,6 +97,10 @@ let
     # NOT implied by any data-plane grant; grant it explicitly over the reserved
     # admin target `broker.revoke`.
     "revoke"
+    # Subscribe to bounded broker events. Grant explicitly over `broker.watch`.
+    "watch"
+    # Read bounded named attestor-realm status over `broker.realms`.
+    "realm_status"
     # Read the bounded accepted-connection inventory. Separate from mutation.
     "connection_status"
     # Deliberately terminate typed/exact selected accepted connections.
@@ -558,8 +562,8 @@ let
           verify, sign, encrypt, decrypt, mint, sign_nats_jwt, validate_nats_jwt,
           encrypt_nats_curve, decrypt_nats_curve, validate, set, rotate, import,
           new_key, and use_software_custody. Broker-wide admin ops (reload,
-          explain, revoke, connection_status, connection_drop) are granted over
-          their reserved broker.* targets.
+          explain, revoke, watch, realm_status, connection_status,
+          connection_drop) are granted over their reserved broker.* targets.
         '';
       };
 

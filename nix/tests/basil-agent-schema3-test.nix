@@ -39,6 +39,10 @@ let
       };
 
       policy = {
+        roles.observer = [
+          "watch"
+          "realm_status"
+        ];
         unixSubjects.operator-root.user = "root";
         rules = [
           {
@@ -99,7 +103,10 @@ let
         domain = "host-process";
         match.all = [ { "process.uid" = 0; } ];
       };
-      roles = { };
+      roles.observer = [
+        "watch"
+        "realm_status"
+      ];
       rules = [
         {
           id = "root-read-demo";
