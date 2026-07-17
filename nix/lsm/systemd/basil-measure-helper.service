@@ -1,0 +1,91 @@
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+# Confined system unit for the single per-host Basil measurement helper
+# (SPEC.md rev 1.2; basil-uvsx). Installed once by packaging (basil-9tj.28)
+# and never restarted or duplicated by an authority change; only its
+# allowlist files under /etc/basil/measure/policy.d are generation-versioned.
+#
+# There is deliberately no matching .socket unit: the helper process itself
+# removes a verified stale socket and binds its own SOCK_SEQPACKET listener,
+# so a client's SO_PEERCRED names the helper, never PID 1.
+#
+# LSM attachment is a distro-conditional drop-in installed with the policy,
+# not part of this base unit:
+#   10-selinux.conf:  [Service] SELinuxContext=system_u:system_r:basil_measure_t:s0
+#   10-apparmor.conf: [Service] AppArmorProfile=basil-measure-helper
+
+[Unit]
+Description=Basil measurement helper
+Documentation=file:///usr/share/doc/basil/helper-protocol.md
+After=local-fs.target
+Wants=dbus.service
+After=dbus.service
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/basil-measure-helper --endpoint /run/basil/measure/control.sock --policy-dir /etc/basil/measure/policy.d --socket-mode 0660
+Restart=on-failure
+RestartSec=1s
+
+# Identity and privilege floor. Root retains exactly the measurement
+# authority; every other capability is removed at the bounding set.
+User=root
+CapabilityBoundingSet=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+UMask=0077
+
+# Endpoint runtime directory. The socket mode (0660) and required-owner
+# checks are enforced again by the process itself; group access to the
+# endpoint is granted by packaging via the broker's group on this directory.
+RuntimeDirectory=basil/measure
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+
+# Filesystem: read-only view of the system, no home write access. read-only
+# (not yes) because measuring a rootless workload's executable resolves
+# through /proc/<pid>/exe into paths that can live under /home.
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ReadOnlyPaths=/etc/basil/measure/policy.d
+
+# The helper must see every peer's /proc entry to measure it.
+ProtectProc=default
+ProcSubset=all
+
+# Kernel and namespace surface.
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RemoveIPC=yes
+PrivateDevices=yes
+DevicePolicy=closed
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+KeyringMode=private
+Delegate=no
+
+# Unix sockets only (endpoint, SCM_RIGHTS duplicates, system bus); no
+# network address families and no packet access.
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+
+# Manager-applied baseline syscall filter, active before exec as the SPEC
+# requires. @system-service already excludes ptrace(2), mount, and module
+# syscalls; PTRACE_MODE_READ file access does not use ptrace(2). The
+# process-installed post-init lockdown profile (basil-kqc7 design) tightens
+# further at runtime.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+# File contexts for the static Basil measurement-helper pieces (basil-uvsx).
+# Installed once per host with basil_lsm_base; per-generation contexts live
+# in basil_attestor.fc.in.
+
+/usr/bin/basil-measure-helper		--	system_u:object_r:basil_measure_exec_t:s0
+/usr/libexec/basil/basil-attestor	--	system_u:object_r:basil_attestor_exec_t:s0
+/etc/basil/measure/policy\.d(/.*)?		system_u:object_r:basil_measure_policy_t:s0
+/run/basil/measure(/.*)?			system_u:object_r:basil_measure_var_run_t:s0

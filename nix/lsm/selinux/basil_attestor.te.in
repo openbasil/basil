@@ -1,0 +1,97 @@
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+# basil_attestor.te.in: per-generation attestor domain template
+# (SPEC.md rev 1.2; basil-uvsx). The authority installer renders @GEN@ with
+# the exact decimal authorityGeneration and loads the module additively as
+# `basil_attestor_policy_g@GEN@`; the old generation's module stays loaded
+# and serving until drain and retirement.
+#
+# The domain is entered only through the rendered unit's
+# SELinuxContext=system_u:system_r:basil_attestor_g@GEN@_t:s0. There is
+# deliberately no type_transition: one executable serves every generation,
+# and an exec transition could select only one domain.
+
+module basil_attestor_policy_g@GEN@ 1.0.0;
+
+require {
+	attribute domain;
+	attribute basil_attestor_domain;
+	role system_r;
+	type init_t;
+	type proc_t;
+	type basil_attestor_exec_t;
+	type basil_attestor_var_run_t;
+	class process { transition sigchld signull getattr };
+	class file { entrypoint map read open getattr execute ioctl lock };
+	class dir { search getattr read open write add_name remove_name watch };
+	class lnk_file { read getattr };
+	class sock_file { create unlink setattr getattr write };
+	class unix_stream_socket { create bind listen accept connectto read write getattr setattr setopt getopt shutdown };
+	class fd { use };
+	class fifo_file { read write getattr };
+}
+
+type basil_attestor_g@GEN@_t;
+typeattribute basil_attestor_g@GEN@_t domain;
+typeattribute basil_attestor_g@GEN@_t basil_attestor_domain;
+role system_r types basil_attestor_g@GEN@_t;
+
+########################################
+#
+# Entry from the generation-qualified unit
+#
+
+allow init_t basil_attestor_g@GEN@_t:process transition;
+allow basil_attestor_g@GEN@_t basil_attestor_exec_t:file { entrypoint read open getattr map execute };
+allow basil_attestor_g@GEN@_t init_t:fd use;
+allow basil_attestor_g@GEN@_t init_t:process sigchld;
+allow basil_attestor_g@GEN@_t init_t:fifo_file { read write getattr };
+
+########################################
+#
+# Runtime directory and realm control socket
+#
+# The admitted attestor process itself removes a verified stale socket,
+# creates the listener, and advertises readiness. Directory ownership, mode,
+# and ACL are installed by the root authority transaction; this domain only
+# gets the narrow socket lifecycle inside it.
+#
+
+allow basil_attestor_g@GEN@_t basil_attestor_var_run_t:dir { search getattr read open write add_name remove_name watch };
+allow basil_attestor_g@GEN@_t basil_attestor_var_run_t:sock_file { create unlink setattr getattr write };
+allow basil_attestor_g@GEN@_t self:unix_stream_socket { create bind listen accept read write getattr setattr setopt getopt shutdown };
+
+########################################
+#
+# Own /proc introspection (start time, fd table) used by readiness and the
+# post-init lockdown sequencing.
+#
+
+allow basil_attestor_g@GEN@_t proc_t:dir { search getattr read open };
+allow basil_attestor_g@GEN@_t proc_t:file { read open getattr };
+allow basil_attestor_g@GEN@_t self:process { getattr signull };
+
+########################################
+#
+# Container runtime socket (provider evidence source)
+#
+# Rootful Docker/Podman under container-selinux. The rootless-owner realm's
+# user socket lives under /run/user/<uid> with user labels; the rootless
+# entry mechanism and its labels are an open item recorded in
+# nix/lsm/README.md and evidenced in the fedora lane.
+#
+
+optional {
+	require {
+		type container_runtime_t;
+		type container_var_run_t;
+		class unix_stream_socket connectto;
+		class sock_file write;
+		class dir { search getattr };
+	}
+	allow basil_attestor_g@GEN@_t container_var_run_t:dir { search getattr };
+	allow basil_attestor_g@GEN@_t container_var_run_t:sock_file write;
+	allow basil_attestor_g@GEN@_t container_runtime_t:unix_stream_socket connectto;
+}

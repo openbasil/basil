@@ -1,0 +1,59 @@
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+# basil-attestor.in: per-generation AppArmor profile template (SPEC.md rev
+# 1.2; basil-uvsx). The authority installer renders @GEN@ with the exact
+# decimal authorityGeneration and loads the profile additively; the old
+# generation's profile stays loaded until drain and retirement.
+#
+# Named profile without an attachment path: one executable serves every
+# generation, so the rendered unit selects the profile with
+# AppArmorProfile=basil-attestor-g@GEN@ and the attachment is active at the
+# exec boundary.
+
+profile basil-attestor-g@GEN@ flags=(attach_disconnected) {
+  # No capabilities: the attestor is a static, unprivileged evidence source.
+
+  # Realm control socket lifecycle inside the root-installed,
+  # generation-qualified runtime directory. The attestor process itself
+  # removes a verified stale socket, binds, and listens.
+  unix (create, getattr, setattr, getopt, setopt, shutdown, bind, listen, accept, send, receive) type=stream,
+  /run/basil/attestors/*/g@GEN@/ rw,
+  /run/basil/attestors/*/g@GEN@/control.sock rw,
+
+  # Container runtime evidence sources: rootful Docker/Podman system
+  # sockets and the rootless-owner Podman user socket.
+  unix (connect, send, receive, getopt) type=stream,
+  /run/docker.sock rw,
+  /run/podman/podman.sock rw,
+  /run/user/[0-9]*/podman/podman.sock rw,
+
+  # Own /proc introspection for readiness and lockdown sequencing.
+  /proc/self/ r,
+  /proc/self/** r,
+  /proc/sys/kernel/pid_max r,
+
+  # Executable, loader, and runtime.
+  /usr/libexec/basil/basil-attestor mr,
+  /usr/bin/basil mr,
+  /usr/lib/** mr,
+  /usr/lib64/** mr,
+  /nix/store/** mr,
+  /etc/ld.so.cache r,
+
+  # Service lifecycle signals from the manager.
+  signal (receive) set=(term, kill, hup) peer=unconfined,
+
+  # Prevention statements from the contract: the attestor never traces,
+  # never executes anything after entry, and never touches the helper's
+  # allowlist. Denials are default; these make the sensitive ones explicit
+  # and audited.
+  deny ptrace,
+  deny capability,
+  deny /etc/basil/measure/policy.d/** rw,
+  deny /proc/[0-9]*/mem rw,
+  deny /** x,
+  deny mount,
+  deny umount,
+}

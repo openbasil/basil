@@ -1,0 +1,102 @@
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+# basil-attestor.service.in: per-realm, per-generation attestor unit
+# template (SPEC.md rev 1.2; basil-uvsx). The authority installer renders
+# the placeholders and installs the result under the exact
+# generation-qualified name from the protected authority:
+#   basil-attestor-@REALM@-g@GEN@.service
+#
+# Placeholders:
+#   @REALM@          canonical realm name
+#   @GEN@            exact decimal authorityGeneration
+#   @ATTESTOR_UID@   measurement.attestorUid (canonical decimal UID)
+#   @BIND_GID@       protected bind GID for the runtime directory
+#   @EXEC@           packaged attestor executable
+#                    (/usr/libexec/basil/basil-attestor)
+#   @RUNTIME_DIR@    /run/basil/attestors/@REALM@/g@GEN@
+#   @CONTAINER_SOCKET@ provider evidence socket (for example
+#                    /run/docker.sock); rendered into ReadWritePaths
+#
+# The old generation's unit stays installed and serving during authority
+# overlap; installation performs daemon-reload only, never a restart of the
+# old unit. There is deliberately no .socket unit: the admitted attestor
+# process itself removes a verified stale socket, creates the listener, and
+# advertises readiness, so SO_PEERCRED/SO_PEERPIDFD name the attestor
+# process, never a launcher or PID 1.
+#
+# This is the rootful system-unit shape. The rootless-owner realm runs as a
+# user unit with a different entry mechanism; its confinement equivalence is
+# an open item recorded in nix/lsm/README.md.
+#
+# LSM attachment is a distro-conditional drop-in rendered with the policy:
+#   10-selinux.conf:  [Service] SELinuxContext=system_u:system_r:basil_attestor_g@GEN@_t:s0
+#   10-apparmor.conf: [Service] AppArmorProfile=basil-attestor-g@GEN@
+
+[Unit]
+Description=Basil attestor for realm @REALM@ (authority generation @GEN@)
+After=local-fs.target
+
+[Service]
+Type=notify
+ExecStart=@EXEC@ --realm @REALM@ --authority-generation @GEN@
+Restart=on-failure
+RestartSec=1s
+
+# Dedicated system identity plus exactly the protected bind group. The
+# setuid from root also clears dumpable until the process's own
+# PR_SET_DUMPABLE(0) takes over after init.
+User=@ATTESTOR_UID@
+SupplementaryGroups=@BIND_GID@
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+# Socket 0660 under the root-installed 0770 runtime directory.
+UMask=0117
+
+# The runtime directory is created by the root authority transaction with
+# pinned owner/group/mode/ACL; the unit must not declare RuntimeDirectory=
+# (systemd would re-own it). The attestor only gets write access into it.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=@RUNTIME_DIR@
+ReadWritePaths=@CONTAINER_SOCKET@
+
+# Attestors never inspect other processes.
+ProtectProc=invisible
+ProcSubset=pid
+
+# Kernel and namespace surface.
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RemoveIPC=yes
+PrivateDevices=yes
+DevicePolicy=closed
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+KeyringMode=private
+Delegate=no
+
+# Unix sockets only: the realm control socket and the provider socket.
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+
+# Manager-applied baseline filter, active before exec as the SPEC requires.
+# The process installs the thread-synchronized post-init lockdown profile
+# (lockdownProfile, basil-kqc7 design) after creating threads/descriptors
+# and before binding the realm socket.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
