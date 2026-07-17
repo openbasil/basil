@@ -71,7 +71,7 @@ struct UnixRealmConnection {
 impl RealmConnector for UnixRealmConnector {
     async fn connect(&self, config: &RealmConfig) -> Result<Box<dyn RealmConnection>, RealmError> {
         let before = authenticate_socket_path(config)?;
-        let stream = UnixStream::connect(&config.socket_path)
+        let stream = UnixStream::connect(&config.measurement.socket_path)
             .await
             .map_err(|error| {
                 if error.kind() == std::io::ErrorKind::NotFound {
@@ -88,7 +88,7 @@ impl RealmConnector for UnixRealmConnector {
             CapturedUnixStream::capture(stream).map_err(|_| RealmError::Authentication)?;
         Ok(Box::new(UnixRealmConnection {
             captured,
-            path: config.socket_path.clone(),
+            path: config.measurement.socket_path.clone(),
             path_identity: before,
             broker_binding: self.broker_binding,
             limits: self.limits,
@@ -118,7 +118,7 @@ impl RealmConnection for UnixRealmConnection {
         epoch: u64,
         admission: &ReleaseAdmission,
     ) -> Result<AuthenticatedRealmSession, RealmError> {
-        if self.path != config.socket_path
+        if self.path != config.measurement.socket_path
             || authenticate_socket_path(config)? != self.path_identity
         {
             return Err(RealmError::Authentication);
@@ -270,7 +270,7 @@ const fn protocol_error(error: &ProtocolError) -> RealmError {
 
 fn authenticate_socket_path(config: &RealmConfig) -> Result<SocketIdentity, RealmError> {
     let mut current = PathBuf::from("/");
-    for component in config.socket_path.components().skip(1) {
+    for component in config.measurement.socket_path.components().skip(1) {
         current.push(component.as_os_str());
         let metadata = fs::symlink_metadata(&current).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
@@ -282,7 +282,7 @@ fn authenticate_socket_path(config: &RealmConfig) -> Result<SocketIdentity, Real
         if metadata.file_type().is_symlink() {
             return Err(RealmError::Authentication);
         }
-        let is_socket = current == config.socket_path;
+        let is_socket = current == config.measurement.socket_path;
         if is_socket {
             let expected_mode = if config.broker_user.uid() == config.attestor_user.uid() {
                 0o600
@@ -426,9 +426,9 @@ fn parse_acl(bytes: &[u8]) -> Result<Vec<AclEntry>, RealmError> {
 
 fn verify_unit(config: &RealmConfig, pin: &PinnedProcess) -> Result<(), RealmError> {
     let expected = SystemdEvidence {
-        unit: config.attestor_unit.clone(),
-        template: config.attestor_unit.find('@').map(|at| {
-            let mut value = config.attestor_unit.clone();
+        unit: config.measurement.service_unit.clone(),
+        template: config.measurement.service_unit.find('@').map(|at| {
+            let mut value = config.measurement.service_unit.clone();
             value.replace_range(at + 1..value.len() - ".service".len(), "");
             value
         }),
@@ -510,7 +510,7 @@ fn binding(
         digest.update(value.to_be_bytes());
     }
     for value in [
-        config.attestor_unit.as_bytes(),
+        config.measurement.service_unit.as_bytes(),
         pin.executable_digest().unwrap_or_default().as_bytes(),
         active.release().product().as_str().as_bytes(),
         active.release().release().as_str().as_bytes(),
@@ -548,7 +548,7 @@ mod tests {
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or_else(|| rustix::process::geteuid().as_raw());
         let unit = std::env::var("BASIL_REALM_EXPECTED_UNIT")
-            .unwrap_or_else(|_| "basil-attestor-owner-podman.service".to_string());
+            .unwrap_or_else(|_| "basil-attestor-owner-podman-g1.service".to_string());
         format!(
             r#"
 schema = "agent"
@@ -562,13 +562,30 @@ provider = "podman"
 runtimeMode = "rootless-owner"
 brokerUser = "{broker_uid}"
 brokerUnit = "basil-agent.service"
-attestorUser = "{attestor_uid}"
-attestorUnit = "{unit}"
-socketPath = "/run/user/{attestor_uid}/basil/attestors/owner-podman/control.sock"
+attestorUid = "{attestor_uid}"
 releaseRole = "podman-attestor"
 target = "x86_64-unknown-linux-gnu"
 protocol = 1
 capabilities = ["health", "query-instances", "resolve-peer"]
+[attestor.realms.owner-podman.measurement]
+authorityGeneration = 1
+serviceUnit = "{unit}"
+helperEndpoint = "/run/basil/measure/control.sock"
+helperPolicy = "basil-measure-policy-g1"
+helperPolicyGeneration = 1
+lsmProfile = "selinux:basil_attestor_g1_t"
+lsmPolicy = "basil-attestor-policy-g1"
+lockdownProfile = "basil-attestor-lockdown-g1"
+runtimeDirectory = "/run/basil/attestors/owner-podman/g1"
+runtimeDirectoryOwner = "0"
+runtimeDirectoryGroup = "{attestor_uid}"
+runtimeDirectoryMode = "0770"
+runtimeDirectoryAcl = "basil-attestor-bind-g1"
+socketPath = "/run/basil/attestors/owner-podman/g1/control.sock"
+socketOwner = "{attestor_uid}"
+socketGroup = "{attestor_uid}"
+socketMode = "0660"
+socketAcl = "basil-attestor-control-g1"
 "#
         )
     }
@@ -646,11 +663,11 @@ capabilities = ["health", "query-instances", "resolve-peer"]
             socket_entries.insert(position, AclEntry::named_user(uid, 0o6));
         }
         let socket_acl = encoded_acl(&socket_entries);
-        let runtime = PathBuf::from(format!("/run/user/{}", config.attestor_user.uid()));
-        let parent = config.socket_path.parent().unwrap();
+        let runtime = PathBuf::from("/run/basil/attestors");
+        let parent = config.measurement.socket_path.parent().unwrap();
         for ancestor in parent
             .ancestors()
-            .take_while(|path| *path != Path::new("/run/user"))
+            .take_while(|path| *path != Path::new("/run/basil/attestors"))
         {
             if ancestor.starts_with(&runtime) {
                 rustix::fs::lsetxattr(
@@ -663,7 +680,7 @@ capabilities = ["health", "query-instances", "resolve-peer"]
             }
         }
         rustix::fs::lsetxattr(
-            &config.socket_path,
+            &config.measurement.socket_path,
             ACL_ACCESS,
             &socket_acl,
             rustix::fs::XattrFlags::empty(),
@@ -711,14 +728,14 @@ capabilities = ["health", "query-instances", "resolve-peer"]
     #[ignore = "requires a transient systemd --user service"]
     async fn live_unix_realm_systemd_server() {
         let config = live_config();
-        fs::create_dir_all(config.socket_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(config.measurement.socket_path.parent().unwrap()).unwrap();
         fs::set_permissions(
-            config.socket_path.parent().unwrap(),
+            config.measurement.socket_path.parent().unwrap(),
             std::os::unix::fs::PermissionsExt::from_mode(0o700),
         )
         .unwrap();
-        let _ = fs::remove_file(&config.socket_path);
-        let listener = UnixListener::bind(&config.socket_path).unwrap();
+        let _ = fs::remove_file(&config.measurement.socket_path);
+        let listener = UnixListener::bind(&config.measurement.socket_path).unwrap();
         install_live_acl(&config);
         let ready = std::env::var("BASIL_REALM_READY").unwrap();
         let server_pid = rustix::process::getpid().as_raw_nonzero().get();
