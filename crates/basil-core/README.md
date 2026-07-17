@@ -37,7 +37,7 @@ a structured audit record.
 | `core::seal`, `x25519_seal`, `ed25519_sign`, `ml_dsa_sign`, `ml_kem_envelope` | Local crypto used for sealed invocations and materialize-to-use operations.                                                     |
 | `core::minter`, `core::revocation`                                            | JWT/SVID minting and revocation state.                                                                                          |
 | `service`                                                                     | tonic service adapters: `broker`, `signing`, `aead`, `secret`, `minting`, `invocation`, `admin`, `jwks`, `spiffe`, `sds`.       |
-| `transport`                                                                   | tonic wiring over the Unix socket, `SO_PEERCRED` peer extraction, and authorization helpers.                                    |
+| `transport`                                                                   | tonic wiring over Unix sockets, `SO_PEERCRED` peer extraction, connection-owned stream tracking, and authorization helpers.      |
 | `init`, `bundle_cli`, `agent_cli`, `doctor`, `unlock`                         | Offline operator commands: scaffolding, sealed credential bundles, run/explain/doctor, and the fail-closed startup unlock path. |
 
 ## Backends

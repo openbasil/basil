@@ -28,7 +28,7 @@ use crate::catalog::{AuthorizationDomain, EvidenceState};
 use crate::decision::{DecisionRecord, op_token};
 use crate::peer::PeerInfo;
 use crate::state::{BrokerState, Generation};
-use connection::ListenerConnectInfo;
+use connection::{ConnectionRegistryError, ConnectionStreamLease, ListenerConnectInfo};
 
 // Wire-exact private encoding of the standard `google.rpc.RetryInfo` message.
 // Keeping this local avoids expanding Basil's generated protocol surface; the
@@ -145,30 +145,64 @@ pub(crate) fn enforce_listener_domain<T>(
     enforce_listener_domain_extensions(state, generation, request.extensions(), actor, op, key)
 }
 
-fn enforce_listener_domain_extensions(
+/// Return the immutable accepted-transport context for a request.
+///
+/// # Errors
+///
+/// Returns a typed unavailable status when the server did not attach listener
+/// context.
+pub(crate) fn listener_context<T>(
+    request: &Request<T>,
+    op: Op,
+) -> Result<ListenerConnectInfo, Status> {
+    request
+        .extensions()
+        .get::<ListenerConnectInfo>()
+        .cloned()
+        .ok_or_else(|| {
+            broker_status(
+                Code::Unavailable,
+                "LISTENER_CONTEXT_UNAVAILABLE",
+                op_token(op),
+                "listener context unavailable",
+            )
+        })
+}
+
+/// Register a long-lived stream against its owning accepted connection.
+///
+/// A missing registry entry means the transport concurrently closed. Its
+/// response stream can no longer reach a client, so no lease is necessary.
+///
+/// # Errors
+///
+/// Returns a typed unavailable status if the stream counter is exhausted.
+pub(crate) fn begin_long_lived_stream(
+    state: &BrokerState,
+    listener: &ListenerConnectInfo,
+    op: Op,
+) -> Result<Option<ConnectionStreamLease>, Status> {
+    match state.connections().begin_stream(listener.connection_id()) {
+        Ok(lease) => Ok(Some(lease)),
+        Err(ConnectionRegistryError::ConnectionUnavailable) => Ok(None),
+        Err(error) => Err(broker_status(
+            Code::Unavailable,
+            "STREAM_REGISTRATION_UNAVAILABLE",
+            op_token(op),
+            error.to_string(),
+        )),
+    }
+}
+
+/// Enforce typed-listener admission using retained immutable connection context.
+pub(crate) fn enforce_listener_domain_info(
     state: &BrokerState,
     generation: u64,
-    extensions: &Extensions,
+    listener: &ListenerConnectInfo,
     actor: &AuthenticatedActor,
     op: Op,
     key: &str,
 ) -> Result<(), Status> {
-    let Some(listener) = extensions.get::<ListenerConnectInfo>() else {
-        state.record_decision(&DecisionRecord::from_actor_evidence_denial(
-            generation,
-            actor,
-            op,
-            key,
-            EvidenceState::Unavailable,
-            "listener_context_unavailable",
-        ));
-        return Err(broker_status(
-            Code::Unavailable,
-            "LISTENER_CONTEXT_UNAVAILABLE",
-            op_token(op),
-            "listener context unavailable",
-        ));
-    };
     state
         .connections()
         .record_actor(listener.connection_id(), actor);
@@ -197,6 +231,33 @@ fn enforce_listener_domain_extensions(
         op_token(op),
         "listener does not admit resolved workload domain",
     ))
+}
+
+fn enforce_listener_domain_extensions(
+    state: &BrokerState,
+    generation: u64,
+    extensions: &Extensions,
+    actor: &AuthenticatedActor,
+    op: Op,
+    key: &str,
+) -> Result<(), Status> {
+    let Some(listener) = extensions.get::<ListenerConnectInfo>() else {
+        state.record_decision(&DecisionRecord::from_actor_evidence_denial(
+            generation,
+            actor,
+            op,
+            key,
+            EvidenceState::Unavailable,
+            "listener_context_unavailable",
+        ));
+        return Err(broker_status(
+            Code::Unavailable,
+            "LISTENER_CONTEXT_UNAVAILABLE",
+            op_token(op),
+            "listener context unavailable",
+        ));
+    };
+    enforce_listener_domain_info(state, generation, listener, actor, op, key)
 }
 
 fn record_resolution_error(

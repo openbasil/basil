@@ -23,7 +23,7 @@ use basil_proto::envoy::service::discovery::v3::{
     DeltaDiscoveryRequest, DeltaDiscoveryResponse, DiscoveryRequest, DiscoveryResponse,
 };
 use basil_proto::envoy::service::secret::v3::secret_discovery_service_server::SecretDiscoveryService;
-use futures::{Stream, StreamExt as _};
+use futures::Stream;
 use prost::Message as _;
 use prost_types::Any;
 use tonic::{Code, Request, Response, Status, Streaming};
@@ -34,7 +34,10 @@ use crate::catalog::{Class, KeyEntry};
 use crate::decision::DecisionRecord;
 use crate::peer::PeerInfo;
 use crate::state::{BrokerState, Generation};
-use crate::transport::peer_from_request;
+use crate::transport::connection::ListenerConnectInfo;
+use crate::transport::{
+    begin_long_lived_stream, enforce_listener_domain_info, listener_context, peer_from_request,
+};
 
 type SdsResult<T> = Result<Response<T>, Status>;
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -68,34 +71,47 @@ impl EnvoySdsGrpc {
     async fn discovery_response(
         &self,
         peer: &PeerInfo,
+        listener: &ListenerConnectInfo,
         request: &DiscoveryRequest,
-    ) -> Result<DiscoveryResponse, Status> {
+    ) -> Result<(u64, DiscoveryResponse), Status> {
         validate_type_url(&request.type_url)?;
-        let plans = self.resource_plans(peer, &request.resource_names)?;
+        let (generation, plans) = self.resource_plans(peer, listener, &request.resource_names)?;
         let mut resources = Vec::with_capacity(plans.len());
         for plan in plans {
             resources.push(secret_resource(&self.state, &plan).await?);
         }
-        Ok(DiscoveryResponse {
-            version_info: VERSION_INFO.to_string(),
-            resources,
-            canary: false,
-            type_url: SECRET_TYPE_URL.to_string(),
-            nonce: NONCE.to_string(),
-            control_plane: None,
-        })
+        Ok((
+            generation,
+            DiscoveryResponse {
+                version_info: VERSION_INFO.to_string(),
+                resources,
+                canary: false,
+                type_url: SECRET_TYPE_URL.to_string(),
+                nonce: NONCE.to_string(),
+                control_plane: None,
+            },
+        ))
     }
 
     fn resource_plans(
         &self,
         peer: &PeerInfo,
+        listener: &ListenerConnectInfo,
         requested: &[String],
-    ) -> Result<Vec<SdsResourcePlan>, Status> {
+    ) -> Result<(u64, Vec<SdsResourcePlan>), Status> {
         let generation = self.state.load_generation();
         let actor = generation
             .pdp()
             .resolve_local_actor(peer)
             .map_err(|err| sds_resolution_status(&err))?;
+        enforce_listener_domain_info(
+            &self.state,
+            generation.id(),
+            listener,
+            &actor,
+            Op::Mint,
+            "spiffe.sds",
+        )?;
         let uid = actor.unix_uid().ok_or_else(|| {
             Status::new(
                 Code::Unauthenticated,
@@ -133,7 +149,7 @@ impl EnvoySdsGrpc {
                 "no Envoy SDS resource matched the request",
             ));
         }
-        Ok(plans)
+        Ok((generation.id(), plans))
     }
 }
 
@@ -175,6 +191,8 @@ impl SecretDiscoveryService for EnvoySdsGrpc {
         request: Request<Streaming<DiscoveryRequest>>,
     ) -> SdsResult<Self::StreamSecretsStream> {
         let peer = peer_from_request(&request);
+        let listener = listener_context(&request, Op::Mint)?;
+        let lease = begin_long_lived_stream(&self.state, &listener, Op::Mint)?;
         let mut stream = request.into_inner();
         let Some(initial) = stream.message().await? else {
             return Err(Status::new(
@@ -182,10 +200,62 @@ impl SecretDiscoveryService for EnvoySdsGrpc {
                 "StreamSecrets requires an initial DiscoveryRequest",
             ));
         };
-        let response = self.discovery_response(&peer, &initial).await;
-        Ok(Response::new(Box::pin(
-            futures::stream::once(async move { response }).chain(futures::stream::pending()),
-        )))
+        let state = Arc::clone(&self.state);
+        let responses = futures::stream::unfold(
+            (state, stream, peer, listener, lease, Some(initial), false),
+            |(state, mut stream, peer, listener, lease, pending, ended)| async move {
+                if ended {
+                    return None;
+                }
+                let request = if let Some(initial) = pending {
+                    initial
+                } else {
+                    match stream.message().await {
+                        Ok(Some(request)) => request,
+                        Ok(None) => return None,
+                        Err(status) => {
+                            return Some((
+                                Err(status),
+                                (state, stream, peer, listener, lease, None, true),
+                            ));
+                        }
+                    }
+                };
+                loop {
+                    let response = Self::new(Arc::clone(&state))
+                        .discovery_response(&peer, &listener, &request)
+                        .await;
+                    let reload_guard = state.live_reload_lock().lock().await;
+                    match response {
+                        Ok((generation, response))
+                            if generation == state.active_generation_id() =>
+                        {
+                            return Some((
+                                Ok(response),
+                                (
+                                    Arc::clone(&state),
+                                    stream,
+                                    peer,
+                                    listener,
+                                    lease,
+                                    None,
+                                    false,
+                                ),
+                            ));
+                        }
+                        Ok(_) => drop(reload_guard),
+                        Err(status) => {
+                            drop(reload_guard);
+                            return Some((
+                                Err(status),
+                                (state, stream, peer, listener, lease, None, true),
+                            ));
+                        }
+                    }
+                }
+            },
+        );
+        Ok(Response::new(Box::pin(responses)))
     }
 
     async fn fetch_secrets(
@@ -193,9 +263,11 @@ impl SecretDiscoveryService for EnvoySdsGrpc {
         request: Request<DiscoveryRequest>,
     ) -> SdsResult<DiscoveryResponse> {
         let peer = peer_from_request(&request);
-        Ok(Response::new(
-            self.discovery_response(&peer, request.get_ref()).await?,
-        ))
+        let listener = listener_context(&request, Op::Mint)?;
+        let (_, response) = self
+            .discovery_response(&peer, &listener, request.get_ref())
+            .await?;
+        Ok(Response::new(response))
     }
 }
 
@@ -444,6 +516,7 @@ mod tests {
     use crate::catalog::loader::load;
     use crate::manager::BackendManager;
     use crate::peer::PeerInfo;
+    use crate::transport::grpc_server::ListenerType;
     use async_trait::async_trait;
     use basil_proto::KeyType;
     use basil_proto::envoy::extensions::transport_sockets::tls::v3::Secret;
@@ -571,10 +644,18 @@ mod tests {
             response_nonce: String::new(),
             error_detail: None,
         });
-        request.extensions_mut().insert(PeerInfo {
+        let peer = PeerInfo {
             uid: Some(uid),
             ..PeerInfo::default()
-        });
+        };
+        request.extensions_mut().insert(peer.clone());
+        request
+            .extensions_mut()
+            .insert(ListenerConnectInfo::for_test(
+                "test-host",
+                ListenerType::Host,
+                peer,
+            ));
         request
     }
 
@@ -653,15 +734,23 @@ mod tests {
           "keys": {}
         }"#;
         let service = service_with_catalog(catalog);
+        let mut request = Request::new(DiscoveryRequest {
+            version_info: String::new(),
+            node: None,
+            resource_names: vec!["default".to_string()],
+            type_url: SECRET_TYPE_URL.to_string(),
+            response_nonce: String::new(),
+            error_detail: None,
+        });
+        request
+            .extensions_mut()
+            .insert(ListenerConnectInfo::for_test(
+                "test-host",
+                ListenerType::Host,
+                PeerInfo::default(),
+            ));
         let status = service
-            .fetch_secrets(Request::new(DiscoveryRequest {
-                version_info: String::new(),
-                node: None,
-                resource_names: vec!["default".to_string()],
-                type_url: SECRET_TYPE_URL.to_string(),
-                response_nonce: String::new(),
-                error_detail: None,
-            }))
+            .fetch_secrets(request)
             .await
             .expect_err("missing peer credentials fail before issuer inventory");
         assert_eq!(status.code(), Code::Unauthenticated);

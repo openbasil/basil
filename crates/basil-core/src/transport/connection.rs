@@ -108,6 +108,7 @@ pub struct ConnectionRecord {
     context: ListenerConnectInfo,
     identity: Option<ConnectionIdentity>,
     cancellation_requested: bool,
+    active_streams: usize,
 }
 
 impl ConnectionRecord {
@@ -127,6 +128,12 @@ impl ConnectionRecord {
     #[must_use]
     pub const fn cancellation_requested(&self) -> bool {
         self.cancellation_requested
+    }
+
+    /// Long-lived streams currently owned by this transport.
+    #[must_use]
+    pub const fn active_streams(&self) -> usize {
+        self.active_streams
     }
 }
 
@@ -217,6 +224,12 @@ pub enum ConnectionRegistryError {
     /// The listener is gated for an atomic configuration transition.
     #[error("listener `{0}` is not accepting during configuration transition")]
     ListenerGated(String),
+    /// The accepted transport disappeared before stream registration completed.
+    #[error("connection is no longer active")]
+    ConnectionUnavailable,
+    /// The per-connection stream counter cannot represent another stream.
+    #[error("connection stream counter exhausted")]
+    StreamCountExhausted,
 }
 
 /// Synchronous bounded inventory shared by all listener accept loops.
@@ -242,6 +255,7 @@ struct RegistryEntry {
     context: ListenerConnectInfo,
     identity: Option<ConnectionIdentity>,
     cancel: Option<oneshot::Sender<()>>,
+    active_streams: usize,
 }
 
 impl ConnectionRegistry {
@@ -346,6 +360,7 @@ impl ConnectionRegistry {
                 context: context.clone(),
                 identity: None,
                 cancel: Some(cancel),
+                active_streams: 0,
             },
         );
         state
@@ -392,6 +407,36 @@ impl ConnectionRegistry {
                 workload: actor.workload_identity.clone(),
             });
         }
+    }
+
+    /// Register one long-lived stream against its owning accepted transport.
+    ///
+    /// The returned lease synchronously and idempotently releases the count
+    /// when the stream closes or its response future is cancelled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection already closed or its counter is
+    /// exhausted.
+    pub fn begin_stream(
+        &self,
+        id: ConnectionId,
+    ) -> Result<ConnectionStreamLease, ConnectionRegistryError> {
+        let mut state = lock_state(&self.inner);
+        let entry = state
+            .entries
+            .get_mut(&id)
+            .ok_or(ConnectionRegistryError::ConnectionUnavailable)?;
+        entry.active_streams = entry
+            .active_streams
+            .checked_add(1)
+            .ok_or(ConnectionRegistryError::StreamCountExhausted)?;
+        drop(state);
+        Ok(ConnectionStreamLease {
+            id,
+            registry: Arc::downgrade(&self.inner),
+            released: false,
+        })
     }
 
     /// Cancel every active entry matching any selector, except the caller.
@@ -446,6 +491,7 @@ impl ConnectionRegistry {
                 context: entry.context.clone(),
                 identity: entry.identity.clone(),
                 cancellation_requested: entry.cancel.is_none(),
+                active_streams: entry.active_streams,
             })
             .collect()
     }
@@ -503,6 +549,29 @@ impl ConnectionRegistry {
             names,
             active,
         })
+    }
+}
+
+/// Connection-owned registration for one long-lived response stream.
+pub struct ConnectionStreamLease {
+    id: ConnectionId,
+    registry: Weak<RegistryInner>,
+    released: bool,
+}
+
+impl Drop for ConnectionStreamLease {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        let mut state = lock_state(&registry);
+        if let Some(entry) = state.entries.get_mut(&self.id) {
+            entry.active_streams = entry.active_streams.saturating_sub(1);
+        }
     }
 }
 
@@ -802,6 +871,30 @@ mod tests {
         drop(tracked);
         assert_eq!(registry.active_for_listener("host"), 0);
         assert!(registry.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_leases_are_connection_owned_and_release_synchronously() {
+        let registry = ConnectionRegistry::new(1, 1).expect("registry");
+        let (stream, _peer) = pair();
+        let tracked = registry
+            .register(stream, "host", ListenerType::Host)
+            .expect("tracked stream");
+        let id = tracked.context.connection_id();
+        let first = registry.begin_stream(id).expect("first stream lease");
+        let second = registry.begin_stream(id).expect("second stream lease");
+        assert_eq!(registry.snapshot()[0].active_streams(), 2);
+
+        drop(first);
+        assert_eq!(registry.snapshot()[0].active_streams(), 1);
+        drop(second);
+        assert_eq!(registry.snapshot()[0].active_streams(), 0);
+
+        drop(tracked);
+        assert!(matches!(
+            registry.begin_stream(id),
+            Err(ConnectionRegistryError::ConnectionUnavailable)
+        ));
     }
 
     #[tokio::test]

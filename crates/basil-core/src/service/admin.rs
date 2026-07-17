@@ -11,7 +11,7 @@ use basil_proto::broker::v1 as pb;
 use basil_proto::broker::v1::admin_service_server::AdminService;
 use tonic::{Code, Request, Response};
 
-use crate::actor::{SubjectResolutionError, WorkloadIdentity};
+use crate::actor::{AuthenticatedActor, SubjectResolutionError, WorkloadIdentity};
 use crate::attestor_realm::{
     RealmMode as CoreRealmMode, RealmProvider as CoreRealmProvider, RealmReadiness,
     RealmReason as CoreRealmReason, RealmState as CoreRealmState, RealmStatus as CoreRealmStatus,
@@ -33,7 +33,8 @@ use crate::transport::connection::{
 };
 use crate::transport::grpc_server::ListenerType;
 use crate::transport::{
-    attestation_unavailable_status, broker_status, enforce_listener_domain, peer_from_request,
+    attestation_unavailable_status, begin_long_lived_stream, broker_status,
+    enforce_listener_domain, enforce_listener_domain_info, listener_context, peer_from_request,
 };
 use tracing::warn;
 
@@ -226,6 +227,7 @@ impl AdminService for BrokerGrpc {
     /// missed `Revoked` must never be invisible). On `DATA_LOSS` the watcher
     /// reconnects and re-fetches whatever state it mirrors (bundles,
     /// revocation lists) from scratch.
+    #[allow(clippy::too_many_lines)]
     async fn watch(&self, request: Request<pb::WatchRequest>) -> GrpcResult<Self::WatchStream> {
         let peer = peer_from_request(&request);
         let generation = self.state.load_generation();
@@ -244,8 +246,6 @@ impl AdminService for BrokerGrpc {
                 ADMIN_WATCH_TARGET,
                 &decision,
             ));
-        drop(generation);
-
         if matches!(decision, Decision::Deny { .. }) {
             return Err(broker_status(
                 Code::PermissionDenied,
@@ -255,24 +255,81 @@ impl AdminService for BrokerGrpc {
             ));
         }
 
+        let authorized_generation = generation.id();
+        let listener = listener_context(&request, Op::Watch)?;
+        let lease = begin_long_lived_stream(&self.state, &listener, Op::Watch)?;
+        drop(generation);
         let kinds = request.get_ref().kinds.clone();
         let state = Arc::clone(&self.state);
         let rx = state.events().subscribe();
         let stream = futures::stream::unfold(
-            (state, rx, kinds, actor, false),
-            |(state, mut rx, kinds, actor, lost)| async move {
-                if lost {
+            (
+                state,
+                rx,
+                kinds,
+                actor,
+                listener,
+                lease,
+                authorized_generation,
+                false,
+            ),
+            |(
+                state,
+                mut rx,
+                kinds,
+                mut actor,
+                listener,
+                lease,
+                mut authorized_generation,
+                ended,
+            )| async move {
+                if ended {
                     return None;
                 }
                 loop {
                     match rx.recv().await {
                         Ok(event) => {
+                            let reload_guard = state.live_reload_lock().lock().await;
+                            if state.active_generation_id() != authorized_generation {
+                                match reauthorize_watch(&state, &listener) {
+                                    Ok((generation, refreshed_actor)) => {
+                                        authorized_generation = generation;
+                                        actor = refreshed_actor;
+                                    }
+                                    Err(status) => {
+                                        return Some((
+                                            Err(status),
+                                            (
+                                                Arc::clone(&state),
+                                                rx,
+                                                kinds,
+                                                actor,
+                                                listener,
+                                                lease,
+                                                authorized_generation,
+                                                true,
+                                            ),
+                                        ));
+                                    }
+                                }
+                            }
                             if event_allowed(&state, &actor, &kinds, &event) {
+                                let response = proto_event(event);
                                 return Some((
-                                    Ok(proto_event(event)),
-                                    (state, rx, kinds, actor, false),
+                                    Ok(response),
+                                    (
+                                        Arc::clone(&state),
+                                        rx,
+                                        kinds,
+                                        actor,
+                                        listener,
+                                        lease,
+                                        authorized_generation,
+                                        false,
+                                    ),
                                 ));
                             }
+                            drop(reload_guard);
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                             // The buffer overflowed and this watcher missed
@@ -286,7 +343,16 @@ impl AdminService for BrokerGrpc {
                                     WATCH_OP_TOKEN,
                                     "watcher lagged and events were dropped; reconnect and resync",
                                 )),
-                                (state, rx, kinds, actor, true),
+                                (
+                                    state,
+                                    rx,
+                                    kinds,
+                                    actor,
+                                    listener,
+                                    lease,
+                                    authorized_generation,
+                                    true,
+                                ),
                             ));
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
@@ -647,6 +713,42 @@ fn authorize_connection_admin<T>(
     Ok(())
 }
 
+fn reauthorize_watch(
+    state: &BrokerState,
+    listener: &ListenerConnectInfo,
+) -> Result<(u64, AuthenticatedActor), tonic::Status> {
+    let generation = state.load_generation();
+    let actor = generation
+        .pdp()
+        .resolve_local_actor(listener.peer())
+        .map_err(|error| admin_resolution_status(WATCH_OP_TOKEN, &error))?;
+    enforce_listener_domain_info(
+        state,
+        generation.id(),
+        listener,
+        &actor,
+        Op::Watch,
+        ADMIN_WATCH_TARGET,
+    )?;
+    let decision = generation.pdp().decide_admin(&actor, Op::Watch);
+    state.record_decision(&DecisionRecord::from_actor_decision(
+        generation.id(),
+        &actor,
+        Op::Watch,
+        ADMIN_WATCH_TARGET,
+        &decision,
+    ));
+    if matches!(decision, Decision::Deny { .. }) {
+        return Err(broker_status(
+            Code::PermissionDenied,
+            "UNAUTHORIZED",
+            WATCH_OP_TOKEN,
+            "watch authorization changed after reload",
+        ));
+    }
+    Ok((generation.id(), actor))
+}
+
 fn connection_info(record: &ConnectionRecord) -> pb::ConnectionInfo {
     let context = record.context();
     let peer = context.peer();
@@ -699,7 +801,7 @@ fn connection_info(record: &ConnectionRecord) -> pb::ConnectionInfo {
         systemd,
         compose,
         cancellation_requested: record.cancellation_requested(),
-        active_streams: 0,
+        active_streams: bounded_u32(record.active_streams()),
     }
 }
 
@@ -1554,8 +1656,8 @@ mod tests {
 
     /// Policy: uid 4242 may `reload`, uid 4243 may `explain`, uid 4244 may
     /// `revoke`, uid 4245 may read realm status, uid 4246 may read connections,
-    /// uid 4247 may drop connections, and uid 7 is a data-plane signer over
-    /// web.signer with no admin grants.
+    /// uid 4247 may drop connections, uid 4248 may watch, and uid 7 is a
+    /// data-plane signer over web.signer with no admin grants.
     const RELOAD_POLICY: &str = r#"{
       "schema": "policy",
       "subjects": {
@@ -1565,6 +1667,7 @@ mod tests {
         "svc.realms": { "domain": "host-process", "match": { "all": [ { "process.uid": 4245 } ] } },
         "svc.connections": { "domain": "host-process", "match": { "all": [ { "process.uid": 4246 } ] } },
         "svc.connection-drop": { "domain": "host-process", "match": { "all": [ { "process.uid": 4247 } ] } },
+        "svc.watch": { "domain": "host-process", "match": { "all": [ { "process.uid": 4248 } ] } },
         "svc.app": { "domain": "host-process", "match": { "all": [ { "process.uid": 7 } ] } }
       },
       "roles": { "signer": ["sign", "verify", "get_public_key"] },
@@ -1575,11 +1678,12 @@ mod tests {
         { "id": "admin-realms", "subjects": ["svc.realms"], "action": ["op:realm_status"], "target": ["broker.realms"] },
         { "id": "admin-connections", "subjects": ["svc.connections"], "action": ["op:connection_status"], "target": ["broker.connections"] },
         { "id": "admin-connection-drop", "subjects": ["svc.connection-drop"], "action": ["op:connection_drop"], "target": ["broker.connections.drop"] },
+        { "id": "admin-watch", "subjects": ["svc.watch"], "action": ["op:watch"], "target": ["broker.watch"] },
         { "id": "data-signer",  "subjects": ["svc.app"],      "action": ["role:signer"], "target": ["web.signer"] }
       ],
       "config": {
-        "names": { "users": { "4242": "svc-admin", "4243": "svc-explain", "4244": "svc-revoke", "4245": "svc-realms", "4246": "svc-connections", "4247": "svc-connection-drop", "7": "svc-app" }, "groups": {} },
-        "memberships": { "4242": [4242], "4243": [4243], "4244": [4244], "4245": [4245], "4246": [4246], "4247": [4247], "7": [7] }
+        "names": { "users": { "4242": "svc-admin", "4243": "svc-explain", "4244": "svc-revoke", "4245": "svc-realms", "4246": "svc-connections", "4247": "svc-connection-drop", "4248": "svc-watch", "7": "svc-app" }, "groups": {} },
+        "memberships": { "4242": [4242], "4243": [4243], "4244": [4244], "4245": [4245], "4246": [4246], "4247": [4247], "4248": [4248], "7": [7] }
       }
     }"#;
 
@@ -1634,6 +1738,14 @@ mod tests {
             .parent()
             .expect("config parent")
             .join("catalog.json")
+    }
+
+    fn reload_policy_path(inputs: &ReloadInputs) -> std::path::PathBuf {
+        inputs
+            .config_path
+            .parent()
+            .expect("reload fixture config has a parent")
+            .join("policy.json")
     }
 
     async fn revoke_grpc() -> BrokerGrpc {
@@ -2172,6 +2284,40 @@ mod tests {
         assert_eq!(wire.session_epoch, 9);
         assert_eq!(wire.protocol, 1);
         assert_eq!(wire.reason, 1);
+    }
+
+    #[tokio::test]
+    async fn watch_reauthorizes_before_first_post_reload_event() {
+        use futures::StreamExt as _;
+
+        let (grpc, inputs) = reload_grpc();
+        let mut watch = grpc
+            .watch(reload_request(4248, false).map(|_| pb::WatchRequest { kinds: vec![] }))
+            .await
+            .expect("watch grant opens the stream")
+            .into_inner();
+
+        let denied_policy = RELOAD_POLICY.replace(
+            "        { \"id\": \"admin-watch\", \"subjects\": [\"svc.watch\"], \"action\": [\"op:watch\"], \"target\": [\"broker.watch\"] },\n",
+            "",
+        );
+        assert_ne!(denied_policy, RELOAD_POLICY);
+        std::fs::write(reload_policy_path(&inputs), denied_policy).expect("rewrite policy");
+        let reload = grpc
+            .reload(reload_request(4242, false))
+            .await
+            .expect("policy reload applies")
+            .into_inner();
+        assert!(reload.applied);
+
+        grpc.state.events().bundle_changed("example.org");
+        let status = watch
+            .next()
+            .await
+            .expect("reauthorization result")
+            .expect_err("revoked watch cannot emit the event");
+        assert_eq!(status.code(), Code::PermissionDenied);
+        assert!(watch.next().await.is_none());
     }
 
     /// No data-plane grant and no *other* admin grant implies watch: the
