@@ -239,15 +239,26 @@ where
     }
 
     /// Perform one bounded diagnostic-only health probe.
-    pub async fn health(&mut self) -> Result<HealthResult, ProtocolError> {
+    ///
+    /// The caller's monotonic `budget` is clamped to the active
+    /// [`ProtocolLimits::request_deadline`] and its remaining window is
+    /// transmitted on the wire so the attestor-side provider stops under the
+    /// caller's original deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::BudgetExhausted`] without any wire traffic
+    /// when `budget` has already elapsed; the session stays usable.
+    pub async fn health(&mut self, budget: RequestBudget) -> Result<HealthResult, ProtocolError> {
+        let (deadline, budget_millis) = self.request_window(budget)?;
         let challenge = self.begin(Operation::Health)?;
         let binding = self.binding(challenge);
         let request = envelope(Body::HealthRequest(wire::HealthRequest {
             binding: Some(binding.clone()),
-            budget_millis: duration_millis(self.limits.request_deadline)?,
+            budget_millis,
         }));
         self.write_or_close(&request).await?;
-        let response = self.read_or_close(self.deadline()).await?;
+        let response = self.read_or_close(deadline).await?;
         let body = checked_response!(self, take_body(response));
         let Body::HealthResponse(response) = body else {
             return self.close_unexpected("health_response").await;
@@ -277,20 +288,32 @@ where
 
     /// Resolve one broker-observed pinned process without accepting any
     /// runtime-instance or Compose lookup hint.
+    ///
+    /// The caller's monotonic `budget` is clamped to the active
+    /// [`ProtocolLimits::request_deadline`] and its remaining window is
+    /// transmitted on the wire so the attestor-side provider stops under the
+    /// caller's original deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::BudgetExhausted`] without any wire traffic
+    /// when `budget` has already elapsed; the session stays usable.
     pub async fn resolve_peer(
         &mut self,
         constraints: wire::PinnedPeer,
+        budget: RequestBudget,
     ) -> Result<ResolvePeerResult, ProtocolError> {
         validate_pinned_peer(&constraints)?;
+        let (deadline, budget_millis) = self.request_window(budget)?;
         let challenge = self.begin(Operation::ResolvePeer)?;
         let binding = self.binding(challenge);
         let request = envelope(Body::ResolvePeerRequest(wire::ResolvePeerRequest {
             binding: Some(binding.clone()),
-            budget_millis: duration_millis(self.limits.request_deadline)?,
+            budget_millis,
             constraints: Some(constraints),
         }));
         self.write_or_close(&request).await?;
-        let response = self.read_or_close(self.deadline()).await?;
+        let response = self.read_or_close(deadline).await?;
         let body = checked_response!(self, take_body(response));
         let Body::ResolvePeerResponse(response) = body else {
             return self.close_unexpected("resolve_peer_response").await;
@@ -327,20 +350,31 @@ where
 
     /// Query one closed, typed scope and verify its bounded chunk sequence,
     /// declared totals, and final digest.
+    ///
+    /// The caller's monotonic `budget` is clamped to the active
+    /// [`ProtocolLimits::request_deadline`] and its remaining window is
+    /// transmitted on the wire so the attestor-side provider stops under the
+    /// caller's original deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::BudgetExhausted`] without any wire traffic
+    /// when `budget` has already elapsed; the session stays usable.
     pub async fn query_instances(
         &mut self,
         scope: QueryScope,
+        budget: RequestBudget,
     ) -> Result<InventoryResult, ProtocolError> {
         let scope = encode_scope(scope)?;
+        let (deadline, budget_millis) = self.request_window(budget)?;
         let challenge = self.begin(Operation::QueryInstances)?;
         let binding = self.binding(challenge);
         let request = envelope(Body::QueryInstancesRequest(wire::QueryInstancesRequest {
             binding: Some(binding.clone()),
-            budget_millis: duration_millis(self.limits.request_deadline)?,
+            budget_millis,
             scope: Some(scope),
         }));
         self.write_or_close(&request).await?;
-        let deadline = self.deadline();
         let mut accumulator = InventoryAccumulator::new(
             self.limits,
             capability_enabled(&self.required_capabilities, MOUNT_SECURITY_CAPABILITY),
@@ -383,6 +417,22 @@ where
 
     fn deadline(&self) -> Instant {
         Instant::now() + self.limits.request_deadline
+    }
+
+    /// Clamp a caller budget to the active limits and derive the monotonic
+    /// response deadline plus the wire budget for one request.
+    ///
+    /// Runs before [`Self::begin`] so an exhausted budget neither advances the
+    /// serial phase nor terminates the session.
+    fn request_window(&self, budget: RequestBudget) -> Result<(Instant, u64), ProtocolError> {
+        let remaining = budget.remaining().min(self.limits.request_deadline);
+        let budget_millis = duration_millis(remaining)?;
+        if budget_millis == 0 {
+            return Err(ProtocolError::BudgetExhausted);
+        }
+        let now = Instant::now();
+        let deadline = now.checked_add(remaining).unwrap_or(now);
+        Ok((deadline, budget_millis))
     }
 
     async fn write_or_close(&mut self, envelope: &wire::Envelope) -> Result<(), ProtocolError> {
@@ -472,6 +522,21 @@ pub struct RequestBudget {
 }
 
 impl RequestBudget {
+    /// Start a monotonic budget of `budget` from the current instant.
+    ///
+    /// This is the broker-side entry point of the budget seam: a caller
+    /// derives one budget from its own remaining deadline and every
+    /// downstream dispatch step observes the same monotonic expiry. A budget
+    /// too large for the monotonic clock saturates to an empty budget, which
+    /// fails closed at dispatch.
+    #[must_use]
+    pub fn starting_now(budget: Duration) -> Self {
+        let now = Instant::now();
+        Self {
+            deadline: now.checked_add(budget).unwrap_or(now),
+        }
+    }
+
     /// Return the duration remaining before the original broker deadline.
     #[must_use]
     pub fn remaining(self) -> Duration {
@@ -1671,6 +1736,10 @@ pub enum ProtocolError {
     /// The original operation deadline expired; the session is terminated.
     #[error("attestor request deadline exceeded")]
     DeadlineExceeded,
+    /// The caller's budget elapsed before the request was dispatched; the
+    /// session stays open because no wire traffic occurred.
+    #[error("attestor request budget exhausted before dispatch")]
+    BudgetExhausted,
     /// A response was accepted after its operation had already completed.
     #[error("duplicate attestor response")]
     DuplicateResponse,

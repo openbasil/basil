@@ -1268,6 +1268,7 @@ fn ready_json(r: &basil::AgentReadiness) -> serde_json::Value {
         "realms_ready": r.realms_ready,
         "realms_degraded": r.realms_degraded,
         "realms_absent": r.realms_absent,
+        "listeners_rewire_required": r.listeners_rewire_required,
     })
 }
 
@@ -1298,18 +1299,23 @@ async fn reload(client: &mut Client, check: bool, json: bool) -> Result<()> {
             "previous_generation: {} (still serving)",
             r.previous_generation
         );
+        print_listener_impacts(&r, "blocking listener");
     } else if check {
         println!("checked: ok (no swap)");
         println!("previous_generation: {}", r.previous_generation);
         println!("would_be_generation: {}", r.new_generation);
         println!("key_count: {}", r.key_count);
         println!("grant_count: {}", r.grant_count);
+        print_listener_impacts(&r, "listener change");
+        print_rewire_required(&r);
     } else {
         println!("applied: {}", r.applied);
         println!("previous_generation: {}", r.previous_generation);
         println!("new_generation: {}", r.new_generation);
         println!("key_count: {}", r.key_count);
         println!("grant_count: {}", r.grant_count);
+        print_listener_impacts(&r, "listener change");
+        print_rewire_required(&r);
     }
     if reload_exit_code(&r) != 0 {
         // Exit 1 = "rejected" (the candidate did not validate / changed a
@@ -1529,7 +1535,59 @@ fn reload_json(r: &basil::AgentReload) -> serde_json::Value {
             "reason": rej.reason,
             "message": rej.message,
         })),
+        "listener_impacts": r.listener_impacts.iter().map(|impact| serde_json::json!({
+            "name": impact.name,
+            "kind": listener_change_token(impact.kind),
+            "active_connections": impact.active_connections,
+            "previous_path": impact.previous_path,
+            "new_path": impact.new_path,
+        })).collect::<Vec<_>>(),
+        "rewire_required": r.rewire_required.iter().map(|entry| serde_json::json!({
+            "listener": entry.listener,
+            "previous_path": entry.previous_path,
+            "new_path": entry.new_path,
+            "applied_generation": entry.applied_generation,
+            "recorded_at_unix": entry.recorded_at_unix,
+        })).collect::<Vec<_>>(),
     })
+}
+
+/// Stable scriptable token for a listener change kind.
+const fn listener_change_token(kind: basil::AgentListenerChange) -> &'static str {
+    match kind {
+        basil::AgentListenerChange::Add => "add",
+        basil::AgentListenerChange::Remove => "remove",
+        basil::AgentListenerChange::Reconfigure => "reconfigure",
+        _ => "unknown",
+    }
+}
+
+/// Human-readable candidate-aware listener impact lines (one per change).
+fn print_listener_impacts(r: &basil::AgentReload, label: &str) {
+    for impact in &r.listener_impacts {
+        let path = match (impact.previous_path.as_deref(), impact.new_path.as_deref()) {
+            (Some(previous), Some(new)) if previous != new => format!("{previous} -> {new}"),
+            (_, Some(new)) => new.to_string(),
+            (Some(previous), None) => previous.to_string(),
+            (None, None) => "-".to_string(),
+        };
+        println!(
+            "{label}: {} {} ({path}, active_connections: {})",
+            listener_change_token(impact.kind),
+            impact.name,
+            impact.active_connections,
+        );
+    }
+}
+
+/// Human-readable persistent rewire diagnostics (one line per listener).
+fn print_rewire_required(r: &basil::AgentReload) {
+    for entry in &r.rewire_required {
+        println!(
+            "rewire_required: {} ({} -> {}, since generation {})",
+            entry.listener, entry.previous_path, entry.new_path, entry.applied_generation,
+        );
+    }
 }
 
 /// Map a reload outcome to the process exit code automation gates on: `0` when
@@ -2455,6 +2513,7 @@ mod tests {
             realms_ready: 0,
             realms_degraded: 0,
             realms_absent: 0,
+            listeners_rewire_required: 0,
         }
     }
 
@@ -2474,11 +2533,12 @@ mod tests {
         assert_eq!(v["realms_ready"], serde_json::json!(0));
         assert_eq!(v["realms_degraded"], serde_json::json!(0));
         assert_eq!(v["realms_absent"], serde_json::json!(0));
+        assert_eq!(v["listeners_rewire_required"], serde_json::json!(0));
         let obj = v.as_object().expect("ready --json is a JSON object");
         assert_eq!(
             obj.len(),
-            11,
-            "ready --json carries the complete key and realm summary"
+            12,
+            "ready --json carries the complete key, realm, and rewire summary"
         );
 
         // The coarse reason tokens automation matches on are stable.
@@ -2521,6 +2581,20 @@ mod tests {
             key_count: 12,
             grant_count: 9,
             rejection: None,
+            listener_impacts: vec![basil::AgentListenerImpact {
+                name: "workloads".to_string(),
+                kind: basil::AgentListenerChange::Add,
+                active_connections: 0,
+                previous_path: None,
+                new_path: Some("/run/basil/workloads.sock".to_string()),
+            }],
+            rewire_required: vec![basil::AgentRewireDiagnostic {
+                listener: "workloads".to_string(),
+                previous_path: "/run/basil/old.sock".to_string(),
+                new_path: "/run/basil/workloads.sock".to_string(),
+                applied_generation: 5,
+                recorded_at_unix: 1_700_000_000,
+            }],
         }
     }
 
@@ -2537,6 +2611,8 @@ mod tests {
                 reason: "routing_shape_changed".to_string(),
                 message: "a key's backend locator changed (restart-only)".to_string(),
             }),
+            listener_impacts: Vec::new(),
+            rewire_required: Vec::new(),
         }
     }
 
@@ -2553,7 +2629,27 @@ mod tests {
         // always present so automation can test for it unconditionally).
         assert_eq!(v["rejection"], serde_json::Value::Null);
         let obj = v.as_object().expect("reload --json is a JSON object");
-        assert_eq!(obj.len(), 7, "reload --json carries 7 keys incl. rejection");
+        assert_eq!(obj.len(), 9, "reload --json carries 9 keys incl. rejection");
+        let impacts = v["listener_impacts"]
+            .as_array()
+            .expect("listener_impacts is an array");
+        assert_eq!(impacts[0]["name"], serde_json::json!("workloads"));
+        assert_eq!(impacts[0]["kind"], serde_json::json!("add"));
+        assert_eq!(impacts[0]["active_connections"], serde_json::json!(0));
+        assert_eq!(impacts[0]["previous_path"], serde_json::Value::Null);
+        assert_eq!(
+            impacts[0]["new_path"],
+            serde_json::json!("/run/basil/workloads.sock")
+        );
+        let rewire = v["rewire_required"]
+            .as_array()
+            .expect("rewire_required is an array");
+        assert_eq!(rewire[0]["listener"], serde_json::json!("workloads"));
+        assert_eq!(
+            rewire[0]["previous_path"],
+            serde_json::json!("/run/basil/old.sock")
+        );
+        assert_eq!(rewire[0]["applied_generation"], serde_json::json!(5));
     }
 
     #[test]

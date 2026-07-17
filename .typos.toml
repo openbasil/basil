@@ -24,6 +24,7 @@ extend-ignore-identifiers-re = [
 [default.extend-identifiers]
 # overrides: if right side of equals is same as left side, no change is made
 AOTHER = "AOTHER"
+WRONLY = "WRONLY" # rustix::fs::OFlags::WRONLY (POSIX O_WRONLY)
 HashiCorp = "HashiCorp"
 PNGs = "PNGs"
 encrypter = "encrypter"

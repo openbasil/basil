@@ -242,6 +242,7 @@ struct RegistryInner {
     maximum: usize,
     maximum_per_listener: usize,
     state: Mutex<RegistryState>,
+    rewire: super::rewire::RewireLedger,
 }
 
 struct RegistryState {
@@ -272,6 +273,7 @@ impl ConnectionRegistry {
                     listener_counts: BTreeMap::new(),
                     gated_listeners: BTreeSet::new(),
                 }),
+                rewire: super::rewire::RewireLedger::default(),
             }),
         }
     }
@@ -299,6 +301,7 @@ impl ConnectionRegistry {
                     listener_counts: BTreeMap::new(),
                     gated_listeners: BTreeSet::new(),
                 }),
+                rewire: super::rewire::RewireLedger::default(),
             }),
         })
     }
@@ -505,6 +508,17 @@ impl ConnectionRegistry {
             .get(listener_name)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// The process-lifetime persistent listener rewire diagnostics.
+    ///
+    /// Kept on the connection registry because it shares the registry's
+    /// lifetime (both span every generation of one broker process) and both are
+    /// facts about the live transport surface rather than about a single
+    /// configuration generation.
+    #[must_use]
+    pub fn rewire(&self) -> &super::rewire::RewireLedger {
+        &self.inner.rewire
     }
 
     /// Gate registration for listener names and atomically snapshot their active

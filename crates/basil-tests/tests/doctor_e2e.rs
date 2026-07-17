@@ -215,6 +215,11 @@ fn assert_healthy_doctor(run: &DoctorRun, name: &str) {
         "bundle_perms",
         "bundle_freshness",
         "catalog_policy",
+        // The per-listener socket-path preflight (basil-9tj.15): the legacy
+        // `socket = ...` resolves to the typed `host` listener, whose final
+        // path is absent (no agent is booted here) under a trusted parent, so
+        // a startup or SIGHUP hot-add would publish cleanly.
+        "listener_path:host",
     ] {
         assert_eq!(
             check_status(&run.report, arm),

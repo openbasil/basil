@@ -170,7 +170,8 @@ mod tests {
 
     use super::*;
     use crate::attestor_protocol::{
-        BrokerSession, FrameCodec, ProtocolLimits, SessionAuthentication, VerifiedPeerBinding,
+        BrokerSession, FrameCodec, ProtocolLimits, RequestBudget, SessionAuthentication,
+        VerifiedPeerBinding,
     };
 
     const BROKER_BINDING: VerifiedPeerBinding = VerifiedPeerBinding::from_authenticator([0x42; 32]);
@@ -255,11 +256,18 @@ mod tests {
         )
         .unwrap();
         broker.handshake().await.unwrap();
-        let health = broker.health().await.unwrap();
+        let caller_budget = Duration::from_millis(400);
+        let health = broker
+            .health(RequestBudget::starting_now(caller_budget))
+            .await
+            .unwrap();
         assert_eq!(health.outcome.code, wire::OutcomeCode::Ok as i32);
         server_task.await.unwrap();
         let budget = observed_budget.lock().unwrap().unwrap();
         assert!(!budget.is_zero());
+        // The provider observes the caller's lowered budget, not the larger
+        // configured session ceiling.
+        assert!(budget <= caller_budget);
         assert!(budget <= limits.request_deadline);
     }
 }
