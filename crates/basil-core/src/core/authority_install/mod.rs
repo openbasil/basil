@@ -46,8 +46,8 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 pub use journal::{
-    ActiveReceipt, FileIntentJournal, IntentReceipt, JournalError, JournalReadout, JournalRecord,
-    RetiredReceipt, StagedReceipt, TransactionId,
+    ActiveReceipt, DiscardedReceipt, FileIntentJournal, IntentReceipt, JournalError,
+    JournalReadout, JournalRecord, RetiredReceipt, StagedReceipt, TransactionId,
 };
 pub use manifest::{ManifestError, ManifestId, RetainedGeneration, StagedManifest};
 pub use reconciler::{ReconcileAction, ReconcileError, ReconcilePlan, reconcile};
@@ -196,8 +196,12 @@ pub trait InstallerAuthority: Send + Sync {
     async fn retire_generation(&self, receipt: &RetiredReceipt) -> Result<(), InstallError>;
 
     /// Remove one staged, never-committed candidate (manifest, unit,
-    /// policies, helper generation). Legal only while no commit-intent
-    /// receipt exists for the transaction.
+    /// policies, helper generation) and durably append the transaction's
+    /// terminal [`DiscardedReceipt`] so the staged record does not
+    /// accumulate as a live journal track. Legal only while no commit-intent
+    /// receipt exists for the transaction. Must be idempotent: the
+    /// reconciler re-issues the discard on every startup until the terminal
+    /// receipt is durable.
     async fn discard_staged(&self, transaction: TransactionId) -> Result<(), InstallError>;
 
     /// Read the durable journal for reconciliation.
@@ -398,54 +402,8 @@ where
     F: FnOnce() -> Fut + Send,
     Fut: Future<Output = Result<Box<dyn CandidatePromotion>, RealmError>> + Send,
 {
-    let staged_receipt = request.staged_receipt();
-    if let Err(error) = installer
-        .stage_manifest(&staged_receipt, &request.manifest)
-        .await
-    {
-        return reject_pre_commit(
-            installer,
-            request.transaction,
-            InstallStep::StageManifest,
-            error,
-        )
-        .await;
-    }
-    if let Err(error) = installer.load_lsm_additive(&request.manifest).await {
-        return reject_pre_commit(
-            installer,
-            request.transaction,
-            InstallStep::LoadLsmAdditive,
-            error,
-        )
-        .await;
-    }
-    if let Err(error) = installer.daemon_reload().await {
-        return reject_pre_commit(
-            installer,
-            request.transaction,
-            InstallStep::DaemonReload,
-            error,
-        )
-        .await;
-    }
-    if let Err(error) = installer.install_helper_generation(&request.manifest).await {
-        return reject_pre_commit(
-            installer,
-            request.transaction,
-            InstallStep::InstallHelperGeneration,
-            error,
-        )
-        .await;
-    }
-    if let Err(error) = installer.start_candidate(&request.manifest).await {
-        return reject_pre_commit(
-            installer,
-            request.transaction,
-            InstallStep::StartCandidate,
-            error,
-        )
-        .await;
+    if let Err((step, error)) = run_pre_intent_steps(installer, &request).await {
+        return reject_pre_commit(installer, request.transaction, step, error).await;
     }
     let promotion = match qualify().await {
         Ok(promotion) => promotion,
@@ -508,6 +466,36 @@ where
     }
 }
 
+/// Run the additive pre-intent installer steps in their fixed order,
+/// pairing any failure with the step that rejected.
+async fn run_pre_intent_steps(
+    installer: &dyn InstallerAuthority,
+    request: &InstallationRequest,
+) -> Result<(), (InstallStep, InstallError)> {
+    let staged_receipt = request.staged_receipt();
+    installer
+        .stage_manifest(&staged_receipt, &request.manifest)
+        .await
+        .map_err(|error| (InstallStep::StageManifest, error))?;
+    installer
+        .load_lsm_additive(&request.manifest)
+        .await
+        .map_err(|error| (InstallStep::LoadLsmAdditive, error))?;
+    installer
+        .daemon_reload()
+        .await
+        .map_err(|error| (InstallStep::DaemonReload, error))?;
+    installer
+        .install_helper_generation(&request.manifest)
+        .await
+        .map_err(|error| (InstallStep::InstallHelperGeneration, error))?;
+    installer
+        .start_candidate(&request.manifest)
+        .await
+        .map_err(|error| (InstallStep::StartCandidate, error))?;
+    Ok(())
+}
+
 /// Complete a logically committed transaction forward: publication, then the
 /// committed/active receipt. Failure is applied/recovery-required, never a
 /// rejection.
@@ -550,8 +538,9 @@ async fn complete_forward(
 }
 
 /// Resolve one pre-commit rejection: the old authority stays serving and the
-/// staged candidate is removed best-effort (the reconciler discards any
-/// remainder as a staged transaction without intent).
+/// staged candidate is removed best-effort — including its terminal
+/// discarded receipt (the reconciler re-discards any remainder as an inert
+/// staged transaction without intent until that receipt lands).
 async fn reject_pre_commit(
     installer: &dyn InstallerAuthority,
     transaction: TransactionId,

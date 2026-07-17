@@ -13,18 +13,24 @@
 //! directory before it is reported durable.
 //!
 //! Records use checksummed length-prefixed framing so a torn append (a crash
-//! mid-write) is distinguishable from interior corruption: a partial or
-//! checksum-failing record at the exact tail reads as a torn tail, while any
-//! damaged record followed by more bytes fails closed as corruption. A torn
-//! record that still validates by chance is a known residual gap tracked as
-//! `basil-3c3l`.
+//! mid-write) is distinguishable from interior corruption: a record cut short
+//! at the exact tail reads as a torn tail, while a fully present frame whose
+//! checksum fails reads as corruption and fails closed **even at the tail** —
+//! treating it as torn could silently drop a durable intent under bit rot. A
+//! crash that persists the appended file length but not the payload bytes
+//! (metadata-before-data ordering on some filesystems) therefore blocks
+//! startup as [`JournalError::Corrupt`] and needs operator intervention, the
+//! same as any other corruption. A torn record that still validates by chance
+//! is a known residual gap tracked as `basil-3c3l`.
 
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
+use rustix::fs::{Mode, OFlags};
+use rustix::io::Errno;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -242,6 +248,23 @@ pub struct RetiredReceipt {
     pub retired_helper_policy_generation: Option<NonZeroU64>,
 }
 
+/// Terminal receipt written when a staged, never-committed candidate is
+/// removed (pre-commit rejection, provably-absent intent, or reconciliation
+/// discard).
+///
+/// It closes the transaction's journal track so rejected attempts do not
+/// accumulate as live staged records across restarts. Legal only while no
+/// commit-intent receipt exists for the transaction.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DiscardedReceipt {
+    /// Owning installation transaction.
+    pub transaction: TransactionId,
+    /// Target realm.
+    #[serde(with = "realm_serde")]
+    pub realm: RealmName,
+}
+
 /// One durable journal record.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "receipt", rename_all = "camelCase")]
@@ -254,6 +277,8 @@ pub enum JournalRecord {
     Active(ActiveReceipt),
     /// Old generation retired after bounded drain.
     Retired(RetiredReceipt),
+    /// Staged candidate discarded without ever committing (terminal).
+    Discarded(DiscardedReceipt),
 }
 
 impl JournalRecord {
@@ -265,6 +290,7 @@ impl JournalRecord {
             Self::Intent(receipt) => receipt.transaction,
             Self::Active(receipt) => receipt.transaction,
             Self::Retired(receipt) => receipt.transaction,
+            Self::Discarded(receipt) => receipt.transaction,
         }
     }
 
@@ -276,6 +302,7 @@ impl JournalRecord {
             Self::Intent(receipt) => &receipt.realm,
             Self::Active(receipt) => &receipt.realm,
             Self::Retired(receipt) => &receipt.realm,
+            Self::Discarded(receipt) => &receipt.realm,
         }
     }
 }
@@ -292,8 +319,8 @@ pub enum JournalError {
     /// Serialization failed.
     #[error("journal record serialization failed")]
     Serialize,
-    /// A complete interior record failed checksum or decoding: the journal
-    /// fails closed.
+    /// A fully present record failed checksum or decoding — interior or at
+    /// the tail: the journal fails closed.
     #[error("journal is corrupt")]
     Corrupt,
     /// Filesystem I/O failed.
@@ -373,11 +400,23 @@ impl FileIntentJournal {
     /// Append one record, fsync the file, then fsync the parent directory.
     /// The record is durable only when this returns `Ok`.
     ///
+    /// The file is created `0600` and opened with `O_NOFOLLOW` on its final
+    /// component, so a symlink planted at the journal path fails closed. The
+    /// caller must place the journal in a root-owned, non-world-writable
+    /// installer state directory (the full descriptor-relative directory
+    /// walk is future installer-lockdown work). The journal has exactly one
+    /// writer — the root installer authority — and appends are serialized.
+    ///
+    /// A torn tail (a partial frame from a crashed earlier append) is healed
+    /// here: it is not durable by definition, so it is truncated away before
+    /// the new frame is written. Appending to a journal with interior
+    /// corruption refuses with [`JournalError::Corrupt`].
+    ///
     /// # Errors
     ///
-    /// Returns [`JournalError`] when serialization, the size bound, or any
-    /// I/O or fsync step fails. On error the record must be treated as not
-    /// durable until a read proves otherwise.
+    /// Returns [`JournalError`] when serialization, the size bound, existing
+    /// corruption, or any I/O or fsync step fails. On error the record must
+    /// be treated as not durable until a read proves otherwise.
     pub fn append(&self, record: &JournalRecord) -> Result<(), JournalError> {
         let payload = serde_json::to_vec(record).map_err(|_| JournalError::Serialize)?;
         if payload.len() > MAX_RECORD_BYTES {
@@ -391,10 +430,28 @@ impl FileIntentJournal {
         frame.extend_from_slice(&payload);
         frame.extend_from_slice(&checksum);
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        // Validate the existing journal and locate the durable end so a torn
+        // tail never prefixes (and thereby corrupts) the new frame.
+        let (existing_len, durable_len) = match self.read_bytes()? {
+            Some(bytes) => {
+                let (_, durable_len) = parse_journal(&bytes)?;
+                (bytes.len(), durable_len)
+            }
+            None => (0, 0),
+        };
+
+        let fd = rustix::fs::open(
+            &self.path,
+            OFlags::WRONLY | OFlags::APPEND | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )
+        .map_err(io_error)?;
+        let mut file = File::from(fd);
+        if existing_len > durable_len
+            && let Ok(durable) = u64::try_from(durable_len)
+        {
+            file.set_len(durable)?;
+        }
         file.write_all(&frame)?;
         file.sync_all()?;
         drop(file);
@@ -408,35 +465,56 @@ impl FileIntentJournal {
     ///
     /// # Errors
     ///
-    /// Returns [`JournalError::Corrupt`] when an interior record is damaged
-    /// (fail closed) and [`JournalError::Io`] on filesystem failure. A
-    /// partial record at the exact tail is reported via
+    /// Returns [`JournalError::Corrupt`] when a fully present record is
+    /// damaged (fail closed, even at the tail) and [`JournalError::Io`] on
+    /// filesystem failure. A partial record at the exact tail is reported via
     /// [`JournalReadout::torn_tail`], not as an error.
     pub fn read(&self) -> Result<JournalReadout, JournalError> {
-        let mut bytes = Vec::new();
-        match File::open(&self.path) {
-            Ok(mut file) => {
-                file.read_to_end(&mut bytes)?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(JournalReadout::default());
-            }
-            Err(error) => return Err(error.into()),
+        match self.read_bytes()? {
+            Some(bytes) => Ok(parse_journal(&bytes)?.0),
+            None => Ok(JournalReadout::default()),
         }
-        parse_journal(&bytes)
+    }
+
+    /// Read the raw journal bytes with `O_NOFOLLOW` on the final component.
+    /// An absent file reads as `None`.
+    fn read_bytes(&self) -> Result<Option<Vec<u8>>, JournalError> {
+        let fd = match rustix::fs::open(
+            &self.path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => return Ok(None),
+            Err(errno) => return Err(io_error(errno)),
+        };
+        let mut bytes = Vec::new();
+        File::from(fd).read_to_end(&mut bytes)?;
+        Ok(Some(bytes))
     }
 }
 
-fn parse_journal(bytes: &[u8]) -> Result<JournalReadout, JournalError> {
+fn io_error(errno: Errno) -> JournalError {
+    JournalError::Io {
+        kind: std::io::Error::from(errno).kind(),
+    }
+}
+
+/// Parse the journal bytes into a readout plus the byte offset just past the
+/// last complete valid frame (the durable length; a torn tail lies beyond it).
+fn parse_journal(bytes: &[u8]) -> Result<(JournalReadout, usize), JournalError> {
     let mut records = Vec::new();
     let mut offset = 0_usize;
     while offset < bytes.len() {
         let Some(header) = bytes.get(offset..offset.saturating_add(FRAME_LENGTH_BYTES)) else {
             // Fewer than four trailing bytes: torn mid-length append.
-            return Ok(JournalReadout {
-                records,
-                torn_tail: true,
-            });
+            return Ok((
+                JournalReadout {
+                    records,
+                    torn_tail: true,
+                },
+                offset,
+            ));
         };
         let mut length_bytes = [0_u8; FRAME_LENGTH_BYTES];
         length_bytes.copy_from_slice(header);
@@ -450,16 +528,22 @@ fn parse_journal(bytes: &[u8]) -> Result<JournalReadout, JournalError> {
         let payload_end = payload_start.saturating_add(length);
         let frame_end = payload_end.saturating_add(FRAME_CHECKSUM_BYTES);
         let Some(payload) = bytes.get(payload_start..payload_end) else {
-            return Ok(JournalReadout {
-                records,
-                torn_tail: true,
-            });
+            return Ok((
+                JournalReadout {
+                    records,
+                    torn_tail: true,
+                },
+                offset,
+            ));
         };
         let Some(stored_checksum) = bytes.get(payload_end..frame_end) else {
-            return Ok(JournalReadout {
-                records,
-                torn_tail: true,
-            });
+            return Ok((
+                JournalReadout {
+                    records,
+                    torn_tail: true,
+                },
+                offset,
+            ));
         };
         let computed: [u8; 32] = Sha256::digest(payload).into();
         if stored_checksum != computed {
@@ -472,13 +556,16 @@ fn parse_journal(bytes: &[u8]) -> Result<JournalReadout, JournalError> {
         records.push(record);
         offset = frame_end;
     }
-    Ok(JournalReadout {
-        records,
-        torn_tail: false,
-    })
+    Ok((
+        JournalReadout {
+            records,
+            torn_tail: false,
+        },
+        offset,
+    ))
 }
 
 #[cfg(test)]
 pub(crate) fn parse_journal_bytes(bytes: &[u8]) -> Result<JournalReadout, JournalError> {
-    parse_journal(bytes)
+    parse_journal(bytes).map(|(readout, _)| readout)
 }

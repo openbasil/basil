@@ -295,9 +295,26 @@ impl InstallerAuthority for FakeInstaller {
         Ok(())
     }
 
-    async fn discard_staged(&self, _transaction: TransactionId) -> Result<(), InstallError> {
+    async fn discard_staged(&self, transaction: TransactionId) -> Result<(), InstallError> {
         self.log_step("discard");
         self.discards.fetch_add(1, Ordering::SeqCst);
+        // Close the journal track with the terminal discarded receipt, as
+        // the installer contract requires (skipped when staging failed
+        // before its receipt was appended).
+        let readout = self.journal.read()?;
+        let staged_realm = readout.records.iter().find_map(|record| match record {
+            JournalRecord::Staged(receipt) if receipt.transaction == transaction => {
+                Some(receipt.realm.clone())
+            }
+            _ => None,
+        });
+        if let Some(realm) = staged_realm {
+            self.journal
+                .append(&JournalRecord::Discarded(DiscardedReceipt {
+                    transaction,
+                    realm,
+                }))?;
+        }
         Ok(())
     }
 
@@ -386,11 +403,16 @@ fn journal_round_trips_every_receipt_kind_durably() {
         retired_generation: nonzero(1),
         retired_helper_policy_generation: Some(nonzero(1)),
     };
+    let discarded = DiscardedReceipt {
+        transaction: TransactionId::from_bytes([99; 16]),
+        realm: RealmName::new("owner-podman").expect("realm"),
+    };
     let records = [
         JournalRecord::Staged(staged),
         JournalRecord::Intent(intent),
         JournalRecord::Active(active),
         JournalRecord::Retired(retired),
+        JournalRecord::Discarded(discarded),
     ];
     for record in &records {
         journal.append(record).expect("append");
@@ -456,6 +478,88 @@ fn journal_interior_damage_fails_closed() {
         journal::parse_journal_bytes(&absurd),
         Err(JournalError::Corrupt)
     ));
+}
+
+#[test]
+fn journal_append_heals_a_torn_tail_and_refuses_corruption() {
+    let dir = tempdir::create();
+    let journal = FileIntentJournal::in_directory(&dir.path);
+    let transaction = TransactionId::from_bytes([4; 16]);
+    journal
+        .append(&JournalRecord::Staged(
+            request(transaction).staged_receipt(),
+        ))
+        .expect("append staged");
+    // Simulate a crashed earlier append: a partial frame at the tail.
+    let intent = request(transaction).intent_receipt();
+    let payload = serde_json::to_vec(&JournalRecord::Intent(intent.clone())).expect("serialize");
+    let length = u32::try_from(payload.len()).expect("bounded");
+    let mut bytes = std::fs::read(journal.path()).expect("read");
+    let durable_len = bytes.len();
+    bytes.extend_from_slice(&length.to_be_bytes());
+    bytes.extend_from_slice(payload.get(..payload.len() / 2).expect("half"));
+    std::fs::write(journal.path(), bytes).expect("write torn");
+    // The next append truncates the non-durable torn tail first, so the new
+    // frame never reads as interior corruption.
+    journal
+        .append(&JournalRecord::Intent(intent))
+        .expect("append heals the torn tail");
+    let readout = journal.read().expect("read");
+    assert!(!readout.torn_tail);
+    assert_eq!(readout.records.len(), 2);
+    assert!(readout.intent_for(transaction).is_some());
+    // Interior corruption refuses further appends: fail closed.
+    let mut damaged = std::fs::read(journal.path()).expect("read");
+    if let Some(byte) = damaged.get_mut(10) {
+        *byte ^= 0xFF;
+    }
+    std::fs::write(journal.path(), damaged).expect("write damaged");
+    assert!(matches!(
+        journal.append(&JournalRecord::Staged(
+            request(TransactionId::from_bytes([5; 16])).staged_receipt(),
+        )),
+        Err(JournalError::Corrupt)
+    ));
+    let expected_len = u64::try_from(durable_len).expect("bounded");
+    assert!(
+        std::fs::metadata(journal.path()).expect("metadata").len() > expected_len,
+        "a refused append never truncates a corrupt journal"
+    );
+}
+
+#[test]
+fn journal_is_created_private_and_never_follows_a_symlink() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempdir::create();
+    let journal = FileIntentJournal::in_directory(&dir.path);
+    let transaction = TransactionId::from_bytes([6; 16]);
+    journal
+        .append(&JournalRecord::Staged(
+            request(transaction).staged_receipt(),
+        ))
+        .expect("append");
+    let mode = std::fs::metadata(journal.path())
+        .expect("metadata")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o077, 0, "no group/world access: {mode:o}");
+    // A symlink planted at the journal path fails closed on both paths.
+    let target = dir.path.join("elsewhere");
+    std::fs::write(&target, b"decoy").expect("write target");
+    std::fs::remove_file(journal.path()).expect("remove journal");
+    std::os::unix::fs::symlink(&target, journal.path()).expect("plant symlink");
+    assert!(matches!(
+        journal.append(&JournalRecord::Staged(
+            request(transaction).staged_receipt(),
+        )),
+        Err(JournalError::Io { .. })
+    ));
+    assert!(matches!(journal.read(), Err(JournalError::Io { .. })));
+    assert_eq!(
+        std::fs::read(&target).expect("target intact"),
+        b"decoy",
+        "the symlink target is never written through"
+    );
 }
 
 // --- Staged manifests ---
@@ -786,10 +890,16 @@ async fn torn_intent_append_is_not_durable() {
         "a torn append is provably absent once the installer says so"
     );
     assert!(!published.load(Ordering::SeqCst));
-    let readout = installer.journal.read().expect("torn journal reads");
-    assert!(readout.torn_tail);
+    let readout = installer.journal.read().expect("journal reads");
     assert!(readout.intent_for(transaction).is_none());
-    assert_eq!(readout.records.len(), 1, "staged receipt survives");
+    // The rejection's discard appended the terminal discarded receipt,
+    // healing (truncating) the non-durable torn tail in the process.
+    assert!(!readout.torn_tail, "the discard append heals the torn tail");
+    assert_eq!(readout.records.len(), 2, "staged + discarded receipts");
+    assert!(matches!(
+        readout.records.last(),
+        Some(JournalRecord::Discarded(_))
+    ));
 }
 
 #[tokio::test]
@@ -909,6 +1019,46 @@ async fn shared_helper_policy_generation_is_not_retired() {
     assert_eq!(retired[0].retired_helper_policy_generation, None);
 }
 
+#[tokio::test]
+async fn rejected_attempts_accumulate_without_bricking_reconciliation() {
+    let dir = tempdir::create();
+    let installer = FakeInstaller::new(&dir);
+    // Two rejected attempts in the same realm (stale corpus), no crash.
+    for id in [21_u8, 22] {
+        let (mut promotion, _, _) = tracked_promotion();
+        promotion.corpus = digest(200);
+        let outcome = run_installation(
+            &installer,
+            request(TransactionId::from_bytes([id; 16])),
+            move || async move { Ok(promotion as Box<dyn CandidatePromotion>) },
+        )
+        .await;
+        assert!(matches!(outcome, InstallOutcome::RejectedPreCommit { .. }));
+    }
+    // A third attempt succeeds.
+    let transaction = TransactionId::from_bytes([23; 16]);
+    let (promotion, _, _) = tracked_promotion();
+    let outcome = run_installation(&installer, request(transaction), move || async move {
+        Ok(promotion as Box<dyn CandidatePromotion>)
+    })
+    .await;
+    assert!(matches!(outcome, InstallOutcome::Committed(_)));
+    // The journal now holds three transactions' history for one realm.
+    // Reconciliation still classifies it: recover the committed authority,
+    // nothing else, and readiness is never bricked.
+    let readout = installer.journal.read().expect("read journal");
+    let plan = reconcile(&readout).expect("multi-attempt journal reconciles");
+    assert_eq!(
+        plan.actions,
+        vec![ReconcileAction::RecoverActive {
+            transaction,
+            realm: RealmName::new("owner-podman").expect("realm"),
+            retirement_pending: true,
+        }]
+    );
+    assert!(plan.ready());
+}
+
 // --- SPEC test 9: reconciler ---
 
 fn staged_record(id: u8, realm: &str) -> JournalRecord {
@@ -923,6 +1073,10 @@ fn staged_record(id: u8, realm: &str) -> JournalRecord {
 }
 
 fn intent_record(id: u8, realm: &str, previous: Option<u64>) -> JournalRecord {
+    intent_gen_record(id, realm, 2, previous)
+}
+
+fn intent_gen_record(id: u8, realm: &str, generation: u64, previous: Option<u64>) -> JournalRecord {
     JournalRecord::Intent(IntentReceipt {
         transaction: TransactionId::from_bytes([id; 16]),
         realm: RealmName::new(realm).expect("realm"),
@@ -930,9 +1084,16 @@ fn intent_record(id: u8, realm: &str, previous: Option<u64>) -> JournalRecord {
         previous_manifest: None,
         candidate_corpus: digest(9),
         configuration_generation: digest(11),
-        authority_generation: nonzero(2),
+        authority_generation: nonzero(generation),
         previous_generation: previous.map(nonzero),
         drain_deadline_millis: 30_000,
+    })
+}
+
+fn discarded_record(id: u8, realm: &str) -> JournalRecord {
+    JournalRecord::Discarded(DiscardedReceipt {
+        transaction: TransactionId::from_bytes([id; 16]),
+        realm: RealmName::new(realm).expect("realm"),
     })
 }
 
@@ -1076,39 +1237,202 @@ fn reconciler_rejects_order_violations_and_duplicates() {
         ])),
         Err(ReconcileError::DuplicateRecord)
     );
-}
-
-#[test]
-fn reconciler_never_splits_ownership() {
-    // Two unfinished transactions for one realm: fail closed.
+    assert_eq!(
+        reconcile(&readout(vec![discarded_record(1, "owner-podman")])),
+        Err(ReconcileError::OrderViolation),
+        "discarded without staged"
+    );
     assert_eq!(
         reconcile(&readout(vec![
             staged_record(1, "owner-podman"),
-            staged_record(2, "owner-podman"),
+            intent_record(1, "owner-podman", None),
+            discarded_record(1, "owner-podman"),
         ])),
-        Err(ReconcileError::SplitOwnership)
+        Err(ReconcileError::OrderViolation),
+        "a committed transaction can never be discarded"
     );
-    // Distinct realms may each own one unfinished transaction.
+    assert_eq!(
+        reconcile(&readout(vec![
+            staged_record(1, "owner-podman"),
+            discarded_record(1, "owner-podman"),
+            discarded_record(1, "owner-podman"),
+        ])),
+        Err(ReconcileError::DuplicateRecord)
+    );
+    assert_eq!(
+        reconcile(&readout(vec![
+            staged_record(1, "owner-podman"),
+            intent_record(1, "production-docker", None),
+        ])),
+        Err(ReconcileError::RealmMismatch),
+        "one transaction's records must agree on the realm"
+    );
+}
+
+#[test]
+fn reconciler_discards_repeated_rejected_attempts_without_split_ownership() {
+    // Two rejected attempts (staged, never committed) in one realm are both
+    // inert: neither claims realm ownership, and startup stays recoverable.
     let plan = reconcile(&readout(vec![
         staged_record(1, "owner-podman"),
-        staged_record(2, "production-docker"),
+        staged_record(2, "owner-podman"),
+    ]))
+    .expect("repeated rejected attempts never brick reconciliation");
+    assert_eq!(plan.actions.len(), 2);
+    assert!(
+        plan.actions
+            .iter()
+            .all(|action| matches!(action, ReconcileAction::DiscardStaged { .. }))
+    );
+    assert!(plan.ready());
+    // Once their terminal discarded receipts land, nothing remains.
+    let plan = reconcile(&readout(vec![
+        staged_record(1, "owner-podman"),
+        discarded_record(1, "owner-podman"),
+        staged_record(2, "owner-podman"),
+        discarded_record(2, "owner-podman"),
     ]))
     .expect("plan");
-    assert_eq!(plan.actions.len(), 2);
-    // A retired transaction releases realm ownership for a successor.
+    assert!(plan.actions.is_empty());
+    assert!(plan.ready());
+    // Rejected attempts coexist with the realm's serving authority.
     let plan = reconcile(&readout(vec![
         staged_record(1, "owner-podman"),
         intent_record(1, "owner-podman", Some(1)),
         active_record(1, "owner-podman"),
-        retired_record(1, "owner-podman"),
+        staged_record(2, "owner-podman"),
+        discarded_record(2, "owner-podman"),
+        staged_record(3, "owner-podman"),
+    ]))
+    .expect("plan");
+    assert_eq!(
+        plan.actions,
+        vec![
+            ReconcileAction::RecoverActive {
+                transaction: TransactionId::from_bytes([1; 16]),
+                realm: RealmName::new("owner-podman").expect("realm"),
+                retirement_pending: true,
+            },
+            ReconcileAction::DiscardStaged {
+                transaction: TransactionId::from_bytes([3; 16]),
+                realm: RealmName::new("owner-podman").expect("realm"),
+            },
+        ]
+    );
+}
+
+#[test]
+fn reconciler_supersedes_predecessors_across_transactions() {
+    let realm = RealmName::new("owner-podman").expect("realm");
+    // A committed first install (no previous, so no retired record ever)
+    // keeps owning the realm while a successor is merely staged.
+    let plan = reconcile(&readout(vec![
+        staged_record(1, "owner-podman"),
+        intent_gen_record(1, "owner-podman", 2, None),
+        active_record(1, "owner-podman"),
         staged_record(2, "owner-podman"),
     ]))
     .expect("plan");
-    assert_eq!(plan.actions.len(), 1);
-    assert!(matches!(
-        plan.actions[0],
-        ReconcileAction::DiscardStaged { .. }
-    ));
+    assert_eq!(
+        plan.actions,
+        vec![
+            ReconcileAction::RecoverActive {
+                transaction: TransactionId::from_bytes([1; 16]),
+                realm: realm.clone(),
+                retirement_pending: false,
+            },
+            ReconcileAction::DiscardStaged {
+                transaction: TransactionId::from_bytes([2; 16]),
+                realm: realm.clone(),
+            },
+        ]
+    );
+    // The successor's durable intent supersedes the first install: only the
+    // successor completes forward; the predecessor needs no action of its
+    // own (its retirement belongs to the successor).
+    let history = vec![
+        staged_record(1, "owner-podman"),
+        intent_gen_record(1, "owner-podman", 2, None),
+        active_record(1, "owner-podman"),
+        staged_record(2, "owner-podman"),
+        intent_gen_record(2, "owner-podman", 3, Some(2)),
+    ];
+    let plan = reconcile(&readout(history.clone())).expect("plan");
+    assert_eq!(
+        plan.actions,
+        vec![ReconcileAction::CompleteForward {
+            transaction: TransactionId::from_bytes([2; 16]),
+            realm: realm.clone(),
+        }]
+    );
+    assert!(!plan.ready());
+    // Successor active: recover it, with the predecessor's drain pending —
+    // never the superseded generation.
+    let mut with_active = history;
+    with_active.push(active_record(2, "owner-podman"));
+    let plan = reconcile(&readout(with_active.clone())).expect("plan");
+    assert_eq!(
+        plan.actions,
+        vec![ReconcileAction::RecoverActive {
+            transaction: TransactionId::from_bytes([2; 16]),
+            realm,
+            retirement_pending: true,
+        }]
+    );
+    assert!(plan.ready());
+    // Successor retired its predecessor: the realm's whole history is
+    // finished — in particular no RecoverActive for the superseded first
+    // install.
+    let mut finished = with_active;
+    finished.push(retired_record(2, "owner-podman"));
+    let plan = reconcile(&readout(finished)).expect("plan");
+    assert!(plan.actions.is_empty());
+    assert!(plan.ready());
+}
+
+#[test]
+fn reconciler_fails_closed_on_broken_succession() {
+    // A superseded transaction still demanding forward completion: two
+    // transactions would own the realm's forward path.
+    assert_eq!(
+        reconcile(&readout(vec![
+            staged_record(1, "owner-podman"),
+            intent_gen_record(1, "owner-podman", 2, None),
+            staged_record(2, "owner-podman"),
+            intent_gen_record(2, "owner-podman", 3, Some(2)),
+        ])),
+        Err(ReconcileError::SplitOwnership)
+    );
+    // A successor whose intent does not name its predecessor's generation.
+    assert_eq!(
+        reconcile(&readout(vec![
+            staged_record(1, "owner-podman"),
+            intent_gen_record(1, "owner-podman", 2, None),
+            active_record(1, "owner-podman"),
+            staged_record(2, "owner-podman"),
+            intent_gen_record(2, "owner-podman", 3, None),
+        ])),
+        Err(ReconcileError::SplitOwnership)
+    );
+    assert_eq!(
+        reconcile(&readout(vec![
+            staged_record(1, "owner-podman"),
+            intent_gen_record(1, "owner-podman", 2, None),
+            active_record(1, "owner-podman"),
+            staged_record(2, "owner-podman"),
+            intent_gen_record(2, "owner-podman", 3, Some(9)),
+        ])),
+        Err(ReconcileError::SplitOwnership)
+    );
+    // Distinct realms stay independent.
+    let plan = reconcile(&readout(vec![
+        staged_record(1, "owner-podman"),
+        intent_gen_record(1, "owner-podman", 2, None),
+        staged_record(2, "production-docker"),
+        intent_gen_record(2, "production-docker", 2, None),
+    ]))
+    .expect("plan");
+    assert_eq!(plan.actions.len(), 2);
 }
 
 #[test]
