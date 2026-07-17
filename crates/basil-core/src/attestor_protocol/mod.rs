@@ -68,6 +68,10 @@ mod tests {
         }
     }
 
+    fn budget() -> RequestBudget {
+        RequestBudget::starting_now(Duration::from_secs(30))
+    }
+
     fn envelope(body: Body) -> wire::Envelope {
         wire::Envelope {
             protocol: PROTOCOL_VERSION,
@@ -377,7 +381,10 @@ mod tests {
             client.handshake().await,
             Err(ProtocolError::StaleSession)
         ));
-        assert!(matches!(client.health().await, Err(ProtocolError::Closed)));
+        assert!(matches!(
+            client.health(budget()).await,
+            Err(ProtocolError::Closed)
+        ));
 
         let (client, server) = tokio::io::duplex(4096);
         let mut server = codec(server, BROKER_BINDING);
@@ -465,7 +472,7 @@ mod tests {
         )
         .unwrap();
         client.handshake().await.unwrap();
-        let result = client.resolve_peer(peer()).await.unwrap();
+        let result = client.resolve_peer(peer(), budget()).await.unwrap();
         assert_eq!(result.outcome.code, wire::OutcomeCode::NoMatch as i32);
         assert!(result.instance.is_none());
         task.await.unwrap();
@@ -517,7 +524,7 @@ mod tests {
         .unwrap();
         client.handshake().await.unwrap();
         let result = client
-            .query_instances(QueryScope::GlobalDoctor)
+            .query_instances(QueryScope::GlobalDoctor, budget())
             .await
             .unwrap();
         assert_eq!(result.instances.len(), 2);
@@ -583,7 +590,7 @@ mod tests {
             .unwrap();
             client.handshake().await.unwrap();
             let error = client
-                .query_instances(QueryScope::GlobalDoctor)
+                .query_instances(QueryScope::GlobalDoctor, budget())
                 .await
                 .unwrap_err();
             assert!(matches!(
@@ -633,7 +640,7 @@ mod tests {
         .unwrap();
         broker.handshake().await.unwrap();
         let inventory = broker
-            .query_instances(QueryScope::GlobalDoctor)
+            .query_instances(QueryScope::GlobalDoctor, budget())
             .await
             .unwrap();
         assert_eq!(inventory.instances.len(), 2);
@@ -707,7 +714,7 @@ mod tests {
             )
             .unwrap();
             broker.handshake().await.unwrap();
-            let result = broker.resolve_peer(peer()).await.unwrap();
+            let result = broker.resolve_peer(peer(), budget()).await.unwrap();
             let mount = &result.instance.unwrap().mounts[0];
             assert_eq!(mount.tmpfs_nodev, enabled);
             assert_eq!(mount.tmpfs_nosuid, enabled);
@@ -806,6 +813,81 @@ mod tests {
             attestor.receive().await,
             Err(ProtocolError::DuplicateRequest)
         ));
+    }
+
+    #[tokio::test]
+    async fn request_budget_counts_down_monotonically() {
+        assert!(
+            RequestBudget::starting_now(Duration::ZERO)
+                .remaining()
+                .is_zero()
+        );
+        let budget = RequestBudget::starting_now(Duration::from_millis(50));
+        assert!(budget.remaining() <= Duration::from_millis(50));
+        // `sleep` waits at least the requested wall time, so the budget must
+        // have expired afterwards.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(budget.remaining().is_zero());
+    }
+
+    #[tokio::test]
+    async fn exhausted_budget_fails_before_dispatch_and_session_stays_usable() {
+        let limits =
+            ProtocolLimits::lowered(4096, 16 * 1024, 10, 10, Duration::from_secs(1)).unwrap();
+        let (client, server) = tokio::io::duplex(16 * 1024);
+        let mut attestor = AttestorSession::new(
+            FrameCodec::for_test(server, BROKER_BINDING, limits),
+            auth(),
+            ["docker.rootful".to_string()],
+            limits,
+        )
+        .unwrap();
+        let server_task = tokio::spawn(async move {
+            attestor.handshake().await.unwrap();
+            // Exactly one request arrives: the exhausted attempt never
+            // reaches the wire. Its budget was clamped to the lowered
+            // configured deadline even though the caller offered one hour.
+            let AttestorRequest::Health { budget } = attestor.receive().await.unwrap() else {
+                panic!("expected health request");
+            };
+            assert!(budget.remaining() <= limits.request_deadline);
+            attestor
+                .respond_health(
+                    ok(),
+                    Some(wire::HealthFact {
+                        runtime: wire::RuntimeKind::Docker as i32,
+                        diagnostic_version: "test".to_string(),
+                        runtime_mode: wire::RuntimeMode::Rootful as i32,
+                        cgroup_mode: wire::CgroupMode::V2 as i32,
+                        ready: true,
+                        missing_capabilities: Vec::new(),
+                    }),
+                )
+                .await
+                .unwrap();
+        });
+        let mut broker = BrokerSession::new(
+            FrameCodec::for_test(client, ATTESTOR_BINDING, limits),
+            auth(),
+            ["docker.rootful".to_string()],
+            limits,
+        )
+        .unwrap();
+        broker.handshake().await.unwrap();
+        assert!(matches!(
+            broker
+                .health(RequestBudget::starting_now(Duration::ZERO))
+                .await,
+            Err(ProtocolError::BudgetExhausted)
+        ));
+        // The session was not closed or left mid-request by the local
+        // rejection; an over-generous budget is clamped and dispatches.
+        let result = broker
+            .health(RequestBudget::starting_now(Duration::from_secs(3600)))
+            .await
+            .unwrap();
+        assert_eq!(result.outcome.code, wire::OutcomeCode::Ok as i32);
+        server_task.await.unwrap();
     }
 
     #[test]

@@ -23,7 +23,8 @@ use tokio::sync::{Notify, watch};
 
 use crate::attestor_protocol::wire;
 use crate::attestor_protocol::{
-    InventoryResult, MOUNT_SECURITY_CAPABILITY, QueryScope, ResolvePeerResult, VerifiedPeerBinding,
+    InventoryResult, MOUNT_SECURITY_CAPABILITY, QueryScope, RequestBudget, ResolvePeerResult,
+    VerifiedPeerBinding,
 };
 use crate::release_admission::{
     ActiveArtifact, ArtifactRole, CapabilityId, CapabilitySet, ProtocolVersion, ReleaseAdmission,
@@ -602,6 +603,9 @@ pub enum RealmError {
     /// The realm is not ready to serve.
     #[error("attestor realm is unavailable")]
     Unavailable,
+    /// The caller's request budget elapsed before attestor dispatch.
+    #[error("attestor request budget exhausted")]
+    BudgetExhausted,
     /// A checked monotonic counter was exhausted.
     #[error("attestor realm counter exhausted")]
     CounterExhausted,
@@ -657,15 +661,20 @@ pub trait RealmSession: Send {
     async fn handshake(&mut self) -> Result<(), RealmError>;
     /// Return negotiated capabilities after handshake.
     fn negotiated_capabilities(&self) -> &[String];
-    /// Run the bounded qualification health call.
-    async fn health(&mut self) -> Result<wire::HealthFact, RealmError>;
-    /// Resolve one pinned broker-observed peer.
+    /// Run the bounded qualification health call under the caller's budget.
+    async fn health(&mut self, budget: RequestBudget) -> Result<wire::HealthFact, RealmError>;
+    /// Resolve one pinned broker-observed peer under the caller's budget.
     async fn resolve_peer(
         &mut self,
         peer: wire::PinnedPeer,
+        budget: RequestBudget,
     ) -> Result<ResolvePeerResult, RealmError>;
-    /// Query one closed inventory scope.
-    async fn query_instances(&mut self, scope: QueryScope) -> Result<InventoryResult, RealmError>;
+    /// Query one closed inventory scope under the caller's budget.
+    async fn query_instances(
+        &mut self,
+        scope: QueryScope,
+        budget: RequestBudget,
+    ) -> Result<InventoryResult, RealmError>;
     /// Close the transport. Dropping the owner releases its active artifact.
     async fn close(&mut self);
 }
@@ -952,9 +961,14 @@ impl RealmRegistry {
         }
         validate_negotiated(&config, authenticated.session.negotiated_capabilities())?;
         self.advance_attempt(name, revision, epoch, AuthorityState::HealthChecking)?;
-        let health = tokio::time::timeout(CONNECT_STEP_TIMEOUT, authenticated.session.health())
-            .await
-            .map_err(|_| RealmError::Health)??;
+        let health = tokio::time::timeout(
+            CONNECT_STEP_TIMEOUT,
+            authenticated
+                .session
+                .health(RequestBudget::starting_now(CONNECT_STEP_TIMEOUT)),
+        )
+        .await
+        .map_err(|_| RealmError::Health)??;
         if let Err(error) = validate_health(&config, &health) {
             authenticated.session.close().await;
             self.fail_attempt(name, revision, epoch, &error);
@@ -1052,16 +1066,21 @@ impl RealmRegistry {
     }
 
     /// Resolve a peer through the accepted serial session for `name`.
+    ///
+    /// The caller's monotonic `budget` keeps counting while this call waits
+    /// on the serial session, so the attestor-side provider observes the
+    /// caller's original remaining deadline rather than a fresh ceiling.
     pub async fn resolve_peer(
         &self,
         name: &RealmName,
         peer: wire::PinnedPeer,
+        budget: RequestBudget,
     ) -> Result<ResolvePeerResult, RealmError> {
         let (slot, token, config) = self.pin_ready(name)?;
         let mut session = slot.inner.lock().await;
         self.validate_token(name, token)?;
         require_negotiated(&session, "resolve-peer")?;
-        let result = session.session.resolve_peer(peer).await?;
+        let result = session.session.resolve_peer(peer, budget).await?;
         if let Some(instance) = result.instance.as_ref() {
             validate_instance(name, &config, instance)?;
         }
@@ -1071,17 +1090,22 @@ impl RealmRegistry {
     }
 
     /// Query a closed inventory scope through the accepted serial session.
+    ///
+    /// The caller's monotonic `budget` keeps counting while this call waits
+    /// on the serial session, so the attestor-side provider observes the
+    /// caller's original remaining deadline rather than a fresh ceiling.
     pub async fn query_instances(
         &self,
         name: &RealmName,
         scope: QueryScope,
+        budget: RequestBudget,
     ) -> Result<InventoryResult, RealmError> {
         validate_scope(name, &scope)?;
         let (slot, token, config) = self.pin_ready(name)?;
         let mut session = slot.inner.lock().await;
         self.validate_token(name, token)?;
         require_negotiated(&session, "query-instances")?;
-        let result = session.session.query_instances(scope).await?;
+        let result = session.session.query_instances(scope, budget).await?;
         for instance in &result.instances {
             validate_instance(name, &config, instance)?;
         }
@@ -1686,9 +1710,14 @@ async fn qualify_session(
         .await
         .map_err(|_| RealmError::Protocol)??;
     validate_negotiated(config, session.session.negotiated_capabilities())?;
-    let health = tokio::time::timeout(CONNECT_STEP_TIMEOUT, session.session.health())
-        .await
-        .map_err(|_| RealmError::Health)??;
+    let health = tokio::time::timeout(
+        CONNECT_STEP_TIMEOUT,
+        session
+            .session
+            .health(RequestBudget::starting_now(CONNECT_STEP_TIMEOUT)),
+    )
+    .await
+    .map_err(|_| RealmError::Health)??;
     validate_health(config, &health)?;
     let socket_identity = session.socket_identity;
     let peer_binding = session.peer_binding;
@@ -1902,7 +1931,9 @@ const fn reason_for_error(error: &RealmError) -> RealmReason {
         RealmError::Protocol | RealmError::Stale | RealmError::CounterExhausted => {
             RealmReason::ProtocolFailed
         }
-        RealmError::Health | RealmError::Unavailable => RealmReason::HealthFailed,
+        RealmError::Health | RealmError::Unavailable | RealmError::BudgetExhausted => {
+            RealmReason::HealthFailed
+        }
     }
 }
 
@@ -2047,6 +2078,7 @@ capabilities = ["health", "query-instances", "resolve-peer"]
         closes: Arc<AtomicUsize>,
         revalidate_failure: Arc<Mutex<bool>>,
         unblock: Arc<Notify>,
+        observed_budgets: Arc<Mutex<Vec<Duration>>>,
     }
 
     impl FakeConnector {
@@ -2058,6 +2090,7 @@ capabilities = ["health", "query-instances", "resolve-peer"]
                 closes: Arc::new(AtomicUsize::new(0)),
                 revalidate_failure: Arc::new(Mutex::new(false)),
                 unblock: Arc::new(Notify::new()),
+                observed_budgets: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -2085,6 +2118,7 @@ capabilities = ["health", "query-instances", "resolve-peer"]
                 plan,
                 authentications: Arc::clone(&self.authentications),
                 closes: Arc::clone(&self.closes),
+                observed_budgets: Arc::clone(&self.observed_budgets),
             }))
         }
 
@@ -2109,6 +2143,7 @@ capabilities = ["health", "query-instances", "resolve-peer"]
         plan: FakePlan,
         authentications: Arc<AtomicUsize>,
         closes: Arc<AtomicUsize>,
+        observed_budgets: Arc<Mutex<Vec<Duration>>>,
     }
 
     #[async_trait]
@@ -2141,6 +2176,7 @@ capabilities = ["health", "query-instances", "resolve-peer"]
                     health_failure: matches!(self.plan, FakePlan::HealthFailed),
                     capabilities: KNOWN_CAPABILITIES.map(str::to_string).to_vec(),
                     closes: Arc::clone(&self.closes),
+                    observed_budgets: Arc::clone(&self.observed_budgets),
                 }),
                 active_artifact,
                 SocketIdentity {
@@ -2164,6 +2200,16 @@ capabilities = ["health", "query-instances", "resolve-peer"]
         health_failure: bool,
         capabilities: Vec<String>,
         closes: Arc<AtomicUsize>,
+        observed_budgets: Arc<Mutex<Vec<Duration>>>,
+    }
+
+    impl FakeSession {
+        fn record_budget(&self, budget: RequestBudget) {
+            self.observed_budgets
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(budget.remaining());
+        }
     }
 
     #[async_trait]
@@ -2176,7 +2222,8 @@ capabilities = ["health", "query-instances", "resolve-peer"]
             &self.capabilities
         }
 
-        async fn health(&mut self) -> Result<wire::HealthFact, RealmError> {
+        async fn health(&mut self, budget: RequestBudget) -> Result<wire::HealthFact, RealmError> {
+            self.record_budget(budget);
             if self.health_failure {
                 return Err(RealmError::Health);
             }
@@ -2193,14 +2240,18 @@ capabilities = ["health", "query-instances", "resolve-peer"]
         async fn resolve_peer(
             &mut self,
             _peer: wire::PinnedPeer,
+            budget: RequestBudget,
         ) -> Result<ResolvePeerResult, RealmError> {
+            self.record_budget(budget);
             Err(RealmError::Unavailable)
         }
 
         async fn query_instances(
             &mut self,
             _scope: QueryScope,
+            budget: RequestBudget,
         ) -> Result<InventoryResult, RealmError> {
+            self.record_budget(budget);
             Err(RealmError::Unavailable)
         }
 
@@ -2328,6 +2379,52 @@ capabilities = ["health", "query-instances", "resolve-peer"]
         assert_eq!(connector.closes.load(Ordering::SeqCst), 1);
         assert_eq!(admission.snapshot().current.active_preflights, 1);
         assert_eq!(registry.statuses()[0].session_epoch, 2);
+    }
+
+    #[tokio::test]
+    async fn dispatch_passes_caller_budget_through_the_serial_session() {
+        let realms = RealmSet::from_bootstrap(&bootstrap(rootful())).expect("valid realms");
+        let name = RealmName::new("production-docker").expect("valid realm");
+        let registry = RealmRegistry::new(&realms, 1).expect("valid registry");
+        let connector = FakeConnector::new([FakePlan::Success]);
+        let admission = admission();
+        registry
+            .connect_realm(&name, &connector, admission.as_ref())
+            .await
+            .expect("connection");
+        let budgets = connector
+            .observed_budgets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        assert_eq!(budgets.len(), 1, "qualification health carries a budget");
+        assert!(!budgets[0].is_zero());
+        assert!(budgets[0] <= CONNECT_STEP_TIMEOUT);
+        let caller_budget = Duration::from_millis(250);
+        let result = registry
+            .resolve_peer(
+                &name,
+                wire::PinnedPeer {
+                    pid: 123,
+                    start_time_ticks: 456,
+                    cgroup: "/system.slice/example.scope".to_string(),
+                    namespaces: None,
+                },
+                RequestBudget::starting_now(caller_budget),
+            )
+            .await;
+        assert_eq!(result, Err(RealmError::Unavailable));
+        let budgets = connector
+            .observed_budgets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        assert_eq!(budgets.len(), 2);
+        assert!(!budgets[1].is_zero());
+        assert!(
+            budgets[1] <= caller_budget,
+            "provider dispatch observes the caller's remaining budget"
+        );
     }
 
     #[tokio::test]

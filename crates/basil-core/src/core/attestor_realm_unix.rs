@@ -23,8 +23,8 @@ use super::catalog::evidence::SystemdEvidence;
 use super::process_evidence::{LinuxProcfs, PeerCredentials, PinnedProcess};
 use super::release_admission::{ArtifactRequirement, ReleaseAdmission, Sha256Digest};
 use crate::attestor_protocol::{
-    BrokerSession, CapturedUnixStream, InventoryResult, ProtocolLimits, QueryScope,
-    ResolvePeerResult, SessionAuthentication, VerifiedPeerBinding, wire,
+    BrokerSession, CapturedUnixStream, InventoryResult, ProtocolError, ProtocolLimits, QueryScope,
+    RequestBudget, ResolvePeerResult, SessionAuthentication, VerifiedPeerBinding, wire,
 };
 
 const ACL_ACCESS: &str = "system.posix_acl_access";
@@ -224,33 +224,48 @@ impl RealmSession for UnixBrokerRealmSession {
         self.inner.negotiated_capabilities()
     }
 
-    async fn health(&mut self) -> Result<wire::HealthFact, RealmError> {
+    async fn health(&mut self, budget: RequestBudget) -> Result<wire::HealthFact, RealmError> {
         let result = self
             .inner
-            .health()
+            .health(budget)
             .await
-            .map_err(|_| RealmError::Protocol)?;
+            .map_err(|error| protocol_error(&error))?;
         result.health.ok_or(RealmError::Health)
     }
 
     async fn resolve_peer(
         &mut self,
         peer: wire::PinnedPeer,
+        budget: RequestBudget,
     ) -> Result<ResolvePeerResult, RealmError> {
         self.inner
-            .resolve_peer(peer)
+            .resolve_peer(peer, budget)
             .await
-            .map_err(|_| RealmError::Protocol)
+            .map_err(|error| protocol_error(&error))
     }
 
-    async fn query_instances(&mut self, scope: QueryScope) -> Result<InventoryResult, RealmError> {
+    async fn query_instances(
+        &mut self,
+        scope: QueryScope,
+        budget: RequestBudget,
+    ) -> Result<InventoryResult, RealmError> {
         self.inner
-            .query_instances(scope)
+            .query_instances(scope, budget)
             .await
-            .map_err(|_| RealmError::Protocol)
+            .map_err(|error| protocol_error(&error))
     }
 
     async fn close(&mut self) {}
+}
+
+/// Map a protocol failure to its disclosure-safe realm error, preserving the
+/// distinct pre-dispatch budget-exhaustion case.
+const fn protocol_error(error: &ProtocolError) -> RealmError {
+    if matches!(error, ProtocolError::BudgetExhausted) {
+        RealmError::BudgetExhausted
+    } else {
+        RealmError::Protocol
+    }
 }
 
 fn authenticate_socket_path(config: &RealmConfig) -> Result<SocketIdentity, RealmError> {
@@ -654,6 +669,19 @@ capabilities = ["health", "query-instances", "resolve-peer"]
             rustix::fs::XattrFlags::empty(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn protocol_error_mapping_preserves_budget_exhaustion() {
+        assert_eq!(
+            protocol_error(&ProtocolError::BudgetExhausted),
+            RealmError::BudgetExhausted
+        );
+        assert_eq!(
+            protocol_error(&ProtocolError::DeadlineExceeded),
+            RealmError::Protocol
+        );
+        assert_eq!(protocol_error(&ProtocolError::Closed), RealmError::Protocol);
     }
 
     #[test]
