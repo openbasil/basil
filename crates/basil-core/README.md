@@ -29,6 +29,7 @@ a structured audit record.
 | `core::process_evidence`                                                      | Pinned procfs identity, point-of-use credential refresh, caller/host ID mapping, and fail-closed domain resolution.              |
 | `core::attestor_realm`                                                        | Protected realm schema, serial attestor sessions, isolated readiness, and failure-atomic candidate qualification.               |
 | `attestor_protocol`                                                           | Framed private protocol with bounded serial health, peer-resolution, and inventory operations.                                  |
+| `core::authority_install`                                                     | External authority installation transaction: staged manifests, fsynced commit-intent journal, and startup/doctor reconciliation. |
 | `runtime_attestor`                                                            | Facts-only runtime providers for rootful Docker and per-owner rootless Podman on cgroup v2.                                     |
 | `core::oci_verification`                                                      | Repository-scoped Sigstore policy, isolated exact-path Cosign execution, and independent OCI digest-chain verification.         |
 | `core::oci_evidence_cache`                                                    | Private bounded OCI evidence persistence, current-generation local revalidation, refresh health, and preview-first pruning.     |

@@ -216,6 +216,15 @@ pub enum RealmProvider {
 }
 
 impl RealmProvider {
+    /// Canonical kebab-case configuration spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Docker => "docker",
+            Self::Podman => "podman",
+        }
+    }
+
     const fn wire_runtime(self) -> wire::RuntimeKind {
         match self {
             Self::Docker => wire::RuntimeKind::Docker,
@@ -236,6 +245,15 @@ pub enum RealmMode {
 }
 
 impl RealmMode {
+    /// Canonical kebab-case configuration spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RootfulHost => "rootful-host",
+            Self::RootlessOwner => "rootless-owner",
+        }
+    }
+
     const fn wire_runtime(self) -> wire::RuntimeMode {
         match self {
             Self::RootfulHost => wire::RuntimeMode::Rootful,
@@ -1839,10 +1857,60 @@ pub struct PreparedReload {
 }
 
 impl PreparedReload {
-    /// Revalidate immutable receipts and publish all candidate realm routes or
-    /// none of them.
-    #[allow(clippy::too_many_lines)]
-    pub async fn commit(mut self) -> Result<u64, RealmError> {
+    /// Revalidate every immutable receipt and staged binding without
+    /// publishing or mutating anything.
+    ///
+    /// This is the final pre-commit comparison of the external authority
+    /// installation transaction: it runs before the commit-intent receipt is
+    /// requested, so every staleness dimension — preparation reservation,
+    /// base generation, realm revision, actor version, release lifecycle,
+    /// active release reference, socket identity, peer binding, and
+    /// qualified-epoch slot state — rejects before intent without disturbing
+    /// the old serving session. [`Self::commit`] repeats the identical
+    /// checks under the same lock immediately before the swap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RealmError::QualificationRequired`] for a non-activatable
+    /// preparation and [`RealmError::Stale`] for any staleness dimension.
+    pub async fn revalidate_for_intent(&self) -> Result<(), RealmError> {
+        self.revalidate_receipts().await?;
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.locked_staleness_checks(&state)
+    }
+
+    /// The exact fingerprint of the qualified candidate corpus: every change
+    /// name bound to its staged admitted artifact digest.
+    #[must_use]
+    pub fn corpus_fingerprint(&self) -> Sha256Digest {
+        use sha2::Digest as _;
+        let mut hasher = sha2::Sha256::new();
+        for change in &self.changes {
+            let name = change.name.as_str();
+            hasher.update(u64::try_from(name.len()).unwrap_or(u64::MAX).to_be_bytes());
+            hasher.update(name.as_bytes());
+            match self.staged.get(&change.name) {
+                Some(staged) => {
+                    hasher.update([1_u8]);
+                    hasher.update(staged.digest.as_bytes());
+                }
+                None => hasher.update([0_u8]),
+            }
+        }
+        Sha256Digest::from_bytes(hasher.finalize().into())
+    }
+
+    /// The generation this preparation publishes on commit.
+    #[must_use]
+    pub const fn candidate_generation(&self) -> u64 {
+        self.candidate_generation
+    }
+
+    async fn revalidate_receipts(&self) -> Result<(), RealmError> {
         if !self.activatable {
             return Err(RealmError::QualificationRequired);
         }
@@ -1858,6 +1926,54 @@ impl PreparedReload {
                     .await?;
             }
         }
+        Ok(())
+    }
+
+    fn locked_staleness_checks(&self, state: &RegistryState) -> Result<(), RealmError> {
+        if state.generation != self.base_generation
+            || self.admission.snapshot().lifecycle_version != self.lifecycle_version
+        {
+            return Err(RealmError::Stale);
+        }
+        for change in &self.changes {
+            if state.reservations.get(&change.name) != Some(&self.prepare_id) {
+                return Err(RealmError::Stale);
+            }
+            if let Some(entry) = state.entries.get(&change.name) {
+                let expected_actor = self
+                    .staged
+                    .get(&change.name)
+                    .map_or(change.old_actor_version, |staged| {
+                        staged.expected_actor_version
+                    });
+                if entry.revision != change.old_revision || entry.actor_version != expected_actor {
+                    return Err(RealmError::Stale);
+                }
+            }
+            if let Some(staged) = self.staged.get(&change.name) {
+                let session = staged
+                    .slot
+                    .inner
+                    .try_lock()
+                    .map_err(|_| RealmError::Stale)?;
+                if session.socket_identity != staged.socket_identity
+                    || session.peer_binding != staged.peer_binding
+                    || session.active_artifact.release() != &staged.release
+                    || session.active_artifact.artifact().digest() != staged.digest
+                {
+                    return Err(RealmError::Stale);
+                }
+                drop(session);
+            }
+        }
+        Ok(())
+    }
+
+    /// Revalidate immutable receipts and publish all candidate realm routes or
+    /// none of them.
+    #[allow(clippy::too_many_lines)]
+    pub async fn commit(mut self) -> Result<u64, RealmError> {
+        self.revalidate_receipts().await?;
 
         let mut draining = Vec::new();
         {
@@ -1866,44 +1982,7 @@ impl PreparedReload {
                 .state
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            if state.generation != self.base_generation
-                || self.admission.snapshot().lifecycle_version != self.lifecycle_version
-            {
-                return Err(RealmError::Stale);
-            }
-            for change in &self.changes {
-                if state.reservations.get(&change.name) != Some(&self.prepare_id) {
-                    return Err(RealmError::Stale);
-                }
-                if let Some(entry) = state.entries.get(&change.name) {
-                    let expected_actor = self
-                        .staged
-                        .get(&change.name)
-                        .map_or(change.old_actor_version, |staged| {
-                            staged.expected_actor_version
-                        });
-                    if entry.revision != change.old_revision
-                        || entry.actor_version != expected_actor
-                    {
-                        return Err(RealmError::Stale);
-                    }
-                }
-                if let Some(staged) = self.staged.get(&change.name) {
-                    let session = staged
-                        .slot
-                        .inner
-                        .try_lock()
-                        .map_err(|_| RealmError::Stale)?;
-                    if session.socket_identity != staged.socket_identity
-                        || session.peer_binding != staged.peer_binding
-                        || session.active_artifact.release() != &staged.release
-                        || session.active_artifact.artifact().digest() != staged.digest
-                    {
-                        return Err(RealmError::Stale);
-                    }
-                    drop(session);
-                }
-            }
+            self.locked_staleness_checks(&state)?;
 
             for (name, config) in self.candidate.iter() {
                 if let Some(change) = self.changes.iter().find(|change| &change.name == name) {
@@ -2022,6 +2101,21 @@ impl Drop for PreparedReload {
             )
             .await;
         });
+    }
+}
+
+#[async_trait]
+impl crate::core::authority_install::CandidatePromotion for PreparedReload {
+    async fn revalidate(&self) -> Result<(), RealmError> {
+        self.revalidate_for_intent().await
+    }
+
+    fn corpus_fingerprint(&self) -> Sha256Digest {
+        Self::corpus_fingerprint(self)
+    }
+
+    async fn publish(self: Box<Self>) -> Result<u64, RealmError> {
+        (*self).commit().await
     }
 }
 
@@ -2366,6 +2460,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use crate::core::authority_install;
     use crate::release_admission::{
         ArtifactRequirement, HistoricalReleaseIdentityCheck, ProductId, ReleaseArtifact, ReleaseId,
         VerifiedReleaseManifest,
@@ -2447,7 +2542,7 @@ socketAcl = "basil-attestor-control-g{generation}"
         )
     }
 
-    fn admission() -> Arc<ReleaseAdmission> {
+    fn release_manifest(release: &str) -> VerifiedReleaseManifest {
         let capabilities = CapabilitySet::try_from_iter(
             KNOWN_CAPABILITIES
                 .iter()
@@ -2465,14 +2560,17 @@ socketAcl = "basil-attestor-control-g{generation}"
                     capabilities.clone(),
                 )
             });
-        let manifest = VerifiedReleaseManifest::from_verified_parts(
+        VerifiedReleaseManifest::from_verified_parts(
             HistoricalReleaseIdentityCheck::completed(),
             ProductId::new("basil").expect("valid product"),
-            ReleaseId::new("1.0.0").expect("valid release"),
+            ReleaseId::new(release).expect("valid release"),
             artifacts,
         )
-        .expect("valid manifest");
-        Arc::new(ReleaseAdmission::new(manifest))
+        .expect("valid manifest")
+    }
+
+    fn admission() -> Arc<ReleaseAdmission> {
+        Arc::new(ReleaseAdmission::new(release_manifest("1.0.0")))
     }
 
     #[derive(Clone, Copy)]
@@ -3569,5 +3667,589 @@ socketAcl = "basil-attestor-control-g{generation}"
             .await
             .expect("re-add commits");
         assert_eq!(registry.lock_state().entries[&name].revision, 2);
+    }
+
+    // --- SPEC conformance tests 6 and 8: prepared-receipt staleness and
+    // --- reservations (basil-q5we) ---
+
+    async fn booted_prepare() -> (
+        RealmRegistry,
+        Arc<FakeConnector>,
+        Arc<ReleaseAdmission>,
+        RealmName,
+        PreparedReload,
+    ) {
+        let realms =
+            RealmSet::from_bootstrap(&bootstrap(&rootless(1000, 1))).expect("valid realms");
+        let name = RealmName::new("owner-podman").expect("valid realm");
+        let registry = RealmRegistry::new(&realms, 1).expect("valid registry");
+        let connector = Arc::new(FakeConnector::new([FakePlan::Success, FakePlan::Success]));
+        let admission = admission();
+        registry
+            .connect_realm(&name, connector.as_ref(), admission.as_ref())
+            .await
+            .expect("initial connection");
+        let candidate =
+            RealmSet::from_bootstrap(&bootstrap(&rootless(1000, 2))).expect("valid candidate");
+        let prepared = registry
+            .prepare_reload(
+                candidate,
+                Arc::clone(&connector) as Arc<dyn RealmConnector>,
+                Arc::clone(&admission),
+                false,
+            )
+            .await
+            .expect("candidate qualifies");
+        (registry, connector, admission, name, prepared)
+    }
+
+    #[tokio::test]
+    async fn prepared_receipt_registry_staleness_rejects_before_intent() {
+        let (registry, _connector, _admission, name, prepared) = booted_prepare().await;
+        prepared
+            .revalidate_for_intent()
+            .await
+            .expect("fresh preparation revalidates");
+
+        // Stale base generation.
+        registry.lock_state().generation = 9;
+        assert_eq!(
+            prepared.revalidate_for_intent().await,
+            Err(RealmError::Stale)
+        );
+        registry.lock_state().generation = 1;
+
+        // Stale realm revision.
+        {
+            let mut state = registry.lock_state();
+            state.entries.get_mut(&name).expect("entry").revision += 1;
+        }
+        assert_eq!(
+            prepared.revalidate_for_intent().await,
+            Err(RealmError::Stale)
+        );
+        {
+            let mut state = registry.lock_state();
+            state.entries.get_mut(&name).expect("entry").revision -= 1;
+        }
+
+        // Stale actor version.
+        {
+            let mut state = registry.lock_state();
+            state.entries.get_mut(&name).expect("entry").actor_version += 1;
+        }
+        assert_eq!(
+            prepared.revalidate_for_intent().await,
+            Err(RealmError::Stale)
+        );
+        {
+            let mut state = registry.lock_state();
+            state.entries.get_mut(&name).expect("entry").actor_version -= 1;
+        }
+
+        // Lost preparation reservation.
+        let lease = registry
+            .lock_state()
+            .reservations
+            .remove(&name)
+            .expect("reserved realm");
+        assert_eq!(
+            prepared.revalidate_for_intent().await,
+            Err(RealmError::Stale)
+        );
+        registry
+            .lock_state()
+            .reservations
+            .insert(name.clone(), lease);
+
+        // Every rejection happened before intent and never disturbed the old
+        // serving session.
+        prepared
+            .revalidate_for_intent()
+            .await
+            .expect("restored state revalidates");
+        assert_eq!(registry.generation(), 1);
+        assert_eq!(registry.statuses()[0].state, RealmState::Ready);
+        assert_eq!(registry.statuses()[0].session_epoch, 1);
+        drop(prepared);
+        tokio::task::yield_now().await;
+        assert_eq!(registry.generation(), 1);
+        assert_eq!(registry.statuses()[0].state, RealmState::Ready);
+    }
+
+    #[tokio::test]
+    async fn prepared_receipt_lifecycle_staleness_rejects_before_intent() {
+        let (registry, _connector, admission, _name, prepared) = booted_prepare().await;
+        admission
+            .promote(release_manifest("1.0.1"))
+            .expect("release lifecycle transition");
+        assert_eq!(
+            prepared.revalidate_for_intent().await,
+            Err(RealmError::Stale)
+        );
+        drop(prepared);
+        tokio::task::yield_now().await;
+        assert_eq!(registry.generation(), 1);
+        assert_eq!(registry.statuses()[0].state, RealmState::Ready);
+        assert_eq!(registry.statuses()[0].session_epoch, 1);
+    }
+
+    #[tokio::test]
+    async fn prepared_receipt_session_staleness_rejects_before_intent() {
+        let (registry, _connector, _admission, name, prepared) = booted_prepare().await;
+
+        // Stale staged socket identity.
+        let staged_epoch = {
+            let staged = prepared.staged.get(&name).expect("staged session");
+            let mut session = staged.slot.inner.try_lock().expect("free staged slot");
+            let original = session.socket_identity.inode;
+            session.socket_identity.inode = original + 900;
+            original
+        };
+        assert_eq!(
+            prepared.revalidate_for_intent().await,
+            Err(RealmError::Stale)
+        );
+
+        // Stale peer binding.
+        {
+            let staged = prepared.staged.get(&name).expect("staged session");
+            let mut session = staged.slot.inner.try_lock().expect("free staged slot");
+            session.socket_identity.inode = staged_epoch;
+            session.peer_binding = VerifiedPeerBinding::from_authenticator([0xAA; 32]);
+        }
+        assert_eq!(
+            prepared.revalidate_for_intent().await,
+            Err(RealmError::Stale)
+        );
+        {
+            let staged = prepared.staged.get(&name).expect("staged session");
+            let mut session = staged.slot.inner.try_lock().expect("free staged slot");
+            session.peer_binding = staged.peer_binding;
+        }
+
+        // Qualified-epoch slot held elsewhere.
+        let guard = prepared
+            .staged
+            .get(&name)
+            .expect("staged session")
+            .slot
+            .inner
+            .try_lock()
+            .expect("free staged slot");
+        assert_eq!(
+            prepared.revalidate_for_intent().await,
+            Err(RealmError::Stale)
+        );
+        drop(guard);
+
+        // Restored: the preparation revalidates and the old session was
+        // never disturbed.
+        prepared
+            .revalidate_for_intent()
+            .await
+            .expect("restored staged session revalidates");
+        assert_eq!(registry.generation(), 1);
+        assert_eq!(registry.statuses()[0].session_epoch, 1);
+    }
+
+    fn two_realm_body(rootful_generation: u64, rootless_generation: u64) -> String {
+        let mut body = realm_body(
+            "production-docker",
+            "docker",
+            "rootful-host",
+            992,
+            "docker-attestor",
+            rootful_generation,
+        );
+        body.push_str(&rootless(1000, rootless_generation));
+        body
+    }
+
+    #[tokio::test]
+    async fn preparation_conflict_releases_partial_reservations() {
+        let realms =
+            RealmSet::from_bootstrap(&bootstrap(&two_realm_body(1, 1))).expect("valid realms");
+        let docker = RealmName::new("production-docker").expect("valid realm");
+        let podman = RealmName::new("owner-podman").expect("valid realm");
+        let registry = RealmRegistry::new(&realms, 1).expect("valid registry");
+        let connector = Arc::new(FakeConnector::new([]));
+        let admission = admission();
+        for name in [&docker, &podman] {
+            registry
+                .connect_realm(name, connector.as_ref(), admission.as_ref())
+                .await
+                .expect("initial connection");
+        }
+
+        // First preparation reserves only the docker realm.
+        let first_candidate =
+            RealmSet::from_bootstrap(&bootstrap(&two_realm_body(2, 1))).expect("valid candidate");
+        let first = registry
+            .prepare_reload(
+                first_candidate,
+                Arc::clone(&connector) as Arc<dyn RealmConnector>,
+                Arc::clone(&admission),
+                false,
+            )
+            .await
+            .expect("first preparation");
+
+        // The second preparation reserves the podman realm, then conflicts
+        // on the docker realm and must release its partial reservation.
+        let second_candidate =
+            RealmSet::from_bootstrap(&bootstrap(&two_realm_body(3, 2))).expect("valid candidate");
+        let error = registry
+            .prepare_reload(
+                second_candidate.clone(),
+                Arc::clone(&connector) as Arc<dyn RealmConnector>,
+                Arc::clone(&admission),
+                false,
+            )
+            .await
+            .err()
+            .expect("conflicting preparation rejects");
+        assert!(matches!(error, RealmError::PreparationConflict));
+        {
+            let state = registry.lock_state();
+            let docker_reserved = state.reservations.contains_key(&docker);
+            let podman_reserved = state.reservations.contains_key(&podman);
+            drop(state);
+            assert!(docker_reserved, "owner keeps its lease");
+            assert!(
+                !podman_reserved,
+                "partial reservation is released on conflict"
+            );
+        }
+
+        // Old authority was never denied during the conflict.
+        assert!(
+            registry
+                .statuses()
+                .iter()
+                .all(|status| status.state == RealmState::Ready)
+        );
+
+        // Cancellation releases every reservation.
+        drop(first);
+        tokio::task::yield_now().await;
+        assert!(registry.lock_state().reservations.is_empty());
+        let retry = registry
+            .prepare_reload(
+                second_candidate,
+                Arc::clone(&connector) as Arc<dyn RealmConnector>,
+                Arc::clone(&admission),
+                false,
+            )
+            .await
+            .expect("released reservations allow a new preparation");
+        drop(retry);
+        tokio::task::yield_now().await;
+    }
+
+    #[tokio::test]
+    async fn added_realm_preparation_cleanup_is_provisional() {
+        let realms =
+            RealmSet::from_bootstrap(&bootstrap(&rootless(1000, 1))).expect("valid realms");
+        let podman = RealmName::new("owner-podman").expect("valid realm");
+        let docker = RealmName::new("production-docker").expect("valid realm");
+        let registry = RealmRegistry::new(&realms, 1).expect("valid registry");
+        let connector = Arc::new(FakeConnector::new([]));
+        let admission = admission();
+        registry
+            .connect_realm(&podman, connector.as_ref(), admission.as_ref())
+            .await
+            .expect("initial connection");
+
+        let candidate =
+            RealmSet::from_bootstrap(&bootstrap(&two_realm_body(1, 1))).expect("valid candidate");
+        let prepared = registry
+            .prepare_reload(
+                candidate,
+                Arc::clone(&connector) as Arc<dyn RealmConnector>,
+                Arc::clone(&admission),
+                false,
+            )
+            .await
+            .expect("added-realm preparation");
+        // The provisional added realm never serves early.
+        assert_eq!(registry.statuses().len(), 1);
+        drop(prepared);
+        tokio::task::yield_now().await;
+        assert!(!registry.lock_state().entries.contains_key(&docker));
+        assert_eq!(registry.statuses().len(), 1);
+        assert_eq!(registry.statuses()[0].state, RealmState::Ready);
+        assert_eq!(registry.generation(), 1);
+    }
+
+    #[tokio::test]
+    async fn unchanged_realm_is_undisturbed_and_old_serves_during_qualification() {
+        let realms =
+            RealmSet::from_bootstrap(&bootstrap(&two_realm_body(1, 1))).expect("valid realms");
+        let docker = RealmName::new("production-docker").expect("valid realm");
+        let registry = RealmRegistry::new(&realms, 1).expect("valid registry");
+        let connector = Arc::new(FakeConnector::new([]));
+        let admission = admission();
+        for name in ["production-docker", "owner-podman"] {
+            let name = RealmName::new(name).expect("valid realm");
+            registry
+                .connect_realm(&name, connector.as_ref(), admission.as_ref())
+                .await
+                .expect("initial connection");
+        }
+
+        // Change only the podman realm; the docker realm is unchanged.
+        let candidate =
+            RealmSet::from_bootstrap(&bootstrap(&two_realm_body(1, 2))).expect("valid candidate");
+        let prepared = registry
+            .prepare_reload(
+                candidate,
+                Arc::clone(&connector) as Arc<dyn RealmConnector>,
+                Arc::clone(&admission),
+                false,
+            )
+            .await
+            .expect("candidate qualifies");
+        // Valid old authority is not denied during qualification.
+        let readiness = registry.readiness();
+        assert_eq!(readiness.ready, 2);
+        assert_eq!(readiness.total, 2);
+        assert!(registry.statuses().iter().all(|status| {
+            status.state == RealmState::Ready && status.session_epoch == 1 && status.generation == 1
+        }));
+
+        assert_eq!(prepared.commit().await.expect("commit"), 2);
+        tokio::task::yield_now().await;
+        // The unchanged realm carries the new generation without a session
+        // disturbance.
+        let statuses = registry.statuses();
+        let unchanged = statuses
+            .iter()
+            .find(|status| status.name == docker)
+            .expect("unchanged realm status");
+        assert_eq!(unchanged.generation, 2);
+        assert_eq!(unchanged.session_epoch, 1);
+        assert_eq!(unchanged.state, RealmState::Ready);
+    }
+
+    // --- SPEC test 5/7 integration: the installation transaction drives a
+    // --- real registry promotion (basil-q5we) ---
+
+    #[derive(Default)]
+    struct InlineInstaller {
+        records: Mutex<Vec<authority_install::JournalRecord>>,
+    }
+
+    #[async_trait]
+    impl authority_install::InstallerAuthority for InlineInstaller {
+        async fn stage_manifest(
+            &self,
+            receipt: &authority_install::StagedReceipt,
+            _manifest: &authority_install::StagedManifest,
+        ) -> Result<(), authority_install::InstallError> {
+            self.records
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(authority_install::JournalRecord::Staged(receipt.clone()));
+            Ok(())
+        }
+
+        async fn load_lsm_additive(
+            &self,
+            _manifest: &authority_install::StagedManifest,
+        ) -> Result<(), authority_install::InstallError> {
+            Ok(())
+        }
+
+        async fn daemon_reload(&self) -> Result<(), authority_install::InstallError> {
+            Ok(())
+        }
+
+        async fn install_helper_generation(
+            &self,
+            _manifest: &authority_install::StagedManifest,
+        ) -> Result<(), authority_install::InstallError> {
+            Ok(())
+        }
+
+        async fn start_candidate(
+            &self,
+            _manifest: &authority_install::StagedManifest,
+        ) -> Result<(), authority_install::InstallError> {
+            Ok(())
+        }
+
+        async fn append_commit_intent(
+            &self,
+            receipt: &authority_install::IntentReceipt,
+        ) -> authority_install::IntentAck {
+            self.records
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(authority_install::JournalRecord::Intent(receipt.clone()));
+            authority_install::IntentAck::Durable
+        }
+
+        async fn intent_status(
+            &self,
+            transaction: authority_install::TransactionId,
+        ) -> Result<authority_install::IntentStatus, authority_install::InstallError> {
+            let readout = authority_install::JournalReadout {
+                records: self
+                    .records
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone(),
+                torn_tail: false,
+            };
+            if readout.intent_for(transaction).is_some() {
+                Ok(authority_install::IntentStatus::Durable)
+            } else {
+                Ok(authority_install::IntentStatus::Unknown)
+            }
+        }
+
+        async fn finalize_active(
+            &self,
+            receipt: &authority_install::ActiveReceipt,
+        ) -> Result<(), authority_install::InstallError> {
+            self.records
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(authority_install::JournalRecord::Active(receipt.clone()));
+            Ok(())
+        }
+
+        async fn retire_generation(
+            &self,
+            receipt: &authority_install::RetiredReceipt,
+        ) -> Result<(), authority_install::InstallError> {
+            self.records
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(authority_install::JournalRecord::Retired(receipt.clone()));
+            Ok(())
+        }
+
+        async fn discard_staged(
+            &self,
+            _transaction: authority_install::TransactionId,
+        ) -> Result<(), authority_install::InstallError> {
+            Ok(())
+        }
+
+        async fn read_journal(
+            &self,
+        ) -> Result<authority_install::JournalReadout, authority_install::InstallError> {
+            Ok(authority_install::JournalReadout {
+                records: self
+                    .records
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone(),
+                torn_tail: false,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn authority_installation_transaction_commits_through_registry() {
+        use crate::core::authority_install::{
+            CandidatePromotion, InstallOutcome, InstallationRequest, InstallerAuthority as _,
+            PreviousAuthority, StagedManifest, TransactionId, reconcile,
+        };
+        let realms =
+            RealmSet::from_bootstrap(&bootstrap(&rootless(1000, 1))).expect("valid realms");
+        let name = RealmName::new("owner-podman").expect("valid realm");
+        let registry = RealmRegistry::new(&realms, 1).expect("valid registry");
+        let connector = Arc::new(FakeConnector::new([]));
+        let admission = admission();
+        registry
+            .connect_realm(&name, connector.as_ref(), admission.as_ref())
+            .await
+            .expect("initial connection");
+
+        let candidate =
+            RealmSet::from_bootstrap(&bootstrap(&rootless(1000, 2))).expect("valid candidate");
+        let old_config = realms.get(&name).expect("old realm config");
+        let new_config = candidate.get(&name).expect("candidate realm config");
+        let previous_manifest =
+            StagedManifest::stage(&name, old_config, BTreeMap::new(), &[], None)
+                .expect("previous manifest")
+                .manifest_id();
+        let retained = vec![authority_install::RetainedGeneration {
+            generation: old_config.measurement.authority_generation,
+            manifest: previous_manifest,
+            runtime_directory: old_config.measurement.runtime_directory.clone(),
+            socket_path: old_config.measurement.socket_path.clone(),
+        }];
+        let manifest = StagedManifest::stage(
+            &name,
+            new_config,
+            BTreeMap::new(),
+            &retained,
+            Some(previous_manifest),
+        )
+        .expect("staged candidate manifest");
+
+        // The expected candidate corpus: one changed realm bound to its
+        // staged admitted-artifact digest.
+        let mut hasher = Sha256::new();
+        hasher.update(
+            u64::try_from(name.as_str().len())
+                .expect("bounded")
+                .to_be_bytes(),
+        );
+        hasher.update(name.as_str().as_bytes());
+        hasher.update([1_u8]);
+        hasher.update([7_u8; 32]);
+        let corpus = Sha256Digest::from_bytes(hasher.finalize().into());
+
+        let transaction = TransactionId::from_bytes([42; 16]);
+        let request = InstallationRequest {
+            transaction,
+            manifest,
+            candidate_corpus: corpus,
+            configuration_generation: Sha256Digest::from_bytes([11; 32]),
+            previous: Some(PreviousAuthority {
+                manifest: previous_manifest,
+                generation: old_config.measurement.authority_generation,
+                helper_policy_generation: old_config.measurement.helper_policy_generation,
+            }),
+            drain_deadline: Duration::from_secs(30),
+        };
+
+        let installer = InlineInstaller::default();
+        let qualify_registry = registry.clone();
+        let qualify_connector = Arc::clone(&connector) as Arc<dyn RealmConnector>;
+        let qualify_admission = Arc::clone(&admission);
+        let outcome =
+            authority_install::run_installation(&installer, request, move || async move {
+                let prepared = qualify_registry
+                    .prepare_reload(candidate, qualify_connector, qualify_admission, false)
+                    .await?;
+                Ok(Box::new(prepared) as Box<dyn CandidatePromotion>)
+            })
+            .await;
+
+        let InstallOutcome::Committed(committed) = outcome else {
+            panic!("installation must commit through the registry");
+        };
+        assert_eq!(committed.serving_generation, 2);
+        assert_eq!(registry.generation(), 2);
+        tokio::task::yield_now().await;
+        assert_eq!(registry.statuses()[0].session_epoch, 2);
+        let readout = installer.read_journal().await.expect("journal");
+        assert!(readout.intent_for(transaction).is_some());
+        assert!(readout.active_for(transaction).is_some());
+        let plan = reconcile(&readout).expect("reconcile plan");
+        assert!(plan.ready());
+        assert!(matches!(
+            plan.actions[..],
+            [authority_install::ReconcileAction::RecoverActive {
+                retirement_pending: true,
+                ..
+            }]
+        ));
     }
 }
