@@ -72,6 +72,14 @@ broker, and
 [make it your own](https://docs.openbasil.org/getting-started/make-it-your-own/)
 covers writing your own catalog and policy.
 
+## Rotate the built-in keystore DEK
+
+The `basil keystore rekey` command surface is reserved but currently fails
+closed pending `basil-w37e`. `db-keystore` 0.4.4 copies DEKs and credential
+secrets through ordinary non-zeroizing Turso `String` and `Vec` values during
+rekey. Basil will enable the command only after a released upstream version
+provides an end-to-end zeroizing boundary.
+
 ## Install
 
 | Method        | Command                                                                                                    |

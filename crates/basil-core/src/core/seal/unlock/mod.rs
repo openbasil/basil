@@ -84,4 +84,19 @@ pub trait UnlockMethod: Send + Sync {
         header_aad: &[u8],
         slot_id: u32,
     ) -> Result<(format::MethodParams, format::KekWrap), UnlockError>;
+
+    /// Rewrap an existing slot under new header AAD while preserving that slot's
+    /// exact non-secret protection parameters (for example Argon2 cost or TPM PCR
+    /// selection). Implementations may refresh salts, nonces, and sealed objects.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `slot` has parameters for another method or the
+    /// underlying wrap operation fails.
+    fn rewrap_kek(
+        &self,
+        slot: &format::Slot,
+        kek: &MasterKek,
+        header_aad: &[u8],
+    ) -> Result<(format::MethodParams, format::KekWrap), UnlockError>;
 }

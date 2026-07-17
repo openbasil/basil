@@ -22,6 +22,11 @@ pub mod deposit;
 pub mod format;
 pub mod unlock;
 
+use std::ffi::{OsStr, OsString};
+use std::path::{Component, Path};
+
+use rand::RngCore as _;
+use rustix::fd::OwnedFd;
 use zeroize::Zeroizing;
 
 pub use cred::{BackendCred, CRED_SCHEMA_VERSION, CredBundle, DepositContributor};
@@ -172,9 +177,8 @@ pub fn seal(payload: &CredBundle, specs: &[SlotSpec<'_>]) -> Result<Vec<u8>, Sea
 /// recovers the master KEK on first success, decrypts the payload, then
 /// **zeroizes the KEK**.
 ///
-/// `methods` maps a [`MethodKind`] to a configured [`UnlockMethod`] able to
-/// recover that slot (e.g. a `Bip39Method` holding the operator's phrase). A
-/// `None` entry (or absent kind) means that method is not available this boot.
+/// `methods` retains every configured [`UnlockMethod`], including independent
+/// same-kind secrets. Each slot tries all methods of its kind until one opens it.
 ///
 /// # Errors
 /// [`SealError::NoSlotOpened`] if nothing opens (fail closed); [`SealError::AuthFailed`]
@@ -186,29 +190,36 @@ pub fn open_bundle(
     let header_aad = parsed.header_aad();
 
     for slot in &parsed.body.slots {
-        let Some(method) = openable_method(slot, methods, SlotLog::Open) else {
-            continue;
-        };
-        match method.recover_kek(slot, header_aad) {
-            Ok(kek) => {
-                tracing::info!(
-                    slot_id = slot.slot_id,
-                    method = %slot.method,
-                    "unlock slot opened"
-                );
-                let payload = decrypt_payload(&kek, header_aad, &parsed.body.payload)?;
-                // KEK zeroized here as `kek` drops at end of scope (Zeroizing).
-                drop(kek);
-                return Ok(payload);
+        let mut configured = false;
+        for method in methods.for_kind(slot.method) {
+            configured = true;
+            if !method.available() {
+                log_unavailable_method(slot);
+                continue;
             }
-            Err(e) => {
-                tracing::warn!(
-                    slot_id = slot.slot_id,
-                    method = %slot.method,
-                    error = %e,
-                    "unlock slot failed"
-                );
+            match method.recover_kek(slot, header_aad) {
+                Ok(kek) => {
+                    tracing::info!(
+                        slot_id = slot.slot_id,
+                        method = %slot.method,
+                        "unlock slot opened"
+                    );
+                    let payload = decrypt_payload(&kek, header_aad, &parsed.body.payload)?;
+                    drop(kek);
+                    return Ok(payload);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        slot_id = slot.slot_id,
+                        method = %slot.method,
+                        error = %e,
+                        "unlock slot failed"
+                    );
+                }
             }
+        }
+        if !configured {
+            log_missing_method(slot);
         }
     }
     Err(SealError::NoSlotOpened)
@@ -410,37 +421,216 @@ pub fn verify_epoch_sidecar(
     write_epoch_sidecar(sidecar_path, current)
 }
 
+fn normalized_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn io_format(operation: &str, error: rustix::io::Errno) -> SealError {
+    SealError::Format(format!("{operation}: {error}"))
+}
+
+fn pin_directory(path: &Path) -> Result<OwnedFd, SealError> {
+    let flags = rustix::fs::OFlags::RDONLY
+        | rustix::fs::OFlags::DIRECTORY
+        | rustix::fs::OFlags::CLOEXEC
+        | rustix::fs::OFlags::NOFOLLOW;
+    let mut directory = rustix::fs::open(
+        if path.is_absolute() {
+            Path::new("/")
+        } else {
+            Path::new(".")
+        },
+        flags,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|error| io_format("opening starting directory", error))?;
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => {
+                directory = rustix::fs::openat(&directory, name, flags, rustix::fs::Mode::empty())
+                    .map_err(|error| io_format("opening parent component", error))?;
+            }
+            Component::ParentDir => {
+                return Err(SealError::Format(
+                    "atomic write parent may not contain `..`".into(),
+                ));
+            }
+            Component::Prefix(_) => {
+                return Err(SealError::Format(
+                    "atomic write path prefix is unsupported".into(),
+                ));
+            }
+        }
+    }
+    Ok(directory)
+}
+
+pub(crate) struct PinnedPath {
+    parent: OwnedFd,
+    file_name: OsString,
+}
+
+impl PinnedPath {
+    pub(crate) fn new(path: &Path) -> Result<Self, SealError> {
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| SealError::Format("atomic write destination has no file name".into()))?
+            .to_os_string();
+        let parent = pin_directory(normalized_parent(path))?;
+        Ok(Self { parent, file_name })
+    }
+
+    pub(crate) fn open_lock(&self, suffix: &str) -> Result<std::fs::File, SealError> {
+        let name = suffixed_name(&self.file_name, suffix);
+        rustix::fs::openat(
+            &self.parent,
+            name,
+            rustix::fs::OFlags::RDWR
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::from_raw_mode(0o600),
+        )
+        .map(std::fs::File::from)
+        .map_err(|error| io_format("opening descriptor-relative lock", error))
+    }
+
+    pub(crate) fn write_0600(&self, bytes: &[u8]) -> Result<(), SealError> {
+        self.write_name(&self.file_name, bytes)
+    }
+
+    pub(crate) fn write_sibling_0600(&self, suffix: &str, bytes: &[u8]) -> Result<(), SealError> {
+        self.write_name(&suffixed_name(&self.file_name, suffix), bytes)
+    }
+
+    fn write_name(&self, destination: &OsStr, bytes: &[u8]) -> Result<(), SealError> {
+        let mut rng = rand::rngs::OsRng;
+        self.write_name_with_fill(destination, bytes, &mut |entropy| {
+            rng.try_fill_bytes(entropy)
+                .map_err(|_| SealError::Format("temporary-name randomness failed".into()))
+        })
+    }
+
+    fn write_name_with_fill(
+        &self,
+        destination: &OsStr,
+        bytes: &[u8],
+        fill: &mut impl FnMut(&mut [u8]) -> Result<(), SealError>,
+    ) -> Result<(), SealError> {
+        self.write_name_with_fill_and_hook(destination, bytes, fill, &mut || {})
+    }
+
+    fn write_name_with_fill_and_hook(
+        &self,
+        destination: &OsStr,
+        bytes: &[u8],
+        fill: &mut impl FnMut(&mut [u8]) -> Result<(), SealError>,
+        before_rename: &mut impl FnMut(),
+    ) -> Result<(), SealError> {
+        use std::io::Write as _;
+
+        for _ in 0..32 {
+            let temporary = temporary_name(destination, fill)?;
+            let owned = match rustix::fs::openat(
+                &self.parent,
+                &temporary,
+                rustix::fs::OFlags::WRONLY
+                    | rustix::fs::OFlags::CREATE
+                    | rustix::fs::OFlags::EXCL
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NOFOLLOW,
+                rustix::fs::Mode::from_raw_mode(0o600),
+            ) {
+                Ok(owned) => owned,
+                Err(rustix::io::Errno::EXIST) => continue,
+                Err(error) => return Err(io_format("opening private temp", error)),
+            };
+            let mut temporary_file = std::fs::File::from(owned);
+            let result = (|| {
+                temporary_file
+                    .write_all(bytes)
+                    .map_err(|error| SealError::Format(format!("private temp write: {error}")))?;
+                temporary_file
+                    .sync_all()
+                    .map_err(|error| SealError::Format(format!("private temp sync: {error}")))?;
+                drop(temporary_file);
+                before_rename();
+                rustix::fs::renameat(&self.parent, &temporary, &self.parent, destination)
+                    .map_err(|error| io_format("descriptor-relative rename", error))?;
+                rustix::fs::fsync(&self.parent)
+                    .map_err(|error| io_format("parent directory sync", error))
+            })();
+            if result.is_err() {
+                let _ =
+                    rustix::fs::unlinkat(&self.parent, &temporary, rustix::fs::AtFlags::empty());
+            }
+            return result;
+        }
+        Err(SealError::Format(
+            "could not allocate unique private temp file".into(),
+        ))
+    }
+}
+
+fn suffixed_name(name: &OsStr, suffix: &str) -> OsString {
+    let mut value = name.to_os_string();
+    value.push(suffix);
+    value
+}
+
+fn temporary_name(
+    destination: &OsStr,
+    fill: &mut impl FnMut(&mut [u8]) -> Result<(), SealError>,
+) -> Result<OsString, SealError> {
+    let mut entropy = [0u8; 8];
+    fill(&mut entropy)?;
+    Ok(suffixed_name(
+        destination,
+        &format!(
+            ".basil-write-{}-{:016x}.tmp",
+            std::process::id(),
+            u64::from_le_bytes(entropy)
+        ),
+    ))
+}
+
+/// Atomically replace an owner-only file in a pinned parent directory.
+pub(crate) fn atomic_write_0600(path: &Path, bytes: &[u8]) -> Result<(), SealError> {
+    PinnedPath::new(path)?.write_0600(bytes)
+}
+
+#[cfg(test)]
+fn atomic_write_0600_with_fill(
+    path: &Path,
+    bytes: &[u8],
+    fill: &mut impl FnMut(&mut [u8]) -> Result<(), SealError>,
+) -> Result<(), SealError> {
+    let target = PinnedPath::new(path)?;
+    let destination = target.file_name.clone();
+    target.write_name_with_fill(&destination, bytes, fill)
+}
+
+#[cfg(test)]
+fn atomic_write_0600_with_fill_and_hook(
+    path: &Path,
+    bytes: &[u8],
+    fill: &mut impl FnMut(&mut [u8]) -> Result<(), SealError>,
+    before_rename: &mut impl FnMut(),
+) -> Result<(), SealError> {
+    let target = PinnedPath::new(path)?;
+    let destination = target.file_name.clone();
+    target.write_name_with_fill_and_hook(&destination, bytes, fill, before_rename)
+}
+
 /// Write the bundle epoch sidecar as owner-only text.
 ///
 /// # Errors
-/// [`SealError::Format`] on sidecar IO errors.
-pub fn write_epoch_sidecar(sidecar_path: &std::path::Path, epoch: u64) -> Result<(), SealError> {
-    let tmp = sidecar_path.with_extension("epoch.tmp");
-    {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.create(true).write(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            opts.mode(0o600);
-        }
-        std::io::Write::write_all(
-            &mut opts
-                .open(&tmp)
-                .map_err(|e| SealError::Format(format!("epoch sidecar open: {e}")))?,
-            format!("{epoch}\n").as_bytes(),
-        )
-        .map_err(|e| SealError::Format(format!("epoch sidecar write: {e}")))?;
-    }
-    std::fs::rename(&tmp, sidecar_path)
-        .map_err(|e| SealError::Format(format!("epoch sidecar rename: {e}")))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(sidecar_path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| SealError::Format(format!("epoch sidecar chmod: {e}")))?;
-    }
-    Ok(())
+/// [`SealError::Format`] on sidecar IO or durability errors.
+pub fn write_epoch_sidecar(sidecar_path: &Path, epoch: u64) -> Result<(), SealError> {
+    atomic_write_0600(sidecar_path, format!("{epoch}\n").as_bytes())
 }
 
 /// Recover the master KEK from any openable slot (shared by add/reseal).
@@ -450,37 +640,15 @@ fn recover_any(
 ) -> Result<MasterKek, SealError> {
     let header_aad = parsed.header_aad();
     for slot in &parsed.body.slots {
-        let Some(method) = openable_method(slot, methods, SlotLog::Quiet) else {
-            continue;
-        };
-        if let Ok(kek) = recover_slot_kek(method, slot, header_aad) {
-            return Ok(kek);
+        for method in methods.for_kind(slot.method) {
+            if method.available()
+                && let Ok(kek) = recover_slot_kek(method, slot, header_aad)
+            {
+                return Ok(kek);
+            }
         }
     }
     Err(SealError::NoSlotOpened)
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SlotLog {
-    Open,
-    Quiet,
-}
-
-fn openable_method<'a>(
-    slot: &Slot,
-    methods: &MethodRegistry<'a>,
-    log: SlotLog,
-) -> Option<&'a dyn UnlockMethod> {
-    let method = methods.get(slot.method).or_else(|| {
-        log_missing_method(slot, log);
-        None
-    })?;
-    if method.available() {
-        Some(method)
-    } else {
-        log_unavailable_method(slot, log);
-        None
-    }
 }
 
 fn recover_slot_kek(
@@ -491,10 +659,7 @@ fn recover_slot_kek(
     method.recover_kek(slot, header_aad)
 }
 
-fn log_missing_method(slot: &Slot, log: SlotLog) {
-    if log != SlotLog::Open {
-        return;
-    }
+fn log_missing_method(slot: &Slot) {
     match slot.method {
         // Feature-off builds carry only the reserved fail-closed TPM method, so
         // a TPM slot is genuinely unimplemented on this build. With `unlock-tpm`
@@ -513,14 +678,12 @@ fn log_missing_method(slot: &Slot, log: SlotLog) {
     }
 }
 
-fn log_unavailable_method(slot: &Slot, log: SlotLog) {
-    if log == SlotLog::Open {
-        tracing::debug!(
-            slot_id = slot.slot_id,
-            method = %slot.method,
-            "slot method unavailable"
-        );
-    }
+fn log_unavailable_method(slot: &Slot) {
+    tracing::debug!(
+        slot_id = slot.slot_id,
+        method = %slot.method,
+        "slot method unavailable"
+    );
 }
 
 fn rewrap_slots(
@@ -529,10 +692,24 @@ fn rewrap_slots(
     kek: &MasterKek,
     header_aad: &[u8],
 ) -> Result<Vec<Slot>, SealError> {
+    let old_header_aad = parsed.header_aad();
     let mut slots = Vec::with_capacity(parsed.body.slots.len());
     for slot in &parsed.body.slots {
-        let method = methods.get(slot.method).ok_or(SealError::NoSlotOpened)?;
-        let (params, wrap) = method.wrap_kek(kek, header_aad, slot.slot_id)?;
+        let mut matched = None;
+        for method in methods.for_kind(slot.method) {
+            if !method.available() {
+                continue;
+            }
+            if let Ok(recovered) = method.recover_kek(slot, old_header_aad)
+                && recovered.as_bytes() == kek.as_bytes()
+            {
+                matched = Some(method);
+                drop(recovered);
+                break;
+            }
+        }
+        let method = matched.ok_or(SealError::NoSlotOpened)?;
+        let (params, wrap) = method.rewrap_kek(slot, kek, header_aad)?;
         slots.push(Slot {
             slot_id: slot.slot_id,
             method: slot.method,
@@ -577,46 +754,37 @@ fn decrypt_payload(
     serde_json::from_slice(&plaintext).map_err(|e| SealError::Payload(e.to_string()))
 }
 
-/// A registry of configured unlock methods, keyed by [`MethodKind`].
+/// A registry of configured unlock methods.
 ///
-/// The broker builds this from config at startup (which method has the phrase /
-/// recipient / key file this boot). `open_bundle` consults it per slot.
+/// Multiple methods of the same [`MethodKind`] are retained independently so a
+/// full epoch re-seal can identify and rewrap every same-kind slot with the
+/// out-of-band secret that actually opens it.
 #[derive(Default)]
 pub struct MethodRegistry<'a> {
-    age_yubikey: Option<&'a dyn UnlockMethod>,
-    bip39: Option<&'a dyn UnlockMethod>,
-    passphrase: Option<&'a dyn UnlockMethod>,
-    tpm: Option<&'a dyn UnlockMethod>,
+    methods: Vec<&'a dyn UnlockMethod>,
 }
 
 impl<'a> MethodRegistry<'a> {
     /// An empty registry (nothing available).
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub const fn new() -> Self {
+        Self {
+            methods: Vec::new(),
+        }
     }
 
-    /// Register a method under its kind (last registration wins).
+    /// Register one method without replacing earlier same-kind methods.
     #[must_use]
     pub fn with(mut self, method: &'a dyn UnlockMethod) -> Self {
-        match method.kind() {
-            MethodKind::AgeYubikey => self.age_yubikey = Some(method),
-            MethodKind::Bip39 => self.bip39 = Some(method),
-            MethodKind::Passphrase => self.passphrase = Some(method),
-            MethodKind::Tpm => self.tpm = Some(method),
-        }
+        self.methods.push(method);
         self
     }
 
-    /// The configured method for `kind`, if any.
-    #[must_use]
-    pub fn get(&self, kind: MethodKind) -> Option<&'a dyn UnlockMethod> {
-        match kind {
-            MethodKind::AgeYubikey => self.age_yubikey,
-            MethodKind::Bip39 => self.bip39,
-            MethodKind::Passphrase => self.passphrase,
-            MethodKind::Tpm => self.tpm,
-        }
+    fn for_kind(&self, kind: MethodKind) -> impl Iterator<Item = &'a dyn UnlockMethod> + '_ {
+        self.methods
+            .iter()
+            .copied()
+            .filter(move |method| method.kind() == kind)
     }
 }
 

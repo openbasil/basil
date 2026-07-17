@@ -63,6 +63,8 @@ async fn main() -> Result<()> {
         }
         Command::Agent(args) => agent_cli::run_agent(args, basil_bin::VERSION).await,
         Command::Bundle(command) => agent_cli::run_bundle(*command),
+        #[cfg(feature = "db-keystore")]
+        Command::Keystore(command) => basil_bin::run_keystore(*command),
         // Unified `explain`: offline file dry-run by default; `--live` queries the
         // running broker over the global `--socket` (needs the `explain` perm).
         Command::Explain(args) => {

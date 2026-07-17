@@ -81,6 +81,10 @@ pub enum Command {
     /// Create and manage a sealed credential bundle.
     #[command(subcommand)]
     Bundle(Box<bundle_cli::BundleCommand>),
+    /// Reserved built-in keystore maintenance surface; currently fails closed.
+    #[cfg(feature = "db-keystore")]
+    #[command(subcommand)]
+    Keystore(Box<basil_core::keystore_cli::KeystoreCommand>),
     /// Explain a policy decision: why a subject would be allowed or denied an op
     /// on a key. By DEFAULT this is an offline dry-run: it builds the PDP from
     /// the catalog + policy FILES on disk and evaluates the tuple through the same
@@ -193,6 +197,16 @@ pub fn cli() -> clap::Command {
     Cli::command()
 }
 
+/// Dispatch the reserved keystore surface without initializing configuration or logging.
+///
+/// # Errors
+///
+/// Always returns the stable rekey-disabled rejection.
+#[cfg(feature = "db-keystore")]
+pub fn run_keystore(command: basil_core::keystore_cli::KeystoreCommand) -> anyhow::Result<()> {
+    basil_core::keystore_cli::run(command)
+}
+
 /// Render the completion script for `shell` and write it to `out`.
 ///
 /// Generation goes through an in-memory buffer so a closed pipe (`basil
@@ -226,6 +240,42 @@ mod tests {
             "passphrase:file=/run/pass",
         ]);
         assert!(matches!(cli.command, Command::Bundle(_)));
+    }
+
+    #[cfg(feature = "db-keystore")]
+    #[test]
+    fn keystore_rekey_dispatch_rejects_before_config_or_filesystem_access() {
+        let root = std::env::temp_dir().join(format!(
+            "basil-disabled-rekey-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time after epoch")
+                .as_nanos()
+        ));
+        let config = root.join("config.toml");
+        let dek = root.join("new-dek");
+        let passphrase = root.join("passphrase");
+        let cli = Cli::try_parse_from([
+            "basil".to_string(),
+            "keystore".to_string(),
+            "rekey".to_string(),
+            "--backend".to_string(),
+            "local".to_string(),
+            "--new-dek-file".to_string(),
+            dek.display().to_string(),
+            "--open".to_string(),
+            format!("passphrase:file={}", passphrase.display()),
+            "--config".to_string(),
+            config.display().to_string(),
+        ])
+        .expect("parse reserved rekey command");
+        let Command::Keystore(command) = cli.command else {
+            panic!("keystore command expected");
+        };
+        let error = run_keystore(*command).expect_err("reserved command rejects");
+        assert_eq!(error.to_string(), basil_core::keystore_cli::REKEY_DISABLED);
+        assert!(!root.exists(), "dispatch must not touch any supplied path");
     }
 
     #[test]

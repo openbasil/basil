@@ -10,6 +10,7 @@
 //! values so each source is self-contained and unambiguous.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -294,6 +295,7 @@ pub fn run(cmd: BundleCommand) -> Result<()> {
 }
 
 fn create(args: &CreateArgs) -> Result<()> {
+    let lock = acquire_bundle_maintenance_lock(&args.bundle)?;
     let source = create_source(args)?;
     if source.slots.is_empty() {
         bail!("create requires at least one --slot or [[slot]] manifest table");
@@ -306,8 +308,8 @@ fn create(args: &CreateArgs) -> Result<()> {
     }
     let file = seal::seal(&creds, &specs).context("sealing new bundle")?;
     let parsed = format::decode(&file).context("parsing sealed bundle after create")?;
-    write_0600(&args.bundle, &file)?;
-    seal::write_epoch_sidecar(&epoch_sidecar_path(&args.bundle), parsed.body.header.epoch)
+    write_0600(&lock, &file)?;
+    lock.write_epoch(parsed.body.header.epoch)
         .context("writing epoch sidecar")?;
     if let Some(path) = &args.deposit_key {
         let recipient = creds
@@ -321,6 +323,7 @@ fn create(args: &CreateArgs) -> Result<()> {
 }
 
 fn add_slot(args: &AddSlotArgs) -> Result<()> {
+    let lock = acquire_bundle_maintenance_lock(&args.bundle)?;
     let bytes = read_bundle(&args.bundle)?;
     let parsed = format::decode(&bytes).context("parsing bundle")?;
     let open_methods = open_methods(&args.open)?;
@@ -331,8 +334,8 @@ fn add_slot(args: &AddSlotArgs) -> Result<()> {
         bail!("add-slot requires one --slot");
     };
     let new_file = seal::add_slot(&parsed, &registry, spec).context("adding bundle slot")?;
-    write_0600(&args.bundle, &new_file)?;
-    seal::write_epoch_sidecar(&epoch_sidecar_path(&args.bundle), parsed.body.header.epoch)
+    write_0600(&lock, &new_file)?;
+    lock.write_epoch(parsed.body.header.epoch)
         .context("writing epoch sidecar")?;
     print_generated_phrases(&new_slot.generated_phrases);
     println!("added slot to {}", args.bundle.display());
@@ -340,6 +343,7 @@ fn add_slot(args: &AddSlotArgs) -> Result<()> {
 }
 
 fn set_backend(args: &SetBackendArgs) -> Result<()> {
+    let lock = acquire_bundle_maintenance_lock(&args.bundle)?;
     let bytes = read_bundle(&args.bundle)?;
     let parsed = format::decode(&bytes).context("parsing bundle")?;
     let open_methods = open_methods(&args.open)?;
@@ -352,12 +356,9 @@ fn set_backend(args: &SetBackendArgs) -> Result<()> {
         seal::reseal_payload(&parsed, &registry, &creds).context("re-sealing bundle payload")?;
     let new_parsed = format::decode(&new_file).context("parsing updated sealed bundle")?;
     drop(creds);
-    write_0600(&args.bundle, &new_file)?;
-    seal::write_epoch_sidecar(
-        &epoch_sidecar_path(&args.bundle),
-        new_parsed.body.header.epoch,
-    )
-    .context("writing epoch sidecar")?;
+    write_0600(&lock, &new_file)?;
+    lock.write_epoch(new_parsed.body.header.epoch)
+        .context("writing epoch sidecar")?;
     println!(
         "updated backend `{}` in {}",
         backend_id,
@@ -367,6 +368,7 @@ fn set_backend(args: &SetBackendArgs) -> Result<()> {
 }
 
 fn deposit(args: &DepositArgs) -> Result<()> {
+    let lock = acquire_bundle_maintenance_lock(&args.bundle)?;
     let bytes = read_bundle(&args.bundle)?;
     let mut parsed = format::decode(&bytes).context("parsing bundle")?;
     let recipient = read_public_key_token(&args.recipient)?;
@@ -399,12 +401,13 @@ fn deposit(args: &DepositArgs) -> Result<()> {
         parsed.body.deposits,
     )
     .context("encoding bundle with deposit")?;
-    write_0600(&args.bundle, &file)?;
+    write_0600(&lock, &file)?;
     println!("deposited backend `{backend_id}` as contributor `{contributor_key_id}` seq {seq}");
     Ok(())
 }
 
 fn allow(args: &AllowArgs) -> Result<()> {
+    let lock = acquire_bundle_maintenance_lock(&args.bundle)?;
     if args.backend.is_empty() {
         bail!("allow requires at least one --backend ID");
     }
@@ -432,12 +435,13 @@ fn allow(args: &AllowArgs) -> Result<()> {
     );
     let new_file =
         seal::reseal_payload(&parsed, &registry, &creds).context("re-sealing allow-list")?;
-    write_0600(&args.bundle, &new_file)?;
+    write_0600(&lock, &new_file)?;
     println!("allowed contributor `{contributor_id}`");
     Ok(())
 }
 
 fn promote(args: &PromoteArgs) -> Result<()> {
+    let lock = acquire_bundle_maintenance_lock(&args.bundle)?;
     let bytes = read_bundle(&args.bundle)?;
     let parsed = format::decode(&bytes).context("parsing bundle")?;
     let open_methods = open_methods(&args.open)?;
@@ -454,18 +458,16 @@ fn promote(args: &PromoteArgs) -> Result<()> {
         seal::promote_deposits(&parsed, &registry, &backend_filter, &contributor_filter)
             .context("promoting deposits")?;
     let new_parsed = format::decode(&new_file).context("parsing promoted bundle")?;
-    write_0600(&args.bundle, &new_file)?;
-    seal::write_epoch_sidecar(
-        &epoch_sidecar_path(&args.bundle),
-        new_parsed.body.header.epoch,
-    )
-    .context("writing epoch sidecar")?;
+    write_0600(&lock, &new_file)?;
+    lock.write_epoch(new_parsed.body.header.epoch)
+        .context("writing epoch sidecar")?;
     print_deposit_reviews(&reviews);
     println!("promoted selected deposits in {}", args.bundle.display());
     Ok(())
 }
 
 fn deposit_key(args: &DepositKeyArgs) -> Result<()> {
+    let lock = acquire_bundle_maintenance_lock(&args.bundle)?;
     let bytes = read_bundle(&args.bundle)?;
     let parsed = format::decode(&bytes).context("parsing bundle")?;
     let open_methods = open_methods(&args.open)?;
@@ -478,7 +480,7 @@ fn deposit_key(args: &DepositKeyArgs) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("deposit identity was not generated"))?;
     let new_file =
         seal::reseal_payload(&parsed, &registry, &creds).context("re-sealing deposit identity")?;
-    write_0600(&args.bundle, &new_file)?;
+    write_0600(&lock, &new_file)?;
     write_public_token(&args.out, &seal::public_key_token(&recipient))?;
     println!("wrote deposit recipient to {}", args.out.display());
     Ok(())
@@ -1049,11 +1051,13 @@ fn read_secret_string_0600(path: &Path) -> Result<SecretString> {
     read_secret_string(path)
 }
 
-fn read_dek_0600(path: &Path) -> Result<SecretArray<32>> {
+pub(crate) fn read_dek_0600(path: &Path) -> Result<SecretArray<32>> {
     require_0600(path)?;
-    let bytes = read_secret_file(path)?;
+    let bytes = Zeroizing::new(
+        std::fs::read(path).with_context(|| format!("reading raw DEK {}", path.display()))?,
+    );
     let dek = <[u8; 32]>::try_from(bytes.as_slice())
-        .map_err(|_| anyhow::anyhow!("db-keystore DEK file must contain exactly 32 bytes"))?;
+        .map_err(|_| anyhow::anyhow!("db-keystore DEK file must contain exactly 32 raw bytes"))?;
     Ok(SecretArray::new(dek))
 }
 
@@ -1134,36 +1138,59 @@ fn require_0600(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Atomically write `bytes` to `path` with mode `0600`.
-fn write_0600(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let tmp = path.with_extension("sealed.tmp");
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp)
-            .with_context(|| format!("creating temp bundle {}", tmp.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            f.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .context("setting 0600 on temp bundle")?;
-        }
-        f.write_all(bytes).context("writing temp bundle")?;
-        f.sync_all().context("fsync temp bundle")?;
-    }
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
-    if let Ok(d) = std::fs::File::open(dir) {
-        let _ = d.sync_all();
-    }
-    Ok(())
+pub(crate) struct BundleMaintenanceLock {
+    target: seal::PinnedPath,
+    file: std::fs::File,
 }
 
-fn epoch_sidecar_path(bundle_path: &Path) -> PathBuf {
+impl BundleMaintenanceLock {
+    fn write_bundle(&self, bytes: &[u8]) -> Result<()> {
+        self.target.write_0600(bytes).map_err(anyhow::Error::from)
+    }
+
+    fn write_epoch(&self, epoch: u64) -> Result<()> {
+        self.target
+            .write_sibling_0600(".epoch", format!("{epoch}\n").as_bytes())
+            .map_err(anyhow::Error::from)
+    }
+}
+
+impl Drop for BundleMaintenanceLock {
+    fn drop(&mut self) {
+        let _ = rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock);
+    }
+}
+
+pub(crate) fn acquire_bundle_maintenance_lock(path: &Path) -> Result<BundleMaintenanceLock> {
+    let target = seal::PinnedPath::new(path).map_err(anyhow::Error::from)?;
+    let file = target
+        .open_lock(".basil-lock")
+        .map_err(anyhow::Error::from)?;
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))
+        .with_context(|| {
+            format!(
+                "locking bundle {}; another bundle operation may be active",
+                path.display()
+            )
+        })?;
+    Ok(BundleMaintenanceLock { target, file })
+}
+
+#[cfg(test)]
+fn append_path_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = OsString::from(path.as_os_str());
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+/// Atomically write bundle bytes relative to the lock's pinned parent.
+fn write_0600(lock: &BundleMaintenanceLock, bytes: &[u8]) -> Result<()> {
+    lock.write_bundle(bytes)
+}
+
+#[cfg(test)]
+pub(crate) fn epoch_sidecar_path(bundle_path: &Path) -> PathBuf {
     let mut path = OsString::from(bundle_path.as_os_str());
     path.push(".epoch");
     PathBuf::from(path)
@@ -1195,6 +1222,114 @@ mod tests {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
                 .expect("chmod secret file");
         }
+    }
+
+    #[test]
+    fn bundle_maintenance_lock_serializes_writers() {
+        let bundle = temp_path("maintenance-lock");
+        let first = acquire_bundle_maintenance_lock(&bundle).expect("first lock");
+        assert!(acquire_bundle_maintenance_lock(&bundle).is_err());
+        drop(first);
+        acquire_bundle_maintenance_lock(&bundle).expect("lock after release");
+        let _ = std::fs::remove_file(append_path_suffix(&bundle, ".basil-lock"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundle_maintenance_lock_rejects_preplaced_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = temp_path("maintenance-lock-symlink");
+        std::fs::create_dir(&directory).expect("create lock test directory");
+        let bundle = directory.join("creds.sealed");
+        let victim = directory.join("victim");
+        std::fs::write(&victim, b"do-not-touch").expect("write lock symlink target");
+        symlink(&victim, append_path_suffix(&bundle, ".basil-lock"))
+            .expect("preplace lock symlink");
+
+        assert!(acquire_bundle_maintenance_lock(&bundle).is_err());
+        assert_eq!(
+            std::fs::read(&victim).expect("read lock symlink target"),
+            b"do-not-touch"
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn bare_relative_bundle_and_sidecar_create_and_mutate() {
+        const CHILD_ENV: &str = "BASIL_RELATIVE_BUNDLE_WRITER_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let bundle = Path::new("creds.sealed");
+            let lock = acquire_bundle_maintenance_lock(bundle).expect("lock bare bundle");
+            write_0600(&lock, b"first").expect("create bare bundle");
+            lock.write_epoch(1).expect("create bare sidecar");
+            write_0600(&lock, b"second").expect("mutate bare bundle");
+            lock.write_epoch(2).expect("mutate bare sidecar");
+            assert_eq!(std::fs::read(bundle).expect("read bundle"), b"second");
+            assert_eq!(
+                std::fs::read_to_string("creds.sealed.epoch").expect("read sidecar"),
+                "2\n"
+            );
+            return;
+        }
+
+        let directory = temp_path("bare-relative-dir");
+        std::fs::create_dir(&directory).expect("create temp current directory");
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "bundle_cli::tests::bare_relative_bundle_and_sidecar_create_and_mutate",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .current_dir(&directory)
+            .output()
+            .expect("run isolated relative-path test");
+        assert!(
+            output.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read(directory.join("creds.sealed")).unwrap(),
+            b"second"
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.join("creds.sealed.epoch")).unwrap(),
+            "2\n"
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_parent_defeats_ancestor_symlink_substitution() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_path("pinned-parent-root");
+        let original = root.join("original");
+        let pinned = root.join("pinned");
+        let alternate = root.join("alternate");
+        std::fs::create_dir_all(&original).expect("create original");
+        std::fs::create_dir_all(&alternate).expect("create alternate");
+        let bundle = original.join("creds.sealed");
+        let lock = acquire_bundle_maintenance_lock(&bundle).expect("pin and lock original");
+        std::fs::rename(&original, &pinned).expect("move pinned ancestor");
+        symlink(&alternate, &original).expect("substitute ancestor symlink");
+
+        write_0600(&lock, b"pinned-bytes").expect("write through pinned descriptor");
+        lock.write_epoch(9).expect("write pinned sidecar");
+        assert_eq!(
+            std::fs::read(pinned.join("creds.sealed")).unwrap(),
+            b"pinned-bytes"
+        );
+        assert_eq!(
+            std::fs::read_to_string(pinned.join("creds.sealed.epoch")).unwrap(),
+            "9\n"
+        );
+        assert!(!alternate.join("creds.sealed").exists());
+        assert!(!alternate.join("creds.sealed.epoch").exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1422,7 +1557,9 @@ region = "us-east-1"
             }],
         )
         .expect("seal bundle");
-        write_0600(&bundle, &initial_file).expect("write bundle");
+        let lock = acquire_bundle_maintenance_lock(&bundle).expect("lock bundle");
+        write_0600(&lock, &initial_file).expect("write bundle");
+        drop(lock);
 
         verify(&VerifyArgs {
             bundle: bundle.clone(),
@@ -1437,6 +1574,29 @@ region = "us-east-1"
         assert!(passphrase_file.exists());
         let _ = std::fs::remove_file(&bundle);
         let _ = std::fs::remove_file(&passphrase_file);
+    }
+
+    #[test]
+    fn raw_dek_reader_preserves_terminal_cr_and_lf_bytes() {
+        let path = temp_path("raw-dek-terminal-bytes");
+        let mut raw = [0x44; 32];
+        raw[30] = b'\r';
+        raw[31] = b'\n';
+        write_secret_file(&path, &raw);
+        let decoded = read_dek_0600(&path).expect("32 raw bytes accepted");
+        assert_eq!(decoded.expose_secret(), &raw);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn raw_dek_reader_rejects_appended_newline() {
+        let path = temp_path("raw-dek-appended-newline");
+        let mut raw = vec![0x55; 32];
+        raw.push(b'\n');
+        write_secret_file(&path, &raw);
+        let error = read_dek_0600(&path).expect_err("33 raw bytes rejected");
+        assert!(error.to_string().contains("exactly 32 raw bytes"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

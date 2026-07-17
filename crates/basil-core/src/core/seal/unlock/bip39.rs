@@ -73,6 +73,33 @@ impl Bip39Method {
         }
         Ok(Zeroizing::new(mnemonic.to_entropy()))
     }
+
+    fn wrap_with_argon2(
+        &self,
+        kek: &MasterKek,
+        header_aad: &[u8],
+        slot_id: u32,
+        argon2: Argon2Params,
+    ) -> Result<(MethodParams, KekWrap), UnlockError> {
+        let mut salt = [0u8; SALT_LEN];
+        rand::rngs::OsRng.fill_bytes(&mut salt);
+        let entropy = self.entropy()?;
+        let slot_key = derive_slot_key(&entropy, &salt, argon2)?;
+        let nonce = aead::fresh_nonce();
+        let aad = wrap_aad(header_aad, slot_id);
+        let ciphertext = aead::seal(&slot_key, &nonce, &aad, kek.as_bytes())
+            .map_err(|e| UnlockError::Crypto(e.to_string()))?;
+        Ok((
+            MethodParams::Bip39 {
+                salt: B64Bytes(salt.to_vec()),
+                argon2,
+            },
+            KekWrap {
+                nonce: B64Bytes(nonce.to_vec()),
+                ciphertext: B64Bytes(ciphertext),
+            },
+        ))
+    }
 }
 
 impl UnlockMethod for Bip39Method {
@@ -112,25 +139,19 @@ impl UnlockMethod for Bip39Method {
         header_aad: &[u8],
         slot_id: u32,
     ) -> Result<(MethodParams, KekWrap), UnlockError> {
-        let mut salt = [0u8; SALT_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut salt);
-        let entropy = self.entropy()?;
-        let slot_key = derive_slot_key(&entropy, &salt, self.argon2)?;
+        self.wrap_with_argon2(kek, header_aad, slot_id, self.argon2)
+    }
 
-        let nonce = aead::fresh_nonce();
-        let aad = wrap_aad(header_aad, slot_id);
-        let ciphertext = aead::seal(&slot_key, &nonce, &aad, kek.as_bytes())
-            .map_err(|e| UnlockError::Crypto(e.to_string()))?;
-
-        let params = MethodParams::Bip39 {
-            salt: B64Bytes(salt.to_vec()),
-            argon2: self.argon2,
+    fn rewrap_kek(
+        &self,
+        slot: &Slot,
+        kek: &MasterKek,
+        header_aad: &[u8],
+    ) -> Result<(MethodParams, KekWrap), UnlockError> {
+        let MethodParams::Bip39 { argon2, .. } = &slot.params else {
+            return Err(UnlockError::ParamsMismatch("expected bip39 params".into()));
         };
-        let wrap = KekWrap {
-            nonce: B64Bytes(nonce.to_vec()),
-            ciphertext: B64Bytes(ciphertext),
-        };
-        Ok((params, wrap))
+        self.wrap_with_argon2(kek, header_aad, slot.slot_id, *argon2)
     }
 }
 

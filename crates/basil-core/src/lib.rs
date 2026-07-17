@@ -50,6 +50,8 @@ pub mod core;
 pub mod demo;
 pub mod doctor;
 pub mod init;
+#[cfg(feature = "db-keystore")]
+pub mod keystore_cli;
 pub mod runtime_attestor;
 pub mod service;
 pub mod transport;
