@@ -399,6 +399,7 @@ mod tests {
         AuthenticatedActor {
             domain: AuthorizationDomain::HostProcess,
             subject: "svc.nats".to_string(),
+            workload_identity: None,
             authenticated_by: vec![ProofSummary {
                 kind: ProofKind::ProcessCredentials,
                 subject: "svc.nats".to_string(),

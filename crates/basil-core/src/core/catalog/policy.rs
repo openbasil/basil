@@ -95,6 +95,18 @@ pub enum Op {
     /// [`ALL_OPS`], so wildcard grants never imply it. Grant it explicitly over
     /// `broker.realms`.
     RealmStatus,
+    /// Read the bounded accepted-connection inventory.
+    ///
+    /// This broker-wide admin op exposes peer and attested workload metadata.
+    /// Wildcard grants never imply it; grant it explicitly over
+    /// `broker.connections`.
+    ConnectionStatus,
+    /// Deliberately terminate selected accepted connections.
+    ///
+    /// This mutation is separate from inventory access for least privilege.
+    /// Wildcard grants never imply it; grant it explicitly over
+    /// `broker.connections.drop`.
+    ConnectionDrop,
     /// Permit a caller to use the **local-software** crypto provider for a key
     /// (the software-custodied PQC arm: ML-DSA signing, ML-KEM unwrap).
     ///
@@ -173,6 +185,8 @@ impl Op {
             Self::Revoke => "revoke",
             Self::Watch => "watch",
             Self::RealmStatus => "realm_status",
+            Self::ConnectionStatus => "connection_status",
+            Self::ConnectionDrop => "connection_drop",
             Self::UseSoftwareCustody => "use_software_custody",
         }
     }
@@ -202,6 +216,8 @@ impl Op {
             "revoke" => Self::Revoke,
             "watch" => Self::Watch,
             "realm_status" => Self::RealmStatus,
+            "connection_status" => Self::ConnectionStatus,
+            "connection_drop" => Self::ConnectionDrop,
             "use_software_custody" => Self::UseSoftwareCustody,
             other => return Err(ActionTermError::UnknownOp(other.to_string())),
         };
@@ -447,6 +463,11 @@ mod tests {
         assert_eq!(Op::parse("revoke").unwrap(), Op::Revoke);
         assert_eq!(Op::parse("watch").unwrap(), Op::Watch);
         assert_eq!(Op::parse("realm_status").unwrap(), Op::RealmStatus);
+        assert_eq!(
+            Op::parse("connection_status").unwrap(),
+            Op::ConnectionStatus
+        );
+        assert_eq!(Op::parse("connection_drop").unwrap(), Op::ConnectionDrop);
         assert_eq!(Op::Reload.token(), "reload");
         assert_eq!(Op::Explain.token(), "explain");
         assert_eq!(Op::Revoke.token(), "revoke");

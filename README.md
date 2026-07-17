@@ -96,7 +96,10 @@ for details and backend prerequisites.
 ## Clients
 
 - **CLI**: the `basil` binary is both the daemon and the client; every broker
-  operation is available as a subcommand.
+  operation is available as a subcommand. Operators with explicit policy
+  grants can inspect accepted transports with `basil connections list` and
+  terminate exact, UID, systemd-unit, or Compose-workload matches with
+  `basil connections drop`.
 - **Rust**: the [`basil` crate](https://docs.openbasil.org/clients/rust/)
   (`crates/basil-client` in this repo).
 - **Go**: `go get github.com/openbasil/basil-go/basil`, documented at
@@ -126,7 +129,7 @@ vulnerabilities.
 
 [Feature matrix and Roadmap](https://docs.openbasil.org/reference/feature-matrix/)
 
-Basil is pre-1.0 (currently 0.7.x) and under active development.
+Basil is pre-1.0 (currently 0.8.0-pre.1) and under active development.
 All changes are documented in [CHANGELOG.md](CHANGELOG.md).
 
 Basil is committed to following Rust SEMVER conventions: any breaking api change or wire

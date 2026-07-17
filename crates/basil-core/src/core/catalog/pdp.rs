@@ -287,6 +287,7 @@ impl<'a> Pdp<'a> {
             .map(|definition| AuthenticatedActor {
                 domain: definition.domain,
                 subject: subject.to_string(),
+                workload_identity: None,
                 authenticated_by: Vec::new(),
                 presenter: PresenterInfo {
                     pid: None,
@@ -544,6 +545,12 @@ pub const ADMIN_WATCH_TARGET: &str = "broker.watch";
 /// or data-plane actions do not imply this inventory-bearing operation.
 pub const ADMIN_REALM_STATUS_TARGET: &str = "broker.realms";
 
+/// The reserved policy target for accepted-connection inventory.
+pub const ADMIN_CONNECTION_STATUS_TARGET: &str = "broker.connections";
+
+/// The reserved policy target for deliberate accepted-connection termination.
+pub const ADMIN_CONNECTION_DROP_TARGET: &str = "broker.connections.drop";
+
 const fn admin_target(op: Op) -> Option<&'static str> {
     match op {
         Op::Reload => Some(ADMIN_RELOAD_TARGET),
@@ -551,6 +558,8 @@ const fn admin_target(op: Op) -> Option<&'static str> {
         Op::Revoke => Some(ADMIN_REVOKE_TARGET),
         Op::Watch => Some(ADMIN_WATCH_TARGET),
         Op::RealmStatus => Some(ADMIN_REALM_STATUS_TARGET),
+        Op::ConnectionStatus => Some(ADMIN_CONNECTION_STATUS_TARGET),
+        Op::ConnectionDrop => Some(ADMIN_CONNECTION_DROP_TARGET),
         Op::Get
         | Op::List
         | Op::GetPublicKey
@@ -1196,7 +1205,13 @@ mod tests {
             }
         );
         // The watch grant implies NO other admin op.
-        for op in [Op::Reload, Op::Explain, Op::Revoke] {
+        for op in [
+            Op::Reload,
+            Op::Explain,
+            Op::Revoke,
+            Op::ConnectionStatus,
+            Op::ConnectionDrop,
+        ] {
             assert_eq!(
                 decide_admin(&pdp, 9008, op),
                 Decision::Deny {
@@ -1240,6 +1255,8 @@ mod tests {
                 Op::Revoke,
                 Op::Watch,
                 Op::RealmStatus,
+                Op::ConnectionStatus,
+                Op::ConnectionDrop,
             ] {
                 assert_eq!(
                     decide_admin(&pdp, uid, op),
@@ -1274,6 +1291,8 @@ mod tests {
             Op::Revoke,
             Op::Watch,
             Op::RealmStatus,
+            Op::ConnectionStatus,
+            Op::ConnectionDrop,
         ] {
             assert_eq!(
                 pdp.decide_admin(&actor, op),

@@ -169,6 +169,9 @@ fn enforce_listener_domain_extensions(
             "listener context unavailable",
         ));
     };
+    state
+        .connections()
+        .record_actor(listener.connection_id(), actor);
     let admitted = match listener.listener_type() {
         grpc_server::ListenerType::Host => matches!(
             actor.domain,

@@ -1346,6 +1346,20 @@ mod tests {
         ) -> Result<Response<pb::RevokeResponse>, Status> {
             Err(Status::unimplemented("revoke"))
         }
+
+        async fn list_connections(
+            &self,
+            _request: Request<pb::ListConnectionsRequest>,
+        ) -> Result<Response<pb::ListConnectionsResponse>, Status> {
+            Err(Status::unimplemented("list connections"))
+        }
+
+        async fn drop_connections(
+            &self,
+            _request: Request<pb::DropConnectionsRequest>,
+        ) -> Result<Response<pb::DropConnectionsResponse>, Status> {
+            Err(Status::unimplemented("drop connections"))
+        }
     }
 
     struct MockServer {

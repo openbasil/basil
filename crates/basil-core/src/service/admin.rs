@@ -11,7 +11,7 @@ use basil_proto::broker::v1 as pb;
 use basil_proto::broker::v1::admin_service_server::AdminService;
 use tonic::{Code, Request, Response};
 
-use crate::actor::SubjectResolutionError;
+use crate::actor::{SubjectResolutionError, WorkloadIdentity};
 use crate::attestor_realm::{
     RealmMode as CoreRealmMode, RealmProvider as CoreRealmProvider, RealmReadiness,
     RealmReason as CoreRealmReason, RealmState as CoreRealmState, RealmStatus as CoreRealmStatus,
@@ -19,14 +19,19 @@ use crate::attestor_realm::{
 use crate::audit::ReloadActor;
 use crate::catalog::policy::Op;
 use crate::catalog::{
-    ADMIN_EXPLAIN_TARGET, ADMIN_REALM_STATUS_TARGET, ADMIN_RELOAD_TARGET, ADMIN_REVOKE_TARGET,
-    ADMIN_WATCH_TARGET, AllowVia, Decision, DenyReason, Explanation, MatchedRule, MissingPolicy,
+    ADMIN_CONNECTION_DROP_TARGET, ADMIN_CONNECTION_STATUS_TARGET, ADMIN_EXPLAIN_TARGET,
+    ADMIN_REALM_STATUS_TARGET, ADMIN_RELOAD_TARGET, ADMIN_REVOKE_TARGET, ADMIN_WATCH_TARGET,
+    AllowVia, AuthorizationDomain, Decision, DenyReason, Explanation, MatchedRule, MissingPolicy,
 };
 use crate::decision::DecisionRecord;
 use crate::reload::{ReloadError, check_reload, reload_generation_live};
 use crate::service::broker::{BoxStream, BrokerGrpc, GrpcResult};
 use crate::service::shared::{event_allowed, payload_too_large, proto_event};
 use crate::state::{BrokerState, Generation, ReadinessOutcome, ReadinessState};
+use crate::transport::connection::{
+    ConnectionId, ConnectionRecord, ConnectionSelector, ListenerConnectInfo,
+};
+use crate::transport::grpc_server::ListenerType;
 use crate::transport::{
     attestation_unavailable_status, broker_status, enforce_listener_domain, peer_from_request,
 };
@@ -40,6 +45,10 @@ const REVOKE_OP_TOKEN: &str = "revoke";
 const WATCH_OP_TOKEN: &str = "watch";
 const STATUS_OP_TOKEN: &str = "status";
 const REALM_STATUS_OP_TOKEN: &str = "realm_status";
+const CONNECTION_STATUS_OP_TOKEN: &str = "connection_status";
+const CONNECTION_DROP_OP_TOKEN: &str = "connection_drop";
+const MAX_CONNECTION_SELECTORS: usize = 64;
+const MAX_CONNECTION_SELECTOR_TEXT_BYTES: usize = 253;
 
 fn admin_resolution_status(op: &'static str, err: &SubjectResolutionError) -> tonic::Status {
     match err {
@@ -71,6 +80,8 @@ fn enforce_admin_listener<T>(
         Op::Explain => ADMIN_EXPLAIN_TARGET,
         Op::Revoke => ADMIN_REVOKE_TARGET,
         Op::RealmStatus => ADMIN_REALM_STATUS_TARGET,
+        Op::ConnectionStatus => ADMIN_CONNECTION_STATUS_TARGET,
+        Op::ConnectionDrop => ADMIN_CONNECTION_DROP_TARGET,
         _ => "admin",
     };
     enforce_listener_domain(state, generation.id(), request, actor, op, target)
@@ -553,6 +564,208 @@ impl AdminService for BrokerGrpc {
             persisted: true,
         }))
     }
+
+    /// Return the stable-id ordered, globally bounded accepted-connection inventory.
+    async fn list_connections(
+        &self,
+        request: Request<pb::ListConnectionsRequest>,
+    ) -> GrpcResult<pb::ListConnectionsResponse> {
+        authorize_connection_admin(
+            &self.state,
+            &request,
+            Op::ConnectionStatus,
+            ADMIN_CONNECTION_STATUS_TARGET,
+            CONNECTION_STATUS_OP_TOKEN,
+        )?;
+        let connections = self
+            .state
+            .connections()
+            .snapshot()
+            .iter()
+            .map(connection_info)
+            .collect();
+        Ok(Response::new(pb::ListConnectionsResponse { connections }))
+    }
+
+    /// Deliberately terminate a bounded OR-set of exact or typed connections.
+    async fn drop_connections(
+        &self,
+        request: Request<pb::DropConnectionsRequest>,
+    ) -> GrpcResult<pb::DropConnectionsResponse> {
+        authorize_connection_admin(
+            &self.state,
+            &request,
+            Op::ConnectionDrop,
+            ADMIN_CONNECTION_DROP_TARGET,
+            CONNECTION_DROP_OP_TOKEN,
+        )?;
+        let selectors = connection_selectors(request.get_ref())?;
+        let caller = request
+            .extensions()
+            .get::<ListenerConnectInfo>()
+            .map(ListenerConnectInfo::connection_id);
+        let outcome = self.state.connections().cancel_matching(&selectors, caller);
+        Ok(Response::new(pb::DropConnectionsResponse {
+            matched: bounded_u32(outcome.matched),
+            cancelled: bounded_u32(outcome.cancelled),
+            already_requested: bounded_u32(outcome.already_requested),
+            caller_excluded: bounded_u32(outcome.caller_excluded),
+        }))
+    }
+}
+
+fn authorize_connection_admin<T>(
+    state: &BrokerState,
+    request: &Request<T>,
+    op: Op,
+    target: &'static str,
+    token: &'static str,
+) -> Result<(), tonic::Status> {
+    let peer = peer_from_request(request);
+    let generation = state.load_generation();
+    let actor = generation
+        .pdp()
+        .resolve_local_actor(&peer)
+        .map_err(|error| admin_resolution_status(token, &error))?;
+    enforce_admin_listener(state, &generation, request, &actor, op)?;
+    let decision = generation.pdp().decide_admin(&actor, op);
+    state.record_decision(&DecisionRecord::from_actor_decision(
+        generation.id(),
+        &actor,
+        op,
+        target,
+        &decision,
+    ));
+    if matches!(decision, Decision::Deny { .. }) {
+        return Err(broker_status(
+            Code::PermissionDenied,
+            "UNAUTHORIZED",
+            token,
+            "not authorized",
+        ));
+    }
+    Ok(())
+}
+
+fn connection_info(record: &ConnectionRecord) -> pb::ConnectionInfo {
+    let context = record.context();
+    let peer = context.peer();
+    let (domain, subject, systemd, compose) = record.identity().map_or_else(
+        || (pb::ConnectionDomain::Unspecified, String::new(), None, None),
+        |identity| {
+            let domain = match identity.domain() {
+                AuthorizationDomain::HostProcess => pb::ConnectionDomain::HostProcess,
+                AuthorizationDomain::SystemdUnit => pb::ConnectionDomain::SystemdUnit,
+                AuthorizationDomain::Container => pb::ConnectionDomain::Container,
+            };
+            let (systemd, compose) = match identity.workload() {
+                Some(WorkloadIdentity::Systemd { unit, manager_user }) => (
+                    Some(pb::ConnectionSystemdIdentity {
+                        unit: unit.clone(),
+                        manager_uid: *manager_user,
+                    }),
+                    None,
+                ),
+                Some(WorkloadIdentity::Compose {
+                    realm,
+                    project,
+                    service,
+                }) => (
+                    None,
+                    Some(pb::ConnectionComposeIdentity {
+                        realm: realm.clone(),
+                        project: project.clone(),
+                        service: service.clone(),
+                    }),
+                ),
+                None => (None, None),
+            };
+            (domain, identity.subject().to_string(), systemd, compose)
+        },
+    );
+    pb::ConnectionInfo {
+        id: context.connection_id().get(),
+        listener_name: context.listener_name().to_string(),
+        listener_type: match context.listener_type() {
+            ListenerType::Host => pb::ConnectionListenerType::Host,
+            ListenerType::Container => pb::ConnectionListenerType::Container,
+        }
+        .into(),
+        pid: peer.pid,
+        uid: peer.uid,
+        gid: peer.gid,
+        domain: domain.into(),
+        subject,
+        systemd,
+        compose,
+        cancellation_requested: record.cancellation_requested(),
+        active_streams: 0,
+    }
+}
+
+fn connection_selectors(
+    request: &pb::DropConnectionsRequest,
+) -> Result<Vec<ConnectionSelector>, tonic::Status> {
+    if request.selectors.is_empty() || request.selectors.len() > MAX_CONNECTION_SELECTORS {
+        return Err(connection_drop_invalid(
+            "selectors must contain between 1 and 64 entries",
+        ));
+    }
+    request.selectors.iter().map(connection_selector).collect()
+}
+
+fn connection_selector(
+    selector: &pb::ConnectionSelector,
+) -> Result<ConnectionSelector, tonic::Status> {
+    use pb::connection_selector::Selector;
+    match selector.selector.as_ref() {
+        Some(Selector::Id(id)) => ConnectionId::from_u64(*id)
+            .map(ConnectionSelector::Id)
+            .ok_or_else(|| connection_drop_invalid("connection id must be nonzero")),
+        Some(Selector::Uid(uid)) => Ok(ConnectionSelector::Uid(*uid)),
+        Some(Selector::Systemd(systemd)) => {
+            validate_selector_text("systemd unit", &systemd.unit)?;
+            Ok(ConnectionSelector::Systemd {
+                unit: systemd.unit.clone(),
+                manager_user: systemd.manager_uid,
+            })
+        }
+        Some(Selector::Compose(compose)) => {
+            validate_selector_text("Compose realm", &compose.realm)?;
+            validate_selector_text("Compose project", &compose.project)?;
+            if let Some(service) = &compose.service {
+                validate_selector_text("Compose service", service)?;
+            }
+            Ok(ConnectionSelector::Compose {
+                realm: compose.realm.clone(),
+                project: compose.project.clone(),
+                service: compose.service.clone(),
+            })
+        }
+        None => Err(connection_drop_invalid("selector variant is required")),
+    }
+}
+
+fn validate_selector_text(label: &str, value: &str) -> Result<(), tonic::Status> {
+    if value.is_empty() || value.len() > MAX_CONNECTION_SELECTOR_TEXT_BYTES {
+        return Err(connection_drop_invalid(format!(
+            "{label} must contain between 1 and 253 bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn connection_drop_invalid(message: impl Into<String>) -> tonic::Status {
+    broker_status(
+        Code::InvalidArgument,
+        "INVALID_ARGUMENT",
+        CONNECTION_DROP_OP_TOKEN,
+        message,
+    )
+}
+
+fn bounded_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 impl BrokerGrpc {
@@ -1340,8 +1553,9 @@ mod tests {
     }
 
     /// Policy: uid 4242 may `reload`, uid 4243 may `explain`, uid 4244 may
-    /// `revoke`, uid 4245 may read realm status, and uid 7 is a data-plane
-    /// signer over web.signer with no admin grants.
+    /// `revoke`, uid 4245 may read realm status, uid 4246 may read connections,
+    /// uid 4247 may drop connections, and uid 7 is a data-plane signer over
+    /// web.signer with no admin grants.
     const RELOAD_POLICY: &str = r#"{
       "schema": "policy",
       "subjects": {
@@ -1349,6 +1563,8 @@ mod tests {
         "svc.explain": { "domain": "host-process", "match": { "all": [ { "process.uid": 4243 } ] } },
         "svc.revoke": { "domain": "host-process", "match": { "all": [ { "process.uid": 4244 } ] } },
         "svc.realms": { "domain": "host-process", "match": { "all": [ { "process.uid": 4245 } ] } },
+        "svc.connections": { "domain": "host-process", "match": { "all": [ { "process.uid": 4246 } ] } },
+        "svc.connection-drop": { "domain": "host-process", "match": { "all": [ { "process.uid": 4247 } ] } },
         "svc.app": { "domain": "host-process", "match": { "all": [ { "process.uid": 7 } ] } }
       },
       "roles": { "signer": ["sign", "verify", "get_public_key"] },
@@ -1357,11 +1573,13 @@ mod tests {
         { "id": "admin-explain", "subjects": ["svc.explain"], "action": ["op:explain"], "target": ["broker.explain"] },
         { "id": "admin-revoke", "subjects": ["svc.revoke"],   "action": ["op:revoke"], "target": ["broker.revoke"] },
         { "id": "admin-realms", "subjects": ["svc.realms"], "action": ["op:realm_status"], "target": ["broker.realms"] },
+        { "id": "admin-connections", "subjects": ["svc.connections"], "action": ["op:connection_status"], "target": ["broker.connections"] },
+        { "id": "admin-connection-drop", "subjects": ["svc.connection-drop"], "action": ["op:connection_drop"], "target": ["broker.connections.drop"] },
         { "id": "data-signer",  "subjects": ["svc.app"],      "action": ["role:signer"], "target": ["web.signer"] }
       ],
       "config": {
-        "names": { "users": { "4242": "svc-admin", "4243": "svc-explain", "4244": "svc-revoke", "4245": "svc-realms", "7": "svc-app" }, "groups": {} },
-        "memberships": { "4242": [4242], "4243": [4243], "4244": [4244], "4245": [4245], "7": [7] }
+        "names": { "users": { "4242": "svc-admin", "4243": "svc-explain", "4244": "svc-revoke", "4245": "svc-realms", "4246": "svc-connections", "4247": "svc-connection-drop", "7": "svc-app" }, "groups": {} },
+        "memberships": { "4242": [4242], "4243": [4243], "4244": [4244], "4245": [4245], "4246": [4246], "4247": [4247], "7": [7] }
       }
     }"#;
 
@@ -1839,6 +2057,98 @@ mod tests {
             .expect("exact realm-status grant")
             .into_inner();
         assert!(response.realms.is_empty());
+    }
+
+    #[tokio::test]
+    async fn connection_inventory_and_drop_require_separate_exact_admin_grants() {
+        let (grpc, _inputs) = reload_grpc();
+
+        let mut inventory = Request::new(pb::ListConnectionsRequest {});
+        attach_host_peer(&mut inventory, 4246);
+        let response = grpc
+            .list_connections(inventory)
+            .await
+            .expect("exact inventory grant")
+            .into_inner();
+        assert!(response.connections.is_empty());
+
+        let mut denied_drop = Request::new(pb::DropConnectionsRequest {
+            selectors: vec![pb::ConnectionSelector {
+                selector: Some(pb::connection_selector::Selector::Id(10)),
+            }],
+        });
+        attach_host_peer(&mut denied_drop, 4246);
+        assert_eq!(
+            grpc.drop_connections(denied_drop)
+                .await
+                .expect_err("inventory grant must not imply drop")
+                .code(),
+            Code::PermissionDenied
+        );
+
+        let mut denied_inventory = Request::new(pb::ListConnectionsRequest {});
+        attach_host_peer(&mut denied_inventory, 4247);
+        assert_eq!(
+            grpc.list_connections(denied_inventory)
+                .await
+                .expect_err("drop grant must not imply inventory")
+                .code(),
+            Code::PermissionDenied
+        );
+
+        let mut allowed_drop = Request::new(pb::DropConnectionsRequest {
+            selectors: vec![pb::ConnectionSelector {
+                selector: Some(pb::connection_selector::Selector::Id(10)),
+            }],
+        });
+        attach_host_peer(&mut allowed_drop, 4247);
+        let response = grpc
+            .drop_connections(allowed_drop)
+            .await
+            .expect("exact drop grant")
+            .into_inner();
+        assert_eq!(response.matched, 0);
+        assert_eq!(response.cancelled, 0);
+    }
+
+    #[tokio::test]
+    async fn connection_drop_rejects_empty_untyped_and_oversized_selectors() {
+        let (grpc, _inputs) = reload_grpc();
+        for selectors in [
+            Vec::new(),
+            vec![pb::ConnectionSelector { selector: None }],
+            vec![pb::ConnectionSelector {
+                selector: Some(pb::connection_selector::Selector::Id(0)),
+            }],
+        ] {
+            let mut request = Request::new(pb::DropConnectionsRequest { selectors });
+            attach_host_peer(&mut request, 4247);
+            assert_eq!(
+                grpc.drop_connections(request)
+                    .await
+                    .expect_err("invalid selector rejected")
+                    .code(),
+                Code::InvalidArgument
+            );
+        }
+
+        let mut request = Request::new(pb::DropConnectionsRequest {
+            selectors: (0..=MAX_CONNECTION_SELECTORS)
+                .map(|id| pb::ConnectionSelector {
+                    selector: Some(pb::connection_selector::Selector::Id(
+                        u64::try_from(id).unwrap_or(1).saturating_add(1),
+                    )),
+                })
+                .collect(),
+        });
+        attach_host_peer(&mut request, 4247);
+        assert_eq!(
+            grpc.drop_connections(request)
+                .await
+                .expect_err("selector count cap")
+                .code(),
+            Code::InvalidArgument
+        );
     }
 
     #[test]

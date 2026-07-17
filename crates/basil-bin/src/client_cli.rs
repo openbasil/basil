@@ -15,8 +15,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use basil::{
-    AeadAlgorithm, CiphertextEnvelope, Client, ImportEntry, KeyMaterial, KeyType, NatsJwtType,
-    NatsUserPermissions, SignNatsJwtOptions,
+    AeadAlgorithm, AgentConnection, AgentConnectionDomain, AgentConnectionListener,
+    AgentConnectionSelector, CiphertextEnvelope, Client, ImportEntry, KeyMaterial, KeyType,
+    NatsJwtType, NatsUserPermissions, SignNatsJwtOptions,
 };
 use basil_core::agent_cli::ExplainArgs;
 use clap::{Subcommand, ValueEnum};
@@ -453,6 +454,12 @@ pub enum Command {
         json: bool,
     },
 
+    /// Inspect or deliberately terminate accepted broker connections.
+    Connections {
+        #[command(subcommand)]
+        command: ConnectionsCommand,
+    },
+
     /// Revoke a JWT-SVID by trust-domain and jti. Requires the dedicated
     /// `revoke` admin permission over `broker.revoke` and a configured
     /// persistent `revocation_store=jwt-svid` value key.
@@ -467,6 +474,34 @@ pub enum Command {
         #[arg(long)]
         expires_at_unix: u64,
         /// Emit a machine-readable JSON object instead of human lines.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConnectionsCommand {
+    /// List the stable-id ordered bounded accepted-connection inventory.
+    List {
+        /// Emit a machine-readable JSON object.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Terminate connections selected by exact id, broad UID, or typed identity.
+    Drop {
+        /// Exact process-lifetime connection id; repeatable.
+        #[arg(long = "id")]
+        ids: Vec<u64>,
+        /// Broad Unix UID selector; repeatable.
+        #[arg(long = "uid")]
+        uids: Vec<u32>,
+        /// Typed systemd selector as `UNIT` (system manager) or `UID:UNIT`.
+        #[arg(long = "systemd")]
+        systemd: Vec<String>,
+        /// Typed Compose selector as `REALM/PROJECT` or `REALM/PROJECT/SERVICE`.
+        #[arg(long = "compose")]
+        compose: Vec<String>,
+        /// Emit a machine-readable JSON object.
         #[arg(long)]
         json: bool,
     },
@@ -660,6 +695,7 @@ async fn dispatch(client: &mut Client, command: Command) -> Result<()> {
         Command::Health { json } => health(client, json).await,
         Command::Ready { json } => ready(client, json).await,
         Command::Reload { check, json } => reload(client, check, json).await,
+        Command::Connections { command } => connections(client, command).await,
         Command::Revoke {
             trust_domain,
             jti,
@@ -1284,6 +1320,199 @@ async fn reload(client: &mut Client, check: bool, json: bool) -> Result<()> {
     Ok(())
 }
 
+async fn connections(client: &mut Client, command: ConnectionsCommand) -> Result<()> {
+    match command {
+        ConnectionsCommand::List { json } => list_connections(client, json).await,
+        ConnectionsCommand::Drop {
+            ids,
+            uids,
+            systemd,
+            compose,
+            json,
+        } => drop_connections(client, ids, uids, systemd, compose, json).await,
+    }
+}
+
+async fn list_connections(client: &mut Client, json: bool) -> Result<()> {
+    let connections = client.connections().await?;
+    if json {
+        let values = connections.iter().map(connection_json).collect::<Vec<_>>();
+        println!("{}", serde_json::json!({ "connections": values }));
+        return Ok(());
+    }
+    for connection in &connections {
+        println!(
+            "id={} listener={} type={} pid={} uid={} gid={} domain={} subject={} identity={} cancelling={} streams={}",
+            connection.id,
+            connection.listener_name,
+            connection_listener_token(connection.listener_type),
+            optional_number(connection.pid),
+            optional_number(connection.uid),
+            optional_number(connection.gid),
+            connection_domain_token(connection.domain),
+            if connection.subject.is_empty() {
+                "-"
+            } else {
+                &connection.subject
+            },
+            connection_identity_token(connection),
+            connection.cancellation_requested,
+            connection.active_streams,
+        );
+    }
+    Ok(())
+}
+
+async fn drop_connections(
+    client: &mut Client,
+    ids: Vec<u64>,
+    uids: Vec<u32>,
+    systemd: Vec<String>,
+    compose: Vec<String>,
+    json: bool,
+) -> Result<()> {
+    let mut selectors = ids
+        .into_iter()
+        .map(AgentConnectionSelector::Id)
+        .chain(uids.into_iter().map(AgentConnectionSelector::Uid))
+        .collect::<Vec<_>>();
+    selectors.extend(
+        systemd
+            .iter()
+            .map(|value| parse_systemd_selector(value))
+            .collect::<Result<Vec<_>>>()?,
+    );
+    selectors.extend(
+        compose
+            .iter()
+            .map(|value| parse_compose_selector(value))
+            .collect::<Result<Vec<_>>>()?,
+    );
+    if selectors.is_empty() {
+        bail!("at least one --id, --uid, --systemd, or --compose selector is required");
+    }
+    let result = client.drop_connections(&selectors).await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "matched": result.matched,
+                "cancelled": result.cancelled,
+                "already_requested": result.already_requested,
+                "caller_excluded": result.caller_excluded,
+            })
+        );
+    } else {
+        println!("matched: {}", result.matched);
+        println!("cancelled: {}", result.cancelled);
+        println!("already_requested: {}", result.already_requested);
+        println!("caller_excluded: {}", result.caller_excluded);
+    }
+    Ok(())
+}
+
+fn parse_systemd_selector(value: &str) -> Result<AgentConnectionSelector> {
+    if let Some((uid, unit)) = value.split_once(':') {
+        if unit.is_empty() {
+            bail!("systemd selector unit must not be empty");
+        }
+        return Ok(AgentConnectionSelector::Systemd {
+            unit: unit.to_string(),
+            manager_uid: Some(uid.parse().context("invalid systemd manager UID")?),
+        });
+    }
+    if value.is_empty() {
+        bail!("systemd selector unit must not be empty");
+    }
+    Ok(AgentConnectionSelector::Systemd {
+        unit: value.to_string(),
+        manager_uid: None,
+    })
+}
+
+fn parse_compose_selector(value: &str) -> Result<AgentConnectionSelector> {
+    let mut fields = value.split('/');
+    let realm = fields.next().unwrap_or_default();
+    let project = fields.next().unwrap_or_default();
+    let service = fields.next();
+    if realm.is_empty()
+        || project.is_empty()
+        || service.is_some_and(str::is_empty)
+        || fields.next().is_some()
+    {
+        bail!("Compose selector must be REALM/PROJECT or REALM/PROJECT/SERVICE");
+    }
+    Ok(AgentConnectionSelector::Compose {
+        realm: realm.to_string(),
+        project: project.to_string(),
+        service: service.map(str::to_string),
+    })
+}
+
+fn connection_json(connection: &AgentConnection) -> serde_json::Value {
+    serde_json::json!({
+        "id": connection.id,
+        "listener_name": connection.listener_name,
+        "listener_type": connection_listener_token(connection.listener_type),
+        "pid": connection.pid,
+        "uid": connection.uid,
+        "gid": connection.gid,
+        "domain": connection_domain_token(connection.domain),
+        "subject": connection.subject,
+        "systemd": connection.systemd.as_ref().map(|identity| serde_json::json!({
+            "unit": identity.unit,
+            "manager_uid": identity.manager_uid,
+        })),
+        "compose": connection.compose.as_ref().map(|identity| serde_json::json!({
+            "realm": identity.realm,
+            "project": identity.project,
+            "service": identity.service,
+        })),
+        "cancellation_requested": connection.cancellation_requested,
+        "active_streams": connection.active_streams,
+    })
+}
+
+const fn connection_listener_token(listener: AgentConnectionListener) -> &'static str {
+    match listener {
+        AgentConnectionListener::Host => "host",
+        AgentConnectionListener::Container => "container",
+        _ => "unknown",
+    }
+}
+
+const fn connection_domain_token(domain: AgentConnectionDomain) -> &'static str {
+    match domain {
+        AgentConnectionDomain::Unresolved => "unresolved",
+        AgentConnectionDomain::HostProcess => "host-process",
+        AgentConnectionDomain::SystemdUnit => "systemd-unit",
+        AgentConnectionDomain::Container => "container",
+        _ => "unknown",
+    }
+}
+
+fn connection_identity_token(connection: &AgentConnection) -> String {
+    if let Some(systemd) = &connection.systemd {
+        return systemd.manager_uid.map_or_else(
+            || format!("systemd:system:{}", systemd.unit),
+            |uid| format!("systemd:{uid}:{}", systemd.unit),
+        );
+    }
+    connection.compose.as_ref().map_or_else(
+        || "-".to_string(),
+        |compose| {
+            compose.service.as_ref().map_or_else(
+                || format!("compose:{}/{}", compose.realm, compose.project),
+                |service| format!("compose:{}/{}/{}", compose.realm, compose.project, service),
+            )
+        },
+    )
+}
+
+fn optional_number(value: Option<u32>) -> String {
+    value.map_or_else(|| "-".to_string(), |value| value.to_string())
+}
+
 /// The stable one-line `--json` object for `basil reload [--check]` (the
 /// scriptable reload contract). Pure: lifted out of [`reload`] so the field set,
 /// including the nested `rejection` object (present only on a rejected
@@ -1452,13 +1681,13 @@ const fn aead_name(value: AeadAlgorithm) -> &'static str {
 mod tests {
     use super::{
         Command as ClientCommand, KeyMaterial, ManifestEntry, check_import_set, explain_json,
-        health_json, key_material, ready_exit_code, ready_json, reload_exit_code, reload_json,
-        revoke_json, status_json,
+        health_json, key_material, parse_compose_selector, parse_systemd_selector, ready_exit_code,
+        ready_json, reload_exit_code, reload_json, revoke_json, status_json,
     };
     use crate::Cli;
     use basil::{
-        AgentDecision, AgentExplanation, AgentHealth, AgentReadiness, AgentReload, AgentRevocation,
-        MatchedRule, ReadinessReason, ReloadRejection,
+        AgentConnectionSelector, AgentDecision, AgentExplanation, AgentHealth, AgentReadiness,
+        AgentReload, AgentRevocation, MatchedRule, ReadinessReason, ReloadRejection,
     };
     use clap::Parser;
     use std::path::Path;
@@ -1474,6 +1703,21 @@ mod tests {
         Cli::parse_from(["basil", "reload"]);
         Cli::parse_from(["basil", "reload", "--check"]);
         Cli::parse_from(["basil", "reload", "--check", "--json"]);
+        Cli::parse_from(["basil", "connections", "list", "--json"]);
+        Cli::parse_from([
+            "basil",
+            "connections",
+            "drop",
+            "--id",
+            "7",
+            "--uid",
+            "1000",
+            "--systemd",
+            "1000:api.service",
+            "--compose",
+            "podman-alice/shop/api",
+            "--json",
+        ]);
         Cli::parse_from([
             "basil",
             "new-key",
@@ -2361,5 +2605,33 @@ mod tests {
         assert_eq!(v["persisted"], serde_json::json!(true));
         let obj = v.as_object().expect("revoke --json is a JSON object");
         assert_eq!(obj.len(), 4, "revoke --json carries exactly four fields");
+    }
+
+    #[test]
+    fn typed_connection_selectors_parse_without_mutable_container_names() {
+        assert_eq!(
+            parse_systemd_selector("api.service").expect("system unit selector"),
+            AgentConnectionSelector::Systemd {
+                unit: "api.service".to_string(),
+                manager_uid: None,
+            }
+        );
+        assert_eq!(
+            parse_systemd_selector("1000:api.service").expect("user unit selector"),
+            AgentConnectionSelector::Systemd {
+                unit: "api.service".to_string(),
+                manager_uid: Some(1000),
+            }
+        );
+        assert_eq!(
+            parse_compose_selector("podman-alice/shop/api").expect("Compose selector"),
+            AgentConnectionSelector::Compose {
+                realm: "podman-alice".to_string(),
+                project: "shop".to_string(),
+                service: Some("api".to_string()),
+            }
+        );
+        assert!(parse_compose_selector("mutable-container-name").is_err());
+        assert!(parse_compose_selector("realm/project/service/extra").is_err());
     }
 }

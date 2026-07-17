@@ -9,9 +9,10 @@ use tokio::runtime::Runtime;
 
 use crate::Client;
 use crate::client::{
-    AgentExplanation, AgentHealth, AgentReadiness, AgentReload, AgentRevocation, AgentStatus,
-    AllowedNatsSigner, ImportEntry, IssuedCertificate, KeyHandle, MintedJwt, NatsJwtValidation,
-    NatsUserPermissions, SecretValue, SignNatsJwtOptions,
+    AgentConnection, AgentConnectionDrop, AgentConnectionSelector, AgentExplanation, AgentHealth,
+    AgentReadiness, AgentReload, AgentRevocation, AgentStatus, AllowedNatsSigner, ImportEntry,
+    IssuedCertificate, KeyHandle, MintedJwt, NatsJwtValidation, NatsUserPermissions, SecretValue,
+    SignNatsJwtOptions,
 };
 use crate::constants::DEFAULT_CONN_TIMEOUT;
 use crate::error::Result;
@@ -396,6 +397,20 @@ impl BlockingClient {
     /// config is read from the broker's on-disk paths only, never the wire.
     pub fn reload(&mut self, check: bool) -> Result<AgentReload> {
         self.runtime.block_on(self.inner.reload(check))
+    }
+
+    /// Return the permission-gated bounded accepted-connection inventory.
+    pub fn connections(&mut self) -> Result<Vec<AgentConnection>> {
+        self.runtime.block_on(self.inner.connections())
+    }
+
+    /// Deliberately terminate exact or typed selected accepted connections.
+    pub fn drop_connections(
+        &mut self,
+        selectors: &[AgentConnectionSelector],
+    ) -> Result<AgentConnectionDrop> {
+        self.runtime
+            .block_on(self.inner.drop_connections(selectors))
     }
 
     /// Explain a policy decision against the broker's serving generation.

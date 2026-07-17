@@ -22,12 +22,35 @@ pub struct AuthenticatedActor {
     pub domain: AuthorizationDomain,
     /// The uniquely selected policy subject.
     pub subject: SubjectName,
+    /// Typed immutable workload identity retained for trusted diagnostics.
+    pub workload_identity: Option<WorkloadIdentity>,
     /// Evidence summaries that established the subject.
     pub authenticated_by: Vec<ProofSummary>,
     /// The local presenter that brought the request to the broker.
     pub presenter: PresenterInfo,
     /// Transport facts for the request.
     pub transport: TransportInfo,
+}
+
+/// Typed immutable workload identity established alongside the policy subject.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkloadIdentity {
+    /// A concrete `systemd` service and its manager scope.
+    Systemd {
+        /// Canonical concrete `.service` unit name.
+        unit: String,
+        /// Per-user manager owner. Absence identifies the system manager.
+        manager_user: Option<u32>,
+    },
+    /// A Compose workload correlated by the runtime attestor.
+    Compose {
+        /// Configured attestor realm.
+        realm: String,
+        /// Effective Compose project name.
+        project: String,
+        /// Compose service name, when the workload is a normal service.
+        service: Option<String>,
+    },
 }
 
 impl AuthenticatedActor {
@@ -303,10 +326,35 @@ pub fn resolve_evidence_actor(
     Ok(AuthenticatedActor {
         domain: resolution.domain,
         subject,
+        workload_identity: workload_identity(evidence, resolution.domain),
         authenticated_by,
         presenter: PresenterInfo::from(peer),
         transport: TransportInfo::default(),
     })
+}
+
+fn workload_identity(
+    evidence: &EvidenceSnapshot,
+    domain: AuthorizationDomain,
+) -> Option<WorkloadIdentity> {
+    match domain {
+        AuthorizationDomain::HostProcess => None,
+        AuthorizationDomain::SystemdUnit => match &evidence.systemd {
+            EvidenceValue::Available(systemd) => Some(WorkloadIdentity::Systemd {
+                unit: systemd.unit.clone(),
+                manager_user: systemd.manager_user,
+            }),
+            EvidenceValue::Unavailable => None,
+        },
+        AuthorizationDomain::Container => match &evidence.compose {
+            EvidenceValue::Available(compose) => Some(WorkloadIdentity::Compose {
+                realm: compose.realm.clone(),
+                project: compose.project.clone(),
+                service: compose.service.clone(),
+            }),
+            EvidenceValue::Unavailable => None,
+        },
+    }
 }
 
 fn signature_key_fingerprint(key: &SignatureKeyEvidence) -> String {

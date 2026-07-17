@@ -486,6 +486,184 @@ pub struct AgentRevocation {
     pub persisted: bool,
 }
 
+/// Closed listener type captured when a connection was accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AgentConnectionListener {
+    /// Host/operator listener.
+    Host,
+    /// Container workload listener.
+    Container,
+    /// A future listener type unknown to this client version.
+    Unknown,
+}
+
+/// Independently resolved authorization domain for a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AgentConnectionDomain {
+    /// The connection has not resolved an actor yet.
+    Unresolved,
+    /// Ordinary host process.
+    HostProcess,
+    /// Concrete `systemd` service.
+    SystemdUnit,
+    /// Runtime-attested container.
+    Container,
+    /// A future domain unknown to this client version.
+    Unknown,
+}
+
+/// Typed concrete `systemd` identity for a connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSystemdIdentity {
+    /// Canonical concrete `.service` unit name.
+    pub unit: String,
+    /// Per-user manager owner. Absence identifies the system manager.
+    pub manager_uid: Option<u32>,
+}
+
+/// Typed Compose identity correlated by a runtime attestor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentComposeIdentity {
+    /// Configured attestor realm.
+    pub realm: String,
+    /// Effective Compose project name.
+    pub project: String,
+    /// Compose service name, when present.
+    pub service: Option<String>,
+}
+
+/// One entry in the broker's bounded accepted-connection inventory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentConnection {
+    /// Stable process-lifetime connection identifier.
+    pub id: u64,
+    /// Listener name captured at accept time.
+    pub listener_name: String,
+    /// Closed listener type captured at accept time.
+    pub listener_type: AgentConnectionListener,
+    /// Kernel peer PID.
+    pub pid: Option<u32>,
+    /// Kernel peer UID.
+    pub uid: Option<u32>,
+    /// Kernel peer primary GID.
+    pub gid: Option<u32>,
+    /// Independently resolved domain.
+    pub domain: AgentConnectionDomain,
+    /// Uniquely selected policy subject; empty until actor resolution.
+    pub subject: String,
+    /// Concrete `systemd` identity, when applicable.
+    pub systemd: Option<AgentSystemdIdentity>,
+    /// Compose identity, when applicable.
+    pub compose: Option<AgentComposeIdentity>,
+    /// Whether cancellation was already requested.
+    pub cancellation_requested: bool,
+    /// Active long-lived streams owned by this connection.
+    pub active_streams: u32,
+}
+
+/// Exact typed selector for [`Client::drop_connections`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AgentConnectionSelector {
+    /// One stable connection id.
+    Id(u64),
+    /// Every connection presented by this UID. Intentionally broad.
+    Uid(u32),
+    /// One concrete `systemd` identity.
+    Systemd {
+        /// Canonical concrete `.service` unit.
+        unit: String,
+        /// Per-user manager owner. Absence selects the system manager.
+        manager_uid: Option<u32>,
+    },
+    /// One typed Compose workload identity.
+    Compose {
+        /// Configured attestor realm.
+        realm: String,
+        /// Effective Compose project.
+        project: String,
+        /// Compose service, when present.
+        service: Option<String>,
+    },
+}
+
+/// Aggregate result of a deliberate connection-drop operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentConnectionDrop {
+    /// Active entries matched by at least one selector.
+    pub matched: u32,
+    /// Cancellation signals delivered by this call.
+    pub cancelled: u32,
+    /// Matching entries already cancelling.
+    pub already_requested: u32,
+    /// Matching caller entry excluded so the RPC could reply.
+    pub caller_excluded: u32,
+}
+
+fn agent_connection(connection: pb::ConnectionInfo) -> AgentConnection {
+    let listener_type = match pb::ConnectionListenerType::try_from(connection.listener_type) {
+        Ok(pb::ConnectionListenerType::Host) => AgentConnectionListener::Host,
+        Ok(pb::ConnectionListenerType::Container) => AgentConnectionListener::Container,
+        Ok(pb::ConnectionListenerType::Unspecified) | Err(_) => AgentConnectionListener::Unknown,
+    };
+    let domain = match pb::ConnectionDomain::try_from(connection.domain) {
+        Ok(pb::ConnectionDomain::Unspecified) => AgentConnectionDomain::Unresolved,
+        Ok(pb::ConnectionDomain::HostProcess) => AgentConnectionDomain::HostProcess,
+        Ok(pb::ConnectionDomain::SystemdUnit) => AgentConnectionDomain::SystemdUnit,
+        Ok(pb::ConnectionDomain::Container) => AgentConnectionDomain::Container,
+        Err(_) => AgentConnectionDomain::Unknown,
+    };
+    AgentConnection {
+        id: connection.id,
+        listener_name: connection.listener_name,
+        listener_type,
+        pid: connection.pid,
+        uid: connection.uid,
+        gid: connection.gid,
+        domain,
+        subject: connection.subject,
+        systemd: connection.systemd.map(|identity| AgentSystemdIdentity {
+            unit: identity.unit,
+            manager_uid: identity.manager_uid,
+        }),
+        compose: connection.compose.map(|identity| AgentComposeIdentity {
+            realm: identity.realm,
+            project: identity.project,
+            service: identity.service,
+        }),
+        cancellation_requested: connection.cancellation_requested,
+        active_streams: connection.active_streams,
+    }
+}
+
+fn connection_selector(selector: &AgentConnectionSelector) -> pb::ConnectionSelector {
+    use pb::connection_selector::Selector;
+    let selector = match selector {
+        AgentConnectionSelector::Id(id) => Selector::Id(*id),
+        AgentConnectionSelector::Uid(uid) => Selector::Uid(*uid),
+        AgentConnectionSelector::Systemd { unit, manager_uid } => {
+            Selector::Systemd(pb::ConnectionSystemdSelector {
+                unit: unit.clone(),
+                manager_uid: *manager_uid,
+            })
+        }
+        AgentConnectionSelector::Compose {
+            realm,
+            project,
+            service,
+        } => Selector::Compose(pb::ConnectionComposeSelector {
+            realm: realm.clone(),
+            project: project.clone(),
+            service: service.clone(),
+        }),
+    };
+    pb::ConnectionSelector {
+        selector: Some(selector),
+    }
+}
+
 impl AgentReload {
     /// Whether the broker accepted the candidate: an applied reload, or a dry-run
     /// that validated cleanly. `false` iff a [`ReloadRejection`] is present.
@@ -1390,6 +1568,42 @@ impl Client {
                 reason: r.reason,
                 message: r.message,
             }),
+        })
+    }
+
+    /// Return the permission-gated, globally bounded active connection inventory.
+    pub async fn connections(&mut self) -> Result<Vec<AgentConnection>> {
+        let response = Self::bounded(
+            self.default_timeout,
+            self.admin.list_connections(pb::ListConnectionsRequest {}),
+        )
+        .await?;
+        Ok(response
+            .into_inner()
+            .connections
+            .into_iter()
+            .map(agent_connection)
+            .collect())
+    }
+
+    /// Deliberately terminate connections matching a bounded typed selector set.
+    pub async fn drop_connections(
+        &mut self,
+        selectors: &[AgentConnectionSelector],
+    ) -> Result<AgentConnectionDrop> {
+        let selectors = selectors.iter().map(connection_selector).collect();
+        let response = Self::bounded(
+            self.default_timeout,
+            self.admin
+                .drop_connections(pb::DropConnectionsRequest { selectors }),
+        )
+        .await?
+        .into_inner();
+        Ok(AgentConnectionDrop {
+            matched: response.matched,
+            cancelled: response.cancelled,
+            already_requested: response.already_requested,
+            caller_excluded: response.caller_excluded,
         })
     }
 

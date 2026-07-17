@@ -19,6 +19,8 @@ use tokio::sync::oneshot;
 use tonic::transport::server::Connected;
 
 use super::grpc_server::ListenerType;
+use crate::actor::{AuthenticatedActor, WorkloadIdentity};
+use crate::catalog::AuthorizationDomain;
 use crate::peer::PeerInfo;
 
 /// Default broker-wide accepted-transport safety ceiling.
@@ -32,6 +34,12 @@ pub const DEFAULT_MAX_CONNECTIONS_PER_LISTENER: usize = 1024;
 pub struct ConnectionId(u64);
 
 impl ConnectionId {
+    /// Construct a nonzero wire identifier.
+    #[must_use]
+    pub const fn from_u64(value: u64) -> Option<Self> {
+        if value == 0 { None } else { Some(Self(value)) }
+    }
+
     /// Numeric identifier for protocol and diagnostic serialization.
     #[must_use]
     pub const fn get(self) -> u64 {
@@ -98,6 +106,7 @@ impl ListenerConnectInfo {
 #[derive(Clone, Debug)]
 pub struct ConnectionRecord {
     context: ListenerConnectInfo,
+    identity: Option<ConnectionIdentity>,
     cancellation_requested: bool,
 }
 
@@ -108,11 +117,83 @@ impl ConnectionRecord {
         &self.context
     }
 
+    /// Most recently resolved workload identity for this transport.
+    #[must_use]
+    pub const fn identity(&self) -> Option<&ConnectionIdentity> {
+        self.identity.as_ref()
+    }
+
     /// Whether transport cancellation has been requested.
     #[must_use]
     pub const fn cancellation_requested(&self) -> bool {
         self.cancellation_requested
     }
+}
+
+/// Disclosure-safe, typed workload identity retained for connection operations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectionIdentity {
+    domain: AuthorizationDomain,
+    subject: String,
+    workload: Option<WorkloadIdentity>,
+}
+
+impl ConnectionIdentity {
+    /// Independently resolved authorization domain.
+    #[must_use]
+    pub const fn domain(&self) -> AuthorizationDomain {
+        self.domain
+    }
+
+    /// Uniquely selected policy subject.
+    #[must_use]
+    pub fn subject(&self) -> &str {
+        &self.subject
+    }
+
+    /// Typed systemd or Compose identity, when the domain supplies one.
+    #[must_use]
+    pub const fn workload(&self) -> Option<&WorkloadIdentity> {
+        self.workload.as_ref()
+    }
+}
+
+/// Exact typed selector for deliberate connection cancellation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConnectionSelector {
+    /// One process-lifetime connection identifier.
+    Id(ConnectionId),
+    /// Every connection presented by one Unix UID. This is intentionally broad.
+    Uid(u32),
+    /// A concrete systemd unit in one manager scope.
+    Systemd {
+        /// Canonical concrete `.service` unit name.
+        unit: String,
+        /// Per-user manager owner. Absence identifies the system manager.
+        manager_user: Option<u32>,
+    },
+    /// An attested Compose workload identity.
+    Compose {
+        /// Configured attestor realm.
+        realm: String,
+        /// Effective Compose project name.
+        project: String,
+        /// Compose service name, when the workload is a normal service.
+        service: Option<String>,
+    },
+}
+
+/// Aggregate result of one bounded selector cancellation operation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ConnectionCancellation {
+    /// Active entries matched by at least one selector.
+    pub matched: usize,
+    /// Cancellation signals delivered during this operation.
+    pub cancelled: usize,
+    /// Matching entries whose cancellation had already been requested.
+    pub already_requested: usize,
+    /// Matching caller entry deliberately excluded so the RPC can reply.
+    pub caller_excluded: usize,
 }
 
 /// Registry construction or registration failure.
@@ -159,6 +240,7 @@ struct RegistryState {
 
 struct RegistryEntry {
     context: ListenerConnectInfo,
+    identity: Option<ConnectionIdentity>,
     cancel: Option<oneshot::Sender<()>>,
 }
 
@@ -262,6 +344,7 @@ impl ConnectionRegistry {
             id,
             RegistryEntry {
                 context: context.clone(),
+                identity: None,
                 cancel: Some(cancel),
             },
         );
@@ -299,6 +382,59 @@ impl ConnectionRegistry {
         sender.is_some_and(|sender| sender.send(()).is_ok())
     }
 
+    /// Retain the latest successfully resolved actor for one active transport.
+    pub fn record_actor(&self, id: ConnectionId, actor: &AuthenticatedActor) {
+        let mut state = lock_state(&self.inner);
+        if let Some(entry) = state.entries.get_mut(&id) {
+            entry.identity = Some(ConnectionIdentity {
+                domain: actor.domain,
+                subject: actor.subject.clone(),
+                workload: actor.workload_identity.clone(),
+            });
+        }
+    }
+
+    /// Cancel every active entry matching any selector, except the caller.
+    ///
+    /// Matching and sender extraction are atomic with registration and release.
+    /// Signals are delivered after releasing the registry lock.
+    #[must_use]
+    pub fn cancel_matching(
+        &self,
+        selectors: &[ConnectionSelector],
+        caller: Option<ConnectionId>,
+    ) -> ConnectionCancellation {
+        let (senders, mut result) = {
+            let mut state = lock_state(&self.inner);
+            let mut senders = Vec::new();
+            let mut result = ConnectionCancellation::default();
+            for (id, entry) in &mut state.entries {
+                if !selectors
+                    .iter()
+                    .any(|selector| selector_matches(selector, *id, entry))
+                {
+                    continue;
+                }
+                result.matched += 1;
+                if caller == Some(*id) {
+                    result.caller_excluded += 1;
+                } else if let Some(sender) = entry.cancel.take() {
+                    senders.push(sender);
+                } else {
+                    result.already_requested += 1;
+                }
+            }
+            drop(state);
+            (senders, result)
+        };
+        result.cancelled = senders
+            .into_iter()
+            .map(|sender| sender.send(()).is_ok())
+            .filter(|delivered| *delivered)
+            .count();
+        result
+    }
+
     /// Return a stable-ID ordered, globally bounded inventory snapshot.
     #[must_use]
     pub fn snapshot(&self) -> Vec<ConnectionRecord> {
@@ -308,6 +444,7 @@ impl ConnectionRegistry {
             .values()
             .map(|entry| ConnectionRecord {
                 context: entry.context.clone(),
+                identity: entry.identity.clone(),
                 cancellation_requested: entry.cancel.is_none(),
             })
             .collect()
@@ -366,6 +503,44 @@ impl ConnectionRegistry {
             names,
             active,
         })
+    }
+}
+
+fn selector_matches(
+    selector: &ConnectionSelector,
+    id: ConnectionId,
+    entry: &RegistryEntry,
+) -> bool {
+    match selector {
+        ConnectionSelector::Id(expected) => id == *expected,
+        ConnectionSelector::Uid(expected) => entry.context.peer.uid == Some(*expected),
+        ConnectionSelector::Systemd { unit, manager_user } => entry
+            .identity
+            .as_ref()
+            .and_then(ConnectionIdentity::workload)
+            .is_some_and(|identity| {
+                matches!(
+                    identity,
+                    WorkloadIdentity::Systemd {
+                        unit: actual_unit,
+                        manager_user: actual_manager,
+                    } if actual_unit == unit && actual_manager == manager_user
+                )
+            }),
+        ConnectionSelector::Compose { realm, project, service } => entry
+            .identity
+            .as_ref()
+            .and_then(ConnectionIdentity::workload)
+            .is_some_and(|identity| {
+                matches!(
+                    identity,
+                    WorkloadIdentity::Compose {
+                        realm: actual_realm,
+                        project: actual_project,
+                        service: actual_service,
+                    } if actual_realm == realm && actual_project == project && actual_service == service
+                )
+            }),
     }
 }
 
@@ -627,6 +802,66 @@ mod tests {
         drop(tracked);
         assert_eq!(registry.active_for_listener("host"), 0);
         assert!(registry.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn typed_cancellation_is_atomic_deduplicated_and_excludes_caller() {
+        let registry = ConnectionRegistry::new(4, 4).expect("registry");
+        let mut tracked = Vec::new();
+        for _ in 0..3 {
+            let (stream, _peer) = pair();
+            tracked.push(
+                registry
+                    .register(stream, "workloads", ListenerType::Container)
+                    .expect("tracked connection"),
+            );
+        }
+        let first = tracked[0].context.connection_id();
+        let second = tracked[1].context.connection_id();
+        let actor = AuthenticatedActor {
+            domain: AuthorizationDomain::Container,
+            subject: "svc.api".to_string(),
+            workload_identity: Some(WorkloadIdentity::Compose {
+                realm: "podman-alice".to_string(),
+                project: "shop".to_string(),
+                service: Some("api".to_string()),
+            }),
+            authenticated_by: Vec::new(),
+            presenter: crate::actor::PresenterInfo::from(tracked[0].context.peer()),
+            transport: crate::actor::TransportInfo::default(),
+        };
+        registry.record_actor(first, &actor);
+        registry.record_actor(second, &actor);
+
+        let selector = ConnectionSelector::Compose {
+            realm: "podman-alice".to_string(),
+            project: "shop".to_string(),
+            service: Some("api".to_string()),
+        };
+        let outcome = registry.cancel_matching(&[selector.clone(), selector], Some(first));
+        assert_eq!(
+            outcome,
+            ConnectionCancellation {
+                matched: 2,
+                cancelled: 1,
+                already_requested: 0,
+                caller_excluded: 1,
+            }
+        );
+        let snapshot = registry.snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .find(|record| record.context.connection_id() == second)
+                .is_some_and(ConnectionRecord::cancellation_requested)
+        );
+
+        let uid = tracked[0].context.peer().uid.expect("peer uid");
+        let broad = registry.cancel_matching(&[ConnectionSelector::Uid(uid)], Some(first));
+        assert_eq!(broad.matched, 3);
+        assert_eq!(broad.cancelled, 1);
+        assert_eq!(broad.already_requested, 1);
+        assert_eq!(broad.caller_excluded, 1);
     }
 
     #[tokio::test]

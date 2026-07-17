@@ -847,6 +847,13 @@ service AdminService {
   // implies it. The broker requires a configured `revocation_store=jwt-svid`
   // backing key so the revocation survives restart.
   rpc Revoke(RevokeRequest) returns (RevokeResponse);
+  // Return the stable-id ordered, globally bounded accepted-connection
+  // inventory. Requires `op:connection_status` over `broker.connections`.
+  rpc ListConnections(ListConnectionsRequest) returns (ListConnectionsResponse);
+  // Deliberately terminate accepted connections selected by exact id, broad UID,
+  // or typed attested workload identity. Requires `op:connection_drop` over
+  // `broker.connections.drop`.
+  rpc DropConnections(DropConnectionsRequest) returns (DropConnectionsResponse);
 }
 
 // Request to hot-reload the catalog/policy generation from disk.
@@ -971,6 +978,97 @@ message RevokeResponse {
   uint64 expires_at_unix = 3;
   // Whether the revocation was persisted to the configured backing store.
   bool persisted = 4;
+}
+
+// Request the complete bounded accepted-connection inventory.
+message ListConnectionsRequest {}
+
+// Closed listener type captured when a connection was accepted.
+enum ConnectionListenerType {
+  CONNECTION_LISTENER_TYPE_UNSPECIFIED = 0;
+  CONNECTION_LISTENER_TYPE_HOST = 1;
+  CONNECTION_LISTENER_TYPE_CONTAINER = 2;
+}
+
+// Independently resolved authorization domain for an active connection.
+enum ConnectionDomain {
+  CONNECTION_DOMAIN_UNSPECIFIED = 0;
+  CONNECTION_DOMAIN_HOST_PROCESS = 1;
+  CONNECTION_DOMAIN_SYSTEMD_UNIT = 2;
+  CONNECTION_DOMAIN_CONTAINER = 3;
+}
+
+// Trusted concrete systemd identity.
+message ConnectionSystemdIdentity {
+  string unit = 1;
+  // Present for a per-user manager; absent for the system manager.
+  optional uint32 manager_uid = 2;
+}
+
+// Trusted Compose identity correlated by a runtime attestor.
+message ConnectionComposeIdentity {
+  string realm = 1;
+  string project = 2;
+  optional string service = 3;
+}
+
+// One accepted transport. Peer fields are kernel-derived; domain, subject, and
+// typed identity are populated after the transport first resolves successfully.
+message ConnectionInfo {
+  uint64 id = 1;
+  string listener_name = 2;
+  ConnectionListenerType listener_type = 3;
+  optional uint32 pid = 4;
+  optional uint32 uid = 5;
+  optional uint32 gid = 6;
+  ConnectionDomain domain = 7;
+  string subject = 8;
+  ConnectionSystemdIdentity systemd = 9;
+  ConnectionComposeIdentity compose = 10;
+  bool cancellation_requested = 11;
+  uint32 active_streams = 12;
+}
+
+message ListConnectionsResponse {
+  repeated ConnectionInfo connections = 1;
+}
+
+// Exact concrete systemd selector. Both fields must match.
+message ConnectionSystemdSelector {
+  string unit = 1;
+  optional uint32 manager_uid = 2;
+}
+
+// Exact typed Compose selector. Bare mutable container names are deliberately
+// absent from this contract.
+message ConnectionComposeSelector {
+  string realm = 1;
+  string project = 2;
+  optional string service = 3;
+}
+
+// One selector in a bounded OR-set.
+message ConnectionSelector {
+  oneof selector {
+    uint64 id = 1;
+    uint32 uid = 2;
+    ConnectionSystemdSelector systemd = 3;
+    ConnectionComposeSelector compose = 4;
+  }
+}
+
+message DropConnectionsRequest {
+  // At least one and at most 64 selectors. A connection matching any selector
+  // is targeted once. The caller's own transport is excluded so the RPC can
+  // return its audited result.
+  repeated ConnectionSelector selectors = 1;
+}
+
+message DropConnectionsResponse {
+  uint32 matched = 1;
+  uint32 cancelled = 2;
+  uint32 already_requested = 3;
+  uint32 caller_excluded = 4;
 }
 
 // Request for broker liveness.
