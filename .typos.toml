@@ -19,6 +19,9 @@ extend-ignore-identifiers-re = [
   ".*(cose|Cose|COSE).*",
   ".*Encrypter.*",
   "Tpm.*",
+  # br ticket-id suffixes (e.g. `basil-1som`): the hyphen splits the id, so
+  # typos sees a digit-prefixed identifier like `1som` and flags `som`.
+  "^[0-9]+[a-z]{1,4}$",
 ]
 
 [default.extend-identifiers]

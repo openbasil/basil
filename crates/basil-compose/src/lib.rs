@@ -401,6 +401,28 @@ mod tests {
         }
     }
 
+    /// Runs [`project`], retrying `ETXTBSY` spawn failures. Parallel tests
+    /// fork while another test's freshly written script descriptor is still
+    /// open; the forked child holds it until its own `exec`, so this test's
+    /// `exec` can transiently fail with `ExecutableFileBusy`. Test-only race.
+    async fn project_retrying_etxtbsy(
+        frontend: &Frontend,
+        invocation: &Invocation,
+    ) -> Result<EffectiveModel, ProjectionError> {
+        let mut attempts = 0_u32;
+        loop {
+            match project(frontend, invocation).await {
+                Err(ProjectionError::Execution(error))
+                    if error.raw_os_error() == Some(26) && attempts < 50 =>
+                {
+                    attempts += 1;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                outcome => return outcome,
+            }
+        }
+    }
+
     #[test]
     fn docker_argv_preserves_all_launch_inputs_in_order() {
         let invocation = Invocation {
@@ -642,7 +664,7 @@ mod tests {
             r#"printf '%s' '{"name":"executed","services":{"api":{"image":"example/api"}}}'
 printf '%s' 'SENSITIVE-FRONTEND-DIAGNOSTIC' >&2"#,
         );
-        let model = project(
+        let model = project_retrying_etxtbsy(
             &Frontend::Docker {
                 executable: frontend.0.clone(),
             },
@@ -658,7 +680,7 @@ printf '%s' 'SENSITIVE-FRONTEND-DIAGNOSTIC' >&2"#,
     async fn failed_frontend_does_not_repeat_its_sensitive_diagnostics() {
         let secret = "SENSITIVE-FAILURE-DIAGNOSTIC";
         let frontend = TempFrontend::new(&format!("printf '%s' '{secret}' >&2\nexit 9"));
-        let error = project(
+        let error = project_retrying_etxtbsy(
             &Frontend::Docker {
                 executable: frontend.0.clone(),
             },
@@ -680,7 +702,7 @@ printf '%s' 'SENSITIVE-FRONTEND-DIAGNOSTIC' >&2"#,
             format!("printf '%*s' {} '' >&2", MAX_STDERR_BYTES + 1),
         ] {
             let frontend = TempFrontend::new(&body);
-            let error = project(
+            let error = project_retrying_etxtbsy(
                 &Frontend::Docker {
                     executable: frontend.0.clone(),
                 },
