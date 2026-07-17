@@ -1,0 +1,73 @@
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+# AppArmor profile for the Basil measurement helper (SPEC.md rev 1.2;
+# basil-uvsx). Path-attached: the helper is a dedicated binary, so the
+# profile is active at the exec boundary. Self-contained on purpose (no
+# abstraction includes) so the loaded text equals this file.
+
+profile basil-measure-helper /usr/bin/basil-measure-helper flags=(attach_disconnected) {
+  # Sole measurement authority: PTRACE_MODE_READ toward attestor peers plus
+  # reading executables it could not otherwise search to.
+  capability sys_ptrace,
+  capability dac_read_search,
+
+  # Peer measurement is read-only tracing of confined attestor generations.
+  # The rootless-owner boundary needs the unconfined peer as well until the
+  # rootless entry mechanism is proven (see nix/lsm/README.md).
+  ptrace (read) peer=basil-attestor-g*,
+  ptrace (read) peer=unconfined,
+
+  # Single shared SOCK_SEQPACKET endpoint; the helper unlinks a verified
+  # stale socket and binds its own listener. No socket unit exists.
+  unix (create, getattr, setattr, getopt, setopt, shutdown, bind, listen, accept, send, receive) type=seqpacket,
+  /run/basil/measure/ rw,
+  /run/basil/measure/control.sock rw,
+
+  # Root-owned installed evidence stores, read-only: allowlist generations
+  # and the authority-manifest store read on every measurement (basil-6gmc).
+  /etc/basil/measure/policy.d/ r,
+  /etc/basil/measure/policy.d/** r,
+  /etc/basil/measure/manifest.d/ r,
+  /etc/basil/measure/manifest.d/** r,
+
+  # Peer evidence reads and the /proc/<pid>/exe resolution.
+  /proc/ r,
+  /proc/[0-9]*/ r,
+  /proc/[0-9]*/stat r,
+  /proc/[0-9]*/status r,
+  /proc/[0-9]*/exe r,
+  /proc/sys/kernel/pid_max r,
+
+  # The peer's current executable may live anywhere a workload can execute
+  # from, including user homes for rootless realms; measurement is a
+  # read-only open of that resolved target.
+  /** r,
+
+  # System bus client scoped to exactly the systemd manager resolution call.
+  /run/dbus/system_bus_socket rw,
+  unix (create, connect, send, receive, getopt, setopt) type=stream,
+  dbus (send) bus=system path=/org/freedesktop/DBus interface=org.freedesktop.DBus member={Hello,GetNameOwner},
+  dbus (send) bus=system path=/org/freedesktop/systemd1 interface=org.freedesktop.systemd1.Manager member=GetUnitByPIDFD,
+  dbus (receive) bus=system,
+
+  # Own binary and the loader/runtime it maps.
+  /usr/bin/basil-measure-helper mr,
+  /usr/lib/** mr,
+  /usr/lib64/** mr,
+  /nix/store/** mr,
+  /etc/ld.so.cache r,
+
+  # Service lifecycle signals from the manager.
+  signal (receive) set=(term, kill, hup) peer=unconfined,
+
+  # Everything else is denied by default; state the sensitive ones so an
+  # accidental future allow is an audited conflict.
+  deny capability dac_override,
+  deny /etc/basil/measure/policy.d/** w,
+  deny /etc/basil/measure/manifest.d/** w,
+  deny /proc/[0-9]*/mem rw,
+  deny mount,
+  deny umount,
+}

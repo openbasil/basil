@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+# Per-generation file contexts (basil-uvsx). The installer renders @GEN@ and
+# packages this beside basil_attestor.te.in's module. The runtime-directory
+# final segment is exactly g@GEN@ per the checked generation binding; realm
+# names cannot contain "/" so one pattern covers every realm of this
+# generation.
+
+/run/basil/attestors/[^/]+/g@GEN@(/.*)?		system_u:object_r:basil_attestor_var_run_t:s0

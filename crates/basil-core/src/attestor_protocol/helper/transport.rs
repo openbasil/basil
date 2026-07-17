@@ -16,7 +16,9 @@
 
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
+use std::time::Instant;
 
+use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::net::{
     AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags,
@@ -45,6 +47,9 @@ pub enum TransportError {
     /// The endpoint path has no parent directory or is not absolute-safe.
     #[error("helper endpoint path is invalid")]
     InvalidPath,
+    /// The caller's deadline elapsed before the peer was ready.
+    #[error("helper transport deadline exceeded")]
+    DeadlineExceeded,
     /// An underlying socket or filesystem operation failed.
     #[error("helper transport I/O failure: {0}")]
     Io(#[from] std::io::Error),
@@ -213,13 +218,20 @@ impl HelperConnection {
     ///
     /// Returns [`TransportError::Io`] when `recvmsg` fails.
     pub fn recv(&self, max_bytes: usize) -> Result<Option<ReceivedDatagram>, TransportError> {
+        self.recv_with_flags(max_bytes, RecvFlags::CMSG_CLOEXEC)
+    }
+
+    fn recv_with_flags(
+        &self,
+        max_bytes: usize,
+        flags: RecvFlags,
+    ) -> Result<Option<ReceivedDatagram>, TransportError> {
         let mut buffer = vec![0u8; max_bytes];
         let mut space = [std::mem::MaybeUninit::uninit();
             rustix::cmsg_space!(ScmRights(MAX_RECEIVED_DESCRIPTORS))];
         let mut ancillary = RecvAncillaryBuffer::new(&mut space);
         let mut iov = [std::io::IoSliceMut::new(&mut buffer)];
-        let message =
-            rustix::net::recvmsg(&self.fd, &mut iov, &mut ancillary, RecvFlags::CMSG_CLOEXEC)?;
+        let message = rustix::net::recvmsg(&self.fd, &mut iov, &mut ancillary, flags)?;
         let mut descriptors = Vec::new();
         for received in ancillary.drain() {
             if let RecvAncillaryMessage::ScmRights(fds) = received {
@@ -247,6 +259,15 @@ impl HelperConnection {
     /// Returns [`TransportError::Io`] when `sendmsg` fails or the payload is
     /// not sent as one record.
     pub fn send(&self, bytes: &[u8], descriptors: &[BorrowedFd<'_>]) -> Result<(), TransportError> {
+        self.send_with_flags(bytes, descriptors, SendFlags::NOSIGNAL)
+    }
+
+    fn send_with_flags(
+        &self,
+        bytes: &[u8],
+        descriptors: &[BorrowedFd<'_>],
+        flags: SendFlags,
+    ) -> Result<(), TransportError> {
         let mut space = [std::mem::MaybeUninit::uninit();
             rustix::cmsg_space!(ScmRights(MAX_RECEIVED_DESCRIPTORS))];
         let mut ancillary = SendAncillaryBuffer::new(&mut space);
@@ -257,13 +278,45 @@ impl HelperConnection {
             )));
         }
         let iov = [std::io::IoSlice::new(bytes)];
-        let sent = rustix::net::sendmsg(&self.fd, &iov, &mut ancillary, SendFlags::NOSIGNAL)?;
+        let sent = rustix::net::sendmsg(&self.fd, &iov, &mut ancillary, flags)?;
         if sent != bytes.len() {
             return Err(TransportError::Io(std::io::Error::other(
                 "short seqpacket send",
             )));
         }
         Ok(())
+    }
+
+    /// Send one datagram with optional `SCM_RIGHTS` descriptors, waiting no
+    /// longer than `deadline` for the peer to accept it.
+    ///
+    /// Poll-then-nonblocking-write: the descriptor itself stays blocking (the
+    /// helper's serial serve loop depends on that), but this path never
+    /// sleeps inside `sendmsg`, so a peer that stops reading cannot block the
+    /// caller past its deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::DeadlineExceeded`] when the deadline elapses
+    /// first, or [`TransportError::Io`] when `poll`/`sendmsg` fail.
+    pub fn send_by(
+        &self,
+        bytes: &[u8],
+        descriptors: &[BorrowedFd<'_>],
+        deadline: Instant,
+    ) -> Result<(), TransportError> {
+        loop {
+            self.wait_ready(PollFlags::OUT, deadline)?;
+            match self.send_with_flags(
+                bytes,
+                descriptors,
+                SendFlags::NOSIGNAL | SendFlags::DONTWAIT,
+            ) {
+                Err(TransportError::Io(error))
+                    if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                outcome => return outcome,
+            }
+        }
     }
 
     /// Receive one bounded response datagram (broker/conformance-test side).
@@ -273,6 +326,59 @@ impl HelperConnection {
     /// Returns [`TransportError::Io`] when `recvmsg` fails.
     pub fn recv_response(&self) -> Result<Option<ReceivedDatagram>, TransportError> {
         self.recv(MAX_RESPONSE_BYTES)
+    }
+
+    /// Receive one bounded response datagram, waiting no longer than
+    /// `deadline` (broker side).
+    ///
+    /// Poll-then-nonblocking-read, so a helper that wedges with its endpoint
+    /// still open (as opposed to crashing, which surfaces as end-of-stream)
+    /// cannot block the caller past its deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::DeadlineExceeded`] when the deadline elapses
+    /// first, or [`TransportError::Io`] when `poll`/`recvmsg` fail.
+    pub fn recv_response_by(
+        &self,
+        deadline: Instant,
+    ) -> Result<Option<ReceivedDatagram>, TransportError> {
+        loop {
+            self.wait_ready(PollFlags::IN, deadline)?;
+            match self.recv_with_flags(
+                MAX_RESPONSE_BYTES,
+                RecvFlags::CMSG_CLOEXEC | RecvFlags::DONTWAIT,
+            ) {
+                Err(TransportError::Io(error))
+                    if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                outcome => return outcome,
+            }
+        }
+    }
+
+    /// Poll until the descriptor reports `ready` (or an error/hangup state,
+    /// which the following nonblocking I/O call surfaces), failing closed at
+    /// `deadline`.
+    fn wait_ready(&self, ready: PollFlags, deadline: Instant) -> Result<(), TransportError> {
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(TransportError::DeadlineExceeded);
+            }
+            let timeout = Timespec {
+                tv_sec: i64::try_from(remaining.as_secs()).unwrap_or(i64::MAX),
+                tv_nsec: i64::from(remaining.subsec_nanos()),
+            };
+            let mut fds = [PollFd::new(&self.fd, ready)];
+            match rustix::event::poll(&mut fds, Some(&timeout)) {
+                Ok(0) | Err(rustix::io::Errno::INTR | rustix::io::Errno::AGAIN) => {
+                    // Timed out or interrupted: the next iteration recomputes
+                    // the remaining window and fails closed once it is empty.
+                }
+                Ok(_) => return Ok(()),
+                Err(errno) => return Err(errno.into()),
+            }
+        }
     }
 }
 

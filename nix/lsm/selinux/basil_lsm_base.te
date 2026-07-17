@@ -1,0 +1,190 @@
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+# basil_lsm_base: static SELinux base module for Basil attestor realms
+# (SPEC.md rev 1.2, "Socket and release authentication"; basil-uvsx).
+#
+# Declares the shared types, the basil_attestor_domain attribute that every
+# per-generation attestor domain joins, and the complete basil_measure_t
+# helper domain. Per-generation attestor domains are separate modules
+# rendered from basil_attestor.te.in and loaded additively per installed
+# authorityGeneration.
+#
+# Raw kernel policy language on purpose: the authority installer builds it
+# with checkmodule/semodule_package on the target host without needing the
+# refpolicy devel macro tree.
+
+module basil_lsm_base 1.0.0;
+
+require {
+	attribute domain;
+	attribute file_type;
+	role system_r;
+	type init_t;
+	type proc_t;
+	type system_dbusd_t;
+	type system_dbusd_var_run_t;
+	class process { transition sigchld signull ptrace getattr };
+	class file { entrypoint execute map read open getattr ioctl lock write append create unlink link rename setattr };
+	class dir { search getattr read open write add_name remove_name watch };
+	class lnk_file { read getattr };
+	class sock_file { create unlink setattr getattr write };
+	class unix_stream_socket { create bind listen accept connectto read write getattr setattr setopt getopt shutdown };
+	class unix_dgram_socket { create connect write getattr setopt };
+	class capability { sys_ptrace dac_read_search dac_override setuid setgid sys_admin sys_module sys_boot sys_chroot net_admin mknod chown fowner fsetid kill setpcap sys_rawio sys_resource };
+	class fd { use };
+	class dbus { send_msg };
+	class fifo_file { read write getattr };
+}
+
+########################################
+#
+# Shared declarations
+#
+
+# Every per-generation attestor domain (basil_attestor_g<N>_t) carries this
+# attribute. The helper's measurement permissions and the module's neverallow
+# assertions are written against the attribute so a new generation module
+# never widens the base.
+attribute basil_attestor_domain;
+
+# Helper domain and its object types.
+type basil_measure_t;
+type basil_measure_exec_t;
+type basil_measure_policy_t;
+type basil_measure_manifest_t;
+type basil_measure_var_run_t;
+
+# Attestor entrypoint label (dedicated packaged executable path) and the
+# runtime-directory subtree label shared by all generations. Generation
+# separation of runtime directories is enforced by ownership, mode, ACL, and
+# the checked generation-qualified paths.
+type basil_attestor_exec_t;
+type basil_attestor_var_run_t;
+
+typeattribute basil_measure_t domain;
+typeattribute basil_measure_exec_t file_type;
+typeattribute basil_measure_policy_t file_type;
+typeattribute basil_measure_manifest_t file_type;
+typeattribute basil_measure_var_run_t file_type;
+typeattribute basil_attestor_exec_t file_type;
+typeattribute basil_attestor_var_run_t file_type;
+
+role system_r types basil_measure_t;
+
+########################################
+#
+# Helper entry: exec transition from init_t
+#
+
+allow init_t basil_measure_exec_t:file { read open getattr map execute };
+allow init_t basil_measure_t:process transition;
+type_transition init_t basil_measure_exec_t:process basil_measure_t;
+allow basil_measure_t basil_measure_exec_t:file { entrypoint read open getattr map execute };
+allow basil_measure_t init_t:fd use;
+allow basil_measure_t init_t:process sigchld;
+allow basil_measure_t init_t:fifo_file { read write getattr };
+
+########################################
+#
+# Helper: installed evidence stores (read-only, root-owned, immutable
+# installed generations)
+#
+# policy.d holds the allowlist generations; manifest.d holds the installed
+# authority-manifest evidence store the helper reads on every measurement to
+# derive lockdown-confinement expectations (basil-6gmc). Both are written
+# only by the root authority-installation transaction, never by the helper.
+#
+
+allow basil_measure_t basil_measure_policy_t:dir { search getattr read open };
+allow basil_measure_t basil_measure_policy_t:file { read open getattr };
+allow basil_measure_t basil_measure_manifest_t:dir { search getattr read open };
+allow basil_measure_t basil_measure_manifest_t:file { read open getattr };
+
+########################################
+#
+# Helper: single shared SOCK_SEQPACKET endpoint
+#
+# The helper itself removes a verified stale socket and creates the listener;
+# there is no socket unit.
+#
+
+allow basil_measure_t basil_measure_var_run_t:dir { search getattr read open write add_name remove_name watch };
+allow basil_measure_t basil_measure_var_run_t:sock_file { create unlink setattr getattr write };
+allow basil_measure_t self:unix_stream_socket { create bind listen accept read write getattr setattr setopt getopt shutdown };
+
+########################################
+#
+# Helper: peer measurement under its sole CAP_SYS_PTRACE authority
+#
+# PTRACE_MODE_READ checks map to process:ptrace. The helper reads
+# /proc/<pid>/{status,stat}, resolves /proc/<pid>/exe, and opens the peer's
+# current executable. Measurement is permitted toward attestor domains only.
+#
+
+allow basil_measure_t self:capability { sys_ptrace dac_read_search };
+allow basil_measure_t proc_t:dir { search getattr read open };
+allow basil_measure_t proc_t:file { read open getattr };
+allow basil_measure_t basil_attestor_domain:process { ptrace getattr signull };
+allow basil_measure_t basil_attestor_domain:dir { search getattr read open };
+allow basil_measure_t basil_attestor_domain:file { read open getattr };
+allow basil_measure_t basil_attestor_domain:lnk_file { read getattr };
+allow basil_measure_t basil_attestor_exec_t:file { read open getattr };
+
+# The request carries one SCM_RIGHTS duplicate of the broker's connected
+# attestor control stream; the helper reads socket metadata (SO_PEERCRED,
+# SO_COOKIE, SO_PEERPIDFD) from it. The duplicate was created by the broker
+# process and connected to an attestor listener, so both endpoint labels can
+# appear. The broker is not yet SELinux-confined; its fd/socket allow rules
+# join this module when a broker domain exists (tracked with basil-9tj.28).
+allow basil_measure_t basil_attestor_domain:unix_stream_socket { read write getattr getopt };
+allow basil_measure_t basil_attestor_domain:fd use;
+
+########################################
+#
+# Helper: system bus client for org.freedesktop.systemd1 GetUnitByPIDFD
+#
+
+allow basil_measure_t system_dbusd_var_run_t:dir { search getattr };
+allow basil_measure_t system_dbusd_var_run_t:sock_file write;
+allow basil_measure_t system_dbusd_t:unix_stream_socket connectto;
+allow basil_measure_t system_dbusd_t:dbus send_msg;
+allow system_dbusd_t basil_measure_t:dbus send_msg;
+allow basil_measure_t init_t:dbus send_msg;
+allow init_t basil_measure_t:dbus send_msg;
+
+########################################
+#
+# Assertions (subjects are this module's own domains only)
+#
+# These encode the module-local prevention contract: the attestor never
+# traces anything, holds no capabilities, and never executes anything after
+# entry, and the helper's capability set is exactly its measurement
+# authority. Every subject below is a type or attribute only this module's
+# own files write allow rules for, so `semodule -i` cannot conflict with the
+# linked host policy even where assertion checking is enabled
+# (expand-check=1).
+#
+# Deliberately absent: domain-wide assertions with all host domains as the
+# subject (`{ domain -basil_measure_t } basil_attestor_domain:process
+# ptrace` and the write-prevention twin on the evidence stores). Both are
+# contradicted by the linked host policy this module must load into:
+# Fedora targeted's boolean-gated unconfined_t ptrace allow (neverallow
+# checking includes conditional rules) and the root authority-installation
+# transaction, whose unconfined/rpm/init-class domains hold file_type-wide
+# write allows and must install the policy.d and manifest.d files. On hosts
+# with expand-check=1 (Debian) such assertions abort `semodule -i`; where
+# checking is disabled (Fedora default) they are unenforced text. The
+# cross-domain ptrace boundary is therefore a host precondition
+# (deny_ptrace / kernel.yama.ptrace_scope, nix/lsm/README.md "Host
+# preconditions") and a conformance-test-15 proof obligation, not a module
+# assertion.
+#
+
+neverallow basil_attestor_domain *:process ptrace;
+neverallow basil_attestor_domain *:capability *;
+neverallow basil_attestor_domain ~basil_attestor_exec_t:file entrypoint;
+neverallow basil_measure_t self:capability { dac_override setuid setgid sys_admin sys_module sys_boot sys_chroot net_admin mknod chown fowner fsetid kill setpcap sys_rawio sys_resource };
+neverallow basil_measure_t ~basil_measure_exec_t:file entrypoint;
+neverallow basil_measure_t { basil_measure_policy_t basil_measure_manifest_t }:file ~{ read open getattr };

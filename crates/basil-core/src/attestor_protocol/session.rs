@@ -26,8 +26,8 @@ use super::helper::wire::{
 };
 use super::limits::{
     ABSOLUTE_MAX_CAPABILITIES, ABSOLUTE_MAX_CAPABILITY_BYTES, ABSOLUTE_MAX_DIAGNOSTIC_BYTES,
-    ABSOLUTE_MAX_ID_MAP_RANGES, ABSOLUTE_MAX_MOUNTS_PER_INSTANCE, ABSOLUTE_MAX_STRING_BYTES,
-    PROTOCOL_VERSION, ProtocolLimits,
+    ABSOLUTE_MAX_ID_MAP_RANGES, ABSOLUTE_MAX_MOUNTS_PER_INSTANCE, ABSOLUTE_MAX_REQUEST_DEADLINE,
+    ABSOLUTE_MAX_STRING_BYTES, PROTOCOL_VERSION, ProtocolLimits,
 };
 use super::wire;
 use super::wire::envelope::Body;
@@ -1845,6 +1845,14 @@ pub enum MeasurementError {
     /// Sending the request or receiving the response failed.
     #[error(transparent)]
     Transport(#[from] TransportError),
+    /// The caller budget was already exhausted; nothing reached the wire.
+    #[error("measurement budget exhausted before any helper I/O")]
+    BudgetExhausted,
+    /// The bounded exchange deadline elapsed while the helper endpoint stayed
+    /// open without answering. The connection must be discarded: a late
+    /// answer left queued on it would be misattributed to a later request.
+    #[error("measurement helper exchange deadline exceeded")]
+    DeadlineExceeded,
     /// The helper endpoint closed before answering; retry after reconnect.
     #[error("measurement helper closed before answering")]
     HelperClosed,
@@ -1935,18 +1943,33 @@ pub enum MeasurementError {
 /// hashes the executable through the returned descriptor.
 ///
 /// The call performs blocking I/O on `helper`; drive it from a blocking
-/// context. The caller owns retry policy across helper outage and restart.
+/// context. The whole wire exchange is bounded by the smaller of `budget`
+/// and [`ABSOLUTE_MAX_REQUEST_DEADLINE`], so a helper that wedges with its
+/// endpoint open (as opposed to crashing) cannot stall the caller
+/// indefinitely; executable hashing afterwards is local, bounded work on the
+/// returned descriptor. The caller owns retry policy across helper outage
+/// and restart. After [`MeasurementError::DeadlineExceeded`] the connection
+/// must be discarded, not reused: the exchange is incomplete and a late
+/// answer left queued on it would be misattributed to a later request.
 ///
 /// # Errors
 ///
 /// Returns a typed [`MeasurementError`]; every failure is fail-closed and
-/// leaves nothing cached.
+/// leaves nothing cached. An already-exhausted `budget` returns
+/// [`MeasurementError::BudgetExhausted`] before any wire I/O.
 pub fn measure_attestor_stream(
     helper: &HelperConnection,
     stream: BorrowedFd<'_>,
     expected_peer: PeerCredentials,
     pin: &PinnedHelperPolicy,
+    budget: RequestBudget,
 ) -> Result<VerifiedMeasurement, MeasurementError> {
+    let remaining = budget.remaining().min(ABSOLUTE_MAX_REQUEST_DEADLINE);
+    if remaining.is_zero() {
+        return Err(MeasurementError::BudgetExhausted);
+    }
+    let now = std::time::Instant::now();
+    let deadline = now.checked_add(remaining).unwrap_or(now);
     let mut nonce = [0_u8; NONCE_BYTES];
     getrandom::fill(&mut nonce).map_err(MeasurementError::Random)?;
     let request = MeasurementRequest {
@@ -1958,9 +1981,12 @@ pub fn measure_attestor_stream(
         policy_identity: pin.policy_identity.clone(),
     };
     let bytes = request.encode()?;
-    helper.send(&bytes, &[stream])?;
+    helper
+        .send_by(&bytes, &[stream], deadline)
+        .map_err(typed_transport_error)?;
     let datagram = helper
-        .recv_response()?
+        .recv_response_by(deadline)
+        .map_err(typed_transport_error)?
         .ok_or(MeasurementError::HelperClosed)?;
     if datagram.ancillary_truncated {
         return Err(MeasurementError::AncillaryTruncated);
@@ -1993,11 +2019,23 @@ pub fn measure_attestor_stream(
     }
 }
 
+/// Surface an elapsed transport deadline as its own typed measurement error.
+fn typed_transport_error(error: TransportError) -> MeasurementError {
+    match error {
+        TransportError::DeadlineExceeded => MeasurementError::DeadlineExceeded,
+        other => MeasurementError::Transport(other),
+    }
+}
+
 /// Require a rejection to answer this request.
 ///
 /// Pre-decode rejections (a request the helper could not read) legitimately
 /// echo a zeroed identity; every post-decode rejection must echo the exact
-/// nonce or it answers some other request.
+/// nonce or it answers some other request. A zero-identity rejection carries
+/// no request binding, so on a reused connection it is attributed to the
+/// current request on faith; both outcomes fail closed, but callers that
+/// need exact attribution must not reuse a connection after an incomplete
+/// exchange.
 fn check_rejection_echo(
     rejection: &super::helper::wire::RejectionRecord,
     nonce: &[u8; NONCE_BYTES],
@@ -2579,7 +2617,7 @@ mod broker_helper_conformance {
         MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, MeasuredRecord, RejectCode, RejectionRecord,
     };
     use super::pidfd_test_support::{blocking_child, exit_child, exited_child_pidfd};
-    use super::{MeasurementError, PinnedHelperPolicy, measure_attestor_stream};
+    use super::{MeasurementError, PinnedHelperPolicy, RequestBudget, measure_attestor_stream};
     use crate::core::release_admission::{
         ArtifactRequirement, ArtifactRole, CapabilityId, CapabilitySet,
         HistoricalReleaseIdentityCheck, ProductId, ProtocolVersion, ReleaseAdmission,
@@ -2653,6 +2691,10 @@ mod broker_helper_conformance {
             policy_generation: NonZeroU64::MIN,
             broker_generation: 7,
         }
+    }
+
+    fn budget() -> RequestBudget {
+        RequestBudget::starting_now(std::time::Duration::from_secs(30))
     }
 
     struct SelfPidfd;
@@ -2801,7 +2843,13 @@ mod broker_helper_conformance {
             server.send(&bytes, &borrowed).expect("send crafted");
         });
         let (broker_end, _attestor_end) = stream_pair();
-        let result = measure_attestor_stream(&client, broker_end.as_fd(), self_peer(), &pin_g1());
+        let result = measure_attestor_stream(
+            &client,
+            broker_end.as_fd(),
+            self_peer(),
+            &pin_g1(),
+            budget(),
+        );
         worker.join().expect("join");
         result.expect_err("crafted response must be rejected")
     }
@@ -2854,9 +2902,14 @@ mod broker_helper_conformance {
     fn measures_verifies_and_admits_the_executable() {
         let (client, worker) = serve(service());
         let (broker_end, _attestor_end) = stream_pair();
-        let measurement =
-            measure_attestor_stream(&client, broker_end.as_fd(), self_peer(), &pin_g1())
-                .expect("measurement");
+        let measurement = measure_attestor_stream(
+            &client,
+            broker_end.as_fd(),
+            self_peer(),
+            &pin_g1(),
+            budget(),
+        )
+        .expect("measurement");
         // The record is bound to this stream's own cookie and this session's
         // pinned helper policy.
         let cookie = sockopt::socket_cookie(broker_end.as_fd()).expect("cookie");
@@ -2923,8 +2976,9 @@ mod broker_helper_conformance {
         for (case, pin, code) in cases {
             let (client, worker) = serve(case);
             let (broker_end, _attestor_end) = stream_pair();
-            let error = measure_attestor_stream(&client, broker_end.as_fd(), self_peer(), &pin)
-                .expect_err("must reject");
+            let error =
+                measure_attestor_stream(&client, broker_end.as_fd(), self_peer(), &pin, budget())
+                    .expect_err("must reject");
             assert!(
                 matches!(&error, MeasurementError::Rejected { code: got } if *got == code),
                 "expected {code:?}, got {error:?}"
@@ -2943,8 +2997,14 @@ mod broker_helper_conformance {
         )]);
         let (client, worker) = serve(service_with(wrong_uid, &[UNIT_G1; 8], LSM));
         let (broker_end, _attestor_end) = stream_pair();
-        let error = measure_attestor_stream(&client, broker_end.as_fd(), self_peer(), &pin_g1())
-            .expect_err("must reject");
+        let error = measure_attestor_stream(
+            &client,
+            broker_end.as_fd(),
+            self_peer(),
+            &pin_g1(),
+            budget(),
+        )
+        .expect_err("must reject");
         assert!(matches!(
             error,
             MeasurementError::Rejected {
@@ -2963,8 +3023,9 @@ mod broker_helper_conformance {
         let (client, worker) = serve(service_with(overlap_allowlist(), &[UNIT_G1, UNIT_G2], LSM));
 
         let (old_end, _old_peer) = stream_pair();
-        let old = measure_attestor_stream(&client, old_end.as_fd(), self_peer(), &pin_g1())
-            .expect("old-generation measurement");
+        let old =
+            measure_attestor_stream(&client, old_end.as_fd(), self_peer(), &pin_g1(), budget())
+                .expect("old-generation measurement");
         assert_eq!(old.record.policy_generation, NonZeroU64::MIN);
         assert_eq!(old.record.service_unit, UNIT_G1);
 
@@ -2975,9 +3036,14 @@ mod broker_helper_conformance {
             broker_generation: 7,
         };
         let (new_end, _new_peer) = stream_pair();
-        let candidate =
-            measure_attestor_stream(&client, new_end.as_fd(), self_peer(), &candidate_pin)
-                .expect("candidate measurement");
+        let candidate = measure_attestor_stream(
+            &client,
+            new_end.as_fd(),
+            self_peer(),
+            &candidate_pin,
+            budget(),
+        )
+        .expect("candidate measurement");
         assert_eq!(candidate.record.policy_generation.get(), 2);
         assert_eq!(candidate.record.service_unit, UNIT_G2);
 
@@ -2987,9 +3053,14 @@ mod broker_helper_conformance {
             ..candidate_pin
         };
         let (third_end, _third_peer) = stream_pair();
-        let error =
-            measure_attestor_stream(&client, third_end.as_fd(), self_peer(), &uninstalled_pin)
-                .expect_err("must reject");
+        let error = measure_attestor_stream(
+            &client,
+            third_end.as_fd(),
+            self_peer(),
+            &uninstalled_pin,
+            budget(),
+        )
+        .expect_err("must reject");
         assert!(matches!(
             error,
             MeasurementError::Rejected {
@@ -3034,8 +3105,14 @@ mod broker_helper_conformance {
                 .expect("send");
         });
         let (broker_end, _attestor_end) = stream_pair();
-        let error = measure_attestor_stream(&client, broker_end.as_fd(), self_peer(), &pin_g1())
-            .expect_err("substituted stream must be rejected");
+        let error = measure_attestor_stream(
+            &client,
+            broker_end.as_fd(),
+            self_peer(),
+            &pin_g1(),
+            budget(),
+        )
+        .expect_err("substituted stream must be rejected");
         assert!(matches!(error, MeasurementError::CookieMismatch));
         worker.join().expect("join");
     }
@@ -3226,13 +3303,26 @@ mod broker_helper_conformance {
             drop(server);
         });
         let (broker_end, _attestor_end) = stream_pair();
-        let error = measure_attestor_stream(&client, broker_end.as_fd(), self_peer(), &pin_g1())
-            .expect_err("outage must reject");
+        let error = measure_attestor_stream(
+            &client,
+            broker_end.as_fd(),
+            self_peer(),
+            &pin_g1(),
+            budget(),
+        )
+        .expect_err("outage must reject");
         assert!(matches!(error, MeasurementError::HelperClosed));
         worker.join().expect("join");
         let (client, worker) = serve(service());
         assert!(
-            measure_attestor_stream(&client, broker_end.as_fd(), self_peer(), &pin_g1()).is_ok()
+            measure_attestor_stream(
+                &client,
+                broker_end.as_fd(),
+                self_peer(),
+                &pin_g1(),
+                budget()
+            )
+            .is_ok()
         );
         drop(client);
         worker.join().expect("join");
@@ -3277,10 +3367,52 @@ mod broker_helper_conformance {
                 .expect("sendmsg");
         });
         let (broker_end, _attestor_end) = stream_pair();
-        let error = measure_attestor_stream(&client, broker_end.as_fd(), self_peer(), &pin_g1())
-            .expect_err("truncated ancillary must reject");
+        let error = measure_attestor_stream(
+            &client,
+            broker_end.as_fd(),
+            self_peer(),
+            &pin_g1(),
+            budget(),
+        )
+        .expect_err("truncated ancillary must reject");
         assert!(matches!(error, MeasurementError::AncillaryTruncated));
         worker.join().expect("join");
+    }
+
+    #[test]
+    fn an_exhausted_budget_fails_closed_before_any_helper_io() {
+        let (client, server) = HelperConnection::pair().expect("pair");
+        let (broker_end, _attestor_end) = stream_pair();
+        let error = measure_attestor_stream(
+            &client,
+            broker_end.as_fd(),
+            self_peer(),
+            &pin_g1(),
+            RequestBudget::starting_now(std::time::Duration::ZERO),
+        )
+        .expect_err("an exhausted budget must fail");
+        assert!(matches!(error, MeasurementError::BudgetExhausted));
+        // Nothing reached the wire: the helper side observes only the close.
+        drop(client);
+        assert!(server.recv(MAX_REQUEST_BYTES).expect("recv").is_none());
+    }
+
+    #[test]
+    fn a_wedged_helper_cannot_block_past_the_deadline() {
+        // The helper endpoint stays open but never answers (a hang, not a
+        // crash): the exchange must fail closed at the deadline instead of
+        // blocking the broker's admission path forever.
+        let (client, _wedged_server) = HelperConnection::pair().expect("pair");
+        let (broker_end, _attestor_end) = stream_pair();
+        let error = measure_attestor_stream(
+            &client,
+            broker_end.as_fd(),
+            self_peer(),
+            &pin_g1(),
+            RequestBudget::starting_now(std::time::Duration::from_millis(50)),
+        )
+        .expect_err("a wedged helper must time out");
+        assert!(matches!(error, MeasurementError::DeadlineExceeded));
     }
 }
 
