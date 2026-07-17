@@ -71,8 +71,10 @@ pub struct ReloadInputs {
 /// The result of a **successful** [`reload_generation`].
 ///
 /// Carries the old → new generation ids plus summary counts so the SIGHUP handler
-/// (and the future gRPC admin-reload, `basil-atq`) can log/return what changed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// (and the gRPC admin-reload, `basil-atq`) can log/return what changed, and the
+/// candidate-aware listener impact so a dry-run reports exactly what a SIGHUP
+/// would do to the listener surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReloadOutcome {
     /// The generation id that was serving before the swap.
     pub previous_generation: u64,
@@ -82,6 +84,10 @@ pub struct ReloadOutcome {
     pub key_count: usize,
     /// Number of resolved policy allow-grants in the new generation.
     pub grant_count: usize,
+    /// Every listener the candidate adds, removes, or reconfigures, with its
+    /// exact active-transport count at assessment time. Empty when the
+    /// candidate changes no listener.
+    pub listener_impacts: Vec<crate::transport::listener_manager::ListenerImpact>,
 }
 
 /// Why a [`reload_generation`] was **rejected**. On any of these the previous
@@ -127,6 +133,13 @@ pub enum ReloadError {
     #[error("validating listener transition: {0}")]
     ListenerTransition(String),
 
+    /// A listener removal or reconfiguration still has accepted transports, so
+    /// applying the candidate would disrupt them. The carried impact set names
+    /// exactly the blocking listeners and their active-transport counts (the
+    /// candidate-aware SIGHUP impact an operator drains before retrying).
+    #[error("validating listener transition: {0}")]
+    ListenerTransitionBlocked(#[from] crate::transport::listener_manager::ActiveListenerTransition),
+
     /// The candidate changed a **restart-only** routing dimension (a backend was
     /// added/removed/repathed, or a key's `backend`/`path`/`engine`/`key_type`/
     /// `public_path` changed). Such an edit needs a re-unlock and is rejected on
@@ -158,6 +171,7 @@ impl ReloadError {
             | Self::OciConfiguration(_)
             | Self::ListenerConfiguration(_)
             | Self::ListenerTransition(_) => "validation_failed",
+            Self::ListenerTransitionBlocked(_) => "listener_transition_blocked",
             Self::RoutingShapeChanged(_) => "routing_shape_changed",
             Self::NoInputs => "no_reload_inputs",
             Self::LiveRuntimeRequired => "listener_runtime_required",
@@ -599,8 +613,7 @@ fn validate_candidate_with_trace_collector_and_observer(
         &listeners,
         state.connections(),
     );
-    crate::transport::listener_manager::require_zero_active(&listener_impacts)
-        .map_err(|error| ReloadError::ListenerTransition(error.to_string()))?;
+    crate::transport::listener_manager::require_zero_active(&listener_impacts)?;
     let previous_generation = current.id();
     let new_generation = previous_generation.saturating_add(1);
     let bundle_changed_trust_domains = bundle_changed_trust_domains(current.catalog(), &catalog);
@@ -617,6 +630,7 @@ fn validate_candidate_with_trace_collector_and_observer(
         new_generation,
         key_count: catalog.keys.len(),
         grant_count: policy.grant_count(),
+        listener_impacts,
     };
 
     Ok(ValidatedCandidate {
@@ -696,7 +710,20 @@ pub fn reload_generation(state: &BrokerState) -> Result<ReloadOutcome, ReloadErr
         &listeners,
         state.connections(),
     )
-    .map_err(|error| ReloadError::ListenerTransition(error.to_string()))?;
+    .map_err(|error| match error {
+        crate::transport::listener_manager::ListenerTransitionError::Active(active) => {
+            ReloadError::ListenerTransitionBlocked(active)
+        }
+        registry @ crate::transport::listener_manager::ListenerTransitionError::Registry(_) => {
+            ReloadError::ListenerTransition(registry.to_string())
+        }
+    })?;
+    let rewire_updates = crate::transport::rewire::rewire_updates(
+        current.listeners(),
+        &listeners,
+        outcome.new_generation,
+        unix_now(),
+    );
     let next = Generation::new_with_overrides_oci_and_listeners(
         outcome.new_generation,
         Arc::new(catalog),
@@ -709,12 +736,21 @@ pub fn reload_generation(state: &BrokerState) -> Result<ReloadOutcome, ReloadErr
     drop(current);
     listener_guard.commit(|| {
         state.swap_generation(Arc::new(next));
+        state.connections().rewire().apply(rewire_updates);
         for trust_domain in bundle_changed_trust_domains {
             state.events().bundle_changed(trust_domain);
         }
     });
 
     Ok(outcome)
+}
+
+/// Wall-clock Unix seconds for diagnostic stamps; `0` before the epoch (never
+/// panics on a skewed clock).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 /// Reload a running agent and apply listener accept-loop changes atomically with
@@ -754,6 +790,12 @@ pub async fn reload_generation_live(state: &BrokerState) -> Result<ReloadOutcome
     }
     let current_listeners = current.listeners().clone();
     drop(current);
+    let rewire_updates = crate::transport::rewire::rewire_updates(
+        &current_listeners,
+        &listeners,
+        outcome.new_generation,
+        unix_now(),
+    );
     let next = Generation::new_with_overrides_oci_and_listeners(
         outcome.new_generation,
         Arc::new(catalog),
@@ -766,6 +808,7 @@ pub async fn reload_generation_live(state: &BrokerState) -> Result<ReloadOutcome
     runtime
         .transition(&current_listeners, &listeners, || {
             state.swap_generation(Arc::new(next));
+            state.connections().rewire().apply(rewire_updates);
             for trust_domain in bundle_changed_trust_domains {
                 state.events().bundle_changed(trust_domain);
             }
@@ -1774,6 +1817,143 @@ mod tests {
             ]
         );
         assert_eq!(state.active_generation_id(), INITIAL_GENERATION_ID + 2);
+    }
+
+    /// The dry-run outcome enumerates the candidate-aware listener impact: what
+    /// a SIGHUP would do to the listener surface right now (adds/removals with
+    /// exact active counts and paths), without swapping anything.
+    #[test]
+    fn check_reload_reports_candidate_listener_impacts() {
+        use crate::transport::listener_manager::ListenerChangeKind;
+
+        let (state, inputs) = state_with_files(&catalog_json(false), &policy_json(false));
+        let socket = format!("/tmp/basil-reload-impact-{}.sock", uuid::Uuid::new_v4());
+        std::fs::write(
+            &inputs.config_path,
+            format!(
+                "schema = \"agent\"\nschemaVersion = 3\n[import]\ncatalog = \"catalog.json\"\npolicy = \"policy.json\"\nbundle = \"bundle.age\"\n[listeners.control]\ntype = \"host\"\npath = {socket:?}\n"
+            ),
+        )
+        .expect("write named listener candidate");
+
+        let dry = check_reload(&state).expect("candidate validates");
+        assert_eq!(dry.listener_impacts.len(), 2, "{:?}", dry.listener_impacts);
+        let add = dry
+            .listener_impacts
+            .iter()
+            .find(|impact| impact.kind() == ListenerChangeKind::Add)
+            .expect("an added listener impact");
+        assert_eq!(add.name(), "control");
+        assert_eq!(add.active_connections(), 0);
+        assert_eq!(add.previous_path(), None);
+        assert_eq!(add.new_path(), Some(std::path::Path::new(socket.as_str())));
+        let remove = dry
+            .listener_impacts
+            .iter()
+            .find(|impact| impact.kind() == ListenerChangeKind::Remove)
+            .expect("the replaced default host listener impact");
+        assert_eq!(remove.name(), "host");
+        assert_eq!(
+            remove.previous_path(),
+            Some(std::path::Path::new(crate::DEFAULT_SOCKET_PATH))
+        );
+        assert_eq!(remove.new_path(), None);
+        assert_eq!(state.active_generation_id(), INITIAL_GENERATION_ID);
+
+        // The applied reload reports the identical impacts.
+        let applied = reload_generation(&state).expect("candidate applies");
+        assert_eq!(applied, dry);
+    }
+
+    /// A removal/reconfiguration of a listener with accepted transports is
+    /// rejected with the STRUCTURED blocking impact set (its own stable audit
+    /// token), and both the dry-run and the real reload reject identically.
+    #[tokio::test]
+    async fn active_listener_transition_is_rejected_with_blocking_impacts() {
+        use crate::transport::grpc_server::ListenerType;
+        use crate::transport::listener_manager::ListenerChangeKind;
+
+        let (state, inputs) = state_with_files(&catalog_json(false), &policy_json(false));
+        let (stream, _peer) = tokio::net::UnixStream::pair().expect("stream pair");
+        let tracked = state
+            .connections()
+            .register(stream, "host", ListenerType::Host)
+            .expect("track a host connection");
+        let socket = format!("/tmp/basil-reload-blocked-{}.sock", uuid::Uuid::new_v4());
+        std::fs::write(
+            &inputs.config_path,
+            format!(
+                "schema = \"agent\"\nschemaVersion = 3\n[import]\ncatalog = \"catalog.json\"\npolicy = \"policy.json\"\nbundle = \"bundle.age\"\n[listeners.control]\ntype = \"host\"\npath = {socket:?}\n"
+            ),
+        )
+        .expect("write removing candidate");
+
+        for result in [check_reload(&state), reload_generation(&state)] {
+            let err = result.expect_err("active host connection blocks the transition");
+            assert_eq!(err.audit_reason(), "listener_transition_blocked");
+            let ReloadError::ListenerTransitionBlocked(active) = err else {
+                panic!("expected the structured blocked variant");
+            };
+            let impacts = active.impacts();
+            assert_eq!(impacts.len(), 1, "{impacts:?}");
+            let blocking = impacts.first().expect("one blocking impact");
+            assert_eq!(blocking.name(), "host");
+            assert_eq!(blocking.kind(), ListenerChangeKind::Remove);
+            assert_eq!(blocking.active_connections(), 1);
+        }
+        assert_eq!(state.active_generation_id(), INITIAL_GENERATION_ID);
+
+        // Draining the connection unblocks the same candidate.
+        drop(tracked);
+        reload_generation(&state).expect("drained transition applies");
+    }
+
+    /// An applied same-name path change records a persistent rewire diagnostic;
+    /// returning the listener to the recorded previous path resolves it.
+    #[test]
+    fn applied_path_change_records_and_reverting_resolves_rewire_diagnostics() {
+        let (state, inputs) = state_with_files(&catalog_json(false), &policy_json(false));
+        assert!(state.connections().rewire().is_empty());
+        let socket = format!("/tmp/basil-reload-rewire-{}.sock", uuid::Uuid::new_v4());
+        std::fs::write(
+            &inputs.config_path,
+            format!(
+                "schema = \"agent\"\nschemaVersion = 3\n[import]\ncatalog = \"catalog.json\"\npolicy = \"policy.json\"\nbundle = \"bundle.age\"\n[listeners.host]\ntype = \"host\"\npath = {socket:?}\n"
+            ),
+        )
+        .expect("write repathed host candidate");
+
+        // The dry-run reports the reconfiguration but records NOTHING.
+        let dry = check_reload(&state).expect("repathed candidate validates");
+        assert!(
+            dry.listener_impacts
+                .iter()
+                .any(crate::transport::listener_manager::ListenerImpact::rewires_path),
+            "{:?}",
+            dry.listener_impacts
+        );
+        assert!(state.connections().rewire().is_empty());
+
+        let outcome = reload_generation(&state).expect("repathed candidate applies");
+        let diagnostics = state.connections().rewire().snapshot();
+        assert_eq!(diagnostics.len(), 1);
+        let diagnostic = diagnostics.first().expect("one rewire diagnostic");
+        assert_eq!(diagnostic.listener(), "host");
+        assert_eq!(
+            diagnostic.previous_path(),
+            std::path::Path::new(crate::DEFAULT_SOCKET_PATH)
+        );
+        assert_eq!(diagnostic.new_path(), std::path::Path::new(socket.as_str()));
+        assert_eq!(diagnostic.applied_generation(), outcome.new_generation);
+
+        // Reverting to the original path resolves the diagnostic.
+        std::fs::write(
+            &inputs.config_path,
+            "schema = \"agent\"\nschemaVersion = 3\n[import]\ncatalog = \"catalog.json\"\npolicy = \"policy.json\"\nbundle = \"bundle.age\"\n",
+        )
+        .expect("restore legacy default host listener");
+        reload_generation(&state).expect("reverting candidate applies");
+        assert!(state.connections().rewire().is_empty());
     }
 
     /// A broker with no configured paths fails the reload closed (no-op), never

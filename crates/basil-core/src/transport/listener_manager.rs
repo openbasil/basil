@@ -44,6 +44,8 @@ pub struct ListenerImpact {
     name: String,
     kind: ListenerChangeKind,
     active_connections: usize,
+    previous_path: Option<PathBuf>,
+    new_path: Option<PathBuf>,
 }
 
 impl ListenerImpact {
@@ -63,6 +65,25 @@ impl ListenerImpact {
     #[must_use]
     pub const fn active_connections(&self) -> usize {
         self.active_connections
+    }
+
+    /// The serving socket path, for a removal or reconfiguration.
+    #[must_use]
+    pub fn previous_path(&self) -> Option<&Path> {
+        self.previous_path.as_deref()
+    }
+
+    /// The candidate socket path, for an addition or reconfiguration.
+    #[must_use]
+    pub fn new_path(&self) -> Option<&Path> {
+        self.new_path.as_deref()
+    }
+
+    /// Whether applying this change would leave stale external wiring behind:
+    /// a same-name reconfiguration whose socket path differs.
+    #[must_use]
+    pub fn rewires_path(&self) -> bool {
+        self.kind == ListenerChangeKind::Reconfigure && self.previous_path != self.new_path
     }
 }
 
@@ -101,16 +122,21 @@ pub fn assess_transition(
 ) -> Vec<ListenerImpact> {
     let mut impacts = Vec::new();
     for listener in current.iter() {
-        let kind = match candidate.get(listener.name()) {
-            None => Some(ListenerChangeKind::Remove),
-            Some(replacement) if replacement != listener => Some(ListenerChangeKind::Reconfigure),
+        let change = match candidate.get(listener.name()) {
+            None => Some((ListenerChangeKind::Remove, None)),
+            Some(replacement) if replacement != listener => Some((
+                ListenerChangeKind::Reconfigure,
+                Some(replacement.path().to_path_buf()),
+            )),
             Some(_) => None,
         };
-        if let Some(kind) = kind {
+        if let Some((kind, new_path)) = change {
             impacts.push(ListenerImpact {
                 name: listener.name().to_string(),
                 kind,
                 active_connections: connections.active_for_listener(listener.name()),
+                previous_path: Some(listener.path().to_path_buf()),
+                new_path,
             });
         }
     }
@@ -120,6 +146,8 @@ pub fn assess_transition(
                 name: listener.name().to_string(),
                 kind: ListenerChangeKind::Add,
                 active_connections: 0,
+                previous_path: None,
+                new_path: Some(listener.path().to_path_buf()),
             });
         }
     }

@@ -14,6 +14,7 @@ pub mod connection;
 pub mod grpc_server;
 pub mod listener;
 pub mod listener_manager;
+pub mod rewire;
 
 use prost::Message;
 use rand::Rng as _;

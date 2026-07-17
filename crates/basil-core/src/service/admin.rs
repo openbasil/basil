@@ -208,6 +208,7 @@ impl AdminService for BrokerGrpc {
             self.state
                 .realm_registry()
                 .map_or_else(RealmReadiness::default, |registry| registry.readiness()),
+            self.state.connections().rewire().len(),
         )))
     }
 
@@ -458,17 +459,11 @@ impl AdminService for BrokerGrpc {
                         );
                     }
                 }
-                let key_count = u32::try_from(outcome.key_count).unwrap_or(u32::MAX);
-                let grant_count = u32::try_from(outcome.grant_count).unwrap_or(u32::MAX);
-                Ok(Response::new(pb::ReloadResponse {
-                    applied: !check,
-                    checked: check,
-                    previous_generation: outcome.previous_generation,
-                    new_generation: outcome.new_generation,
-                    key_count,
-                    grant_count,
-                    rejection: None,
-                }))
+                Ok(Response::new(reload_success_body(
+                    &self.state,
+                    check,
+                    &outcome,
+                )))
             }
             Err(err) => {
                 // A rejection is NOT a wire error: the previous generation keeps
@@ -481,15 +476,12 @@ impl AdminService for BrokerGrpc {
                     err.audit_reason(),
                     ReloadActor::Caller(uid),
                 );
-                Ok(Response::new(pb::ReloadResponse {
-                    applied: false,
-                    checked: check,
-                    previous_generation: active,
-                    new_generation: active,
-                    key_count: 0,
-                    grant_count: 0,
-                    rejection: Some(reload_rejection(&err)),
-                }))
+                Ok(Response::new(reload_rejected_body(
+                    &self.state,
+                    check,
+                    active,
+                    &err,
+                )))
             }
         }
     }
@@ -948,6 +940,7 @@ fn readiness_response(
     outcome: ReadinessOutcome,
     generation: u64,
     realms: RealmReadiness,
+    listeners_rewire_required: usize,
 ) -> pb::ReadinessResponse {
     let reason = match outcome.state {
         ReadinessState::Ready => pb::ReadinessReason::Ready,
@@ -966,6 +959,107 @@ fn readiness_response(
         realms_ready: realms.ready,
         realms_degraded: realms.degraded,
         realms_absent: realms.absent,
+        listeners_rewire_required: u32::try_from(listeners_rewire_required).unwrap_or(u32::MAX),
+    }
+}
+
+/// Map one candidate-aware listener impact onto the wire. Paths are
+/// operator-authored configuration returned only on the gated `Reload` RPC.
+fn listener_impact_info(
+    impact: &crate::transport::listener_manager::ListenerImpact,
+) -> pb::ListenerImpactInfo {
+    use crate::transport::listener_manager::ListenerChangeKind;
+    let kind = match impact.kind() {
+        ListenerChangeKind::Add => pb::ListenerChangeKind::Add,
+        ListenerChangeKind::Remove => pb::ListenerChangeKind::Remove,
+        ListenerChangeKind::Reconfigure => pb::ListenerChangeKind::Reconfigure,
+    };
+    pb::ListenerImpactInfo {
+        name: impact.name().to_string(),
+        kind: kind.into(),
+        active_connections: u32::try_from(impact.active_connections()).unwrap_or(u32::MAX),
+        previous_path: impact
+            .previous_path()
+            .map(|path| path.display().to_string()),
+        new_path: impact.new_path().map(|path| path.display().to_string()),
+    }
+}
+
+/// Map one persistent rewire diagnostic onto the wire.
+fn rewire_diagnostic(
+    diagnostic: &crate::transport::rewire::RewireDiagnostic,
+) -> pb::RewireDiagnostic {
+    pb::RewireDiagnostic {
+        listener: diagnostic.listener().to_string(),
+        previous_path: diagnostic.previous_path().display().to_string(),
+        new_path: diagnostic.new_path().display().to_string(),
+        applied_generation: diagnostic.applied_generation(),
+        recorded_at_unix: diagnostic.recorded_at_unix(),
+    }
+}
+
+/// Snapshot the persistent rewire diagnostics for a gated `Reload` response.
+fn rewire_required(state: &BrokerState) -> Vec<pb::RewireDiagnostic> {
+    state
+        .connections()
+        .rewire()
+        .snapshot()
+        .iter()
+        .map(rewire_diagnostic)
+        .collect()
+}
+
+/// The gated `Reload` body for an accepted candidate (applied, or a clean
+/// dry-run): the outcome counts, the candidate-aware listener impact, and the
+/// persistent rewire diagnostics.
+fn reload_success_body(
+    state: &BrokerState,
+    check: bool,
+    outcome: &crate::reload::ReloadOutcome,
+) -> pb::ReloadResponse {
+    pb::ReloadResponse {
+        applied: !check,
+        checked: check,
+        previous_generation: outcome.previous_generation,
+        new_generation: outcome.new_generation,
+        key_count: u32::try_from(outcome.key_count).unwrap_or(u32::MAX),
+        grant_count: u32::try_from(outcome.grant_count).unwrap_or(u32::MAX),
+        rejection: None,
+        listener_impacts: outcome
+            .listener_impacts
+            .iter()
+            .map(listener_impact_info)
+            .collect(),
+        rewire_required: rewire_required(state),
+    }
+}
+
+/// The gated `Reload` body for a rejected candidate: the previous generation
+/// keeps serving. On a blocked listener transition the impacts name exactly
+/// the listeners an operator must drain before retrying.
+fn reload_rejected_body(
+    state: &BrokerState,
+    check: bool,
+    active: u64,
+    err: &ReloadError,
+) -> pb::ReloadResponse {
+    pb::ReloadResponse {
+        applied: false,
+        checked: check,
+        previous_generation: active,
+        new_generation: active,
+        key_count: 0,
+        grant_count: 0,
+        rejection: Some(reload_rejection(err)),
+        listener_impacts: match err {
+            ReloadError::ListenerTransitionBlocked(active_transition) => active_transition
+                .impacts()
+                .iter()
+                .map(listener_impact_info)
+                .collect(),
+            _ => Vec::new(),
+        },
+        rewire_required: rewire_required(state),
     }
 }
 

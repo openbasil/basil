@@ -12,9 +12,10 @@
 //!
 //! - **`basil doctor`** (OFFLINE, no unlock): catalog/policy load, backend
 //!   capability enforcement, invocation broker-identity/key bindings, feature
-//!   compatibility, backend binary on PATH, socket, bundle perms/freshness, and
-//!   backend health reachability. It never unlocks the bundle, binds the socket,
-//!   or mutates anything.
+//!   compatibility, backend binary on PATH, socket, the per-listener
+//!   socket-path preflight (the startup / SIGHUP hot-add impact of the typed
+//!   listener set), bundle perms/freshness, and backend health reachability. It
+//!   never unlocks the bundle, binds the socket, or mutates anything.
 //! - **`basil doctor --keys`** (UNLOCK): additionally unlocks the sealed bundle
 //!   and runs an authenticated, read-only per-key existence probe. Still never
 //!   reconciles, generates, writes a sidecar, or binds the socket.
@@ -290,6 +291,11 @@ pub struct DoctorInputs {
     /// Expected rootless container count for the opt-in keyring quota readiness
     /// check. `None` omits the check entirely.
     pub rootless_expected_containers: Option<u32>,
+    /// The resolved typed listener set, for the per-listener socket-path
+    /// preflight (the candidate-aware startup / SIGHUP hot-add impact). `None`
+    /// omits the per-listener rows (direct library callers without a resolved
+    /// bootstrap).
+    pub listeners: Option<crate::transport::listener::ListenerConfigSet>,
 }
 
 /// Which cargo features the running binary was compiled with, captured at the
@@ -371,6 +377,9 @@ pub async fn run_doctor(inputs: &DoctorInputs, features: EnabledFeatures) -> Doc
         inputs.socket_mode,
         inputs.socket_group.as_deref(),
     ));
+    if let Some(listeners) = &inputs.listeners {
+        checks.extend(listener_path_checks(listeners));
+    }
     if let Some(expected_containers) = inputs.rootless_expected_containers {
         checks.push(rootless_keyring_quota_check(expected_containers));
     }
@@ -881,6 +890,156 @@ fn socket_check(socket: &str, mode: u32, group: Option<&str>) -> CheckResult {
     )
 }
 
+/// Per-listener socket-path preflight: the candidate-aware **startup / SIGHUP
+/// hot-add impact** of the resolved typed listener set (`basil-9tj.15`).
+///
+/// For every configured listener this runs the SAME read-only qualification the
+/// listener manager runs before binding
+/// ([`crate::transport::listener_manager::QualifiedListener::validate`]): the
+/// full parent-directory trust walk (owned by this user, no symlink component,
+/// no group/world write) plus final-path absence. It never binds, unlinks, or
+/// writes. The broker **never** unlinks or overwrites an unexpected existing
+/// path — including an apparently stale socket — so an occupied path is
+/// reported here with its object type and ownership plus explicit remediation:
+///
+/// - absent path + trusted parent → `ok` (a startup or SIGHUP hot-add would
+///   publish cleanly);
+/// - occupied by a **unix socket** → `warn` (a live agent already serving this
+///   listener, or a stale socket the operator must remove manually);
+/// - occupied by anything else → `fatal` (startup and hot-add both fail closed
+///   rather than replace it);
+/// - untrusted parent → `fatal` (the manager rejects the traversal).
+fn listener_path_checks(
+    listeners: &crate::transport::listener::ListenerConfigSet,
+) -> Vec<CheckResult> {
+    use crate::transport::listener_manager::{ListenerManagerError, QualifiedListener};
+
+    listeners
+        .iter()
+        .map(|config| {
+            let name = format!("listener_path:{}", config.name());
+            let path = config.path().display();
+            match QualifiedListener::validate(config) {
+                Ok(_qualified) => CheckResult::ok(
+                    name,
+                    format!(
+                        "listener `{}` would publish `{path}` cleanly (startup or SIGHUP hot-add)",
+                        config.name()
+                    ),
+                ),
+                Err(ListenerManagerError::PathOccupied { .. }) => {
+                    occupied_listener_path(name, config.name(), config.path())
+                }
+                Err(ListenerManagerError::UntrustedParent { path: parent, .. }) => {
+                    CheckResult::fatal(
+                        name,
+                        format!(
+                            "listener `{}` socket parent `{}` is untrusted: absent, a symlink \
+                             component, not owned by this user, or group/world-writable",
+                            config.name(),
+                            parent.display()
+                        ),
+                        format!(
+                            "Create `{}` owned by the agent user with no group/world write \
+                             (e.g. `install -d -m 0755 {}`), then re-run.",
+                            parent.display(),
+                            parent.display()
+                        ),
+                    )
+                }
+                Err(error) => CheckResult::warn(
+                    name,
+                    format!(
+                        "listener `{}` socket path `{path}` could not be inspected: {error}",
+                        config.name()
+                    ),
+                    "Verify the path is reachable and readable by the agent user, then re-run.",
+                ),
+            }
+        })
+        .collect()
+}
+
+/// Diagnose an occupied final listener path: object type + ownership + the
+/// exact operator remediation. Basil never unlinks or replaces the object.
+fn occupied_listener_path(name: String, listener: &str, path: &Path) -> CheckResult {
+    let display = path.display();
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return CheckResult::warn(
+            name,
+            format!("listener `{listener}` socket path `{display}` is occupied but unreadable"),
+            "Verify the path is readable by the agent user, then re-run.",
+        );
+    };
+    let (kind, is_socket) = file_type_label(metadata.file_type());
+    let ownership = ownership_label(&metadata);
+    if is_socket {
+        CheckResult::warn(
+            name,
+            format!(
+                "listener `{listener}` socket path `{display}` is already a unix socket \
+                 ({ownership}): a running agent serving this listener, or a stale socket \
+                 from an unclean shutdown"
+            ),
+            format!(
+                "If an agent is running, no action is needed (hot reload keeps serving the \
+                 published socket). If it is stale, remove `{display}` manually: basil never \
+                 unlinks or replaces an existing path, even an apparently stale socket."
+            ),
+        )
+    } else {
+        CheckResult::fatal(
+            name,
+            format!(
+                "listener `{listener}` socket path `{display}` is occupied by a {kind} \
+                 ({ownership}); startup and SIGHUP hot-add both fail closed rather than \
+                 replace an unexpected object"
+            ),
+            format!(
+                "Move or remove the object at `{display}`, or point the listener at a \
+                 different path, then re-run."
+            ),
+        )
+    }
+}
+
+/// A short object-type label plus whether the object is a unix socket.
+fn file_type_label(file_type: std::fs::FileType) -> (&'static str, bool) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt as _;
+        if file_type.is_socket() {
+            return ("unix socket", true);
+        }
+        if file_type.is_fifo() {
+            return ("fifo", false);
+        }
+        if file_type.is_block_device() || file_type.is_char_device() {
+            return ("device node", false);
+        }
+    }
+    if file_type.is_dir() {
+        ("directory", false)
+    } else if file_type.is_symlink() {
+        ("symlink", false)
+    } else {
+        ("regular file", false)
+    }
+}
+
+/// `owner uid X gid Y` for occupied-path diagnostics (never file contents).
+#[cfg(unix)]
+fn ownership_label(metadata: &std::fs::Metadata) -> String {
+    use std::os::unix::fs::MetadataExt as _;
+    format!("owner uid {} gid {}", metadata.uid(), metadata.gid())
+}
+
+/// `owner uid X gid Y` for occupied-path diagnostics (never file contents).
+#[cfg(not(unix))]
+fn ownership_label(_metadata: &std::fs::Metadata) -> String {
+    "ownership unavailable".to_string()
+}
+
 /// Can we create an entry under `dir`? Probe with an exclusively-created temp
 /// file we immediately remove (never binds a socket).
 fn dir_is_writable(dir: &Path) -> bool {
@@ -1269,6 +1428,7 @@ mod tests {
             unlock_bip39_selected: false,
             unlock_age_yubikey_selected: false,
             rootless_expected_containers: None,
+            listeners: None,
         }
     }
 
@@ -1774,5 +1934,88 @@ mod tests {
         );
         let res = backend_reachability_check(Some(&backends)).await;
         assert_eq!(res.status, CheckStatus::Ok);
+    }
+
+    fn listener_set(entries: &[(&str, &Path)]) -> crate::transport::listener::ListenerConfigSet {
+        crate::transport::listener::ListenerConfigSet::resolve(
+            entries
+                .iter()
+                .map(|(name, path)| {
+                    (
+                        (*name).to_string(),
+                        crate::transport::listener::ListenerConfigInput {
+                            listener_type: crate::transport::grpc_server::ListenerType::Host,
+                            path: path.to_path_buf(),
+                            mode: None,
+                            group: None,
+                        },
+                    )
+                })
+                .collect(),
+            crate::transport::listener::LegacyListenerConfig::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn listener_path_absent_under_trusted_parent_is_ok() {
+        let dir = unique_dir();
+        let listeners = listener_set(&[("host", &dir.join("agent.sock"))]);
+        let rows = listener_path_checks(&listeners);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "listener_path:host");
+        assert_eq!(rows[0].status, CheckStatus::Ok);
+        assert!(rows[0].detail.contains("SIGHUP hot-add"));
+    }
+
+    #[test]
+    fn listener_path_occupied_by_regular_file_is_fatal_with_type_and_ownership() {
+        let dir = unique_dir();
+        let path = dir.join("agent.sock");
+        write_mode(&path, b"not a socket", 0o600);
+        let listeners = listener_set(&[("host", &path)]);
+        let rows = listener_path_checks(&listeners);
+        assert_eq!(rows[0].status, CheckStatus::Fatal);
+        assert!(
+            rows[0].detail.contains("regular file"),
+            "{}",
+            rows[0].detail
+        );
+        assert!(rows[0].detail.contains("owner uid"), "{}", rows[0].detail);
+        assert!(
+            rows[0].remediation.contains("Move or remove"),
+            "{}",
+            rows[0].remediation
+        );
+    }
+
+    #[tokio::test]
+    async fn listener_path_occupied_by_socket_is_an_advisory_warning() {
+        let dir = unique_dir();
+        let path = dir.join("agent.sock");
+        let bound = tokio::net::UnixListener::bind(&path).unwrap();
+        let listeners = listener_set(&[("host", &path)]);
+        let rows = listener_path_checks(&listeners);
+        drop(bound);
+        assert_eq!(rows[0].status, CheckStatus::Warn);
+        assert!(rows[0].detail.contains("unix socket"), "{}", rows[0].detail);
+        assert!(
+            rows[0].remediation.contains("never unlinks"),
+            "{}",
+            rows[0].remediation
+        );
+    }
+
+    #[test]
+    fn listener_path_under_symlinked_parent_is_fatal() {
+        let dir = unique_dir();
+        let real = dir.join("real");
+        let linked = dir.join("linked");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        let listeners = listener_set(&[("host", &linked.join("agent.sock"))]);
+        let rows = listener_path_checks(&listeners);
+        assert_eq!(rows[0].status, CheckStatus::Fatal);
+        assert!(rows[0].detail.contains("untrusted"), "{}", rows[0].detail);
     }
 }

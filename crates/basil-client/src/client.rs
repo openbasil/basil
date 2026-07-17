@@ -433,6 +433,12 @@ pub struct AgentReadiness {
     pub realms_degraded: u32,
     /// Accepted realms whose configured socket is absent.
     pub realms_absent: u32,
+    /// Listeners whose socket path changed in an applied reload and whose
+    /// externally generated wiring has not been regenerated (`rewire-required`).
+    /// A count only on this ungated probe; the named diagnostics are returned by
+    /// the permission-gated [`Client::reload`]. Configuration-attention state:
+    /// it never blocks readiness and never affects authorization.
+    pub listeners_rewire_required: u32,
 }
 
 /// Why an admin [`Client::reload`] candidate was rejected. On a rejection the
@@ -440,10 +446,66 @@ pub struct AgentReadiness {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReloadRejection {
     /// A stable, non-secret reason token (e.g. `validation_failed`,
-    /// `routing_shape_changed`, `catalog_read_failed`, `no_reload_inputs`).
+    /// `routing_shape_changed`, `catalog_read_failed`, `no_reload_inputs`,
+    /// `listener_transition_blocked`).
     pub reason: String,
     /// A human-readable, non-secret message describing the rejection.
     pub message: String,
+}
+
+/// Closed classification of one candidate listener change reported by
+/// [`Client::reload`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AgentListenerChange {
+    /// A new listener would be added without affecting existing accepts.
+    Add,
+    /// An existing listener would be removed.
+    Remove,
+    /// Type, path, mode, or group would change under an existing name.
+    Reconfigure,
+    /// A future change kind unknown to this client version.
+    Unknown,
+}
+
+/// Candidate-aware impact for one named listener in a reload candidate.
+///
+/// On an applied reload these are the committed changes; on a dry-run they are
+/// what a `SIGHUP` (or a real reload) would do right now; on a
+/// `listener_transition_blocked` rejection they are the blocking listeners.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentListenerImpact {
+    /// Stable listener name.
+    pub name: String,
+    /// Change classification.
+    pub kind: AgentListenerChange,
+    /// Exact accepted-transport count on this listener at assessment time. A
+    /// removal or reconfiguration applies only when this is zero.
+    pub active_connections: u32,
+    /// Serving socket path (removal/reconfiguration); absent for an addition.
+    pub previous_path: Option<String>,
+    /// Candidate socket path (addition/reconfiguration); absent for a removal.
+    pub new_path: Option<String>,
+}
+
+/// One persistent listener rewire diagnostic: a same-name socket-path change
+/// applied by an earlier reload.
+///
+/// External wiring generated against the previous resolved path keeps failing
+/// closed until it is regenerated and its workloads are recreated. Advisory
+/// only: it never affects authorization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRewireDiagnostic {
+    /// Stable listener name whose path changed.
+    pub listener: String,
+    /// The oldest resolved path external wiring may still record.
+    pub previous_path: String,
+    /// The path the listener now serves on.
+    pub new_path: String,
+    /// The generation whose reload applied the (latest) path change.
+    pub applied_generation: u64,
+    /// Unix seconds when the (latest) path change was recorded.
+    pub recorded_at_unix: u64,
 }
 
 /// The outcome of an admin [`Client::reload`].
@@ -471,6 +533,12 @@ pub struct AgentReload {
     pub grant_count: u32,
     /// Set only when the candidate was rejected (the previous generation serves on).
     pub rejection: Option<ReloadRejection>,
+    /// Candidate-aware listener impact (adds/removals/reconfigurations with
+    /// exact active-transport counts). Empty when no listener changes.
+    pub listener_impacts: Vec<AgentListenerImpact>,
+    /// Persistent rewire diagnostics still awaiting external wiring
+    /// regeneration, in stable listener-name order.
+    pub rewire_required: Vec<AgentRewireDiagnostic>,
 }
 
 /// Result of a live JWT-SVID revocation, returned by [`Client::revoke`].
@@ -670,6 +738,32 @@ impl AgentReload {
     #[must_use]
     pub const fn succeeded(&self) -> bool {
         self.rejection.is_none()
+    }
+}
+
+fn agent_listener_impact(info: pb::ListenerImpactInfo) -> AgentListenerImpact {
+    let kind = match info.kind() {
+        pb::ListenerChangeKind::Add => AgentListenerChange::Add,
+        pb::ListenerChangeKind::Remove => AgentListenerChange::Remove,
+        pb::ListenerChangeKind::Reconfigure => AgentListenerChange::Reconfigure,
+        pb::ListenerChangeKind::Unspecified => AgentListenerChange::Unknown,
+    };
+    AgentListenerImpact {
+        name: info.name,
+        kind,
+        active_connections: info.active_connections,
+        previous_path: info.previous_path,
+        new_path: info.new_path,
+    }
+}
+
+fn agent_rewire_diagnostic(info: pb::RewireDiagnostic) -> AgentRewireDiagnostic {
+    AgentRewireDiagnostic {
+        listener: info.listener,
+        previous_path: info.previous_path,
+        new_path: info.new_path,
+        applied_generation: info.applied_generation,
+        recorded_at_unix: info.recorded_at_unix,
     }
 }
 
@@ -1536,6 +1630,7 @@ impl Client {
             realms_ready: body.realms_ready,
             realms_degraded: body.realms_degraded,
             realms_absent: body.realms_absent,
+            listeners_rewire_required: body.listeners_rewire_required,
         })
     }
 
@@ -1568,6 +1663,16 @@ impl Client {
                 reason: r.reason,
                 message: r.message,
             }),
+            listener_impacts: body
+                .listener_impacts
+                .into_iter()
+                .map(agent_listener_impact)
+                .collect(),
+            rewire_required: body
+                .rewire_required
+                .into_iter()
+                .map(agent_rewire_diagnostic)
+                .collect(),
         })
     }
 

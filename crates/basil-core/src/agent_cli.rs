@@ -2505,6 +2505,8 @@ fn load_doctor_inputs(
     )
     .context("loading configuration corpus documents")?;
     let setup = build_setup(&file, overrides, &bootstrap)?;
+    let listeners = resolve_listener_configs(&file)
+        .context("resolving typed listener configuration for doctor")?;
     let socket = file
         .socket
         .unwrap_or_else(|| crate::DEFAULT_SOCKET_PATH.to_string());
@@ -2529,6 +2531,7 @@ fn load_doctor_inputs(
         unlock_bip39_selected,
         unlock_age_yubikey_selected,
         rootless_expected_containers,
+        listeners: Some(listeners),
     })
 }
 

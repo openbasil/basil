@@ -893,15 +893,77 @@ message ReloadResponse {
   // Set only when the candidate was rejected (`applied = false` and not a clean
   // dry-run). Carries a stable non-secret reason token + a human message.
   ReloadRejection rejection = 7;
+  // Candidate-aware listener impact: every listener the candidate would add,
+  // remove, or reconfigure, with its exact active-transport count at assessment
+  // time. On an applied reload these are the changes that were committed; on a
+  // dry-run they are what a SIGHUP (or a real reload) would do right now; on a
+  // `listener_transition_blocked` rejection they are the blocking listeners.
+  // Empty when the candidate changes no listener.
+  repeated ListenerImpactInfo listener_impacts = 8;
+  // Persistent rewire diagnostics: listeners whose socket path changed in an
+  // earlier applied reload and whose externally generated wiring (for example
+  // Compose bind mounts recorded against the old resolved path) has not been
+  // regenerated. Reported until the listener is removed or its path returns to
+  // the recorded previous path. Advisory only: it never affects authorization.
+  repeated RewireDiagnostic rewire_required = 9;
 }
 
 // Why a `Reload` candidate was rejected (the previous generation keeps serving).
 message ReloadRejection {
   // A stable, non-secret reason token (e.g. `validation_failed`,
-  // `routing_shape_changed`, `catalog_read_failed`, `no_reload_inputs`).
+  // `routing_shape_changed`, `catalog_read_failed`, `no_reload_inputs`,
+  // `listener_transition_blocked`).
   string reason = 1;
   // A human-readable, non-secret message describing the rejection.
   string message = 2;
+}
+
+// Closed classification of one candidate listener change.
+enum ListenerChangeKind {
+  LISTENER_CHANGE_KIND_UNSPECIFIED = 0;
+  // A new listener would be added without affecting existing accepts.
+  LISTENER_CHANGE_KIND_ADD = 1;
+  // An existing listener would be removed.
+  LISTENER_CHANGE_KIND_REMOVE = 2;
+  // Type, path, mode, or group would change under an existing name.
+  LISTENER_CHANGE_KIND_RECONFIGURE = 3;
+}
+
+// Candidate-aware impact for one named listener in a reload candidate.
+// Paths are operator-authored configuration (never key material); this message
+// is only returned on the permission-gated `Reload` RPC.
+message ListenerImpactInfo {
+  // Stable listener name.
+  string name = 1;
+  // Change classification.
+  ListenerChangeKind kind = 2;
+  // Exact accepted-transport count on this listener at assessment time. A
+  // removal or reconfiguration applies only when this is zero; an addition
+  // never depends on existing connections.
+  uint32 active_connections = 3;
+  // Serving socket path (removal/reconfiguration); absent for an addition.
+  optional string previous_path = 4;
+  // Candidate socket path (addition/reconfiguration); absent for a removal.
+  optional string new_path = 5;
+}
+
+// One persistent listener rewire diagnostic: a same-name socket-path change
+// applied by an earlier reload. External wiring generated against the previous
+// resolved path (for example Compose long-syntax bind mounts) keeps failing
+// closed until it is regenerated and its workloads are recreated. Structured
+// configuration-attention state: it never affects authorization, and unrelated
+// listeners keep serving.
+message RewireDiagnostic {
+  // Stable listener name whose path changed.
+  string listener = 1;
+  // The oldest resolved path external wiring may still record.
+  string previous_path = 2;
+  // The path the listener now serves on.
+  string new_path = 3;
+  // The generation whose reload applied the (latest) path change.
+  uint64 applied_generation = 4;
+  // Unix seconds when the (latest) path change was recorded.
+  uint64 recorded_at_unix = 5;
 }
 
 // Request for a live policy explanation against the broker's serving generation.
@@ -1132,6 +1194,13 @@ message ReadinessResponse {
   uint32 realms_degraded = 10;
   // Accepted realms whose configured socket is absent.
   uint32 realms_absent = 11;
+  // Listeners whose socket path changed in an applied reload and whose
+  // externally generated wiring has not been regenerated (`rewire-required`).
+  // A COUNT only (bounded disclosure on this ungated probe): the named
+  // diagnostics are returned by the permission-gated `Reload` RPC. Non-zero is
+  // configuration-attention state; it does not by itself make the broker not
+  // ready and never affects authorization.
+  uint32 listeners_rewire_required = 12;
 }
 
 // Request for broker status.
