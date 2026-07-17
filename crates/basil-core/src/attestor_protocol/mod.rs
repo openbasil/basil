@@ -9,11 +9,21 @@
 //! deliberately serial: after the handshake, one request must reach its final
 //! response before another request may begin.
 //!
-//! Runtime socket enrollment, `systemd` unit verification, executable release
-//! admission, and provider implementations are intentionally outside this
-//! module. [`CapturedUnixStream`] ensures kernel credentials are captured
-//! before a decoder can consume protocol bytes; the later authentication layer
+//! Runtime socket enrollment, `systemd` unit verification, and provider
+//! implementations are intentionally outside this module.
+//! [`CapturedUnixStream`] ensures kernel credentials are captured before a
+//! decoder can consume protocol bytes; the later authentication layer
 //! supplies the opaque [`VerifiedPeerBinding`] used by the handshake.
+//!
+//! Two broker-side cross-UID authentication pieces also live here (see
+//! `docs/attestor-realm-contract/SPEC.md`, "Socket and release
+//! authentication"): [`measure_attestor_stream`] drives one bounded exchange
+//! with the [`helper`] endpoint and cross-checks the returned record and
+//! descriptors against broker-held facts, yielding a [`VerifiedMeasurement`]
+//! whose executable digest feeds `ReleaseAdmission::begin_preflight`; and
+//! [`PidfdGuardedSession`] is the pidfd-monitored publication linearization
+//! point binding one session epoch's completed fact to its complete
+//! [`SessionPin`] token.
 
 mod codec;
 pub mod helper;
@@ -34,9 +44,11 @@ pub use limits::{
     ABSOLUTE_MAX_REQUEST_DEADLINE, ABSOLUTE_MAX_STRING_BYTES, LimitsError, ProtocolLimits,
 };
 pub use session::{
-    AttestorRequest, AttestorSession, BrokerSession, HealthResult, InventoryResult,
-    MOUNT_SECURITY_CAPABILITY, ProtocolError, QueryScope, RequestBudget, ResolvePeerResult,
-    SessionAuthentication,
+    ABSOLUTE_MAX_MEASURED_EXECUTABLE_BYTES, AttestorRequest, AttestorSession, BrokerSession,
+    FactUseError, HealthResult, InvalidationCause, InventoryResult, MOUNT_SECURITY_CAPABILITY,
+    MeasurementError, PidfdGuardedSession, PinnedHelperPolicy, ProtocolError, PublicationRejection,
+    QueryScope, RejectedPublication, RequestBudget, ResolvePeerResult, SessionAuthentication,
+    SessionPin, VerifiedMeasurement, measure_attestor_stream, run_pidfd_monitor,
 };
 
 #[cfg(test)]

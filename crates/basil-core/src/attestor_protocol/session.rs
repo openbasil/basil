@@ -3,15 +3,27 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::BTreeSet;
+use std::fmt;
+use std::num::NonZeroU64;
+use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, OwnedFd};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use prost::Message;
+use rustix::event::{PollFd, PollFlags};
+use rustix::fs::FileType;
+use rustix::net::sockopt;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::{Instant, timeout_at};
 
-use super::codec::{CodecError, FrameCodec, VerifiedPeerBinding};
+use super::codec::{CodecError, FrameCodec, PeerCredentials, VerifiedPeerBinding};
+use super::helper::transport::{HelperConnection, TransportError};
+use super::helper::wire::{
+    HELPER_PROTOCOL_VERSION, HelperResponse, MeasuredRecord, MeasurementRequest, NONCE_BYTES,
+    RejectCode, WireError,
+};
 use super::limits::{
     ABSOLUTE_MAX_CAPABILITIES, ABSOLUTE_MAX_CAPABILITY_BYTES, ABSOLUTE_MAX_DIAGNOSTIC_BYTES,
     ABSOLUTE_MAX_ID_MAP_RANGES, ABSOLUTE_MAX_MOUNTS_PER_INSTANCE, ABSOLUTE_MAX_STRING_BYTES,
@@ -1777,6 +1789,668 @@ pub enum ProtocolError {
     DigestEncoding(prost::EncodeError),
 }
 
+// ---------------------------------------------------------------------------
+// Broker-side measurement-helper client.
+// ---------------------------------------------------------------------------
+
+/// Absolute maximum bytes hashed from one measured executable descriptor.
+pub const ABSOLUTE_MAX_MEASURED_EXECUTABLE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Bytes read per bounded hashing step.
+const EXECUTABLE_HASH_CHUNK_BYTES: usize = 64 * 1024;
+
+/// The helper-policy pin the broker's protected measurement authority binds to
+/// one session's authority generation.
+///
+/// The request names this exact installed identity and generation, and the
+/// helper's echo must match it exactly: an echo of the broker generation alone
+/// never establishes helper-policy freshness. Old serving sessions and
+/// candidate qualifiers each carry their own pin, so one helper endpoint
+/// serves both installed generations concurrently.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PinnedHelperPolicy {
+    /// Allowlisted realm name.
+    pub realm: String,
+    /// Exact required installed helper-policy identity.
+    pub policy_identity: String,
+    /// Exact required installed helper-policy generation.
+    pub policy_generation: NonZeroU64,
+    /// Broker configuration generation at the time of the request.
+    pub broker_generation: u64,
+}
+
+/// One fully cross-checked helper measurement of a connected attestor stream.
+///
+/// Both descriptors were type-checked and associated with the same peer the
+/// broker independently authenticated on its own stream end. The digest covers
+/// the complete executable bytes read through the helper-opened descriptor.
+/// Neither descriptor may be cached for a future connection: the value binds
+/// to exactly one session epoch.
+#[derive(Debug)]
+pub struct VerifiedMeasurement {
+    /// The bounded record the helper bound to the stream's socket cookie.
+    pub record: MeasuredRecord,
+    /// The epoch-owned peer pidfd (first response descriptor).
+    pub pidfd: OwnedFd,
+    /// The measured executable (second response descriptor).
+    pub executable: OwnedFd,
+    /// Full-file SHA-256 of the executable descriptor's bytes; feeds the exact
+    /// `ArtifactRequirement` for `ReleaseAdmission::begin_preflight`.
+    pub executable_sha256: [u8; 32],
+}
+
+/// Typed, fail-closed broker-side measurement failure.
+#[derive(Debug, Error)]
+pub enum MeasurementError {
+    /// Sending the request or receiving the response failed.
+    #[error(transparent)]
+    Transport(#[from] TransportError),
+    /// The helper endpoint closed before answering; retry after reconnect.
+    #[error("measurement helper closed before answering")]
+    HelperClosed,
+    /// The kernel flagged the response datagram as clipped.
+    #[error("measurement helper response exceeded its bound")]
+    OversizedResponse,
+    /// The kernel dropped ancillary descriptors from the response.
+    #[error("measurement helper response ancillary data was truncated")]
+    AncillaryTruncated,
+    /// The request or response record violated the fixed wire contract.
+    #[error("measurement helper wire record invalid: {0}")]
+    Wire(#[from] WireError),
+    /// The helper rejected this request with a typed disclosure-safe code.
+    #[error("measurement helper rejected the request")]
+    Rejected {
+        /// Typed helper rejection code.
+        code: RejectCode,
+    },
+    /// A rejection record illegally carried descriptors.
+    #[error("measurement helper rejection carried descriptors")]
+    RejectionCarriedDescriptors,
+    /// The response does not answer this request (replayed or foreign nonce).
+    #[error("measurement helper response nonce does not answer this request")]
+    StaleResponse,
+    /// The response echoed another broker generation.
+    #[error("measurement helper response echoed a foreign broker generation")]
+    GenerationEchoMismatch,
+    /// The response echoed another realm.
+    #[error("measurement helper response echoed a foreign realm")]
+    RealmEchoMismatch,
+    /// The applied helper policy is not the pinned identity and generation.
+    #[error("measurement helper applied a policy other than the pinned one")]
+    PolicyPinMismatch,
+    /// The record is bound to a cookie other than this stream's own cookie.
+    #[error("measured record cookie does not match this stream")]
+    CookieMismatch,
+    /// The record names peer credentials other than the broker's own
+    /// independently captured `SO_PEERCRED` for the same stream.
+    #[error("measured record peer credentials do not match this stream")]
+    PeerCredentialsMismatch,
+    /// The measured response did not carry exactly two descriptors.
+    #[error("measured response carried {received} descriptors; required 2")]
+    DescriptorCount {
+        /// Received descriptor count.
+        received: usize,
+    },
+    /// The first response descriptor is not a process descriptor.
+    #[error("measured response first descriptor is not a pidfd")]
+    PidfdType,
+    /// The pidfd names a process other than the record's peer.
+    #[error("measured pidfd is not associated with the record's peer")]
+    PidfdAssociation,
+    /// The nonblocking pidfd exit poll itself failed.
+    #[error("measured pidfd could not be polled")]
+    PidfdPollFailed,
+    /// The measured peer already exited.
+    #[error("measured peer process exited")]
+    PeerExited,
+    /// The second response descriptor is not a regular file.
+    #[error("measured response second descriptor is not a regular file")]
+    ExecutableType,
+    /// The executable descriptor's device/inode differ from the record.
+    #[error("measured executable identity does not match the record")]
+    ExecutableIdentityMismatch,
+    /// The executable exceeds the compiled hashing ceiling.
+    #[error("measured executable exceeds {ABSOLUTE_MAX_MEASURED_EXECUTABLE_BYTES} bytes")]
+    ExecutableTooLarge,
+    /// Reading the executable bytes for hashing failed.
+    #[error("measured executable read failed: {0}")]
+    ExecutableRead(std::io::Error),
+    /// Secure random generation failed before the request was sent.
+    #[error("could not generate a measurement nonce: {0}")]
+    Random(getrandom::Error),
+}
+
+/// Request one measurement of a connected attestor control stream and
+/// cross-check the complete response against broker-held facts.
+///
+/// One `SCM_RIGHTS` duplicate of `stream` travels with the bounded request;
+/// the request carries no PID, path, digest, unit, or UID. Every check the
+/// helper applies comes from its own installed allowlist generation named by
+/// `pin`. The broker then independently verifies, in order: the exact nonce
+/// echo, the broker-generation/realm echoes, the pinned helper-policy
+/// identity and generation, the stream's own `SO_COOKIE`, its own
+/// `SO_PEERCRED` capture (`expected_peer`), the exact descriptor count and
+/// types, the pidfd's association with the record's peer, that the peer has
+/// not already exited, the executable's device/inode identity, and finally
+/// hashes the executable through the returned descriptor.
+///
+/// The call performs blocking I/O on `helper`; drive it from a blocking
+/// context. The caller owns retry policy across helper outage and restart.
+///
+/// # Errors
+///
+/// Returns a typed [`MeasurementError`]; every failure is fail-closed and
+/// leaves nothing cached.
+pub fn measure_attestor_stream(
+    helper: &HelperConnection,
+    stream: BorrowedFd<'_>,
+    expected_peer: PeerCredentials,
+    pin: &PinnedHelperPolicy,
+) -> Result<VerifiedMeasurement, MeasurementError> {
+    let mut nonce = [0_u8; NONCE_BYTES];
+    getrandom::fill(&mut nonce).map_err(MeasurementError::Random)?;
+    let request = MeasurementRequest {
+        protocol: HELPER_PROTOCOL_VERSION,
+        broker_generation: pin.broker_generation,
+        policy_generation: pin.policy_generation,
+        nonce,
+        realm: pin.realm.clone(),
+        policy_identity: pin.policy_identity.clone(),
+    };
+    let bytes = request.encode()?;
+    helper.send(&bytes, &[stream])?;
+    let datagram = helper
+        .recv_response()?
+        .ok_or(MeasurementError::HelperClosed)?;
+    if datagram.ancillary_truncated {
+        return Err(MeasurementError::AncillaryTruncated);
+    }
+    if datagram.oversized {
+        return Err(MeasurementError::OversizedResponse);
+    }
+    let descriptors = datagram.descriptors;
+    match HelperResponse::decode(&datagram.bytes)? {
+        HelperResponse::Rejected(rejection) => {
+            if !descriptors.is_empty() {
+                return Err(MeasurementError::RejectionCarriedDescriptors);
+            }
+            check_rejection_echo(&rejection, &nonce)?;
+            Err(MeasurementError::Rejected {
+                code: rejection.code,
+            })
+        }
+        HelperResponse::Measured(record) => {
+            verify_record_binding(&record, stream, expected_peer, pin, &nonce)?;
+            let (pidfd, executable) = bind_descriptors(descriptors, &record)?;
+            let executable_sha256 = hash_executable(executable.as_fd())?;
+            Ok(VerifiedMeasurement {
+                record,
+                pidfd,
+                executable,
+                executable_sha256,
+            })
+        }
+    }
+}
+
+/// Require a rejection to answer this request.
+///
+/// Pre-decode rejections (a request the helper could not read) legitimately
+/// echo a zeroed identity; every post-decode rejection must echo the exact
+/// nonce or it answers some other request.
+fn check_rejection_echo(
+    rejection: &super::helper::wire::RejectionRecord,
+    nonce: &[u8; NONCE_BYTES],
+) -> Result<(), MeasurementError> {
+    if rejection.nonce == *nonce {
+        return Ok(());
+    }
+    let pre_decode = matches!(
+        rejection.code,
+        RejectCode::MalformedRequest
+            | RejectCode::UnsupportedProtocol
+            | RejectCode::AncillaryTruncated
+    );
+    if pre_decode && rejection.nonce == [0_u8; NONCE_BYTES] && rejection.broker_generation == 0 {
+        return Ok(());
+    }
+    Err(MeasurementError::StaleResponse)
+}
+
+/// Cross-check the measured record against every broker-held fact.
+fn verify_record_binding(
+    record: &MeasuredRecord,
+    stream: BorrowedFd<'_>,
+    expected_peer: PeerCredentials,
+    pin: &PinnedHelperPolicy,
+    nonce: &[u8; NONCE_BYTES],
+) -> Result<(), MeasurementError> {
+    if record.nonce != *nonce {
+        return Err(MeasurementError::StaleResponse);
+    }
+    if record.broker_generation != pin.broker_generation {
+        return Err(MeasurementError::GenerationEchoMismatch);
+    }
+    if record.realm != pin.realm {
+        return Err(MeasurementError::RealmEchoMismatch);
+    }
+    if record.policy_identity != pin.policy_identity
+        || record.policy_generation != pin.policy_generation
+    {
+        return Err(MeasurementError::PolicyPinMismatch);
+    }
+    let cookie = sockopt::socket_cookie(stream).map_err(|_| MeasurementError::CookieMismatch)?;
+    if record.cookie != cookie {
+        return Err(MeasurementError::CookieMismatch);
+    }
+    let expected_pid = expected_peer
+        .pid
+        .ok_or(MeasurementError::PeerCredentialsMismatch)?;
+    if record.peer_pid != expected_pid
+        || record.peer_uid != expected_peer.uid
+        || record.peer_gid != expected_peer.gid
+    {
+        return Err(MeasurementError::PeerCredentialsMismatch);
+    }
+    Ok(())
+}
+
+/// Take exactly the pidfd and executable descriptors and verify each type and
+/// its association with the record's peer.
+fn bind_descriptors(
+    descriptors: Vec<OwnedFd>,
+    record: &MeasuredRecord,
+) -> Result<(OwnedFd, OwnedFd), MeasurementError> {
+    let received = descriptors.len();
+    let mut iterator = descriptors.into_iter();
+    let (Some(pidfd), Some(executable), None) = (iterator.next(), iterator.next(), iterator.next())
+    else {
+        return Err(MeasurementError::DescriptorCount { received });
+    };
+    verify_pidfd_association(pidfd.as_fd(), record.peer_pid)?;
+    if pidfd_has_exited(pidfd.as_fd()).map_err(|()| MeasurementError::PidfdPollFailed)? {
+        return Err(MeasurementError::PeerExited);
+    }
+    verify_executable_identity(executable.as_fd(), record)?;
+    Ok((pidfd, executable))
+}
+
+/// Verify the descriptor is a pidfd whose process is exactly `peer_pid`.
+///
+/// A pidfd's `fdinfo` carries a `Pid:` field; no other descriptor kind does.
+/// A reaped process reports `-1` and a process outside this PID namespace
+/// reports `0`; both fail closed.
+fn verify_pidfd_association(pidfd: BorrowedFd<'_>, peer_pid: u32) -> Result<(), MeasurementError> {
+    let path = format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd());
+    let info = std::fs::read_to_string(path).map_err(|_| MeasurementError::PidfdType)?;
+    let value = info
+        .lines()
+        .find_map(|line| line.strip_prefix("Pid:"))
+        .ok_or(MeasurementError::PidfdType)?;
+    let pid: i64 = value
+        .trim()
+        .parse()
+        .map_err(|_| MeasurementError::PidfdType)?;
+    if pid == -1 {
+        return Err(MeasurementError::PeerExited);
+    }
+    if u32::try_from(pid).ok() != Some(peer_pid) || pid == 0 {
+        return Err(MeasurementError::PidfdAssociation);
+    }
+    Ok(())
+}
+
+/// Nonblocking exit poll of one pidfd.
+///
+/// A pidfd polls readable exactly when its process has exited. The zero
+/// timeout keeps this callable at the publication linearization point while
+/// the registry mutex is held.
+fn pidfd_has_exited(pidfd: BorrowedFd<'_>) -> Result<bool, ()> {
+    let mut fds = [PollFd::new(&pidfd, PollFlags::IN)];
+    let zero = rustix::event::Timespec::default();
+    let ready = rustix::event::poll(&mut fds, Some(&zero)).map_err(|_| ())?;
+    if ready == 0 {
+        return Ok(false);
+    }
+    let Some(fd) = fds.first() else {
+        return Err(());
+    };
+    let events = fd.revents();
+    if events.intersects(PollFlags::NVAL | PollFlags::ERR) {
+        return Err(());
+    }
+    Ok(events.intersects(PollFlags::IN | PollFlags::HUP))
+}
+
+/// Verify the executable descriptor is a regular file with the record's exact
+/// device and inode identity, within the hashing ceiling.
+fn verify_executable_identity(
+    executable: BorrowedFd<'_>,
+    record: &MeasuredRecord,
+) -> Result<(), MeasurementError> {
+    let stat = rustix::fs::fstat(executable).map_err(|_| MeasurementError::ExecutableType)?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(MeasurementError::ExecutableType);
+    }
+    if stat_device(&stat) != record.executable_device || stat.st_ino != record.executable_inode {
+        return Err(MeasurementError::ExecutableIdentityMismatch);
+    }
+    if u64::try_from(stat.st_size).unwrap_or(u64::MAX) > ABSOLUTE_MAX_MEASURED_EXECUTABLE_BYTES {
+        return Err(MeasurementError::ExecutableTooLarge);
+    }
+    Ok(())
+}
+
+#[allow(clippy::useless_conversion)] // `st_dev` width is platform-dependent.
+fn stat_device(stat: &rustix::fs::Stat) -> u64 {
+    u64::from(stat.st_dev)
+}
+
+/// Hash the complete executable bytes through the helper-opened descriptor.
+///
+/// Positioned reads leave the shared file offset untouched and are bounded by
+/// [`ABSOLUTE_MAX_MEASURED_EXECUTABLE_BYTES`] even if the file grows.
+fn hash_executable(executable: BorrowedFd<'_>) -> Result<[u8; 32], MeasurementError> {
+    let mut hasher = Sha256::new();
+    let mut offset: u64 = 0;
+    let mut buffer = vec![0_u8; EXECUTABLE_HASH_CHUNK_BYTES];
+    loop {
+        let read = rustix::io::pread(executable, buffer.as_mut_slice(), offset)
+            .map_err(|errno| MeasurementError::ExecutableRead(errno.into()))?;
+        if read == 0 {
+            return Ok(hasher.finalize().into());
+        }
+        let chunk = buffer
+            .get(..read)
+            .ok_or_else(|| MeasurementError::ExecutableRead(std::io::Error::other("short read")))?;
+        hasher.update(chunk);
+        offset = offset.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        if offset > ABSOLUTE_MAX_MEASURED_EXECUTABLE_BYTES {
+            return Err(MeasurementError::ExecutableTooLarge);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pidfd-guarded publication linearization.
+// ---------------------------------------------------------------------------
+
+/// The complete pinned token naming one authenticated session epoch.
+///
+/// Publication and every later fact use compare all six dimensions; any
+/// mismatch is treated as another session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionPin {
+    /// Accepted broker configuration generation at authentication.
+    pub configuration_generation: u64,
+    /// Accepted realm entry generation.
+    pub entry_generation: u64,
+    /// Tombstone-derived realm revision.
+    pub realm_revision: u64,
+    /// Session epoch owning the pidfd.
+    pub session_epoch: u64,
+    /// Session-handle identity.
+    pub session_handle: u64,
+    /// Actor version advanced by supervisor mutations.
+    pub actor_version: u64,
+}
+
+/// Why a guarded session stopped accepting publication and use.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InvalidationCause {
+    /// The epoch-owned pidfd reported the peer process exited.
+    PeerExited,
+    /// A publication attempt carried a token other than the pinned one.
+    PinMismatch,
+    /// Session close or drain cancelled the epoch.
+    Cancelled,
+}
+
+/// Why one publication attempt was rejected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PublicationRejection {
+    /// The session was already invalidated.
+    Invalidated(InvalidationCause),
+    /// A fact was already published for this epoch.
+    AlreadyPublished,
+    /// The nonblocking poll found the peer exited; the session is now
+    /// invalidated.
+    PeerExited,
+    /// The complete token comparison failed; the session is now invalidated.
+    PinMismatch,
+}
+
+/// A rejected publication carrying its fact back out of the lock scope.
+///
+/// Returning the fact lets the caller drop it (releasing, for example, an
+/// active release-admission reference) outside the registry mutex.
+#[derive(Debug)]
+pub struct RejectedPublication<F> {
+    /// Typed rejection.
+    pub rejection: PublicationRejection,
+    /// The fact that lost the linearization race.
+    pub fact: F,
+}
+
+/// Why a published fact could not be used.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FactUseError {
+    /// The session was invalidated.
+    Invalidated(InvalidationCause),
+    /// The caller's token is not the pinned one.
+    PinMismatch,
+    /// No fact was published for this epoch.
+    NotPublished,
+}
+
+struct GuardedSessionState<F> {
+    pidfd: OwnedFd,
+    pin: SessionPin,
+    published: Option<F>,
+    invalidated: Option<InvalidationCause>,
+}
+
+/// One session epoch's pidfd monitor and publication linearization point.
+///
+/// The single internal mutex is the registry mutex from the design: the
+/// response path publishes under it, the monitor invalidates under it, and
+/// every later fact use rechecks the pinned token under it. Exactly one
+/// publication or invalidation wins; buffered response state that loses the
+/// race never becomes authoritative. No I/O beyond the nonblocking pidfd poll,
+/// no await, and no logging happens while the mutex is held; invalidation and
+/// cancellation hand the fact back so its drop runs outside the lock.
+///
+/// A replacement epoch is a fresh value with a fresh pin: a detached monitor
+/// still holding this value can never invalidate the replacement.
+pub struct PidfdGuardedSession<F> {
+    state: Arc<Mutex<GuardedSessionState<F>>>,
+}
+
+impl<F> Clone for PidfdGuardedSession<F> {
+    fn clone(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+impl<F> fmt::Debug for PidfdGuardedSession<F> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PidfdGuardedSession")
+    }
+}
+
+impl<F> PidfdGuardedSession<F> {
+    /// Bind one epoch-owned pidfd to its complete session pin.
+    #[must_use]
+    pub fn new(pidfd: OwnedFd, pin: SessionPin) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(GuardedSessionState {
+                pidfd,
+                pin,
+                published: None,
+                invalidated: None,
+            })),
+        }
+    }
+
+    /// Atomically publish the completed fact for this epoch.
+    ///
+    /// Under the registry mutex this performs the nonblocking exit poll of the
+    /// epoch-owned pidfd and the complete token comparison, then either
+    /// publishes or invalidates the session. Decode and validation of response
+    /// bytes must already have happened outside the lock into the
+    /// non-authoritative `fact`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RejectedPublication`] carrying `fact` back for out-of-lock
+    /// disposal when the session is invalidated, already published, exited, or
+    /// pinned to another token.
+    pub fn publish(&self, pin: SessionPin, fact: F) -> Result<(), RejectedPublication<F>> {
+        let mut state = self.lock_state();
+        if let Some(cause) = state.invalidated {
+            drop(state);
+            return Err(RejectedPublication {
+                rejection: PublicationRejection::Invalidated(cause),
+                fact,
+            });
+        }
+        if state.published.is_some() {
+            drop(state);
+            return Err(RejectedPublication {
+                rejection: PublicationRejection::AlreadyPublished,
+                fact,
+            });
+        }
+        if pidfd_has_exited(state.pidfd.as_fd()).unwrap_or(true) {
+            state.invalidated = Some(InvalidationCause::PeerExited);
+            drop(state);
+            return Err(RejectedPublication {
+                rejection: PublicationRejection::PeerExited,
+                fact,
+            });
+        }
+        if pin != state.pin {
+            state.invalidated = Some(InvalidationCause::PinMismatch);
+            drop(state);
+            return Err(RejectedPublication {
+                rejection: PublicationRejection::PinMismatch,
+                fact,
+            });
+        }
+        state.published = Some(fact);
+        drop(state);
+        Ok(())
+    }
+
+    /// Record the peer's exit under the registry mutex.
+    ///
+    /// Exit ordered after publication is ordered after that completed fact:
+    /// the fact is handed back for out-of-lock disposal and every later use
+    /// rejects. Idempotent; a second observation (or one after cancellation)
+    /// returns `None` and changes nothing.
+    #[must_use = "drop the returned fact outside the registry mutex"]
+    pub fn observe_exit(&self) -> Option<F> {
+        let mut state = self.lock_state();
+        if state.invalidated.is_none() {
+            state.invalidated = Some(InvalidationCause::PeerExited);
+        }
+        let fact = state.published.take();
+        drop(state);
+        fact
+    }
+
+    /// Cancel this epoch at session close or drain.
+    ///
+    /// Cancellation is owned by the session lifecycle, not the monitor; the
+    /// returned fact is dropped by the caller outside the lock.
+    #[must_use = "drop the returned fact outside the registry mutex"]
+    pub fn cancel(&self) -> Option<F> {
+        let mut state = self.lock_state();
+        if state.invalidated.is_none() {
+            state.invalidated = Some(InvalidationCause::Cancelled);
+        }
+        let fact = state.published.take();
+        drop(state);
+        fact
+    }
+
+    /// Use the published fact after rechecking the complete pinned token.
+    ///
+    /// The closure runs under the registry mutex and must therefore be
+    /// lock-cheap: no I/O, no await, no logging.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FactUseError`] when the session is invalidated, the token is
+    /// not the pinned one, or nothing was published.
+    pub fn with_fact<R>(
+        &self,
+        pin: SessionPin,
+        read: impl FnOnce(&F) -> R,
+    ) -> Result<R, FactUseError> {
+        let state = self.lock_state();
+        if let Some(cause) = state.invalidated {
+            drop(state);
+            return Err(FactUseError::Invalidated(cause));
+        }
+        if pin != state.pin {
+            drop(state);
+            return Err(FactUseError::PinMismatch);
+        }
+        let Some(fact) = state.published.as_ref() else {
+            drop(state);
+            return Err(FactUseError::NotPublished);
+        };
+        let result = read(fact);
+        drop(state);
+        Ok(result)
+    }
+
+    /// Duplicate the epoch-owned pidfd for an asynchronous exit monitor.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying I/O error when the descriptor cannot be
+    /// duplicated.
+    pub fn monitor_fd(&self) -> Result<OwnedFd, std::io::Error> {
+        let state = self.lock_state();
+        let fd = state.pidfd.try_clone();
+        drop(state);
+        fd
+    }
+
+    fn lock_state(&self) -> MutexGuard<'_, GuardedSessionState<F>> {
+        // Poisoning is recovered: a panicked writer must not permanently
+        // strand session invalidation on this long-running broker.
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Await the peer's exit and invalidate the session when it happens.
+///
+/// The returned fact (if a publication had completed) is handed to the caller
+/// for disposal outside the registry mutex — for example dropping the
+/// session's `ActiveArtifact` and triggering full reconnection. Cancelling
+/// this future never invalidates anything: cancellation is owned by session
+/// close and drain, so no detached monitor can invalidate a replacement
+/// epoch's fresh session value. A monitoring setup failure fails closed by
+/// invalidating immediately.
+pub async fn run_pidfd_monitor<F>(session: PidfdGuardedSession<F>) -> Option<F> {
+    let Ok(fd) = session.monitor_fd() else {
+        return session.observe_exit();
+    };
+    let Ok(async_fd) = tokio::io::unix::AsyncFd::with_interest(fd, tokio::io::Interest::READABLE)
+    else {
+        return session.observe_exit();
+    };
+    // Readable or failed both mean the epoch cannot be monitored further:
+    // fail closed by observing the exit.
+    let _readiness = async_fd.readable().await;
+    session.observe_exit()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ProtocolError, validate_mount, wire};
@@ -1819,5 +2493,1078 @@ mod tests {
                 ..
             })
         ));
+    }
+}
+
+#[cfg(test)]
+mod pidfd_test_support {
+    //! Shared real-process pidfd fixtures for the conformance modules.
+
+    use std::os::fd::OwnedFd;
+    use std::process::{Child, Command, Stdio};
+
+    use rustix::process::{Pid, PidfdFlags, pidfd_open};
+
+    /// A pidfd for this (never-exiting) test process.
+    pub(super) fn self_pidfd() -> OwnedFd {
+        pidfd_open(rustix::process::getpid(), PidfdFlags::empty()).expect("self pidfd")
+    }
+
+    /// A child that blocks on stdin until [`exit_child`] releases it, plus its
+    /// pidfd acquired while it is alive.
+    pub(super) fn blocking_child() -> (Child, OwnedFd) {
+        let child = Command::new("/bin/sh")
+            .args(["-c", "read _line"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn blocking child");
+        let raw = i32::try_from(child.id()).expect("child pid fits i32");
+        let pid = Pid::from_raw(raw).expect("nonzero child pid");
+        let pidfd = pidfd_open(pid, PidfdFlags::empty()).expect("child pidfd");
+        (child, pidfd)
+    }
+
+    /// Release, exit, and reap a [`blocking_child`].
+    pub(super) fn exit_child(mut child: Child) {
+        drop(child.stdin.take());
+        let _status = child.wait().expect("wait");
+    }
+
+    /// A pidfd whose process has already exited and been reaped.
+    pub(super) fn exited_child_pidfd() -> OwnedFd {
+        let (child, pidfd) = blocking_child();
+        exit_child(child);
+        pidfd
+    }
+}
+
+#[cfg(test)]
+mod broker_helper_conformance {
+    //! Broker-side SPEC conformance test 16.
+    //!
+    //! Helper-side coverage (allowlist selection, unit/LSM/lockdown checks,
+    //! the start-time sandwich) lives in `helper::conformance`. This module
+    //! proves the broker's own cross-checks: substituted streams and cookies,
+    //! replayed nonces, echo and helper-policy pin verification against the
+    //! protected measurement authority, its own `SO_PEERCRED` capture,
+    //! descriptor count/type/association (including PID reuse via an
+    //! already-exited pidfd), executable identity and hashing into
+    //! `ReleaseAdmission::begin_preflight`, generation overlap on one
+    //! endpoint, typed rejection surfacing for wrong realm/UID/unit/LSM
+    //! identity, and transport-level violations (oversize, ancillary
+    //! truncation, outage).
+
+    use std::collections::VecDeque;
+    use std::num::NonZeroU64;
+    use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
+    use std::sync::Mutex;
+
+    use rustix::net::{
+        AddressFamily, SendAncillaryBuffer, SendAncillaryMessage, SendFlags, SocketFlags,
+        SocketType, sockopt,
+    };
+    use sha2::{Digest as _, Sha256};
+
+    use super::super::codec::PeerCredentials;
+    use super::super::helper::allowlist::{InstalledAllowlist, RealmExpectation};
+    use super::super::helper::service::{
+        ConfinementFacts, ExecutableError, ExecutableOpener, HelperOutcome, HelperService,
+        InspectError, PeerPidfdError, PeerPidfdSource, ProcessIdentity, ProcessInspector,
+        ResolvedUnit, UnitResolveError, UnitResolver, serve_connection,
+    };
+    use super::super::helper::transport::{HelperConnection, ReceivedDatagram};
+    use super::super::helper::wire::{
+        MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, MeasuredRecord, RejectCode, RejectionRecord,
+    };
+    use super::pidfd_test_support::{blocking_child, exit_child, exited_child_pidfd};
+    use super::{MeasurementError, PinnedHelperPolicy, measure_attestor_stream};
+    use crate::core::release_admission::{
+        ArtifactRequirement, ArtifactRole, CapabilityId, CapabilitySet,
+        HistoricalReleaseIdentityCheck, ProductId, ProtocolVersion, ReleaseAdmission,
+        ReleaseArtifact, ReleaseId, Sha256Digest, TargetTriple, VerifiedReleaseManifest,
+    };
+
+    const REALM: &str = "production-docker";
+    const POLICY_G1: &str = "basil-measure-policy-g1";
+    const POLICY_G2: &str = "basil-measure-policy-g2";
+    const UNIT_G1: &str = "basil-attestor-production-docker-g1.service";
+    const UNIT_G2: &str = "basil-attestor-production-docker-g2.service";
+    const LSM: &str = "selinux:basil_attestor_g1_t";
+    const LOCKDOWN: &str = "basil-attestor-lockdown-g1";
+    /// A small, stable regular file measured as the "executable".
+    const EXECUTABLE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+
+    fn own_uid() -> u32 {
+        rustix::process::getuid().as_raw()
+    }
+
+    fn own_gid() -> u32 {
+        rustix::process::getgid().as_raw()
+    }
+
+    fn self_peer() -> PeerCredentials {
+        PeerCredentials {
+            pid: Some(std::process::id()),
+            uid: own_uid(),
+            gid: own_gid(),
+        }
+    }
+
+    fn expectation(generation: u64, unit: &str) -> RealmExpectation {
+        RealmExpectation {
+            authority_generation: NonZeroU64::new(generation).expect("nonzero"),
+            service_unit: unit.to_owned(),
+            attestor_uid: own_uid(),
+            lsm_profile: LSM.to_owned(),
+            lockdown_profile: LOCKDOWN.to_owned(),
+        }
+    }
+
+    fn allowlist_g1() -> InstalledAllowlist {
+        InstalledAllowlist::from_parts(vec![(
+            POLICY_G1.to_owned(),
+            NonZeroU64::MIN,
+            vec![(REALM.to_owned(), expectation(1, UNIT_G1))],
+        )])
+    }
+
+    fn overlap_allowlist() -> InstalledAllowlist {
+        let two = NonZeroU64::new(2).expect("nonzero");
+        InstalledAllowlist::from_parts(vec![
+            (
+                POLICY_G1.to_owned(),
+                NonZeroU64::MIN,
+                vec![(REALM.to_owned(), expectation(1, UNIT_G1))],
+            ),
+            (
+                POLICY_G2.to_owned(),
+                two,
+                vec![(REALM.to_owned(), expectation(2, UNIT_G2))],
+            ),
+        ])
+    }
+
+    fn pin_g1() -> PinnedHelperPolicy {
+        PinnedHelperPolicy {
+            realm: REALM.to_owned(),
+            policy_identity: POLICY_G1.to_owned(),
+            policy_generation: NonZeroU64::MIN,
+            broker_generation: 7,
+        }
+    }
+
+    struct SelfPidfd;
+
+    impl PeerPidfdSource for SelfPidfd {
+        fn peer_pidfd(&self, _stream: BorrowedFd<'_>) -> Result<OwnedFd, PeerPidfdError> {
+            rustix::process::pidfd_open(
+                rustix::process::getpid(),
+                rustix::process::PidfdFlags::empty(),
+            )
+            .map_err(|_| PeerPidfdError::Io)
+        }
+    }
+
+    struct QueuedUnits(Mutex<VecDeque<String>>);
+
+    impl QueuedUnits {
+        fn of(units: &[&str]) -> Self {
+            Self(Mutex::new(
+                units.iter().map(|unit| (*unit).to_owned()).collect(),
+            ))
+        }
+    }
+
+    impl UnitResolver for QueuedUnits {
+        fn unit_by_pidfd(&self, _pidfd: BorrowedFd<'_>) -> Result<ResolvedUnit, UnitResolveError> {
+            self.0
+                .lock()
+                .expect("units lock")
+                .pop_front()
+                .map(|unit| ResolvedUnit { unit })
+                .ok_or(UnitResolveError::Io)
+        }
+    }
+
+    struct FakeInspector {
+        lsm: String,
+    }
+
+    impl ProcessInspector for FakeInspector {
+        fn identity(
+            &self,
+            _pid: u32,
+            _pidfd: BorrowedFd<'_>,
+        ) -> Result<ProcessIdentity, InspectError> {
+            Ok(ProcessIdentity {
+                uid: own_uid(),
+                gid: own_gid(),
+                start_time_ticks: 1000,
+            })
+        }
+
+        fn confinement(
+            &self,
+            _pid: u32,
+            _pidfd: BorrowedFd<'_>,
+        ) -> Result<ConfinementFacts, InspectError> {
+            Ok(ConfinementFacts {
+                lsm_profile: self.lsm.clone(),
+                lockdown_profile: LOCKDOWN.to_owned(),
+            })
+        }
+    }
+
+    struct FileOpener;
+
+    impl ExecutableOpener for FileOpener {
+        fn open_executable(
+            &self,
+            _pid: u32,
+            _pidfd: BorrowedFd<'_>,
+        ) -> Result<OwnedFd, ExecutableError> {
+            rustix::fs::open(
+                EXECUTABLE_PATH,
+                rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(|_| ExecutableError::Io)
+        }
+    }
+
+    type Service = HelperService<SelfPidfd, QueuedUnits, FakeInspector, FileOpener>;
+
+    fn service_with(allowlist: InstalledAllowlist, units: &[&str], lsm: &str) -> Service {
+        HelperService::new(
+            allowlist,
+            SelfPidfd,
+            QueuedUnits::of(units),
+            FakeInspector {
+                lsm: lsm.to_owned(),
+            },
+            FileOpener,
+        )
+    }
+
+    fn service() -> Service {
+        service_with(allowlist_g1(), &[UNIT_G1; 8], LSM)
+    }
+
+    fn stream_pair() -> (OwnedFd, OwnedFd) {
+        rustix::net::socketpair(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .expect("stream socketpair")
+    }
+
+    fn serve(service: Service) -> (HelperConnection, std::thread::JoinHandle<()>) {
+        let (client, server) = HelperConnection::pair().expect("pair");
+        let worker = std::thread::spawn(move || {
+            let _ = serve_connection(&server, &service);
+        });
+        (client, worker)
+    }
+
+    /// One crafted exchange: the honest service measures the request, then
+    /// `craft` substitutes or mutates the response before it is sent.
+    type Craft =
+        Box<dyn FnOnce(MeasuredRecord, OwnedFd, OwnedFd) -> (Vec<u8>, Vec<OwnedFd>) + Send>;
+
+    fn measure_with_crafted(craft: Craft) -> MeasurementError {
+        let (client, server) = HelperConnection::pair().expect("pair");
+        let worker = std::thread::spawn(move || {
+            let datagram = server
+                .recv(MAX_REQUEST_BYTES)
+                .expect("recv")
+                .expect("datagram");
+            let outcome = service().handle(ReceivedDatagram {
+                bytes: datagram.bytes,
+                descriptors: datagram.descriptors,
+                oversized: false,
+                ancillary_truncated: false,
+            });
+            let HelperOutcome::Measured {
+                record,
+                pidfd,
+                executable,
+            } = outcome
+            else {
+                panic!("expected an honest measurement");
+            };
+            let (bytes, fds) = craft(record, pidfd, executable);
+            let borrowed: Vec<_> = fds.iter().map(|fd| fd.as_fd()).collect();
+            server.send(&bytes, &borrowed).expect("send crafted");
+        });
+        let (broker_end, _attestor_end) = stream_pair();
+        let result = measure_attestor_stream(&client, broker_end.as_fd(), self_peer(), &pin_g1());
+        worker.join().expect("join");
+        result.expect_err("crafted response must be rejected")
+    }
+
+    fn expect_mutation(mutate: fn(&mut MeasuredRecord), check: fn(&MeasurementError) -> bool) {
+        let error = measure_with_crafted(Box::new(move |mut record, pidfd, executable| {
+            mutate(&mut record);
+            (
+                record.encode().expect("encode mutated record"),
+                vec![pidfd, executable],
+            )
+        }));
+        assert!(check(&error), "unexpected error: {error:?}");
+    }
+
+    fn admission_for(digest: [u8; 32]) -> (ReleaseAdmission, ArtifactRequirement) {
+        let role = ArtifactRole::new("attestor").expect("role");
+        let target = TargetTriple::new("x86_64-unknown-linux-gnu").expect("target");
+        let protocol = ProtocolVersion::new(1).expect("protocol");
+        let capabilities =
+            CapabilitySet::try_from_iter(
+                [CapabilityId::new("docker.rootful").expect("capability")],
+            )
+            .expect("capabilities");
+        let artifact = ReleaseArtifact::new(
+            role.clone(),
+            target.clone(),
+            Sha256Digest::from_bytes(digest),
+            protocol,
+            capabilities.clone(),
+        );
+        let manifest = VerifiedReleaseManifest::from_verified_parts(
+            HistoricalReleaseIdentityCheck::completed(),
+            ProductId::new("basil-attestor").expect("product"),
+            ReleaseId::new("1.0.0").expect("release"),
+            [artifact],
+        )
+        .expect("manifest");
+        let requirement = ArtifactRequirement::new(
+            Sha256Digest::from_bytes(digest),
+            role,
+            target,
+            protocol,
+            capabilities,
+        );
+        (ReleaseAdmission::new(manifest), requirement)
+    }
+
+    #[test]
+    fn measures_verifies_and_admits_the_executable() {
+        let (client, worker) = serve(service());
+        let (broker_end, _attestor_end) = stream_pair();
+        let measurement =
+            measure_attestor_stream(&client, broker_end.as_fd(), self_peer(), &pin_g1())
+                .expect("measurement");
+        // The record is bound to this stream's own cookie and this session's
+        // pinned helper policy.
+        let cookie = sockopt::socket_cookie(broker_end.as_fd()).expect("cookie");
+        assert_eq!(measurement.record.cookie, cookie);
+        assert_eq!(measurement.record.policy_identity, POLICY_G1);
+        assert_eq!(measurement.record.policy_generation, NonZeroU64::MIN);
+        assert_eq!(measurement.record.service_unit, UNIT_G1);
+        // The digest covers the exact bytes behind the returned descriptor.
+        let expected: [u8; 32] =
+            Sha256::digest(std::fs::read(EXECUTABLE_PATH).expect("read")).into();
+        assert_eq!(measurement.executable_sha256, expected);
+        // The exact digest feeds the artifact requirement, and admission
+        // holds the release active for this preflight.
+        let (admission, requirement) = admission_for(measurement.executable_sha256);
+        let active = admission
+            .begin_preflight(&requirement)
+            .expect("begin preflight");
+        assert_eq!(admission.snapshot().current.active_preflights, 1);
+        drop(active);
+        assert_eq!(admission.snapshot().current.active_preflights, 0);
+        drop(client);
+        worker.join().expect("join");
+    }
+
+    #[test]
+    fn a_foreign_digest_is_never_admitted() {
+        let (admission, _requirement) = admission_for([0x11; 32]);
+        let (_admission_other, foreign) = admission_for([0x22; 32]);
+        assert!(admission.begin_preflight(&foreign).is_err());
+    }
+
+    #[test]
+    fn surfaces_typed_rejections_for_wrong_realm_generation_unit_lsm_and_uid() {
+        // (allowlist, resolved units, live lsm, pin mutation, expected code)
+        let wrong_realm = || {
+            let mut pin = pin_g1();
+            pin.realm = "other-realm".to_owned();
+            pin
+        };
+        let stale_generation = || {
+            let mut pin = pin_g1();
+            pin.policy_identity = "basil-measure-policy-g9".to_owned();
+            pin.policy_generation = NonZeroU64::new(9).expect("nonzero");
+            pin
+        };
+        let cases: Vec<(Service, PinnedHelperPolicy, RejectCode)> = vec![
+            (service(), wrong_realm(), RejectCode::RealmNotInstalled),
+            (
+                service(),
+                stale_generation(),
+                RejectCode::PolicyNotInstalled,
+            ),
+            (
+                service_with(allowlist_g1(), &["basil-attestor-other-g1.service"], LSM),
+                pin_g1(),
+                RejectCode::UnitMismatch,
+            ),
+            (
+                service_with(allowlist_g1(), &[UNIT_G1; 8], "selinux:unconfined_t"),
+                pin_g1(),
+                RejectCode::ConfinementMismatch,
+            ),
+        ];
+        for (case, pin, code) in cases {
+            let (client, worker) = serve(case);
+            let (broker_end, _attestor_end) = stream_pair();
+            let error = measure_attestor_stream(&client, broker_end.as_fd(), self_peer(), &pin)
+                .expect_err("must reject");
+            assert!(
+                matches!(&error, MeasurementError::Rejected { code: got } if *got == code),
+                "expected {code:?}, got {error:?}"
+            );
+            drop(client);
+            worker.join().expect("join");
+        }
+
+        // A wrong peer UID in the installed expectation rejects.
+        let mut foreign = expectation(1, UNIT_G1);
+        foreign.attestor_uid = own_uid().wrapping_add(1);
+        let wrong_uid = InstalledAllowlist::from_parts(vec![(
+            POLICY_G1.to_owned(),
+            NonZeroU64::MIN,
+            vec![(REALM.to_owned(), foreign)],
+        )]);
+        let (client, worker) = serve(service_with(wrong_uid, &[UNIT_G1; 8], LSM));
+        let (broker_end, _attestor_end) = stream_pair();
+        let error = measure_attestor_stream(&client, broker_end.as_fd(), self_peer(), &pin_g1())
+            .expect_err("must reject");
+        assert!(matches!(
+            error,
+            MeasurementError::Rejected {
+                code: RejectCode::PeerIdentityMismatch
+            }
+        ));
+        drop(client);
+        worker.join().expect("join");
+    }
+
+    #[test]
+    fn one_endpoint_serves_old_sessions_and_candidate_qualifiers_concurrently() {
+        // Both installed generations are live on one endpoint. The old
+        // serving session and the candidate qualifier each name their own
+        // pinned generation and are measured under their own expectations.
+        let (client, worker) = serve(service_with(overlap_allowlist(), &[UNIT_G1, UNIT_G2], LSM));
+
+        let (old_end, _old_peer) = stream_pair();
+        let old = measure_attestor_stream(&client, old_end.as_fd(), self_peer(), &pin_g1())
+            .expect("old-generation measurement");
+        assert_eq!(old.record.policy_generation, NonZeroU64::MIN);
+        assert_eq!(old.record.service_unit, UNIT_G1);
+
+        let candidate_pin = PinnedHelperPolicy {
+            realm: REALM.to_owned(),
+            policy_identity: POLICY_G2.to_owned(),
+            policy_generation: NonZeroU64::new(2).expect("nonzero"),
+            broker_generation: 7,
+        };
+        let (new_end, _new_peer) = stream_pair();
+        let candidate =
+            measure_attestor_stream(&client, new_end.as_fd(), self_peer(), &candidate_pin)
+                .expect("candidate measurement");
+        assert_eq!(candidate.record.policy_generation.get(), 2);
+        assert_eq!(candidate.record.service_unit, UNIT_G2);
+
+        // A request naming a generation not installed for the realm rejects.
+        let uninstalled_pin = PinnedHelperPolicy {
+            policy_generation: NonZeroU64::new(3).expect("nonzero"),
+            ..candidate_pin
+        };
+        let (third_end, _third_peer) = stream_pair();
+        let error =
+            measure_attestor_stream(&client, third_end.as_fd(), self_peer(), &uninstalled_pin)
+                .expect_err("must reject");
+        assert!(matches!(
+            error,
+            MeasurementError::Rejected {
+                code: RejectCode::PolicyNotInstalled
+            }
+        ));
+        drop(client);
+        worker.join().expect("join");
+    }
+
+    #[test]
+    fn rejects_a_substituted_stream_by_its_cookie() {
+        // The helper measures a different (equally self-owned) stream than
+        // the one the broker holds: peer credentials agree, so the socket
+        // cookie is the discriminator.
+        let (client, server) = HelperConnection::pair().expect("pair");
+        let worker = std::thread::spawn(move || {
+            let datagram = server
+                .recv(MAX_REQUEST_BYTES)
+                .expect("recv")
+                .expect("datagram");
+            let (substituted, _peer) = stream_pair();
+            let outcome = service().handle(ReceivedDatagram {
+                bytes: datagram.bytes,
+                descriptors: vec![substituted],
+                oversized: false,
+                ancillary_truncated: false,
+            });
+            let HelperOutcome::Measured {
+                record,
+                pidfd,
+                executable,
+            } = outcome
+            else {
+                panic!("expected measurement");
+            };
+            server
+                .send(
+                    &record.encode().expect("encode"),
+                    &[pidfd.as_fd(), executable.as_fd()],
+                )
+                .expect("send");
+        });
+        let (broker_end, _attestor_end) = stream_pair();
+        let error = measure_attestor_stream(&client, broker_end.as_fd(), self_peer(), &pin_g1())
+            .expect_err("substituted stream must be rejected");
+        assert!(matches!(error, MeasurementError::CookieMismatch));
+        worker.join().expect("join");
+    }
+
+    type Mutator = fn(&mut MeasuredRecord);
+    type ErrorCheck = fn(&MeasurementError) -> bool;
+
+    #[test]
+    fn rejects_mutated_records_field_by_field() {
+        let cases: [(Mutator, ErrorCheck); 8] = [
+            (
+                |record| record.nonce = [0xEE; 32],
+                |error| matches!(error, MeasurementError::StaleResponse),
+            ),
+            (
+                |record| record.broker_generation ^= 1,
+                |error| matches!(error, MeasurementError::GenerationEchoMismatch),
+            ),
+            (
+                |record| record.realm = "other-realm".to_owned(),
+                |error| matches!(error, MeasurementError::RealmEchoMismatch),
+            ),
+            (
+                |record| record.policy_identity = POLICY_G2.to_owned(),
+                |error| matches!(error, MeasurementError::PolicyPinMismatch),
+            ),
+            (
+                |record| record.policy_generation = NonZeroU64::new(2).expect("nonzero"),
+                |error| matches!(error, MeasurementError::PolicyPinMismatch),
+            ),
+            (
+                |record| record.cookie ^= 1,
+                |error| matches!(error, MeasurementError::CookieMismatch),
+            ),
+            (
+                |record| record.peer_pid ^= 1,
+                |error| matches!(error, MeasurementError::PeerCredentialsMismatch),
+            ),
+            (
+                |record| record.peer_uid ^= 1,
+                |error| matches!(error, MeasurementError::PeerCredentialsMismatch),
+            ),
+        ];
+        for (mutate, check) in cases {
+            expect_mutation(mutate, check);
+        }
+    }
+
+    #[test]
+    fn rejects_missing_surplus_and_wrong_type_descriptors() {
+        // Missing executable descriptor.
+        let error = measure_with_crafted(Box::new(|record, pidfd, _executable| {
+            (record.encode().expect("encode"), vec![pidfd])
+        }));
+        assert!(matches!(
+            error,
+            MeasurementError::DescriptorCount { received: 1 }
+        ));
+
+        // A surplus third descriptor.
+        let error = measure_with_crafted(Box::new(|record, pidfd, executable| {
+            let (extra, _peer) = stream_pair();
+            (
+                record.encode().expect("encode"),
+                vec![pidfd, executable, extra],
+            )
+        }));
+        assert!(matches!(
+            error,
+            MeasurementError::DescriptorCount { received: 3 }
+        ));
+
+        // Swapped order: a regular file is not a pidfd.
+        let error = measure_with_crafted(Box::new(|record, pidfd, executable| {
+            (record.encode().expect("encode"), vec![executable, pidfd])
+        }));
+        assert!(matches!(error, MeasurementError::PidfdType));
+
+        // A socket is not a regular executable file.
+        let error = measure_with_crafted(Box::new(|record, pidfd, _executable| {
+            let (socket, _peer) = stream_pair();
+            (record.encode().expect("encode"), vec![pidfd, socket])
+        }));
+        assert!(matches!(error, MeasurementError::ExecutableType));
+
+        // A different regular file than the record's identity.
+        let error = measure_with_crafted(Box::new(|mut record, pidfd, executable| {
+            record.executable_inode ^= 1;
+            (record.encode().expect("encode"), vec![pidfd, executable])
+        }));
+        assert!(matches!(
+            error,
+            MeasurementError::ExecutableIdentityMismatch
+        ));
+    }
+
+    #[test]
+    fn rejects_an_exited_pidfd_and_a_foreign_process_pidfd() {
+        // PID reuse defense: the returned pidfd names a process that already
+        // exited; any same-numbered live PID is a different process.
+        let error = measure_with_crafted(Box::new(|record, _pidfd, executable| {
+            (
+                record.encode().expect("encode"),
+                vec![exited_child_pidfd(), executable],
+            )
+        }));
+        assert!(matches!(error, MeasurementError::PeerExited));
+
+        // Exact association: a live pidfd for some other process is not the
+        // record's peer.
+        let (child, child_pidfd) = blocking_child();
+        let error = measure_with_crafted(Box::new(move |record, _pidfd, executable| {
+            (
+                record.encode().expect("encode"),
+                vec![child_pidfd, executable],
+            )
+        }));
+        assert!(matches!(error, MeasurementError::PidfdAssociation));
+        exit_child(child);
+    }
+
+    #[test]
+    fn rejects_rejections_that_do_not_answer_this_request() {
+        // A rejection record may never carry descriptors.
+        let error = measure_with_crafted(Box::new(|record, pidfd, _executable| {
+            let rejection = RejectionRecord {
+                protocol: super::super::helper::wire::HELPER_PROTOCOL_VERSION,
+                code: RejectCode::UnitMismatch,
+                broker_generation: record.broker_generation,
+                nonce: record.nonce,
+            };
+            (rejection.encode(), vec![pidfd])
+        }));
+        assert!(matches!(
+            error,
+            MeasurementError::RejectionCarriedDescriptors
+        ));
+
+        // A post-decode rejection must echo this request's nonce.
+        let error = measure_with_crafted(Box::new(|record, _pidfd, _executable| {
+            let rejection = RejectionRecord {
+                protocol: super::super::helper::wire::HELPER_PROTOCOL_VERSION,
+                code: RejectCode::UnitMismatch,
+                broker_generation: record.broker_generation,
+                nonce: [0xEE; 32],
+            };
+            (rejection.encode(), Vec::new())
+        }));
+        assert!(matches!(error, MeasurementError::StaleResponse));
+
+        // A pre-decode rejection legitimately echoes a zeroed identity.
+        let error = measure_with_crafted(Box::new(|_record, _pidfd, _executable| {
+            let rejection = RejectionRecord {
+                protocol: super::super::helper::wire::HELPER_PROTOCOL_VERSION,
+                code: RejectCode::MalformedRequest,
+                broker_generation: 0,
+                nonce: [0; 32],
+            };
+            (rejection.encode(), Vec::new())
+        }));
+        assert!(matches!(
+            error,
+            MeasurementError::Rejected {
+                code: RejectCode::MalformedRequest
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_transport_level_violations_and_outage() {
+        // Malformed response bytes.
+        let error = measure_with_crafted(Box::new(|_record, _pidfd, _executable| {
+            (vec![1, 2, 3], Vec::new())
+        }));
+        assert!(matches!(error, MeasurementError::Wire(_)));
+
+        // Oversized response datagram.
+        let error = measure_with_crafted(Box::new(|_record, _pidfd, _executable| {
+            (vec![0x42; MAX_RESPONSE_BYTES + 64], Vec::new())
+        }));
+        assert!(matches!(error, MeasurementError::OversizedResponse));
+
+        // Helper outage: the endpoint closes before answering. The caller
+        // owns retry; a fresh connection (restart) succeeds afterwards.
+        let (client, server) = HelperConnection::pair().expect("pair");
+        let worker = std::thread::spawn(move || {
+            let _request = server.recv(MAX_REQUEST_BYTES).expect("recv");
+            drop(server);
+        });
+        let (broker_end, _attestor_end) = stream_pair();
+        let error = measure_attestor_stream(&client, broker_end.as_fd(), self_peer(), &pin_g1())
+            .expect_err("outage must reject");
+        assert!(matches!(error, MeasurementError::HelperClosed));
+        worker.join().expect("join");
+        let (client, worker) = serve(service());
+        assert!(
+            measure_attestor_stream(&client, broker_end.as_fd(), self_peer(), &pin_g1()).is_ok()
+        );
+        drop(client);
+        worker.join().expect("join");
+    }
+
+    #[test]
+    fn rejects_kernel_ancillary_truncation_on_the_response() {
+        let (client, server) = HelperConnection::pair().expect("pair");
+        let worker = std::thread::spawn(move || {
+            let datagram = server
+                .recv(MAX_REQUEST_BYTES)
+                .expect("recv")
+                .expect("datagram");
+            let outcome = service().handle(ReceivedDatagram {
+                bytes: datagram.bytes,
+                descriptors: datagram.descriptors,
+                oversized: false,
+                ancillary_truncated: false,
+            });
+            let HelperOutcome::Measured {
+                record,
+                pidfd,
+                executable,
+            } = outcome
+            else {
+                panic!("expected measurement");
+            };
+            // Twelve descriptors exceed the broker's reserved ancillary
+            // space for four; the kernel flags CTRUNC on receive.
+            let mut fds = Vec::new();
+            for _ in 0..6 {
+                fds.push(pidfd.try_clone().expect("dup pidfd"));
+                fds.push(executable.try_clone().expect("dup executable"));
+            }
+            let borrowed: Vec<_> = fds.iter().map(|fd| fd.as_fd()).collect();
+            let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(12))];
+            let mut ancillary = SendAncillaryBuffer::new(&mut space);
+            assert!(ancillary.push(SendAncillaryMessage::ScmRights(&borrowed)));
+            let bytes = record.encode().expect("encode");
+            let iov = [std::io::IoSlice::new(&bytes)];
+            rustix::net::sendmsg(server.as_fd(), &iov, &mut ancillary, SendFlags::NOSIGNAL)
+                .expect("sendmsg");
+        });
+        let (broker_end, _attestor_end) = stream_pair();
+        let error = measure_attestor_stream(&client, broker_end.as_fd(), self_peer(), &pin_g1())
+            .expect_err("truncated ancillary must reject");
+        assert!(matches!(error, MeasurementError::AncillaryTruncated));
+        worker.join().expect("join");
+    }
+}
+
+#[cfg(test)]
+mod pidfd_publication_conformance {
+    //! Pidfd state-machine SPEC conformance test 17.
+    //!
+    //! Response bytes are always decoded and validated outside the registry
+    //! mutex into a non-authoritative fact; these tests race exit against
+    //! registry-lock acquisition, the nonblocking poll, the complete-token
+    //! comparison, atomic publication, later fact use, monitor cancellation,
+    //! drain, and replacement. Exactly one publication or invalidation wins,
+    //! every later use rechecks the pinned token, and no old monitor affects
+    //! a new session.
+
+    use std::time::Duration;
+
+    use super::pidfd_test_support::{blocking_child, exit_child, exited_child_pidfd, self_pidfd};
+    use super::{
+        FactUseError, InvalidationCause, PidfdGuardedSession, PublicationRejection, SessionPin,
+        run_pidfd_monitor,
+    };
+    use crate::core::release_admission::{
+        ArtifactRequirement, ArtifactRole, CapabilityId, CapabilitySet,
+        HistoricalReleaseIdentityCheck, ProductId, ProtocolVersion, ReleaseAdmission,
+        ReleaseArtifact, ReleaseId, Sha256Digest, TargetTriple, VerifiedReleaseManifest,
+    };
+
+    fn pin(session_epoch: u64) -> SessionPin {
+        SessionPin {
+            configuration_generation: 3,
+            entry_generation: 2,
+            realm_revision: 5,
+            session_epoch,
+            session_handle: 9,
+            actor_version: 4,
+        }
+    }
+
+    fn admission() -> (ReleaseAdmission, ArtifactRequirement) {
+        let digest = Sha256Digest::from_bytes([0x5A; 32]);
+        let role = ArtifactRole::new("attestor").expect("role");
+        let target = TargetTriple::new("x86_64-unknown-linux-gnu").expect("target");
+        let protocol = ProtocolVersion::new(1).expect("protocol");
+        let capabilities =
+            CapabilitySet::try_from_iter(
+                [CapabilityId::new("docker.rootful").expect("capability")],
+            )
+            .expect("capabilities");
+        let artifact = ReleaseArtifact::new(
+            role.clone(),
+            target.clone(),
+            digest,
+            protocol,
+            capabilities.clone(),
+        );
+        let manifest = VerifiedReleaseManifest::from_verified_parts(
+            HistoricalReleaseIdentityCheck::completed(),
+            ProductId::new("basil-attestor").expect("product"),
+            ReleaseId::new("1.0.0").expect("release"),
+            [artifact],
+        )
+        .expect("manifest");
+        let requirement = ArtifactRequirement::new(digest, role, target, protocol, capabilities);
+        (ReleaseAdmission::new(manifest), requirement)
+    }
+
+    #[test]
+    fn later_use_rechecks_every_pinned_token_dimension() {
+        let cell = PidfdGuardedSession::new(self_pidfd(), pin(1));
+        assert!(matches!(
+            cell.with_fact(pin(1), |fact: &u32| *fact),
+            Err(FactUseError::NotPublished)
+        ));
+        cell.publish(pin(1), 7_u32).expect("publish");
+        assert_eq!(cell.with_fact(pin(1), |fact| *fact).expect("use"), 7);
+
+        let stale_pins = [
+            SessionPin {
+                configuration_generation: 99,
+                ..pin(1)
+            },
+            SessionPin {
+                entry_generation: 99,
+                ..pin(1)
+            },
+            SessionPin {
+                realm_revision: 99,
+                ..pin(1)
+            },
+            SessionPin {
+                session_epoch: 99,
+                ..pin(1)
+            },
+            SessionPin {
+                session_handle: 99,
+                ..pin(1)
+            },
+            SessionPin {
+                actor_version: 99,
+                ..pin(1)
+            },
+        ];
+        for stale in stale_pins {
+            assert!(matches!(
+                cell.with_fact(stale, |fact| *fact),
+                Err(FactUseError::PinMismatch)
+            ));
+        }
+        // A stale use does not invalidate the session for the pinned token.
+        assert_eq!(cell.with_fact(pin(1), |fact| *fact).expect("use"), 7);
+    }
+
+    #[test]
+    fn a_second_publication_never_wins() {
+        let cell = PidfdGuardedSession::new(self_pidfd(), pin(1));
+        cell.publish(pin(1), 1_u32).expect("first publication");
+        let rejected = cell.publish(pin(1), 2_u32).expect_err("second must lose");
+        assert_eq!(rejected.rejection, PublicationRejection::AlreadyPublished);
+        assert_eq!(rejected.fact, 2);
+        assert_eq!(cell.with_fact(pin(1), |fact| *fact).expect("use"), 1);
+    }
+
+    #[test]
+    fn a_stale_token_at_publication_invalidates_and_rejects_the_session() {
+        let cell = PidfdGuardedSession::new(self_pidfd(), pin(1));
+        let rejected = cell.publish(pin(2), 7_u32).expect_err("stale token");
+        assert_eq!(rejected.rejection, PublicationRejection::PinMismatch);
+        assert_eq!(rejected.fact, 7);
+        // The session is invalidated: even the pinned token now rejects.
+        let rejected = cell.publish(pin(1), 8_u32).expect_err("invalidated");
+        assert_eq!(
+            rejected.rejection,
+            PublicationRejection::Invalidated(InvalidationCause::PinMismatch)
+        );
+        assert!(matches!(
+            cell.with_fact(pin(1), |fact: &u32| *fact),
+            Err(FactUseError::Invalidated(InvalidationCause::PinMismatch))
+        ));
+    }
+
+    #[test]
+    fn an_exit_between_validation_and_publication_loses_the_race() {
+        // Decode and validation completed outside the lock; the peer exits
+        // before the response path reaches the linearization point. The
+        // nonblocking poll under the mutex rejects and invalidates.
+        let (child, pidfd) = blocking_child();
+        let cell = PidfdGuardedSession::new(pidfd, pin(1));
+        exit_child(child);
+        let rejected = cell.publish(pin(1), 7_u32).expect_err("exited peer");
+        assert_eq!(rejected.rejection, PublicationRejection::PeerExited);
+        assert_eq!(rejected.fact, 7);
+        assert!(matches!(
+            cell.with_fact(pin(1), |fact: &u32| *fact),
+            Err(FactUseError::Invalidated(InvalidationCause::PeerExited))
+        ));
+    }
+
+    #[test]
+    fn an_already_exited_pidfd_rejects_publication() {
+        let cell = PidfdGuardedSession::new(exited_child_pidfd(), pin(1));
+        let rejected = cell.publish(pin(1), 7_u32).expect_err("exited peer");
+        assert_eq!(rejected.rejection, PublicationRejection::PeerExited);
+    }
+
+    #[test]
+    fn exit_after_publication_is_ordered_after_the_fact_and_releases_admission() {
+        let (release_admission, requirement) = admission();
+        let active = release_admission
+            .begin_preflight(&requirement)
+            .expect("preflight");
+        let cell = PidfdGuardedSession::new(self_pidfd(), pin(1));
+        cell.publish(pin(1), active).expect("publish");
+        assert_eq!(release_admission.snapshot().current.active_preflights, 1);
+
+        // The monitor observes exit under the same mutex; the completed fact
+        // is handed back and dropped outside the lock, releasing admission.
+        let taken = cell.observe_exit();
+        assert!(taken.is_some());
+        drop(taken);
+        assert_eq!(release_admission.snapshot().current.active_preflights, 0);
+
+        // New work is rejected and a second observation changes nothing.
+        assert!(matches!(
+            cell.with_fact(pin(1), |_fact| ()),
+            Err(FactUseError::Invalidated(InvalidationCause::PeerExited))
+        ));
+        assert!(cell.observe_exit().is_none());
+    }
+
+    #[test]
+    fn exactly_one_linearization_winner_under_a_racing_monitor() {
+        for _ in 0..64 {
+            let cell = PidfdGuardedSession::new(self_pidfd(), pin(1));
+            let publisher = {
+                let cell = cell.clone();
+                std::thread::spawn(move || cell.publish(pin(1), 1_u8))
+            };
+            let monitor = {
+                let cell = cell.clone();
+                std::thread::spawn(move || cell.observe_exit())
+            };
+            let attempt = publisher.join().expect("racing publication");
+            let taken = monitor.join().expect("monitor");
+            let visible = cell.with_fact(pin(1), |fact| *fact).is_ok();
+            match attempt {
+                // The publication won the lock first; the monitor either ran
+                // later and took the fact, or the fact is still visible.
+                Ok(()) => assert!(
+                    taken.is_some() ^ visible,
+                    "the fact must be in exactly one place"
+                ),
+                // The monitor won: the fact came back to the response path
+                // and nothing was ever published.
+                Err(rejected) => {
+                    assert_eq!(
+                        rejected.rejection,
+                        PublicationRejection::Invalidated(InvalidationCause::PeerExited)
+                    );
+                    assert_eq!(rejected.fact, 1);
+                    assert!(taken.is_none());
+                    assert!(!visible);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn drain_cancellation_is_owned_by_close_and_never_touches_a_replacement() {
+        let old = PidfdGuardedSession::new(self_pidfd(), pin(1));
+        old.publish(pin(1), 1_u8).expect("publish");
+        // Drain: session close cancels the epoch and disposes the fact.
+        assert_eq!(old.cancel(), Some(1));
+        // A detached monitor firing late observes nothing to release.
+        assert!(old.observe_exit().is_none());
+        assert!(matches!(
+            old.with_fact(pin(1), |fact| *fact),
+            Err(FactUseError::Invalidated(InvalidationCause::Cancelled))
+        ));
+
+        // The replacement epoch is a fresh cell with a fresh pin; the old
+        // session's monitor and invalidation cannot reach it.
+        let replacement = PidfdGuardedSession::new(self_pidfd(), pin(2));
+        replacement.publish(pin(2), 2_u8).expect("publish");
+        assert_eq!(replacement.with_fact(pin(2), |fact| *fact).expect("use"), 2);
+        // The old pin never matches the replacement.
+        assert!(matches!(
+            replacement.with_fact(pin(1), |fact| *fact),
+            Err(FactUseError::PinMismatch)
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_async_monitor_observes_a_real_exit_and_invalidates() {
+        let (child, pidfd) = blocking_child();
+        let cell = PidfdGuardedSession::new(pidfd, pin(1));
+        cell.publish(pin(1), 5_u8).expect("publish while alive");
+        let monitor = tokio::spawn(run_pidfd_monitor(cell.clone()));
+        exit_child(child);
+        let taken = tokio::time::timeout(Duration::from_secs(30), monitor)
+            .await
+            .expect("monitor must observe the exit")
+            .expect("monitor task");
+        assert_eq!(taken, Some(5));
+        assert!(matches!(
+            cell.with_fact(pin(1), |fact| *fact),
+            Err(FactUseError::Invalidated(InvalidationCause::PeerExited))
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_monitor_future_never_invalidates_the_session() {
+        let (child, pidfd) = blocking_child();
+        let cell = PidfdGuardedSession::new(pidfd, pin(1));
+        cell.publish(pin(1), 5_u8).expect("publish");
+        let monitor = tokio::spawn(run_pidfd_monitor(cell.clone()));
+        // Give the monitor a chance to register before it is cancelled.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        monitor.abort();
+        let _aborted = monitor.await;
+        // Cancellation is owned by session close and drain: the session is
+        // untouched and still serving its published fact.
+        assert_eq!(cell.with_fact(pin(1), |fact| *fact).expect("use"), 5);
+        assert_eq!(cell.cancel(), Some(5));
+        exit_child(child);
     }
 }

@@ -89,8 +89,10 @@ reqwest = { workspace = true }
 rsa = { workspace = true }
 # `net` (additive to the workspace `fs`/`process` features) backs the
 # measurement-helper `SOCK_SEQPACKET` + `SCM_RIGHTS` transport and the
-# `SO_PEERCRED`/`SO_COOKIE` derivation in `attestor_protocol::helper`.
-rustix = { workspace = true, features = ["fs", "net"] }
+# `SO_PEERCRED`/`SO_COOKIE` derivation in `attestor_protocol::helper`; `event`
+# backs the nonblocking pidfd exit poll at the broker-side publication
+# linearization point in `attestor_protocol`.
+rustix = { workspace = true, features = ["event", "fs", "net"] }
 # Not optional: `reqwest` (rustls-no-provider) always pulls rustls, and we must
 # install its `ring` crypto provider before building any client (see
 # `ensure_crypto_provider`). `http-tls` gates only the server-side tokio-rustls.
