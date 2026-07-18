@@ -27,15 +27,15 @@ converts a missing lane, artifact, event, or test into a pass.
 
 ## Status and exit contract
 
-| Status | Exit | Meaning |
-| --- | ---: | --- |
-| `PASS` | 0 | Every required test terminal is present and passed. |
-| `TEST_FAIL` | 10 | The lane ran and a tested product or feasibility assertion failed. |
-| `INFRA_ERROR` | 20 | A required artifact, host facility, or harness operation failed. |
-| `UNSUPPORTED` | 30 | The requested lane or shape is outside the declared matrix. |
-| `INCOMPLETE` | 40 | Collection or cleanup was interrupted, ambiguous, or unverifiable. |
-| `UNQUALIFIED_DIRTY_SOURCE` | 50 | A formal run was refused because the `jj` source snapshot was dirty. |
-| `NOT_MEASURED` | 60 | The dimension has no representative runnable prototype yet. |
+| Status                     | Exit | Meaning                                                              |
+| -------------------------- | ---: | -------------------------------------------------------------------- |
+| `PASS`                     |    0 | Every required test terminal is present and passed.                  |
+| `TEST_FAIL`                |   10 | The lane ran and a tested product or feasibility assertion failed.   |
+| `INFRA_ERROR`              |   20 | A required artifact, host facility, or harness operation failed.     |
+| `UNSUPPORTED`              |   30 | The requested lane or shape is outside the declared matrix.          |
+| `INCOMPLETE`               |   40 | Collection or cleanup was interrupted, ambiguous, or unverifiable.   |
+| `UNQUALIFIED_DIRTY_SOURCE` |   50 | A formal run was refused because the `jj` source snapshot was dirty. |
+| `NOT_MEASURED`             |   60 | The dimension has no representative runnable prototype yet.          |
 
 These are evidence statuses, not product support claims. `COMPLETE` on disk means
 only that a terminal manifest was finalized; the manifest status may still be a
@@ -182,11 +182,11 @@ no permissive domain, no unconfined workaround).
 Package pins (Fedora 44 release + updates, `download.fedoraproject.org`; Podman is
 already in the base image, so the offline delta adds only the provider and jq):
 
-| package | NEVRA |
-| --- | --- |
-| podman (base image) | `podman-5:5.8.1-1.fc44.x86_64` |
+| package                           | NEVRA                                |
+| --------------------------------- | ------------------------------------ |
+| podman (base image)               | `podman-5:5.8.1-1.fc44.x86_64`       |
 | podman-compose (Compose provider) | `podman-compose-1.6.0-1.fc44.noarch` |
-| jq | `jq-1.8.1-3.fc44.x86_64` |
+| jq                                | `jq-1.8.1-3.fc44.x86_64`             |
 
 Signed repository metadata: fedora `repomd.xml` sha256
 `da3845427d188097f6fd71b417a039bdfb8efefc4f38ca44b5cbb94f95a18991`; updates
@@ -253,13 +253,13 @@ Package pins (`download.docker.com/linux/ubuntu`, suite `noble`, component
 it pins hashed `ee23b23badda70914fb90302d4abd6c55a20dd2646ac93df65aa68e16a8c74ad`
 at selection time, and each `.deb` below is pinned by its `Packages` sha256:
 
-| package | version | deb sha256 |
-| --- | --- | --- |
-| `docker-ce` | `5:29.6.1-1~ubuntu.24.04~noble` | `b71c54e01bf05489384b01c97621293a2803a3c38c754a655456f6c1821a6b55` |
-| `docker-ce-cli` | `5:29.6.1-1~ubuntu.24.04~noble` | `bab40fb817b8b541a2eb1c33ac3285b06439de06cf05c2cd0cb47a3f87c193c4` |
-| `containerd.io` | `2.2.6-1~ubuntu.24.04~noble` | `ad9d5ed46615d5adf0fab492101996a395776f0f15fdc37ff425c59d5c4dca02` |
-| `docker-compose-plugin` | `5.3.1-1~ubuntu.24.04~noble` | `19d9473c2f011f94e1e54b035dcac170dab0c19671799db6f015e29eb9f23357` |
-| `docker-buildx-plugin` | `0.35.0-1~ubuntu.24.04~noble` | `ddcd67d3e9a8b4cda74326ebebe4ebdc3879210d2d0093274d19f5e1bbaf24f4` |
+| package                 | version                         | deb sha256                                                         |
+| ----------------------- | ------------------------------- | ------------------------------------------------------------------ |
+| `docker-ce`             | `5:29.6.1-1~ubuntu.24.04~noble` | `b71c54e01bf05489384b01c97621293a2803a3c38c754a655456f6c1821a6b55` |
+| `docker-ce-cli`         | `5:29.6.1-1~ubuntu.24.04~noble` | `bab40fb817b8b541a2eb1c33ac3285b06439de06cf05c2cd0cb47a3f87c193c4` |
+| `containerd.io`         | `2.2.6-1~ubuntu.24.04~noble`    | `ad9d5ed46615d5adf0fab492101996a395776f0f15fdc37ff425c59d5c4dca02` |
+| `docker-compose-plugin` | `5.3.1-1~ubuntu.24.04~noble`    | `19d9473c2f011f94e1e54b035dcac170dab0c19671799db6f015e29eb9f23357` |
+| `docker-buildx-plugin`  | `0.35.0-1~ubuntu.24.04~noble`   | `ddcd67d3e9a8b4cda74326ebebe4ebdc3879210d2d0093274d19f5e1bbaf24f4` |
 
 The `ubuntu-2404-lane-smoke` suite requires the runner-owned `lane.artifacts`
 plus five driver-reported tests: `lane.cgroup-v2` (cgroup2fs),
@@ -558,13 +558,13 @@ Historical v1 retained readiness evidence (under `~/.local/state/basil/ph1`;
 runner runs verify with `verify-run` exit `0`, artifacts carry a `README.md`
 label and `SHA256SUMS`):
 
-| kind | run id | verdict |
-| --- | --- | --- |
-| Fedora 44 runner run (suite `capacity-preflight`) | `20260714T082858Z-4534b95ced67cd8b` | `PASS` (4/4 terminals; guest verdict `ready=false` in messages) |
-| Ubuntu 24.04 runner run (suite `capacity-preflight`) | `20260714T082930Z-7021c7269f810ae0` | `PASS` (4/4 terminals; guest verdict `ready=false` in messages) |
-| host artifact | `host-preflight-20260714T075853Z-49095` | `ready=true` |
-| Fedora 44 guest artifact (pre-runner, host-orchestrated) | `fedora-44-x86_64-20260714T080222Z` | `ready=false` (see below) |
-| Ubuntu 24.04 guest artifact (pre-runner, host-orchestrated) | `ubuntu-24.04-x86_64-20260714T080806Z` | `ready=false` (see below) |
+| kind                                                        | run id                                  | verdict                                                         |
+| ----------------------------------------------------------- | --------------------------------------- | --------------------------------------------------------------- |
+| Fedora 44 runner run (suite `capacity-preflight`)           | `20260714T082858Z-4534b95ced67cd8b`     | `PASS` (4/4 terminals; guest verdict `ready=false` in messages) |
+| Ubuntu 24.04 runner run (suite `capacity-preflight`)        | `20260714T082930Z-7021c7269f810ae0`     | `PASS` (4/4 terminals; guest verdict `ready=false` in messages) |
+| host artifact                                               | `host-preflight-20260714T075853Z-49095` | `ready=true`                                                    |
+| Fedora 44 guest artifact (pre-runner, host-orchestrated)    | `fedora-44-x86_64-20260714T080222Z`     | `ready=false` (see below)                                       |
+| Ubuntu 24.04 guest artifact (pre-runner, host-orchestrated) | `ubuntu-24.04-x86_64-20260714T080806Z`  | `ready=false` (see below)                                       |
 
 The host preflight stays a labeled artifact (the runner executes only VM lane
 drivers, and host readiness needs no guest); the two host-orchestrated guest
@@ -586,21 +586,21 @@ Headline measured numbers:
   32 GiB, and retention is evaluated against the supplied host evidence snapshot.
   The cloud images still surface the genuine **`nofile` soft = 1024** prerequisite;
   confinement remains enforced (Fedora SELinux + rootless Podman, Ubuntu AppArmor
-  + rootful Docker).
+  - rootful Docker).
 
 Safe scale-ladder **stop conditions** (abort the serial ladder when a live
 reading crosses these). Filesystem thresholds are emitted once per unique
 device identity across local, runtime, and evidence storage:
 
-| condition | threshold | basis |
-| --- | --- | --- |
-| memory floor | stop below `max(profile stop reserve, 10% of MemTotal)` (host profile retains the 4 GiB minimum) | measured + readiness constant |
-| disk floor | stop below `max(profile local-disk reserve, 5% of each applicable filesystem)` | measured + readiness constant |
-| inode floor | stop below the readiness inode reserve; null for the dynamic-inode zero pair | measured + readiness constant |
-| fd headroom | keep soft `nofile` above `containers * 16` fds | measured + estimate |
-| pid headroom | keep `pid_max`/cgroup `pids.max` above `containers * 4` tasks | measured + estimate |
-| per-step latency | stop above the runbook per-step wall-clock ceiling (default 5 min) | readiness constant |
-| evidence retention | stop before the projected ladder evidence would breach the disk reserve | measured + estimate + readiness constant |
+| condition          | threshold                                                                                        | basis                                    |
+| ------------------ | ------------------------------------------------------------------------------------------------ | ---------------------------------------- |
+| memory floor       | stop below `max(profile stop reserve, 10% of MemTotal)` (host profile retains the 4 GiB minimum) | measured + readiness constant            |
+| disk floor         | stop below `max(profile local-disk reserve, 5% of each applicable filesystem)`                   | measured + readiness constant            |
+| inode floor        | stop below the readiness inode reserve; null for the dynamic-inode zero pair                     | measured + readiness constant            |
+| fd headroom        | keep soft `nofile` above `containers * 16` fds                                                   | measured + estimate                      |
+| pid headroom       | keep `pid_max`/cgroup `pids.max` above `containers * 4` tasks                                    | measured + estimate                      |
+| per-step latency   | stop above the runbook per-step wall-clock ceiling (default 5 min)                               | readiness constant                       |
+| evidence retention | stop before the projected ladder evidence would breach the disk reserve                          | measured + estimate + readiness constant |
 
 **Readiness prerequisite surfaced by the guest preflights:** the cloud-image
 default `nofile` soft limit of 1024 is far below a 1,000-container ladder's need,

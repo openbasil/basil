@@ -5,38 +5,38 @@
 [workspace]
 resolver = "3"
 members = [
+  "crates/basil-bin",
   "crates/basil-client",
-  "crates/basil-cose",
-  "crates/basil-proto",
-  "crates/basil-nats",
-  "crates/basil-nats-bridge",
-  "crates/basil-keystore-backend",
   "crates/basil-compose",
   "crates/basil-core",
-  "crates/basil-bin",
+  "crates/basil-cose",
+  "crates/basil-keystore-backend",
+  "crates/basil-nats",
+  "crates/basil-nats-bridge",
+  "crates/basil-proto",
   "crates/basil-tests",
   "xtask",
 ]
 
 [workspace.package]
 version = "0.8.0-pre.1"
-edition = "2024"
-license = "Apache-2.0"
 authors = ["info@openbasil.org"]
-repository = "https://github.com/openbasil/basil"
-homepage = "https://github.com/openbasil/basil"
 documentation = "https://docs.openbasil.org"
+edition = "2024"
+homepage = "https://github.com/openbasil/basil"
+license = "Apache-2.0"
+repository = "https://github.com/openbasil/basil"
 
 [workspace.dependencies]
 basil = { version = "0.8.0-pre.1", path = "crates/basil-client" }
-basil-cose = { version = "0.8.0-pre.1", path = "crates/basil-cose" }
-basil-proto = { version = "0.8.0-pre.1", path = "crates/basil-proto" }
-basil-nats = { version = "0.8.0-pre.1", path = "crates/basil-nats" }
-basil-nats-bridge = { version = "0.8.0-pre.1", path = "crates/basil-nats-bridge" }
-basil-keystore-backend = { version = "0.8.0-pre.1", path = "crates/basil-keystore-backend" }
+basil-bin = { version = "0.8.0-pre.1", path = "crates/basil-bin" }
 basil-compose = { version = "0.8.0-pre.1", path = "crates/basil-compose" }
 basil-core = { version = "0.8.0-pre.1", path = "crates/basil-core", default-features = false }
-basil-bin = { version = "0.8.0-pre.1", path = "crates/basil-bin" }
+basil-cose = { version = "0.8.0-pre.1", path = "crates/basil-cose" }
+basil-keystore-backend = { version = "0.8.0-pre.1", path = "crates/basil-keystore-backend" }
+basil-nats = { version = "0.8.0-pre.1", path = "crates/basil-nats" }
+basil-nats-bridge = { version = "0.8.0-pre.1", path = "crates/basil-nats-bridge" }
+basil-proto = { version = "0.8.0-pre.1", path = "crates/basil-proto" }
 
 # `aes` is depended on directly (alongside aes-gcm's own `zeroize` feature, which
 # only scrubs the GHASH key) so its `zeroize` feature zeroizes AES round-key
@@ -47,8 +47,8 @@ aes-kw = "0.3"
 age = { version = "0.11.5", features = ["plugin"] }
 anyhow = "1"
 argon2 = "0.5"
-async-trait = "0.1"
 async-nats = { version = "0.49", default-features = false, features = ["nkeys", "ring", "server_2_10", "server_2_11", "server_2_12", "server_2_14"] }
+async-trait = "0.1"
 # AWS KMS transit backend (feature `aws-kms`). No-C-toolchain constraint forbids
 # aws-lc-sys, so we must avoid the `default-https-client` feature (it forces
 # `aws-smithy-http-client/rustls-aws-lc`). The `rustls` feature instead routes to
@@ -71,13 +71,13 @@ db-keystore = "0.4.4"
 ed25519-dalek = { version = "3.0.0", default-features = false, features = ["zeroize"] }
 futures = "0.3"
 getrandom = { version = "0.4.3", default-features = false }
+# gRPC status/code types for the gcp-kms backend (matches google-cloud-kms 0.6).
+google-cloud-gax = "0.19.2"
 # GCP Cloud KMS transit backend (feature `gcp-kms`). yoshidan crate: gRPC/HTTP-2
 # (tonic + prost) for low-latency in-place KMS ops. `default-features = false` +
 # `rustls-tls` avoids the default `default-tls` path (reqwest native-tls →
 # openssl-sys, a forbidden C dependency).
 google-cloud-kms = { version = "=0.6.0", default-features = false, features = ["auth", "rustls-tls"] }
-# gRPC status/code types for the gcp-kms backend (matches google-cloud-kms 0.6).
-google-cloud-gax = "0.19.2"
 hex = "0.4"
 hkdf = { version = "0.13.0", default-features = false }
 hyper = { version = "1.10.1", default-features = false, features = ["http1", "server"] }
@@ -87,10 +87,10 @@ hyper-util = { version = "0.1.20", default-features = false, features = ["http1"
 # it the crate cannot determine a provider and panics at sign/verify time.
 jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
 keyring-core = "1.0.0"
+mimalloc = { version = "0.1.52", default-features = false }
 minicbor = { version = "2.2.2", default-features = false, features = ["alloc"] }
 ml-dsa = { version = "0.1.1", features = ["zeroize"] }
 ml-kem = { version = "0.3.2", features = ["getrandom", "zeroize"] }
-mimalloc = { version = "0.1.52", default-features = false }
 nkeys = { version = "0.4", features = ["xkeys"] }
 opentelemetry-appender-tracing = "0.32"
 opentelemetry-otlp = { version = "0.32", features = ["logs", "http-proto", "http-json", "grpc-tonic", "reqwest-blocking-client"] }
@@ -121,11 +121,11 @@ rustls = { version = "0.23.41", default-features = false, features = ["ring", "s
 salsa20 = { version = "0.11.0", features = ["zeroize"] }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
 serde_bytes = "0.11"
+serde_json = { version = "1", default-features = false, features = ["alloc", "arbitrary_precision"] }
 # `basil init --from-sops`: reads key NAMES out of an existing sops secrets
 # file (YAML or JSON; YAML is a superset so one parser covers both). Values
 # stay encrypted and are never parsed as secrets.
 serde_yaml = "0.9"
-serde_json = { version = "1", default-features = false, features = ["alloc", "arbitrary_precision"] }
 sha2 = { version = "0.11.0", default-features = false }
 # `rsa` 0.9 still implements OAEP against `digest` 0.10. Keep this narrow alias
 # until the stable `rsa` 0.10 line is available.

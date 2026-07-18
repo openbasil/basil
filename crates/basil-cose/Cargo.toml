@@ -4,17 +4,17 @@
 
 [package]
 name = "basil-cose"
-description = "Strict deterministic COSE (RFC 9052/9053) profile for basil sealed invocations: signed, sealed, and seal-only constructions with in-place signer/recipient traits"
 version.workspace = true
-edition.workspace = true
-license.workspace = true
 authors.workspace = true
-homepage.workspace = true
-repository.workspace = true
-documentation = "https://docs.rs/basil-cose"
-keywords = ["cose", "cbor", "cryptography", "security"]
 categories = ["cryptography", "no-std"]
+documentation = "https://docs.rs/basil-cose"
+edition.workspace = true
+homepage.workspace = true
+keywords = ["cose", "cbor", "cryptography", "security"]
+license.workspace = true
 publish = true
+repository.workspace = true
+description = "Strict deterministic COSE (RFC 9052/9053) profile for basil sealed invocations: signed, sealed, and seal-only constructions with in-place signer/recipient traits"
 
 [features]
 # Deterministic build variants (`build_sealed_with_parts`,

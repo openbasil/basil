@@ -1,24 +1,24 @@
 {
-  "capturedAt": "2026-07-16T05:42:55Z",
-  "host": "x86_64-linux NixOS qualification environment",
-  "docker": {
-    "selectedExecutable": "/run/current-system/sw/bin/docker",
-    "resolvedExecutable": "/nix/store/5y9rr0pvw0x1c912lhnpwv1glnj9hjxq-docker-29.6.1/bin/docker",
-    "version": "Docker version 29.6.1, build v29.6.1",
-    "composeSelectedExecutable": "/run/current-system/sw/bin/docker-compose",
-    "composeResolvedExecutable": "/nix/store/f5qch8f2b3hch9ar5nvvadxxgnssxz6c-docker-compose-5.3.1/libexec/docker/cli-plugins/docker-compose",
-    "composeVersion": "Docker Compose version 5.3.1"
-  },
-  "podman": {
-    "selectedExecutable": "/run/current-system/sw/bin/podman",
-    "resolvedExecutable": "/nix/store/w4mhgz9r2zq7f1lmzgg3wlj7pwncdg3j-podman-5.8.4/bin/podman",
-    "version": "podman version 5.8.4",
-    "qualification": "Real podman compose invoked the checked-in absolute fake provider and produced prod-profile.json. The deterministic test lane uses fake-podman.sh so CI does not depend on Podman installation."
-  },
-  "captureCommands": [
-    "capture.sh multi-file command",
-    "capture.sh prod-profile command",
-    "PODMAN_COMPOSE_PROVIDER=<absolute fake provider> podman compose <prod-profile argv>"
-  ],
-  "captureNormalization": "capture.sh appends one trailing newline because Docker Compose 5.3.1 emits formatted JSON without one; JSON content is otherwise byte-for-byte frontend stdout."
+	"capturedAt": "2026-07-16T05:42:55Z",
+	"host": "x86_64-linux NixOS qualification environment",
+	"docker": {
+		"selectedExecutable": "/run/current-system/sw/bin/docker",
+		"resolvedExecutable": "/nix/store/5y9rr0pvw0x1c912lhnpwv1glnj9hjxq-docker-29.6.1/bin/docker",
+		"version": "Docker version 29.6.1, build v29.6.1",
+		"composeSelectedExecutable": "/run/current-system/sw/bin/docker-compose",
+		"composeResolvedExecutable": "/nix/store/f5qch8f2b3hch9ar5nvvadxxgnssxz6c-docker-compose-5.3.1/libexec/docker/cli-plugins/docker-compose",
+		"composeVersion": "Docker Compose version 5.3.1"
+	},
+	"podman": {
+		"selectedExecutable": "/run/current-system/sw/bin/podman",
+		"resolvedExecutable": "/nix/store/w4mhgz9r2zq7f1lmzgg3wlj7pwncdg3j-podman-5.8.4/bin/podman",
+		"version": "podman version 5.8.4",
+		"qualification": "Real podman compose invoked the checked-in absolute fake provider and produced prod-profile.json. The deterministic test lane uses fake-podman.sh so CI does not depend on Podman installation."
+	},
+	"captureCommands": [
+		"capture.sh multi-file command",
+		"capture.sh prod-profile command",
+		"PODMAN_COMPOSE_PROVIDER=<absolute fake provider> podman compose <prod-profile argv>"
+	],
+	"captureNormalization": "capture.sh appends one trailing newline because Docker Compose 5.3.1 emits formatted JSON without one; JSON content is otherwise byte-for-byte frontend stdout."
 }

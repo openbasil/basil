@@ -4,14 +4,14 @@
 
 [package]
 name = "basil-tests"
-description = "Basil live and interop integration tests."
 version.workspace = true
+authors.workspace = true
 edition.workspace = true
 license.workspace = true
-authors.workspace = true
+publish = false
 repository.workspace = true
 rust-version = "1.96"
-publish = false
+description = "Basil live and interop integration tests."
 
 [features]
 default = ["compose-phase1-probe"]
@@ -37,8 +37,6 @@ basil-core = { workspace = true, features = ["http", "unlock-age-yubikey", "unlo
 basil-proto = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
 rustix = { workspace = true, optional = true }
-tonic = { workspace = true, optional = true }
-tower = { workspace = true, optional = true }
 # Not a dev-dep: the shared harness (`src/lib.rs`) installs the pure-Rust `ring`
 # rustls `CryptoProvider` before any test builds a `reqwest` client (see
 # `ensure_crypto_provider`). `reqwest` itself stays test-only below.
@@ -47,6 +45,8 @@ serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true, features = ["std"] }
 spiffe = { workspace = true }
 tokio = { workspace = true }
+tonic = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
 zero-secrets = { workspace = true }
 zeroize = { workspace = true }
 
@@ -62,8 +62,8 @@ bytes = { workspace = true }
 cose_minicbor = { version = "0.1.1", default-features = false, features = ["suit-sha256-ed25519"] }
 ed25519-dalek = { workspace = true }
 hyper-util = { workspace = true }
-minicbor = { workspace = true, features = ["alloc", "std"] }
 jsonwebtoken = { workspace = true }
+minicbor = { workspace = true, features = ["alloc", "std"] }
 pkcs8 = { workspace = true }
 reqwest = { workspace = true }
 spiffe-rustls = { workspace = true }

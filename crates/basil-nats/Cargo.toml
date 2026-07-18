@@ -4,35 +4,35 @@
 
 [package]
 name = "basil-nats"
-description = "Generic, dependency-light builder for NATS account/user JWTs (ed25519-nkey) where signing is delegated to an external signer (e.g. a key held in a vault/HSM)."
 version.workspace = true
-edition.workspace = true
-license.workspace = true
 authors.workspace = true
-homepage.workspace = true
-repository.workspace = true
-documentation = "https://docs.rs/basil-nats"
-keywords = ["nats", "jwt", "nkey", "ed25519", "no-std"]
 categories = ["cryptography", "authentication", "no-std"]
-rust-version = "1.85"
+documentation = "https://docs.rs/basil-nats"
+edition.workspace = true
+homepage.workspace = true
+keywords = ["nats", "jwt", "nkey", "ed25519", "no-std"]
+license.workspace = true
 publish = true
+repository.workspace = true
+rust-version = "1.85"
+description = "Generic, dependency-light builder for NATS account/user JWTs (ed25519-nkey) where signing is delegated to an external signer (e.g. a key held in a vault/HSM)."
 
 # This crate's own source is `#![no_std]` + `extern crate alloc` (see the `std`
 # / `alloc` features below). Its workspace-inherited dependencies are kept on
 # their `alloc` feature sets so the `alloc`-only build stays bare-metal no_std.
 [dependencies]
-serde = { workspace = true }
-serde_json = { workspace = true }
 base64 = { workspace = true }
-sha2 = { workspace = true }
+crypto_secretbox = { workspace = true }
 data-encoding = { workspace = true }
 ed25519-dalek = { workspace = true }
-crypto_secretbox = { workspace = true }
-salsa20 = { workspace = true }
-x25519-dalek = { workspace = true }
 # `Rng` trait only (no ambient RNG): `seal_nats_curve` takes the rng from the
 # caller, so this crate pulls in no `getrandom`/`thread_rng` of its own.
 rand_core = { workspace = true }
+salsa20 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+x25519-dalek = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]

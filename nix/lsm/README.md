@@ -25,28 +25,28 @@ confinement identities:
 
 ## Layout
 
-| Path | Content |
-| --- | --- |
-| `selinux/basil_lsm_base.te` | Static base module: shared types, the `basil_attestor_domain` attribute, the full `basil_measure_t` domain, and the module's `neverallow` assertions. |
-| `selinux/basil_measure.fc` | File contexts for the helper binary, both installed evidence stores (`policy.d` allowlists, `manifest.d` authority manifests), and the endpoint runtime directory. |
-| `selinux/basil_attestor.te.in` | Per-generation attestor domain template. The installer renders `@GEN@` and loads one module per installed generation. |
-| `selinux/basil_attestor.fc.in` | Per-generation file contexts (runtime directory subtree). |
-| `apparmor/basil-measure-helper` | AppArmor profile for the helper (path-attached). |
-| `apparmor/basil-attestor.in` | Per-generation named AppArmor profile template, applied through `AppArmorProfile=` in the unit. |
-| `systemd/basil-measure-helper.service` | Confined system unit for the helper. |
-| `systemd/basil-attestor.service.in` | Confined per-realm, per-generation attestor unit template. |
+| Path                                   | Content                                                                                                                                                            |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `selinux/basil_lsm_base.te`            | Static base module: shared types, the `basil_attestor_domain` attribute, the full `basil_measure_t` domain, and the module's `neverallow` assertions.              |
+| `selinux/basil_measure.fc`             | File contexts for the helper binary, both installed evidence stores (`policy.d` allowlists, `manifest.d` authority manifests), and the endpoint runtime directory. |
+| `selinux/basil_attestor.te.in`         | Per-generation attestor domain template. The installer renders `@GEN@` and loads one module per installed generation.                                              |
+| `selinux/basil_attestor.fc.in`         | Per-generation file contexts (runtime directory subtree).                                                                                                          |
+| `apparmor/basil-measure-helper`        | AppArmor profile for the helper (path-attached).                                                                                                                   |
+| `apparmor/basil-attestor.in`           | Per-generation named AppArmor profile template, applied through `AppArmorProfile=` in the unit.                                                                    |
+| `systemd/basil-measure-helper.service` | Confined system unit for the helper.                                                                                                                               |
+| `systemd/basil-attestor.service.in`    | Confined per-realm, per-generation attestor unit template.                                                                                                         |
 
 ## Identity mapping
 
 The configuration and allowlist identities map to these artifacts:
 
-| Authority field | Artifact |
-| --- | --- |
-| `lsmPolicy = "basil-attestor-policy-g<N>"` | SELinux module `basil_attestor_policy_g<N>` rendered from `basil_attestor.te.in`, or the AppArmor profile file rendered from `basil-attestor.in`. |
-| `lsmProfile = "selinux:basil_attestor_g<N>_t"` | The SELinux domain declared by that module. |
-| `lsmProfile = "apparmor:basil-attestor-g<N>"` | The named AppArmor profile. |
-| `measurement.serviceUnit` | A rendered `basil-attestor.service.in` installed under the exact generation-qualified unit name. |
-| helper (static) | `basil_measure_t` / `basil-measure-helper`, entered by `basil-measure-helper.service`. |
+| Authority field                                | Artifact                                                                                                                                          |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `lsmPolicy = "basil-attestor-policy-g<N>"`     | SELinux module `basil_attestor_policy_g<N>` rendered from `basil_attestor.te.in`, or the AppArmor profile file rendered from `basil-attestor.in`. |
+| `lsmProfile = "selinux:basil_attestor_g<N>_t"` | The SELinux domain declared by that module.                                                                                                       |
+| `lsmProfile = "apparmor:basil-attestor-g<N>"`  | The named AppArmor profile.                                                                                                                       |
+| `measurement.serviceUnit`                      | A rendered `basil-attestor.service.in` installed under the exact generation-qualified unit name.                                                  |
+| helper (static)                                | `basil_measure_t` / `basil-measure-helper`, entered by `basil-measure-helper.service`.                                                            |
 
 `lockdownProfile` names the post-init seccomp profile. That is process-installed
 (design `basil-kqc7`), and only its baseline precursor appears here as the

@@ -4,18 +4,18 @@
 
 [package]
 name = "basil-bin"
-description = "Basil is a host-local secrets broker: your app never touches the key. Unified broker daemon, operator tool, and client CLI."
 version.workspace = true
-edition.workspace = true
-license.workspace = true
 authors.workspace = true
-repository.workspace = true
-homepage.workspace = true
-documentation = "https://docs.openbasil.org"
-keywords = ["basil", "vault", "secrets", "cryptography", "cli"]
 categories = ["cryptography", "command-line-utilities"]
-rust-version = "1.88"
+documentation = "https://docs.openbasil.org"
+edition.workspace = true
+homepage.workspace = true
+keywords = ["basil", "vault", "secrets", "cryptography", "cli"]
+license.workspace = true
 publish = true
+repository.workspace = true
+rust-version = "1.88"
+description = "Basil is a host-local secrets broker: your app never touches the key. Unified broker daemon, operator tool, and client CLI."
 
 [package.metadata.dist]
 # Name the Homebrew formula `basil` (not the crate name `basil-bin`) so the

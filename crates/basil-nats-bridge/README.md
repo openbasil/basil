@@ -56,13 +56,17 @@ the broker authorizes the compound local ingress and verified signer:
 	"subjects": {
 		"content.publisher": {
 			"domain": "host-process",
-			"match": { "all": [
-				{ "process.uid": 991 },
-				{ "invocation.signature-key": {
-					"algorithm": "nats-nkey",
-					"public": "UANATS_PUBLIC_NKEY"
-				} }
-			] }
+			"match": {
+				"all": [
+					{ "process.uid": 991 },
+					{
+						"invocation.signature-key": {
+							"algorithm": "nats-nkey",
+							"public": "UANATS_PUBLIC_NKEY"
+						}
+					}
+				]
+			}
 		}
 	},
 	"rules": [

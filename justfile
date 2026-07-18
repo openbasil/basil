@@ -1,7 +1,7 @@
 
 _default:
     @just --list
-   
+
 rust-docs:
     cargo doc -p basil  -p basil-nats -p basil-proto -p basil-cose --all-features --no-deps
 
@@ -9,7 +9,7 @@ rust-docs:
 # `target/man` (override with `just man-pages <dir>`). Pages are named
 # `basil.1`, `basil-agent.1`, ... one per (nested) subcommand.
 man-pages out="target/man":
-    cargo xtask -o {{out}}
+    cargo xtask -o {{ out }}
 
 # Regenerate .github/workflows/release.yml from the cargo-dist config, then
 # re-append the hand-written jobs (debian-packages + arch-package) that dist
@@ -107,21 +107,18 @@ check-go:
 check-sh:
     fd -e sh | xargs shellcheck
 
-check: (check-rust) (check-go) (check-sh)
+check: check-rust check-go check-sh
     typos
 
-    
 # format all go sources
 format-go:
     fd -e go -E vendor -x gofmt -w
-    
 
-   
 # Run all examples (every examples/*/run.sh, including web-service-axum and
 # python-grpc; python-grpc SKIPs cleanly when grpcio is not installed).
 # before running, either
 #    set BASIL_BIN and BASIL_NATS_BRIDGE_BIN
-#    or ensure `basil` and `basil-nats-bridge` are in your PATH
+# or ensure `basil` and `basil-nats-bridge` are in your PATH
 run-examples:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -138,7 +135,6 @@ st:
 
 clean:
     rm -rf target examples/*/target
-    
 
 # Run Cargo-discovered live OpenBao/Vault integration tests. These are excluded
 # from default package checks; they require `bao` and/or `vault` on PATH. `http`
@@ -184,7 +180,7 @@ test-go-live-interop:
       --ro-bind "$go_client_dir" "$PWD/clients/go" \
       --chdir "$PWD" \
       "$PWD/clients/go/scripts/interop-agent.sh"
- 
+
 # Run all live and cross-language interop suites
 test-interop: cargo-live-e2e test-stream-interop test-go-live-interop
 
@@ -216,8 +212,8 @@ test-compose-phase1-self:
 test-e2e engine="both":
     #!/usr/bin/env bash
     set -uo pipefail
-    case "{{engine}}" in
-      openbao|vault) engines=("{{engine}}") ;;
+    case "{{ engine }}" in
+      openbao|vault) engines=("{{ engine }}") ;;
       both)          engines=(openbao vault) ;;
       *) echo "usage: just test-e2e [openbao|vault|both]" >&2; exit 2 ;;
     esac

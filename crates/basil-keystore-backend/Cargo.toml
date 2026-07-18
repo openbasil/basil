@@ -4,18 +4,18 @@
 
 [package]
 name = "basil-keystore-backend"
-description = "Optional Basil key-store backends over db-keystore and 1Password."
 version.workspace = true
-edition.workspace = true
-license.workspace = true
 authors.workspace = true
-homepage.workspace = true
-repository.workspace = true
-documentation = "https://docs.rs/basil-keystore-backend"
-keywords = ["basil", "keystore", "keyring", "onepassword", "secrets"]
 categories = ["cryptography", "authentication"]
-rust-version = "1.85"
+documentation = "https://docs.rs/basil-keystore-backend"
+edition.workspace = true
+homepage.workspace = true
+keywords = ["basil", "keystore", "keyring", "onepassword", "secrets"]
+license.workspace = true
 publish = true
+repository.workspace = true
+rust-version = "1.85"
+description = "Optional Basil key-store backends over db-keystore and 1Password."
 
 [features]
 default = []
