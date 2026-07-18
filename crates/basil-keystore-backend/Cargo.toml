@@ -14,7 +14,7 @@ keywords = ["basil", "keystore", "keyring", "onepassword", "secrets"]
 license.workspace = true
 publish = true
 repository.workspace = true
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Optional Basil key-store backends over db-keystore and 1Password."
 
 [features]

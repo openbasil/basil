@@ -134,10 +134,14 @@ impl SecretStore {
             }),
             #[cfg(feature = "db-keystore")]
             StoreConfig::DbKeystore { path, cipher, dek } => {
+                // Own the encoded DEK in zeroizing storage before writing its
+                // first byte, then lend it to db-keystore for decoding.
                 let hexkey = hex_key(dek.expose_secret());
+                let encryption_opts = EncryptionOpts::new(&cipher, hexkey.as_str())
+                    .map_err(|e| StoreError::Backend(keyring_error_summary(&e).to_owned()))?;
                 let store = DbKeyStore::new(DbKeyStoreConfig {
                     path,
-                    encryption_opts: Some(EncryptionOpts::new(cipher, hexkey.as_str())),
+                    encryption_opts: Some(encryption_opts),
                     ..Default::default()
                 })
                 .map_err(|e| StoreError::Backend(keyring_error_summary(&e).to_owned()))?;
@@ -277,12 +281,12 @@ impl SecretStore {
 
 #[cfg(feature = "db-keystore")]
 fn hex_key(dek: &[u8]) -> Zeroizing<String> {
-    let mut out = String::with_capacity(64);
+    let mut out = Zeroizing::new(String::with_capacity(64));
     for b in dek {
         push_hex_nibble(&mut out, b >> 4);
         push_hex_nibble(&mut out, b & 0x0f);
     }
-    Zeroizing::new(out)
+    out
 }
 
 #[cfg(feature = "db-keystore")]
@@ -348,6 +352,24 @@ mod tests {
         assert!(rendered.contains("REDACTED"));
         assert!(!rendered.contains("171"));
         assert!(!rendered.contains("ab"));
+    }
+
+    #[cfg(feature = "db-keystore")]
+    #[test]
+    fn db_keystore_rejects_invalid_encryption_options_without_exposing_the_dek() {
+        use zero_secrets::SecretArray;
+
+        let result = super::SecretStore::open(super::StoreConfig::DbKeystore {
+            path: unique_temp_path("invalid-options", "db"),
+            cipher: String::new(),
+            dek: SecretArray::new([0xabu8; 32]),
+        });
+
+        match result {
+            Err(super::StoreError::Backend(summary)) => assert_eq!(summary, "invalid"),
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("invalid encryption options must fail"),
+        }
     }
 
     /// A unique, absolute temp path so parallel tests never share a store file.

@@ -1783,9 +1783,9 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
 name = "db-keystore"
-version = "0.4.4"
+version = "0.5.0-pre.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "767aa47078bb8521f42453480c4349709308a1184ffb65f53a7da8636c587fd4"
+checksum = "c151ed330e7f769cad0e4c7fc99027b5a6c5b3dde56d511b1bf34c576cbff66a"
 dependencies = [
  "anyhow",
  "clap",
@@ -1793,6 +1793,7 @@ dependencies = [
  "keyring-core",
  "log",
  "regex",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "turso",

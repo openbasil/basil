@@ -75,10 +75,11 @@ covers writing your own catalog and policy.
 ## Rotate the built-in keystore DEK
 
 The `basil keystore rekey` command surface is reserved but currently fails
-closed pending `basil-w37e`. `db-keystore` 0.4.4 copies DEKs and credential
-secrets through ordinary non-zeroizing Turso `String` and `Vec` values during
-rekey. Basil will enable the command only after a released upstream version
-provides an end-to-end zeroizing boundary.
+closed pending `basil-w37e`. Basil passes its `Zeroizing<String>` DEK to
+`db-keystore` 0.5.0-pre.1 by reference. `db-keystore` decodes that reference
+directly into its own zeroizing key storage, so the key never crosses the API
+boundary in an ordinary `String` or `Vec`. Enabling the command still requires
+the verified-swap implementation and its adversarial review.
 
 ## Install
 
