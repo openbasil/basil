@@ -19,6 +19,9 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use basil_core::attestor_protocol::helper::host::{
+    AuthorityManifestOptions, DEFAULT_MANIFEST_DIRECTORY, ManifestEvidenceInspector,
+};
 use basil_core::attestor_protocol::helper::{
     AllowlistLoadOptions, HelperConnection, HelperEndpointOptions, HelperListener, HelperService,
     InstalledAllowlist, host, serve_connection,
@@ -37,11 +40,22 @@ struct Args {
     #[arg(long, default_value = "/etc/basil/measure/policy.d")]
     policy_dir: PathBuf,
 
+    /// Directory of installed root-owned authority manifests.
+    ///
+    /// The confinement-evidence store the helper re-reads per measurement to
+    /// bind each generation's LSM identity to its lockdown-profile identity.
+    /// Defaults to the production store; naming an explicit directory (paired
+    /// with `--required-owner-uid`) lets unprivileged development hosts and
+    /// the live e2e lanes point at a store they own, mirroring `--policy-dir`.
+    #[arg(long, default_value = DEFAULT_MANIFEST_DIRECTORY)]
+    manifest_dir: PathBuf,
+
     /// Octal mode applied to the bound endpoint socket.
     #[arg(long, default_value = "0660", value_parser = parse_octal_mode)]
     socket_mode: u32,
 
-    /// Required owner UID for the policy directory and endpoint parent.
+    /// Required owner UID for the policy directory, manifest directory, and
+    /// endpoint parent.
     ///
     /// Production deployments must keep the default of 0 (root). Overriding
     /// is intended only for unprivileged development hosts.
@@ -126,7 +140,10 @@ fn main() -> ExitCode {
         allowlist,
         host::KernelPeerPidfdSource,
         host::SystemdUnitResolver,
-        host::ProcfsProcessInspector,
+        ManifestEvidenceInspector::new(AuthorityManifestOptions {
+            directory: args.manifest_dir,
+            required_owner_uid: args.required_owner_uid,
+        }),
         host::ProcExecutableOpener,
     );
 
@@ -158,7 +175,33 @@ fn main() -> ExitCode {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use super::parse_octal_mode;
+    use std::path::Path;
+
+    use clap::Parser;
+
+    use super::{Args, DEFAULT_MANIFEST_DIRECTORY, parse_octal_mode};
+
+    #[test]
+    fn manifest_dir_defaults_to_the_production_store() {
+        let args = Args::try_parse_from(["basil-measure-helper"]).unwrap();
+        assert_eq!(args.manifest_dir, Path::new(DEFAULT_MANIFEST_DIRECTORY));
+        // The default trust anchor stays root; nothing is loosened implicitly.
+        assert_eq!(args.required_owner_uid, 0);
+    }
+
+    #[test]
+    fn manifest_dir_and_required_owner_uid_override_together() {
+        let args = Args::try_parse_from([
+            "basil-measure-helper",
+            "--manifest-dir",
+            "/home/dev/manifests",
+            "--required-owner-uid",
+            "1000",
+        ])
+        .unwrap();
+        assert_eq!(args.manifest_dir, Path::new("/home/dev/manifests"));
+        assert_eq!(args.required_owner_uid, 1000);
+    }
 
     #[test]
     fn octal_mode_accepts_owner_and_group_permissions_only() {

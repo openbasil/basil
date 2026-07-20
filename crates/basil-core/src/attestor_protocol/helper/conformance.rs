@@ -10,7 +10,8 @@
 //! reuse (start-time sandwich), helper outage/restart, generation overlap on
 //! one endpoint, and exact pidfd/executable/cookie association. Broker-side
 //! items (substituted cookies checked against the broker's own socket,
-//! replayed-nonce tracking, release admission) belong to `basil-nxw5`.
+//! replayed-nonce tracking, release admission) live in the
+//! `broker_helper_conformance` module of `attestor_protocol::session`.
 
 use std::collections::VecDeque;
 use std::num::NonZeroU64;
