@@ -153,7 +153,7 @@ main() {
 
   echo "== scaffold =="
   render_template "$SCRIPT_DIR/catalog.template.json" "$CATALOG"
-  render_template "$SCRIPT_DIR/policy.template.json" "$POLICY"
+  render_template "$SCRIPT_DIR/policy.template" "$POLICY"
   make_secret_files
   "$BASIL" bundle create "$BUNDLE" \
     --slot "passphrase:file=$PASS_FILE" \

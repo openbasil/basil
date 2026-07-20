@@ -9,7 +9,7 @@ ontology:
   #   - function
   #   - module
   #   - trait
-  
+
   # Filter out specific global identifiers during compilation passes
   ignore_identifiers:
     - "String"

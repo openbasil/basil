@@ -18,7 +18,7 @@ on:
     tags:
       # Strict v{semver} (prerelease suffixes match via the trailing `*`):
       # the same tag convention ci.yml and release.yml trigger on.
-      - 'v[0-9]+.[0-9]+.[0-9]+*'
+      - "v[0-9]+.[0-9]+.[0-9]+*"
   workflow_dispatch:
     inputs:
       architecture:

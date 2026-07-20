@@ -22,3 +22,15 @@ Frontend output is untrusted and bounded before parsing. Raw stdout and stderr
 remain in best-effort-scrubbed memory and are never included in errors. This
 crate does not parse source Compose files, pull or build images, or persist raw
 frontend output.
+
+## Qualification fixtures
+
+`tests/qualification/docker-compose-5.3.1/` holds captured frontend output used
+to qualify the projection against a pinned Compose release. `SHA256SUMS` pins the
+exact bytes of every file, and `qualification_hashes_and_frontend_provenance_are_pinned`
+enforces that pin. The `*.json` captures are byte-for-byte frontend stdout with a
+single trailing newline appended by `capture.sh`; they must not be reformatted.
+A generic tree formatter (`gate fmt`, which runs `dprint` over `*.json`) will
+re-indent them and break the pin, so exclude this directory from formatting runs.
+To re-qualify against a new capture, re-run `capture.sh` and regenerate
+`SHA256SUMS` together.

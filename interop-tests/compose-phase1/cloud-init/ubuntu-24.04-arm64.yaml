@@ -26,14 +26,14 @@ users:
     # OCI runtime under `/usr/local` and run an architecture-sensitive container
     # as root. This does not change any LSM mode.
     sudo:
-      - 'ALL=(ALL) NOPASSWD:ALL'
+      - "ALL=(ALL) NOPASSWD:ALL"
     ssh_authorized_keys:
       - __BASIL_PHASE1_SSH_PUBLIC_KEY__
 
 write_files:
   - path: /etc/basil-phase1-lane
     owner: root:root
-    permissions: '0600'
+    permissions: "0600"
     content: |
       lane=ubuntu-24.04-aarch64
       design=Design 0001 revision 1.1
@@ -42,7 +42,7 @@ write_files:
       claims=no-performance,no-capacity,no-timing,no-native-host,no-lsm-qualification
   - path: /etc/systemd/system/basil-phase1-arm64-foundation.service
     owner: root:root
-    permissions: '0644'
+    permissions: "0644"
     content: |
       [Unit]
       Description=Record Ubuntu Phase 1 aarch64 functional foundation (no LSM claim)
@@ -60,7 +60,7 @@ write_files:
       WantedBy=multi-user.target
 
 runcmd:
-  - [systemctl, daemon-reload]
-  - [systemctl, enable, --now, basil-phase1-arm64-foundation.service]
+  - [ systemctl, daemon-reload ]
+  - [ systemctl, enable, --now, basil-phase1-arm64-foundation.service ]
 
 final_message: "Basil Compose Phase 1 Ubuntu arm64 functional foundation ready (TCG emulation; functional-only, no performance or LSM-qualification claim)"

@@ -16,7 +16,7 @@ backend and uses the same CLI to mint a JWT, encrypt/decrypt, and sign/verify.
 The static files are:
 
 - `catalog.template.json` - small catalog with one `kind: "keystore"` backend.
-- `policy.template.json` - policy template rendered for your current uid.
+- `policy.template` - policy template rendered for your current uid (not valid `JSON` until rendered: the `uid` placeholder is a bare token, so the `.json` extension is withheld to keep formatters from rewriting it).
 - `db-keystore.env` - paths and key names used by the runner.
 - agent config TOML - generated under the workdir by `run.sh`.
 - `run.sh` - end-to-end driver.

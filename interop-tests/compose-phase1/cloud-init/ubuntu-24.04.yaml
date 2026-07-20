@@ -19,21 +19,21 @@ users:
     # packages, start rootful dockerd, and read aa-status. This does not weaken
     # AppArmor or change its mode.
     sudo:
-      - 'ALL=(ALL) NOPASSWD:ALL'
+      - "ALL=(ALL) NOPASSWD:ALL"
     ssh_authorized_keys:
       - __BASIL_PHASE1_SSH_PUBLIC_KEY__
 
 write_files:
   - path: /etc/basil-phase1-lane
     owner: root:root
-    permissions: '0600'
+    permissions: "0600"
     content: |
       lane=ubuntu-24.04-x86_64-or-aarch64
       design=Design 0001 revision 1.1
       purpose=feasibility-evidence-only
   - path: /etc/systemd/system/basil-phase1-foundation.service
     owner: root:root
-    permissions: '0644'
+    permissions: "0644"
     content: |
       [Unit]
       Description=Validate Ubuntu Phase 1 foundation without weakening AppArmor
@@ -50,7 +50,7 @@ write_files:
       WantedBy=multi-user.target
 
 runcmd:
-  - [systemctl, daemon-reload]
-  - [systemctl, enable, --now, basil-phase1-foundation.service]
+  - [ systemctl, daemon-reload ]
+  - [ systemctl, enable, --now, basil-phase1-foundation.service ]
 
 final_message: "Basil Compose Phase 1 Ubuntu foundation ready; runtime packages remain lane-provisioning inputs"
