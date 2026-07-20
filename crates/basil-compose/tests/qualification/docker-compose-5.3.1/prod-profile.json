@@ -20,9 +20,7 @@
       }
     },
     "metrics": {
-      "profiles": [
-        "prod"
-      ],
+      "profiles": ["prod"],
       "command": null,
       "entrypoint": null,
       "image": "registry.example/metrics:2026-07-16",
@@ -39,9 +37,7 @@
       }
     },
     "worker": {
-      "profiles": [
-        "prod"
-      ],
+      "profiles": ["prod"],
       "build": {
         "context": "/opt/basil-compose-qualification/worker",
         "dockerfile": "Containerfile",

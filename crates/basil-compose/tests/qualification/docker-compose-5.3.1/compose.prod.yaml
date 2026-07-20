@@ -3,4 +3,4 @@ services:
     image: registry.example/api:${IMAGE_TAG}-prod
   metrics:
     image: registry.example/metrics:${IMAGE_TAG}
-    profiles: [prod]
+    profiles: [ prod ]

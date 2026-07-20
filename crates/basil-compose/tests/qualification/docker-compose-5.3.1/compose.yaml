@@ -12,6 +12,6 @@ services:
       dockerfile: Containerfile
       args:
         PRIVATE_BUILD_ARG: ${DATABASE_PASSWORD}
-    profiles: [prod]
+    profiles: [ prod ]
   prebuilt:
     image: registry.example/prebuilt@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa

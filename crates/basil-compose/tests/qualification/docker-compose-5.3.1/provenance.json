@@ -20,5 +20,5 @@
     "capture.sh prod-profile command",
     "PODMAN_COMPOSE_PROVIDER=<absolute fake provider> podman compose <prod-profile argv>"
   ],
-  "captureNormalization": "capture.sh appends one trailing newline because Docker Compose 5.3.1 emits formatted JSON without one; JSON content is otherwise byte-for-byte frontend stdout."
+  "captureNormalization": "capture.sh appends one trailing newline because Docker Compose 5.3.1 emits formatted JSON without one. Since 2026-07-20 the checked-in JSON captures are additionally reformatted by the repo formatter (gate fmt), so SHA256SUMS pins the formatted bytes, not raw frontend stdout; JSON values are unchanged by formatting."
 }
