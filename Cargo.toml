@@ -47,8 +47,8 @@ aes-kw = "0.3"
 age = { version = "0.11.5", features = ["plugin"] }
 anyhow = "1"
 argon2 = "0.5"
-async-nats = { version = "0.49", default-features = false, features = ["nkeys", "ring", "server_2_10", "server_2_11", "server_2_12", "server_2_14"] }
-async-trait = "0.1"
+async-nats = { version = "0.50.0", default-features = false, features = ["nkeys", "ring", "server_2_10", "server_2_11", "server_2_12", "server_2_14"] }
+async-trait = "0.1.91"
 # AWS KMS transit backend (feature `aws-kms`). No-C-toolchain constraint forbids
 # aws-lc-sys, so we must avoid the `default-https-client` feature (it forces
 # `aws-smithy-http-client/rustls-aws-lc`). The `rustls` feature instead routes to
@@ -67,7 +67,7 @@ clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 crypto_secretbox = { version = "0.1.1", default-features = false, features = ["alloc", "salsa20"] }
 data-encoding = { version = "2", default-features = false, features = ["alloc"] }
-db-keystore = "0.5.0-pre.1"
+db-keystore = "0.5.0-pre.2"
 ed25519-dalek = { version = "3.0.0", default-features = false, features = ["zeroize"] }
 futures = "0.3"
 getrandom = { version = "0.4.3", default-features = false }
@@ -80,7 +80,7 @@ google-cloud-gax = "0.19.2"
 google-cloud-kms = { version = "=0.6.0", default-features = false, features = ["auth", "rustls-tls"] }
 hex = "0.4"
 hkdf = { version = "0.13.0", default-features = false }
-hyper = { version = "1.10.1", default-features = false, features = ["http1", "server"] }
+hyper = { version = "1.11.0", default-features = false, features = ["http1", "server"] }
 hyper-util = { version = "0.1.20", default-features = false, features = ["http1", "server-auto", "service", "tokio"] }
 # jsonwebtoken 10 requires selecting a crypto backend; `rust_crypto` uses the
 # pure-Rust RustCrypto stack (no C toolchain), matching this workspace. Without
@@ -88,7 +88,7 @@ hyper-util = { version = "0.1.20", default-features = false, features = ["http1"
 jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
 keyring-core = "1.0.0"
 mimalloc = { version = "0.1.52", default-features = false }
-minicbor = { version = "2.2.2", default-features = false, features = ["alloc"] }
+minicbor = { version = "2.2.3", default-features = false, features = ["alloc"] }
 ml-dsa = { version = "0.1.1", features = ["zeroize"] }
 ml-kem = { version = "0.3.2", features = ["getrandom", "zeroize"] }
 nkeys = { version = "0.4", features = ["xkeys"] }
@@ -133,7 +133,7 @@ sha2-legacy = { package = "sha2", version = "0.10", default-features = false }
 sha3 = { version = "0.12.0", default-features = false }
 spiffe = { version = "0.16", features = ["x509-source", "jwt-source"] }
 spiffe-rustls = "0.7"
-thiserror = "2.0.18"
+thiserror = "2.0.19"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "time", "signal", "sync"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 tokio-stream = { version = "0.1", features = ["net"] }
@@ -155,7 +155,7 @@ uuid = { version = "1", features = ["v4"] }
 x25519-dalek = { version = "3.0.0", default-features = false, features = ["static_secrets", "zeroize"] }
 x509-parser = "0.18"
 zero-secrets = "0.2.0"
-zeroize = { version = "1", default-features = false, features = ["derive", "alloc"] }
+zeroize = { version = "1.9.0", default-features = false, features = ["derive", "alloc"] }
 
 # TPM sealed-bundle unlock slot (basil-lpj, feature `unlock-tpm`). Pure-Rust, no
 # C build dependency: `tpm2-protocol` is a no_std, alloc-free, zero-dependency
