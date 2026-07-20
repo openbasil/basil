@@ -13,11 +13,16 @@ profile basil-measure-helper /usr/bin/basil-measure-helper flags=(attach_disconn
   capability sys_ptrace,
   capability dac_read_search,
 
-  # Peer measurement is read-only tracing of confined attestor generations.
-  # The rootless-owner boundary needs the unconfined peer as well until the
-  # rootless entry mechanism is proven (see nix/lsm/README.md).
+  # Peer measurement is read-only tracing of confined attestor generations
+  # only, matching the SELinux twin's basil_attestor_domain scope. Both
+  # modes run administrator-owned system units that enter the named
+  # basil-attestor-g<N> profile via AppArmorProfile=, so an unconfined peer
+  # is a confinement failure and measurement of it fails closed; rootless-
+  # owner entry through this path is the conformance-test-15 proof
+  # obligation (see nix/lsm/README.md). Do not widen to peer=unconfined:
+  # with CAP_SYS_PTRACE plus /** r that is a host-wide read authority, and
+  # it masks an attestor profile that failed to load or attach.
   ptrace (read) peer=basil-attestor-g*,
-  ptrace (read) peer=unconfined,
 
   # Single shared SOCK_SEQPACKET endpoint; the helper unlinks a verified
   # stale socket and binds its own listener. No socket unit exists.

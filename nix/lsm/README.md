@@ -120,6 +120,21 @@ State these in packaging docs and verify them in the lane evidence:
   same-UID non-ancestor tracing). This is the open proof obligation for
   conformance test 15 and blocks rootless support until the lane evidences
   it.
+- The AppArmor helper profile scopes `ptrace (read)` to
+  `peer=basil-attestor-g*` only, matching the SELinux
+  `basil_attestor_domain` scope. There is no `peer=unconfined` grant: both
+  realm modes run administrator-owned system units that enter the named
+  per-generation profile through `AppArmorProfile=`, so an attestor peer
+  that shows up unconfined is a confinement failure (profile not loaded, or
+  the directive dropped from the unit) and its measurement fails closed
+  rather than silently succeeding. Proving that the rootless-owner unit
+  actually enters the profile on AppArmor hosts is part of the
+  conformance-test-15 obligation; until the lane evidences it, rootless
+  measurement on AppArmor is expected to fail closed. Widening the grant
+  back would hand the helper (which holds `CAP_SYS_PTRACE`,
+  `CAP_DAC_READ_SEARCH`, and `/** r`) a host-wide read authority over every
+  unconfined process, and per the accepted lockdown design any such profile
+  body change must ride a new authority generation.
 - `fs.suid_dumpable` must be 0 (kernel default) so the `User=` drop from root
   plus the process's own `PR_SET_DUMPABLE(0)` behave as designed.
 - There is no `.socket` unit anywhere in this directory on purpose: the SPEC
