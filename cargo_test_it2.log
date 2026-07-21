@@ -1,0 +1,16 @@
+   Compiling icu_properties v2.2.0
+   Compiling icu_collator v2.2.1
+   Compiling idna_adapter v1.2.1
+   Compiling idna v1.1.0
+   Compiling url v2.5.8
+   Compiling turso_core v0.7.0
+   Compiling turso_sync_engine v0.7.0
+   Compiling turso_sdk_kit v0.7.0
+   Compiling turso_sync_sdk_kit v0.7.0
+   Compiling turso v0.7.0
+   Compiling db-keystore v0.5.0-pre.2
+   Compiling basil-keystore-backend v0.8.0-pre.1 (/home/user/project/basil/crates/basil-keystore-backend)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 43.28s
+     Running unittests src/lib.rs (target/debug/deps/basil_keystore_backend-d70107fe3d846671)
+     Running tests/rekey_boundary.rs (target/debug/deps/rekey_boundary-179ee16f17e58aed)
+   Doc-tests basil_keystore_backend
