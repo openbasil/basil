@@ -1,0 +1,71 @@
+    Checking crypto-common v0.1.7
+    Checking hyper v1.11.0
+    Checking prost v0.14.4
+   Compiling basil-proto v0.8.0-pre.1 (/home/user/project/basil/crates/basil-proto)
+    Checking tracing-subscriber v0.3.23
+    Checking tempfile v3.27.0
+    Checking i18n-embed v0.15.4
+    Checking tower-http v0.6.11
+   Compiling basil-core v0.8.0-pre.1 (/home/user/project/basil/crates/basil-core)
+    Checking byteorder v1.5.0
+    Checking uuid v1.24.0
+    Checking digest v0.10.7
+    Checking cipher v0.4.4
+    Checking universal-hash v0.5.1
+    Checking aead v0.5.2
+    Checking poly1305 v0.8.0
+    Checking hash32 v0.3.1
+    Checking salsa20 v0.10.2
+    Checking chacha20 v0.9.1
+    Checking heapless v0.9.1
+    Checking hmac v0.12.1
+    Checking signature v2.2.0
+    Checking sha2 v0.10.9
+    Checking curve25519-dalek v4.1.3
+    Checking blake2 v0.10.6
+    Checking sha3 v0.10.9
+    Checking prost-types v0.14.4
+    Checking crypto_secretbox v0.1.1
+    Checking chacha20poly1305 v0.10.1
+    Checking hkdf v0.12.4
+    Checking rfc6979 v0.4.0
+    Checking pbkdf2 v0.12.2
+    Checking ed25519 v2.2.3
+    Checking rsa v0.9.10
+    Checking signatory v0.27.1
+    Checking elliptic-curve v0.13.8
+    Checking basil-nats v0.8.0-pre.1 (/home/user/project/basil/crates/basil-nats)
+    Checking argon2 v0.5.3
+    Checking scrypt v0.11.0
+    Checking age-core v0.11.0
+    Checking ecdsa v0.16.9
+    Checking primeorder v0.13.6
+    Checking minicbor-adapters v0.0.8
+    Checking tracing-appender v0.2.5
+    Checking tracing-journald v0.3.2
+    Checking ed25519-dalek v2.2.0
+    Checking x25519-dalek v2.0.1
+    Checking hyper-util v0.1.20
+    Checking age v0.11.5
+    Checking p256 v0.13.2
+    Checking p384 v0.13.1
+    Checking p521 v0.13.3
+    Checking nkeys v0.4.5
+    Checking cose_minicbor v0.1.1
+    Checking async-nats v0.50.0
+    Checking basil-cose v0.8.0-pre.1 (/home/user/project/basil/crates/basil-cose)
+    Checking jsonwebtoken v10.4.0
+    Checking axum v0.8.9
+    Checking hyper-timeout v0.5.2
+    Checking hyper-rustls v0.27.9
+    Checking reqwest v0.13.4
+    Checking tonic v0.14.6
+    Checking tonic-prost v0.14.6
+    Checking spiffe v0.16.0
+    Checking spiffe-rustls v0.8.0
+    Checking basil-nats-bridge v0.8.0-pre.1 (/home/user/project/basil/crates/basil-nats-bridge)
+    Checking basil v0.8.0-pre.1 (/home/user/project/basil/crates/basil-client)
+    Checking basil-tests v0.8.0-pre.1 (/home/user/project/basil/crates/basil-tests)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 29.16s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`

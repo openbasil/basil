@@ -1,0 +1,20 @@
+   Compiling ring v0.17.14
+    Checking basil-cose v0.8.0-pre.1 (/home/user/project/basil/crates/basil-cose)
+    Checking nkeys v0.4.5
+    Checking basil v0.8.0-pre.1 (/home/user/project/basil/crates/basil-client)
+    Checking basil-keystore-backend v0.8.0-pre.1 (/home/user/project/basil/crates/basil-keystore-backend)
+   Compiling rustls v0.23.42
+    Checking rustls-webpki v0.103.13
+    Checking tokio-rustls v0.26.4
+    Checking rustls-platform-verifier v0.7.0
+    Checking hyper-rustls v0.27.9
+    Checking async-nats v0.50.0
+    Checking reqwest v0.13.4
+    Checking basil-core v0.8.0-pre.1 (/home/user/project/basil/crates/basil-core)
+    Checking basil-nats-bridge v0.8.0-pre.1 (/home/user/project/basil/crates/basil-nats-bridge)
+    Checking basil-bin v0.8.0-pre.1 (/home/user/project/basil/crates/basil-bin)
+    Checking basil-tests v0.8.0-pre.1 (/home/user/project/basil/crates/basil-tests)
+    Checking xtask v0.8.0-pre.1 (/home/user/project/basil/xtask)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 16.65s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`

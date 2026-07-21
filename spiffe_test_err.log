@@ -1,0 +1,11 @@
+   Compiling basil-tests v0.8.0-pre.1 (/home/user/project/basil/crates/basil-tests)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.16s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests/spiffe_rustls_interop.rs (target/debug/deps/spiffe_rustls_interop-697f29291160f508)
+INTEROP(spiffe-rustls): Basil-issued X.509-SVID id = spiffe://example.org/test-runner
+INTEROP(spiffe-rustls): case 'exact-id authorize on both ends succeeds'
+INTEROP(spiffe-rustls): case 'h2 ALPN suitable for gRPC negotiates'
+INTEROP(spiffe-rustls): case 'server authorizes only a wrong client id => server accept fails'
+INTEROP(spiffe-rustls): case 'client authorizes only a wrong server id => client connect fails'
+kill: sending signal to 322441 failed: No such process

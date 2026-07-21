@@ -1,0 +1,13 @@
+   Compiling tokio-rustls v0.26.4
+   Compiling spiffe-rustls v0.8.0
+   Compiling hyper-rustls v0.27.9
+   Compiling async-nats v0.50.0
+   Compiling reqwest v0.13.4
+   Compiling basil-nats-bridge v0.8.0-pre.1 (/home/user/project/basil/crates/basil-nats-bridge)
+   Compiling basil-core v0.8.0-pre.1 (/home/user/project/basil/crates/basil-core)
+   Compiling basil-tests v0.8.0-pre.1 (/home/user/project/basil/crates/basil-tests)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 14.50s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/debug/deps/basil_tests-3cc61cfdc00ff22f)
+     Running unittests src/bin/compose_phase1_probe.rs (target/debug/deps/compose_phase1_probe-dcfc888cacabe400)
