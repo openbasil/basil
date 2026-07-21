@@ -96,6 +96,20 @@ pub enum StoreError {
     /// The backend cannot store non-UTF-8 bytes.
     #[error("backend requires UTF-8 values")]
     NonUtf8Value,
+    /// A keystore rekey owns the store: the open was refused by the rekey
+    /// fence (an on-disk intent marker from a crashed rekey, or a live
+    /// rekey's exclusive advisory lock — `marker` then names the lock file).
+    /// Produced only by the `db-keystore` arm on Linux; the refusal text
+    /// names the marker path and the recovery command verbatim.
+    #[error(
+        "keystore rekey in progress: intent marker `{marker}` is present; run \
+         `basil keystore rekey --resume` to complete recovery"
+    )]
+    RekeyInProgress {
+        /// Path (or database-directory-relative name) of the fencing
+        /// marker/lock file.
+        marker: String,
+    },
 }
 
 enum StoreInner {
@@ -144,12 +158,12 @@ impl SecretStore {
                 // Rekey fence + shared advisory lock (Linux): refuse to open
                 // while a rekey intent marker exists or a rekey holds the
                 // exclusive lock; otherwise hold the lock shared for the
-                // store's lifetime. Fail-closed, typed by message (the
-                // exhaustive `StoreError` mapping in basil-core pins the
-                // variant set; see basil-5n7b for a dedicated variant).
+                // store's lifetime. Fail-closed and typed: the fence itself
+                // surfaces as [`StoreError::RekeyInProgress`], every other
+                // guard failure as [`StoreError::Backend`].
                 #[cfg(target_os = "linux")]
-                let rekey_lock = crate::rekey::guard_store_open(&path)
-                    .map_err(|e| StoreError::Backend(e.to_string()))?;
+                let rekey_lock =
+                    crate::rekey::guard_store_open(&path).map_err(store_open_fence_error)?;
                 // Own the encoded DEK in zeroizing storage before writing its
                 // first byte, then lend it to db-keystore for decoding. The
                 // whole database-layer open runs inside `contained_open`:
@@ -306,6 +320,21 @@ impl SecretStore {
                 profile,
             } => provider.set(project, key, value, profile),
         }
+    }
+}
+
+/// Map a [`crate::rekey::guard_store_open`] refusal into the store's typed
+/// error. The rekey fence keeps its dedicated variant (preserving the
+/// refusal-text contract: the marker path and `basil keystore rekey --resume`
+/// verbatim); every other guard failure stays a fail-closed
+/// [`StoreError::Backend`] with the guard's secret-free rendering.
+#[cfg(all(feature = "db-keystore", target_os = "linux"))]
+fn store_open_fence_error(err: crate::rekey::KeystoreRekeyError) -> StoreError {
+    match err {
+        crate::rekey::KeystoreRekeyError::RekeyInProgress { marker } => {
+            StoreError::RekeyInProgress { marker }
+        }
+        other => StoreError::Backend(other.to_string()),
     }
 }
 
@@ -529,6 +558,60 @@ mod tests {
             b"wrong-dek startup qualification"
         );
         drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The rekey store-open fence surfaces as the dedicated typed variant,
+    /// and its rendering keeps the refusal-text contract: it names the
+    /// marker path and `basil keystore rekey --resume` verbatim.
+    #[cfg(all(feature = "db-keystore", target_os = "linux"))]
+    #[test]
+    fn store_open_fence_is_typed_rekey_in_progress() {
+        use zero_secrets::SecretArray;
+
+        let path = unique_temp_path("fence-typed", "db");
+        {
+            let store = super::SecretStore::open(super::StoreConfig::DbKeystore {
+                path: path.clone(),
+                cipher: "aegis256".to_string(),
+                dek: SecretArray::new([0x11u8; 32]),
+            })
+            .expect("provision the store");
+            drop(store);
+        }
+
+        // Plant the on-disk intent marker a crashed rekey would leave.
+        let marker_path = {
+            let mut name = path.file_name().expect("file name").to_os_string();
+            name.push(crate::rekey::MARKER_SUFFIX);
+            path.with_file_name(name)
+        };
+        std::fs::write(&marker_path, b"planted-by-test").expect("write marker");
+
+        let result = super::SecretStore::open(super::StoreConfig::DbKeystore {
+            path: path.clone(),
+            cipher: "aegis256".to_string(),
+            dek: SecretArray::new([0x11u8; 32]),
+        });
+        let Err(err) = result else {
+            panic!("the fence must refuse to open while the marker exists");
+        };
+        let text = err.to_string();
+        let super::StoreError::RekeyInProgress { marker } = err else {
+            panic!("expected RekeyInProgress, got: {text}");
+        };
+        assert!(
+            marker.ends_with(crate::rekey::MARKER_SUFFIX),
+            "marker must name the intent-marker path: {marker}"
+        );
+        assert!(text.contains("keystore rekey in progress"), "got: {text}");
+        assert!(text.contains(marker.as_str()), "got: {text}");
+        assert!(
+            text.contains("basil keystore rekey --resume"),
+            "refusal must name the recovery command verbatim: {text}"
+        );
+
+        let _ = std::fs::remove_file(&marker_path);
         let _ = std::fs::remove_file(&path);
     }
 

@@ -56,9 +56,10 @@ offline, built on db-keystore's descriptor-relative `rekey_at`/`verify_at`
 - **Intent-marker fence**: `<db>.rekey-intent` (created `O_EXCL`, `0600`,
   read back through a validated descriptor) records the candidate **and**
   pre-rekey database ciphertext BLAKE3 hashes plus the bundle epoch pair.
-  While it exists, `SecretStore::open` refuses, naming the marker and the
-  recovery command. The marker is a fence, not the commit point — the
-  bundle reseal/epoch advance (owned by `basil-core`) is.
+  While it exists, `SecretStore::open` refuses with the typed
+  `StoreError::RekeyInProgress`, naming the marker and the recovery command
+  (`basil keystore rekey --resume`) verbatim. The marker is a fence, not the
+  commit point — the bundle reseal/epoch advance (owned by `basil-core`) is.
 - **Advisory lock**: `SecretStore::open` holds `<db>.rekey-lock` shared for
   the store's lifetime; a rekey run holds it exclusive (`RekeyLock`), and
   every destructive primitive requires that witness value.

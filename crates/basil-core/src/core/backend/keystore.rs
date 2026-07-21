@@ -204,6 +204,10 @@ fn store_error(err: StoreError) -> BackendError {
         StoreError::NotFound(key) => BackendError::KeyNotFound(key),
         StoreError::Backend(summary) => BackendError::Backend(summary),
         StoreError::NonUtf8Value => BackendError::Backend("non-utf8-secret-for-provider".into()),
+        // The rekey store-open fence: keep the full typed rendering so the
+        // operator-facing refusal still names the marker path and the
+        // `basil keystore rekey --resume` recovery command verbatim.
+        fence @ StoreError::RekeyInProgress { .. } => BackendError::Backend(fence.to_string()),
     }
 }
 
@@ -217,6 +221,33 @@ fn crypto_error(err: &CryptoError) -> BackendError {
         | CryptoError::BadSignatureLength { .. }
         | CryptoError::BadNonceLength { .. }
         | CryptoError::EncryptFailed => BackendError::Backend(err.to_string()),
+    }
+}
+
+/// The typed rekey store-open fence must survive the `store_error` mapping
+/// with its refusal-text contract intact: the operator-facing text names the
+/// marker path and the `basil keystore rekey --resume` recovery command
+/// verbatim (no live store required: this exercises only the error mapping).
+#[cfg(test)]
+mod store_error_mapping {
+    #![allow(clippy::panic)]
+
+    use super::{BackendError, StoreError, store_error};
+
+    #[test]
+    fn rekey_fence_keeps_the_refusal_text_contract() {
+        let marker = "/var/lib/basil/keystore.db.rekey-intent";
+        let mapped = store_error(StoreError::RekeyInProgress {
+            marker: marker.to_owned(),
+        });
+        let BackendError::Backend(text) = mapped else {
+            panic!("the rekey fence must map to BackendError::Backend");
+        };
+        assert!(text.contains(marker), "must name the marker path: {text}");
+        assert!(
+            text.contains("basil keystore rekey --resume"),
+            "must name the recovery command verbatim: {text}"
+        );
     }
 }
 

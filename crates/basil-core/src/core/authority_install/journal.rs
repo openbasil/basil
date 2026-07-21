@@ -27,6 +27,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::num::NonZeroU64;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use rustix::fs::{Mode, OFlags};
@@ -323,6 +324,15 @@ pub enum JournalError {
     /// the tail: the journal fails closed.
     #[error("journal is corrupt")]
     Corrupt,
+    /// The journal path — a directory component on the way to the installer
+    /// state directory, or the journal file itself — failed the trusted
+    /// ownership/mode verification. Fail closed: never read or append
+    /// through an untrusted path.
+    #[error("journal path failed trust verification: {reason}")]
+    UntrustedPath {
+        /// Which trust check failed (static description, no path content).
+        reason: &'static str,
+    },
     /// Filesystem I/O failed.
     #[error("journal I/O failed: {kind}")]
     Io {
@@ -397,15 +407,21 @@ impl FileIntentJournal {
         &self.path
     }
 
-    /// Append one record, fsync the file, then fsync the parent directory.
+    /// Append one record, fsync the file, then fsync the state directory.
     /// The record is durable only when this returns `Ok`.
     ///
-    /// The file is created `0600` and opened with `O_NOFOLLOW` on its final
-    /// component, so a symlink planted at the journal path fails closed. The
-    /// caller must place the journal in a root-owned, non-world-writable
-    /// installer state directory (the full descriptor-relative directory
-    /// walk is future installer-lockdown work). The journal has exactly one
-    /// writer — the root installer authority — and appends are serialized.
+    /// The open path is hardened against symlink and ownership attacks: the
+    /// installer state directory is reached by a descriptor-relative
+    /// component walk from `/` (`openat` with `O_NOFOLLOW` and `O_DIRECTORY`
+    /// per component), every component must be owned by root or the
+    /// effective user and be neither group- nor world-writable (a root-owned
+    /// sticky directory such as `/tmp` is accepted as an *ancestor*
+    /// boundary, never as the state directory itself), and the journal file
+    /// — created `0600`, opened `O_NOFOLLOW` relative to the walked
+    /// directory descriptor — must be a regular, singly-linked file with the
+    /// same ownership bound and no group/world write bit. The journal has
+    /// exactly one writer — the root installer authority — and appends are
+    /// serialized.
     ///
     /// A torn tail (a partial frame from a crashed earlier append) is healed
     /// here: it is not durable by definition, so it is truncated away before
@@ -415,8 +431,9 @@ impl FileIntentJournal {
     /// # Errors
     ///
     /// Returns [`JournalError`] when serialization, the size bound, existing
-    /// corruption, or any I/O or fsync step fails. On error the record must
-    /// be treated as not durable until a read proves otherwise.
+    /// corruption, path trust verification, or any I/O or fsync step fails.
+    /// On error the record must be treated as not durable until a read
+    /// proves otherwise.
     pub fn append(&self, record: &JournalRecord) -> Result<(), JournalError> {
         let payload = serde_json::to_vec(record).map_err(|_| JournalError::Serialize)?;
         if payload.len() > MAX_RECORD_BYTES {
@@ -430,9 +447,11 @@ impl FileIntentJournal {
         frame.extend_from_slice(&payload);
         frame.extend_from_slice(&checksum);
 
+        let directory = self.open_trusted_state_directory()?;
+
         // Validate the existing journal and locate the durable end so a torn
         // tail never prefixes (and thereby corrupts) the new frame.
-        let (existing_len, durable_len) = match self.read_bytes()? {
+        let (existing_len, durable_len) = match read_bytes_at(&directory)? {
             Some(bytes) => {
                 let (_, durable_len) = parse_journal(&bytes)?;
                 (bytes.len(), durable_len)
@@ -440,13 +459,15 @@ impl FileIntentJournal {
             None => (0, 0),
         };
 
-        let fd = rustix::fs::open(
-            &self.path,
+        let fd = rustix::fs::openat(
+            &directory,
+            Self::FILE_NAME,
             OFlags::WRONLY | OFlags::APPEND | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::from_raw_mode(0o600),
         )
         .map_err(io_error)?;
         let mut file = File::from(fd);
+        verify_trusted_journal_file(&file)?;
         if existing_len > durable_len
             && let Ok(durable) = u64::try_from(durable_len)
         {
@@ -455,43 +476,170 @@ impl FileIntentJournal {
         file.write_all(&frame)?;
         file.sync_all()?;
         drop(file);
-        if let Some(parent) = self.path.parent() {
-            File::open(parent)?.sync_all()?;
-        }
+        directory.sync_all()?;
         Ok(())
     }
 
     /// Read every record. An absent journal file reads as empty.
     ///
+    /// The journal is reached through the same hardened descriptor-relative
+    /// walk and file verification as [`FileIntentJournal::append`], so a
+    /// reader (broker-side reconciliation, doctor) refuses a journal behind
+    /// a symlinked, foreign-owned, or group/world-writable path instead of
+    /// trusting its content.
+    ///
     /// # Errors
     ///
     /// Returns [`JournalError::Corrupt`] when a fully present record is
-    /// damaged (fail closed, even at the tail) and [`JournalError::Io`] on
-    /// filesystem failure. A partial record at the exact tail is reported via
-    /// [`JournalReadout::torn_tail`], not as an error.
+    /// damaged (fail closed, even at the tail),
+    /// [`JournalError::UntrustedPath`] when path trust verification fails,
+    /// and [`JournalError::Io`] on filesystem failure. A partial record at
+    /// the exact tail is reported via [`JournalReadout::torn_tail`], not as
+    /// an error.
     pub fn read(&self) -> Result<JournalReadout, JournalError> {
-        match self.read_bytes()? {
+        let directory = self.open_trusted_state_directory()?;
+        match read_bytes_at(&directory)? {
             Some(bytes) => Ok(parse_journal(&bytes)?.0),
             None => Ok(JournalReadout::default()),
         }
     }
 
-    /// Read the raw journal bytes with `O_NOFOLLOW` on the final component.
-    /// An absent file reads as `None`.
-    fn read_bytes(&self) -> Result<Option<Vec<u8>>, JournalError> {
-        let fd = match rustix::fs::open(
-            &self.path,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        ) {
-            Ok(fd) => fd,
-            Err(Errno::NOENT) => return Ok(None),
-            Err(errno) => return Err(io_error(errno)),
-        };
-        let mut bytes = Vec::new();
-        File::from(fd).read_to_end(&mut bytes)?;
-        Ok(Some(bytes))
+    /// Open the installer state directory (the journal's parent) with a
+    /// descriptor-relative component walk from `/`: every component is
+    /// opened `openat(O_DIRECTORY | O_NOFOLLOW)` relative to the previous
+    /// descriptor and verified for trusted ownership and modes, so neither a
+    /// symlinked component nor a foreign-owned or loosely-permissioned
+    /// directory can redirect or expose the journal.
+    fn open_trusted_state_directory(&self) -> Result<File, JournalError> {
+        let directory = self.path.parent().ok_or(JournalError::UntrustedPath {
+            reason: "journal path has no parent directory",
+        })?;
+        let relative = directory
+            .strip_prefix("/")
+            .map_err(|_| JournalError::UntrustedPath {
+                reason: "installer state directory path must be absolute",
+            })?;
+        let component_count = relative.components().count();
+        let mut current = File::from(
+            rustix::fs::open(
+                "/",
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(io_error)?,
+        );
+        for (index, component) in relative.components().enumerate() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(JournalError::UntrustedPath {
+                    reason: "state directory path has a non-plain component",
+                });
+            };
+            let next = File::from(
+                rustix::fs::openat(
+                    &current,
+                    name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(io_error)?,
+            );
+            verify_trusted_directory(&next.metadata()?, index + 1 == component_count)?;
+            current = next;
+        }
+        if component_count == 0 {
+            // The state directory is `/` itself: verify it directly.
+            verify_trusted_directory(&current.metadata()?, true)?;
+        }
+        Ok(current)
     }
+}
+
+/// Verify one walked directory component. Every component must be a
+/// directory owned by root or the effective user and carry no group/world
+/// write bit. A root-owned sticky directory (for example `/tmp`) is accepted
+/// as an **ancestor** boundary only — other users cannot rename or unlink
+/// foreign entries there, and the next component is opened
+/// descriptor-relative with `O_NOFOLLOW` and re-verified — but the state
+/// directory itself gets no such exception.
+fn verify_trusted_directory(
+    metadata: &std::fs::Metadata,
+    is_state_directory: bool,
+) -> Result<(), JournalError> {
+    let effective_uid = rustix::process::geteuid().as_raw();
+    let mode = metadata.permissions().mode();
+    if !metadata.is_dir() {
+        return Err(JournalError::UntrustedPath {
+            reason: "path component is not a directory",
+        });
+    }
+    if metadata.uid() != 0 && metadata.uid() != effective_uid {
+        return Err(JournalError::UntrustedPath {
+            reason: "directory is not owned by root or the effective user",
+        });
+    }
+    let root_sticky_boundary = !is_state_directory && metadata.uid() == 0 && mode & 0o1000 != 0;
+    if mode & 0o022 != 0 && !root_sticky_boundary {
+        return Err(JournalError::UntrustedPath {
+            reason: "directory is group- or world-writable",
+        });
+    }
+    if metadata.nlink() == 0 {
+        return Err(JournalError::UntrustedPath {
+            reason: "directory was unlinked while being verified",
+        });
+    }
+    Ok(())
+}
+
+/// Verify the opened journal file descriptor: a regular, singly-linked file
+/// owned by root or the effective user with no group/world write bit. Run on
+/// the descriptor (never the path) so the verified inode is exactly the one
+/// read or written.
+fn verify_trusted_journal_file(file: &File) -> Result<(), JournalError> {
+    let metadata = file.metadata()?;
+    let effective_uid = rustix::process::geteuid().as_raw();
+    if !metadata.file_type().is_file() {
+        return Err(JournalError::UntrustedPath {
+            reason: "journal is not a regular file",
+        });
+    }
+    if metadata.uid() != 0 && metadata.uid() != effective_uid {
+        return Err(JournalError::UntrustedPath {
+            reason: "journal is not owned by root or the effective user",
+        });
+    }
+    if metadata.permissions().mode() & 0o022 != 0 {
+        return Err(JournalError::UntrustedPath {
+            reason: "journal is group- or world-writable",
+        });
+    }
+    if metadata.nlink() != 1 {
+        return Err(JournalError::UntrustedPath {
+            reason: "journal has unexpected hard links",
+        });
+    }
+    Ok(())
+}
+
+/// Read the raw journal bytes relative to the verified state-directory
+/// descriptor, with `O_NOFOLLOW` on the file and descriptor verification
+/// before any byte is trusted. An absent file reads as `None`.
+fn read_bytes_at(directory: &File) -> Result<Option<Vec<u8>>, JournalError> {
+    let fd = match rustix::fs::openat(
+        directory,
+        FileIntentJournal::FILE_NAME,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(None),
+        Err(errno) => return Err(io_error(errno)),
+    };
+    let mut file = File::from(fd);
+    verify_trusted_journal_file(&file)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
 }
 
 fn io_error(errno: Errno) -> JournalError {
@@ -568,4 +716,183 @@ fn parse_journal(bytes: &[u8]) -> Result<(JournalReadout, usize), JournalError> 
 #[cfg(test)]
 pub(crate) fn parse_journal_bytes(bytes: &[u8]) -> Result<JournalReadout, JournalError> {
     parse_journal(bytes).map(|(readout, _)| readout)
+}
+
+/// Trust verification of the journal open path (the descriptor-relative
+/// walk and file checks). Framing, torn-tail, and corruption semantics are
+/// covered in `super::tests`.
+#[cfg(test)]
+mod trusted_path_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use std::num::NonZeroU64;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::{Path, PathBuf};
+
+    use super::{
+        FileIntentJournal, JournalError, JournalRecord, ManifestId, StagedReceipt, TransactionId,
+    };
+    use crate::core::attestor_realm::RealmName;
+    use crate::release_admission::Sha256Digest;
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn tempdir(stem: &str) -> TempDir {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "basil-journal-trust-{stem}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("create temp dir");
+        TempDir { path }
+    }
+
+    fn record() -> JournalRecord {
+        JournalRecord::Staged(StagedReceipt {
+            transaction: TransactionId::from_bytes([7; 16]),
+            realm: RealmName::new("owner-podman").expect("realm"),
+            manifest: ManifestId::from_digest(Sha256Digest::from_bytes([1; 32])),
+            authority_generation: NonZeroU64::new(2).expect("nonzero"),
+            helper_policy_generation: NonZeroU64::new(2).expect("nonzero"),
+            previous_manifest: None,
+        })
+    }
+
+    fn chmod(path: &Path, mode: u32) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    }
+
+    fn untrusted_reason(result: Result<impl Sized, JournalError>) -> &'static str {
+        match result {
+            Err(JournalError::UntrustedPath { reason }) => reason,
+            Err(other) => panic!("expected UntrustedPath, got: {other}"),
+            Ok(_) => panic!("expected UntrustedPath, got Ok"),
+        }
+    }
+
+    #[test]
+    fn round_trips_through_a_nested_trusted_walk() {
+        let dir = tempdir("nested");
+        let state = dir.path.join("authority-install");
+        std::fs::create_dir(&state).expect("create state dir");
+        let journal = FileIntentJournal::in_directory(&state);
+        journal.append(&record()).expect("append");
+        let readout = journal.read().expect("read");
+        assert_eq!(readout.records.len(), 1);
+        assert!(!readout.torn_tail);
+    }
+
+    #[test]
+    fn relative_state_directory_is_refused_on_both_paths() {
+        let journal = FileIntentJournal::in_directory(Path::new("relative/state"));
+        assert_eq!(
+            untrusted_reason(journal.append(&record())),
+            "installer state directory path must be absolute"
+        );
+        // Fail closed even where a plain read would report an absent file.
+        assert_eq!(
+            untrusted_reason(journal.read()),
+            "installer state directory path must be absolute"
+        );
+    }
+
+    #[test]
+    fn world_writable_state_directory_is_refused() {
+        let dir = tempdir("world-writable");
+        let journal = FileIntentJournal::in_directory(&dir.path);
+        journal.append(&record()).expect("append while trusted");
+        chmod(&dir.path, 0o757);
+        assert_eq!(
+            untrusted_reason(journal.append(&record())),
+            "directory is group- or world-writable"
+        );
+        assert_eq!(
+            untrusted_reason(journal.read()),
+            "directory is group- or world-writable"
+        );
+        chmod(&dir.path, 0o755);
+        journal.read().expect("trusted again after chmod back");
+    }
+
+    #[test]
+    fn sticky_bit_does_not_excuse_the_state_directory_itself() {
+        // A root-owned sticky ancestor (like `/tmp`) is acceptable, but the
+        // state directory itself must never be sticky-world-writable.
+        let dir = tempdir("sticky-state");
+        let journal = FileIntentJournal::in_directory(&dir.path);
+        chmod(&dir.path, 0o1777);
+        assert_eq!(
+            untrusted_reason(journal.append(&record())),
+            "directory is group- or world-writable"
+        );
+        chmod(&dir.path, 0o755);
+    }
+
+    #[test]
+    fn symlinked_state_directory_component_is_refused() {
+        let dir = tempdir("symlinked-dir");
+        let real = dir.path.join("real");
+        std::fs::create_dir(&real).expect("create real dir");
+        let planted = dir.path.join("state");
+        std::os::unix::fs::symlink(&real, &planted).expect("plant symlink");
+        let journal = FileIntentJournal::in_directory(&planted);
+        // The descriptor-relative `O_NOFOLLOW` open refuses the component.
+        assert!(matches!(
+            journal.append(&record()),
+            Err(JournalError::Io { .. })
+        ));
+        assert!(matches!(journal.read(), Err(JournalError::Io { .. })));
+    }
+
+    #[test]
+    fn group_writable_journal_file_is_refused() {
+        let dir = tempdir("loose-file");
+        let journal = FileIntentJournal::in_directory(&dir.path);
+        journal.append(&record()).expect("append");
+        chmod(journal.path(), 0o620);
+        assert_eq!(
+            untrusted_reason(journal.read()),
+            "journal is group- or world-writable"
+        );
+        assert_eq!(
+            untrusted_reason(journal.append(&record())),
+            "journal is group- or world-writable"
+        );
+    }
+
+    #[test]
+    fn hardlinked_journal_file_is_refused() {
+        let dir = tempdir("hardlink");
+        let journal = FileIntentJournal::in_directory(&dir.path);
+        journal.append(&record()).expect("append");
+        std::fs::hard_link(journal.path(), dir.path.join("second-link")).expect("hard link");
+        assert_eq!(
+            untrusted_reason(journal.read()),
+            "journal has unexpected hard links"
+        );
+        assert_eq!(
+            untrusted_reason(journal.append(&record())),
+            "journal has unexpected hard links"
+        );
+    }
+
+    #[test]
+    fn journal_entry_that_is_not_a_regular_file_is_refused_on_read() {
+        let dir = tempdir("not-regular");
+        let journal = FileIntentJournal::in_directory(&dir.path);
+        std::fs::create_dir(journal.path()).expect("plant directory at journal path");
+        assert_eq!(
+            untrusted_reason(journal.read()),
+            "journal is not a regular file"
+        );
+    }
 }
