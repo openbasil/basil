@@ -151,16 +151,26 @@ impl SecretStore {
                 let rekey_lock = crate::rekey::guard_store_open(&path)
                     .map_err(|e| StoreError::Backend(e.to_string()))?;
                 // Own the encoded DEK in zeroizing storage before writing its
-                // first byte, then lend it to db-keystore for decoding.
-                let hexkey = hex_key(dek.expose_secret());
-                let encryption_opts = EncryptionOpts::new(&cipher, hexkey.as_str())
-                    .map_err(|e| StoreError::Backend(keyring_error_summary(&e).to_owned()))?;
-                let store = DbKeyStore::new(DbKeyStoreConfig {
-                    path,
-                    encryption_opts: Some(encryption_opts),
-                    ..Default::default()
-                })
-                .map_err(|e| StoreError::Backend(keyring_error_summary(&e).to_owned()))?;
+                // first byte, then lend it to db-keystore for decoding. The
+                // whole database-layer open runs inside `contained_open`:
+                // db-keystore 0.5.0 contains panics only in its rekey/verify
+                // entry points, and on a database/DEK mismatch turso may
+                // panic as well as return an error. An unwind here would
+                // crash the broker at startup, so it is converted into a
+                // fail-closed [`StoreError::Backend`] instead. Unwinding
+                // drops `hexkey` (and the moved `dek`), so the key material
+                // is zeroized on the panic path too.
+                let store = contained_open(move || {
+                    let hexkey = hex_key(dek.expose_secret());
+                    let encryption_opts = EncryptionOpts::new(&cipher, hexkey.as_str())
+                        .map_err(|e| StoreError::Backend(keyring_error_summary(&e).to_owned()))?;
+                    DbKeyStore::new(DbKeyStoreConfig {
+                        path,
+                        encryption_opts: Some(encryption_opts),
+                        ..Default::default()
+                    })
+                    .map_err(|e| StoreError::Backend(keyring_error_summary(&e).to_owned()))
+                })?;
                 Ok(Self {
                     inner: StoreInner::DbKeystore {
                         store: store as Arc<CredentialStore>,
@@ -299,6 +309,40 @@ impl SecretStore {
     }
 }
 
+/// Stable summary for a contained database-layer panic during store open.
+#[cfg(feature = "db-keystore")]
+const CONTAINED_PANIC_SUMMARY: &str = "db-keystore-open-panic-contained";
+
+/// Run the db-keystore open path with panic containment, converting an
+/// escaped panic into a fail-closed [`StoreError::Backend`].
+///
+/// db-keystore 0.5.0 wraps its `rekey_at`/`verify_at` entry points in
+/// `catch_unwind`, but **not** [`DbKeyStore::new`]; its own qualification
+/// wraps wrong-key `new` in `catch_unwind` because turso may panic (rather
+/// than error) on a database/DEK mismatch. The broker's no-panic invariant
+/// forbids letting that unwind cross this crate, so the runtime adapter
+/// carries the same containment here.
+///
+/// The panic payload is **discarded**, not reported: it originates in
+/// whatever database code panicked, so it is untrusted and could embed
+/// buffer contents or key encodings, and `StoreError::Backend` renders its
+/// summary via `Display`. The error carries only the stable
+/// [`CONTAINED_PANIC_SUMMARY`] discriminator (matching this crate's
+/// precedent that panic payloads never reach `Display`; see
+/// `rekey::AuditPayload`). Containment presumes `panic = "unwind"`; a
+/// `panic = "abort"` build aborts before this conversion can run.
+#[cfg(feature = "db-keystore")]
+fn contained_open<T>(f: impl FnOnce() -> Result<T, StoreError>) -> Result<T, StoreError> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(payload) => {
+            // Drop (and thereby discard) the untrusted payload explicitly.
+            drop(payload);
+            Err(StoreError::Backend(CONTAINED_PANIC_SUMMARY.to_owned()))
+        }
+    }
+}
+
 #[cfg(feature = "db-keystore")]
 fn hex_key(dek: &[u8]) -> Zeroizing<String> {
     let mut out = Zeroizing::new(String::with_capacity(64));
@@ -390,6 +434,102 @@ mod tests {
             Err(other) => panic!("unexpected error: {other}"),
             Ok(_) => panic!("invalid encryption options must fail"),
         }
+    }
+
+    /// The containment boundary converts an escaped panic into the stable
+    /// fail-closed summary and never lets payload text reach the error.
+    #[cfg(feature = "db-keystore")]
+    #[test]
+    fn contained_open_converts_panics_into_backend_errors() {
+        // Success and error results pass through unchanged.
+        assert!(matches!(super::contained_open(|| Ok(7u32)), Ok(7)));
+        let passthrough: Result<(), _> =
+            super::contained_open(|| Err(super::StoreError::Backend("invalid".to_owned())));
+        assert!(matches!(
+            passthrough,
+            Err(super::StoreError::Backend(summary)) if summary == "invalid"
+        ));
+
+        // A panic is contained; the untrusted payload is discarded, not
+        // echoed into the (Display-rendered) error summary.
+        let contained: Result<(), super::StoreError> =
+            super::contained_open(|| panic!("payload-with-material-abad1dea"));
+        match contained {
+            Err(super::StoreError::Backend(summary)) => {
+                assert_eq!(summary, super::CONTAINED_PANIC_SUMMARY);
+                assert!(!summary.contains("abad1dea"));
+            }
+            Err(other) => panic!("unexpected error variant: {other}"),
+            Ok(()) => panic!("a panicking open must fail"),
+        }
+    }
+
+    /// Wrong-DEK startup qualification (runtime adapter): opening an existing
+    /// encrypted store with the wrong DEK must fail closed as an error and
+    /// must not unwind out of `SecretStore::open`, whether turso reports the
+    /// mismatch as an error or as a panic. The failed attempt must also
+    /// release the advisory lock so the correct DEK can still open.
+    #[cfg(feature = "db-keystore")]
+    #[test]
+    fn wrong_dek_startup_is_contained_and_fails_closed() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use zero_secrets::SecretArray;
+
+        let path = unique_temp_path("wrong-dek", "db");
+        let provisioning_dek = [0x11u8; 32];
+        {
+            let store = super::SecretStore::open(super::StoreConfig::DbKeystore {
+                path: path.clone(),
+                cipher: "aegis256".to_string(),
+                dek: SecretArray::new(provisioning_dek),
+            })
+            .expect("open with the provisioning DEK");
+            store
+                .put("kv2/qualification", b"wrong-dek startup qualification")
+                .expect("store value");
+        }
+
+        // Open (and, if open unexpectedly succeeds, read) with the wrong
+        // DEK. The outer `catch_unwind` proves no unwind path remains: the
+        // adapter itself must have already contained any database-layer
+        // panic and mapped it to a `StoreError`.
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            super::SecretStore::open(super::StoreConfig::DbKeystore {
+                path: path.clone(),
+                cipher: "aegis256".to_string(),
+                dek: SecretArray::new([0x22u8; 32]),
+            })
+            .and_then(|store| store.get("kv2/qualification"))
+        }));
+        match outcome {
+            Ok(Err(err)) => {
+                // Fail-closed, and the rendered error stays secret-free:
+                // neither DEK's hex encoding may appear.
+                let rendered = format!("{err}");
+                assert!(!rendered.contains(&"11".repeat(32)));
+                assert!(!rendered.contains(&"22".repeat(32)));
+            }
+            Ok(Ok(_)) => panic!("wrong DEK must not open and read the store"),
+            Err(unwound) => {
+                drop(unwound);
+                panic!("wrong-DEK startup unwound out of SecretStore::open");
+            }
+        }
+
+        // The wrong-DEK attempt held nothing: the correct DEK still opens
+        // and reads.
+        let store = super::SecretStore::open(super::StoreConfig::DbKeystore {
+            path: path.clone(),
+            cipher: "aegis256".to_string(),
+            dek: SecretArray::new(provisioning_dek),
+        })
+        .expect("reopen with the correct DEK");
+        assert_eq!(
+            store.get("kv2/qualification").expect("read value back"),
+            b"wrong-dek startup qualification"
+        );
+        drop(store);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A unique, absolute temp path so parallel tests never share a store file.

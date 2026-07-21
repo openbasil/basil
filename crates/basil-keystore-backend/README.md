@@ -35,6 +35,9 @@ module).
   plain `Vec`s, or holds material past the operation.
 - Errors are reduced to stable, leak-safe summaries before they leave the crate: no secret bytes
   ride in any error.
+- The db-keystore open path runs under panic containment: a database-layer panic (for example a
+  turso panic on a database/DEK mismatch) is converted into a fail-closed `StoreError` carrying a
+  stable summary — the untrusted panic payload is discarded, and the broker never unwinds.
 - The crate holds storage adapters only. Policy, attestation, and auditing stay in `basil-core`;
   a store cannot be reached except through the broker's decision path.
 
