@@ -15,13 +15,16 @@
 //! (`sd_notify` `READY=1`; there is deliberately no socket unit, so
 //! `SO_PEERCRED`/`SO_PEERPIDFD` name this process, never a launcher).
 //!
-//! Serving state: the listener accepts broker connections and enforces the
-//! enrolled broker UID before any protocol byte, but attestor-side session
-//! authentication (the `broker.toml` trust anchor and the mutual
-//! `VerifiedPeerBinding` derivation, `basil-daaf`) has not landed, so every
-//! accepted connection is currently rejected fail-closed after the UID gate.
-//! The process never panics: startup failures exit nonzero and per-connection
-//! failures reject one connection.
+//! Serving state: the listener accepts broker connections and authenticates
+//! each peer against the enrollment-installed `broker.toml` trust anchor
+//! (SPEC.md rev 1.2): the anchor file is fd-pinned and hashed at startup,
+//! and every accepted connection's kernel credentials, race-free pidfd,
+//! PID/start time, and system-manager unit are verified and bound into a
+//! `VerifiedPeerBinding`. Session construction on top of that binding
+//! (epoch agreement, `AttestorSession`, `basil-agrz`) has not landed, so
+//! every verified connection is still rejected fail-closed after
+//! verification. The process never panics: startup failures exit nonzero
+//! and per-connection failures reject one connection.
 
 use std::num::NonZeroU64;
 use std::os::linux::net::SocketAddrExt as _;
@@ -29,8 +32,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use basil_core::attestor_protocol::{
-    AttestorListener, AttestorListenerOptions, LockdownGuard, LockdownProfile, LockdownProfileId,
-    LockdownProfileKind, engage,
+    AttestorListener, AttestorListenerOptions, BrokerTrustAnchor, LockdownGuard, LockdownProfile,
+    LockdownProfileId, LockdownProfileKind, engage, verify_broker_peer,
 };
 use basil_core::core::attestor_realm::RealmName;
 use clap::Parser;
@@ -67,17 +70,36 @@ struct Args {
 
     /// Exact owner UID the runtime directory must carry.
     ///
-    /// Defaults to this process's effective UID (the unit runs as the
-    /// declared `attestorUid`, which owns the installed directory).
-    #[arg(long)]
-    directory_owner_uid: Option<u32>,
+    /// Defaults to root: SPEC.md rev 1.2 installs the generation-qualified
+    /// runtime directory root-owned in the authority transaction. An
+    /// override is intended only for unprivileged development hosts.
+    #[arg(long, default_value_t = 0)]
+    directory_owner_uid: u32,
 
-    /// Enrolled broker UID allowed to connect.
+    /// Exact owner UID a stale control socket must carry before removal.
     ///
-    /// Until the `broker.toml` trust anchor lands (`basil-daaf`) this is
-    /// the only peer gate; when absent, every connection is rejected.
+    /// Defaults to this process's effective UID (the unit runs as the
+    /// declared `attestorUid` / `socketOwner`, which created any leftover
+    /// socket of a previous run). Declared separately from the root
+    /// directory owner.
     #[arg(long)]
-    broker_uid: Option<u32>,
+    socket_owner_uid: Option<u32>,
+
+    /// Enrollment-installed broker trust anchor (`broker.toml`).
+    ///
+    /// Defaults to the canonical
+    /// `/etc/basil/attestors/<realm>/broker.toml`. The file must exist and
+    /// validate before serving starts; there is no anchor-less mode.
+    #[arg(long)]
+    broker_trust_anchor: Option<PathBuf>,
+
+    /// Exact owner UID the trust anchor and its parent must carry.
+    ///
+    /// Defaults to root (enrollment installs the anchor UID-0-owned below
+    /// UID-0-owned non-writable parents). An override is intended only for
+    /// unprivileged development hosts.
+    #[arg(long, default_value_t = 0)]
+    broker_trust_owner_uid: u32,
 
     /// Checked, generation-qualified lockdown-profile identity to engage.
     ///
@@ -154,6 +176,15 @@ fn runtime_directory(args: &Args) -> Result<PathBuf, String> {
     }
 }
 
+/// The checked trust-anchor location for one realm.
+fn trust_anchor_path(args: &Args) -> PathBuf {
+    args.broker_trust_anchor.clone().unwrap_or_else(|| {
+        PathBuf::from("/etc/basil/attestors")
+            .join(args.realm.as_str())
+            .join("broker.toml")
+    })
+}
+
 /// Pause after one failed `accept` so a persistent failure cannot busy-spin.
 const ACCEPT_FAILURE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
@@ -182,11 +213,32 @@ fn main() -> ExitCode {
     };
     let socket_path = directory.join("control.sock");
     let options = AttestorListenerOptions {
-        required_directory_owner_uid: args
-            .directory_owner_uid
-            .unwrap_or_else(|| rustix::process::geteuid().as_raw()),
+        required_directory_owner_uid: args.directory_owner_uid,
         required_directory_mode: args.directory_mode,
+        required_socket_owner_uid: args
+            .socket_owner_uid
+            .unwrap_or_else(|| rustix::process::geteuid().as_raw()),
         socket_mode: args.socket_mode,
+    };
+
+    // The broker trust anchor must exist and validate before serving
+    // (enrollment installs it before unit start); there is no anchor-less
+    // serving mode.
+    let anchor_path = trust_anchor_path(&args);
+    let anchor = match BrokerTrustAnchor::load(
+        &anchor_path,
+        args.realm.as_str(),
+        args.broker_trust_owner_uid,
+    ) {
+        Ok(anchor) => anchor,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                path = %anchor_path.display(),
+                "failed to load the broker trust anchor"
+            );
+            return ExitCode::FAILURE;
+        }
     };
 
     // Pre-bind resource creation: the (single-threaded) runtime and every
@@ -232,13 +284,14 @@ fn main() -> ExitCode {
         "post-init lockdown engaged"
     );
 
-    runtime.block_on(serve(&args, &socket_path, &options, &lockdown))
+    runtime.block_on(serve(&args, &socket_path, &options, &anchor, &lockdown))
 }
 
 async fn serve(
     args: &Args,
     socket_path: &std::path::Path,
     options: &AttestorListenerOptions,
+    anchor: &BrokerTrustAnchor,
     lockdown: &LockdownGuard,
 ) -> ExitCode {
     let listener = match AttestorListener::bind(socket_path, options, lockdown) {
@@ -274,28 +327,30 @@ async fn serve(
                 continue;
             }
         };
-        // Peer gate before any protocol byte.
-        match args.broker_uid {
-            Some(broker_uid) if accepted.credentials.uid == broker_uid => {
-                // Attestor-side session authentication (broker.toml trust
-                // anchor + mutual VerifiedPeerBinding derivation) has not
-                // landed (basil-daaf); fail closed rather than speak the
-                // protocol without verified bindings.
+        // Full broker peer verification against the trust anchor before any
+        // protocol byte: kernel credentials, race-free pidfd, PID/start
+        // time, and the exact enrolled system unit.
+        match verify_broker_peer(
+            anchor,
+            accepted.credentials,
+            std::os::fd::AsFd::as_fd(&accepted.stream),
+        ) {
+            Ok(verified) => {
+                // The mutual peer binding is derived, but session
+                // construction on top of it (epoch agreement,
+                // `AttestorSession`) has not landed (basil-agrz); fail
+                // closed rather than speak the protocol without a session.
+                drop(verified);
                 tracing::warn!(
                     peer_uid = accepted.credentials.uid,
-                    "broker connection rejected: attestor-side session authentication not yet available (basil-daaf)"
+                    "verified broker connection rejected: attestor-side session construction not yet available (basil-agrz)"
                 );
             }
-            Some(_) => {
+            Err(error) => {
                 tracing::warn!(
+                    %error,
                     peer_uid = accepted.credentials.uid,
-                    "connection rejected: peer is not the enrolled broker UID"
-                );
-            }
-            None => {
-                tracing::warn!(
-                    peer_uid = accepted.credentials.uid,
-                    "connection rejected: no enrolled broker UID configured"
+                    "connection rejected: broker peer verification failed"
                 );
             }
         }
@@ -381,6 +436,39 @@ mod tests {
         assert!(parse(&["--realm", "owner-podman", "--authority-generation", "0"]).is_err());
         assert!(parse(&["--realm", "Not-Canonical", "--authority-generation", "1"]).is_err());
         assert!(parse(&["--realm", "", "--authority-generation", "1"]).is_err());
+    }
+
+    #[test]
+    fn trust_anchor_defaults_to_the_canonical_realm_path() {
+        let args = parse(&["--realm", "owner-podman", "--authority-generation", "3"]).unwrap();
+        assert_eq!(
+            trust_anchor_path(&args),
+            PathBuf::from("/etc/basil/attestors/owner-podman/broker.toml")
+        );
+        let args = parse(&[
+            "--realm",
+            "owner-podman",
+            "--authority-generation",
+            "3",
+            "--broker-trust-anchor",
+            "/tmp/dev/broker.toml",
+        ])
+        .unwrap();
+        assert_eq!(
+            trust_anchor_path(&args),
+            PathBuf::from("/tmp/dev/broker.toml")
+        );
+    }
+
+    /// Rev 1.2 defaults: the runtime directory and the trust anchor are
+    /// root-owned installed state, while the socket owner defaults to this
+    /// process (the attestor account creates the socket).
+    #[test]
+    fn ownership_defaults_follow_the_installed_authority() {
+        let args = parse(&["--realm", "owner-podman", "--authority-generation", "3"]).unwrap();
+        assert_eq!(args.directory_owner_uid, 0);
+        assert_eq!(args.broker_trust_owner_uid, 0);
+        assert_eq!(args.socket_owner_uid, None);
     }
 
     #[test]

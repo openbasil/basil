@@ -17,7 +17,8 @@
 //! the root authority transaction installed it (real directory, declared
 //! owner, exact declared mode; opened `O_NOFOLLOW`), a leftover object at
 //! the socket path is unlinked only when it is verifiably a stale socket
-//! owned by the declared owner, and the fresh socket is chmodded to the
+//! owned by the separately declared socket owner (the attestor account, not
+//! the root directory owner), and the fresh socket is chmodded to the
 //! declared mode before `listen`, so the endpoint is never observable with
 //! wider permissions. The broker independently authenticates the full path,
 //! ACL profile, and socket identity on every connect
@@ -40,14 +41,21 @@ use super::lockdown::LockdownGuard;
 /// Declared measurement-authority facts the bind enforces.
 ///
 /// Values come from the protected realm authority (`runtimeDirectoryOwner`,
-/// `runtimeDirectoryMode`, `socketMode`); tests and unprivileged development
-/// hosts substitute values for a directory they own.
+/// `runtimeDirectoryMode`, `socketOwner`, `socketMode`). The directory owner
+/// and the socket owner are separate declared identities: SPEC.md rev 1.2
+/// installs a root-owned runtime directory while the attestor account owns
+/// the socket it creates inside it. Tests and unprivileged development hosts
+/// substitute values for a directory they own.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AttestorListenerOptions {
-    /// Exact owner UID the runtime directory and any stale socket must carry.
+    /// Exact owner UID the runtime directory must carry
+    /// (`runtimeDirectoryOwner`; root in the installed authority).
     pub required_directory_owner_uid: u32,
     /// Exact mode bits (`& 0o7777`) the runtime directory must carry.
     pub required_directory_mode: u32,
+    /// Exact owner UID a stale socket must carry before it may be removed
+    /// (`socketOwner`; the attestor account that created it).
+    pub required_socket_owner_uid: u32,
     /// Mode bits applied to the bound socket before `listen`.
     pub socket_mode: u32,
 }
@@ -126,14 +134,16 @@ impl AttestorListener {
             return Err(AttestorListenerError::UntrustedDirectory);
         }
 
-        // Remove only a verified stale socket owned by the declared owner;
-        // never any other object. There is no socket unit and exactly one
-        // admitted attestor per generation directory, so a socket here can
-        // only be a leftover of a previous run of this same identity.
+        // Remove only a verified stale socket owned by the declared socket
+        // owner (not the directory owner: the installed directory is
+        // root-owned while the socket belongs to the attestor account that
+        // created it); never any other object. There is no socket unit and
+        // exactly one admitted attestor per generation directory, so a socket
+        // here can only be a leftover of a previous run of this same identity.
         match rustix::fs::statat(&parent_fd, name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(stat) => {
                 if FileType::from_raw_mode(stat.st_mode) != FileType::Socket
-                    || stat.st_uid != options.required_directory_owner_uid
+                    || stat.st_uid != options.required_socket_owner_uid
                 {
                     return Err(AttestorListenerError::PathOccupied);
                 }
@@ -240,6 +250,7 @@ mod tests {
         AttestorListenerOptions {
             required_directory_owner_uid: rustix::process::geteuid().as_raw(),
             required_directory_mode: mode,
+            required_socket_owner_uid: rustix::process::geteuid().as_raw(),
             socket_mode: 0o660,
         }
     }
@@ -304,6 +315,31 @@ mod tests {
             AttestorListener::bind(&path, &options(0o700), &test_guard()),
             Err(AttestorListenerError::PathOccupied)
         ));
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// Stale-socket removal validates the separately declared socket owner
+    /// (`socketOwner`), not the directory owner: with a root-owned rev-1.2
+    /// runtime directory the leftover socket still belongs to the attestor
+    /// account, and a socket owned by anyone else fails closed.
+    #[tokio::test]
+    async fn stale_socket_owner_is_validated_separately_from_the_directory_owner() {
+        let dir = unique_dir(0o700);
+        let path = dir.join("control.sock");
+        let first =
+            AttestorListener::bind(&path, &options(0o700), &test_guard()).expect("first bind");
+        drop(first);
+        // Same directory authority, but the declared socket owner does not
+        // match the leftover socket: fail closed instead of unlinking.
+        let mut wrong_socket_owner = options(0o700);
+        wrong_socket_owner.required_socket_owner_uid =
+            rustix::process::geteuid().as_raw().wrapping_add(1);
+        assert!(matches!(
+            AttestorListener::bind(&path, &wrong_socket_owner, &test_guard()),
+            Err(AttestorListenerError::PathOccupied)
+        ));
+        // The stale socket was not removed by the failed bind.
+        assert!(std::fs::symlink_metadata(&path).is_ok());
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 

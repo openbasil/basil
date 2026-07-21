@@ -68,9 +68,17 @@ boundary (`basil-rslz`: non-dumpable + thread-synchronized seccomp; the engaged
 `basil-attestor-lockdown-g<gen>` profile identity is generation-bound, and only the
 returned guard can bind), then bind the realm control socket and advertise `Type=notify`
 readiness — there is deliberately no socket unit, so `SO_PEERCRED`/`SO_PEERPIDFD` name
-the attestor process itself. The listener enforces the enrolled broker UID before any
-protocol byte; until attestor-side session authentication lands (`basil-daaf`) every
-accepted connection is then rejected fail-closed. Installed and confined by
+the attestor process itself. The bind validates the SPEC rev-1.2 listener topology:
+the runtime directory must carry the root owner installed by the authority transaction
+(`--directory-owner-uid`, default 0) while a stale socket is removed only when owned by
+the separately declared socket owner (`--socket-owner-uid`, default the attestor's own
+UID). The enrollment-installed `/etc/basil/attestors/<realm>/broker.toml` trust anchor
+(schema `basil-attestor-broker-trust` v1) must load at startup; each accepted
+connection's kernel credentials, race-free `SO_PEERPIDFD` pidfd, PID/start time, and
+exact broker system unit are verified against it and bound into a `VerifiedPeerBinding`
+before any protocol byte — with no broker executable measurement or release admission.
+Until session construction on that binding lands (`basil-agrz`) every verified
+connection is then rejected fail-closed. Installed and confined by
 enrollment/packaging, not run by hand.
 
 ## Feature flags
