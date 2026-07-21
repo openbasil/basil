@@ -115,10 +115,21 @@ impl HelperListener {
     /// observable with wider permissions (callers should also run with a
     /// restrictive umask).
     ///
+    /// The `_lockdown` witness makes the ordered lockdown contract
+    /// (`basil-rslz`) a compile-time property: the helper endpoint cannot be
+    /// created unless [`crate::attestor_protocol::engage`] has already returned
+    /// a [`LockdownGuard`], i.e. the allowlist is loaded, the process is
+    /// non-dumpable, and the thread-synchronized seccomp filters are installed
+    /// and verified.
+    ///
     /// # Errors
     ///
     /// Returns [`TransportError`] on trust-check or socket failures.
-    pub fn bind(path: &Path, options: &HelperEndpointOptions) -> Result<Self, TransportError> {
+    pub fn bind(
+        path: &Path,
+        options: &HelperEndpointOptions,
+        _lockdown: &super::super::lockdown::LockdownGuard,
+    ) -> Result<Self, TransportError> {
         let parent = path.parent().ok_or(TransportError::InvalidPath)?;
         let name = path.file_name().ok_or(TransportError::InvalidPath)?;
         let parent_fd = rustix::fs::open(
@@ -392,8 +403,24 @@ impl AsFd for HelperConnection {
 mod tests {
     use std::os::fd::AsFd as _;
 
+    use std::num::NonZeroU64;
+
+    use super::super::super::lockdown::{LockdownGuard, LockdownProfileId, LockdownProfileKind};
     use super::super::wire::MAX_REQUEST_BYTES;
     use super::*;
+
+    /// A helper lockdown witness for bind tests, constructed without engaging
+    /// seccomp (engaging inside the shared cargo-test process would filter or
+    /// kill it).
+    fn test_guard() -> LockdownGuard {
+        let profile = LockdownProfileId::new(
+            "basil-measure-helper-lockdown-g1",
+            NonZeroU64::new(1).expect("nonzero"),
+            LockdownProfileKind::MeasureHelperV1,
+        )
+        .expect("valid helper test profile");
+        LockdownGuard::for_test(profile)
+    }
 
     #[test]
     fn round_trips_one_datagram_with_one_descriptor() {
@@ -487,7 +514,7 @@ mod tests {
             socket_mode: 0o600,
         };
 
-        let listener = HelperListener::bind(&path, &options).expect("bind");
+        let listener = HelperListener::bind(&path, &options, &test_guard()).expect("bind");
         let client = HelperConnection::connect(&path).expect("connect");
         let server = listener.accept().expect("accept");
         client.send(b"ping", &[]).expect("send");
@@ -511,7 +538,7 @@ mod tests {
         }
 
         // Restart: the stale socket file is unlinked and rebinding works.
-        let listener = HelperListener::bind(&path, &options).expect("rebind");
+        let listener = HelperListener::bind(&path, &options, &test_guard()).expect("rebind");
         let client2 = HelperConnection::connect(&path).expect("reconnect");
         let server2 = listener.accept().expect("accept");
         client2.send(b"pong", &[]).expect("send");
@@ -539,7 +566,7 @@ mod tests {
             socket_mode: 0o600,
         };
         assert!(matches!(
-            HelperListener::bind(&path, &options),
+            HelperListener::bind(&path, &options, &test_guard()),
             Err(TransportError::PathOccupied)
         ));
         let _ = std::fs::remove_dir_all(&base);

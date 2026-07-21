@@ -29,6 +29,89 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 4096;
 /// Default accepted-transport ceiling for one listener.
 pub const DEFAULT_MAX_CONNECTIONS_PER_LISTENER: usize = 1024;
 
+/// Default accepted-transport ceiling across every host-type listener.
+pub const DEFAULT_MAX_CONNECTIONS_HOST: usize = 1024;
+
+/// Default accepted-transport ceiling across every container-type listener.
+///
+/// Compiled strictly below [`DEFAULT_MAX_CONNECTIONS`] so container workloads
+/// can never occupy the whole global ceiling: the host/operator surface always
+/// retains `DEFAULT_MAX_CONNECTIONS - DEFAULT_MAX_CONNECTIONS_CONTAINER`
+/// admittable connections, whatever the container side does (`basil-22pt`).
+pub const DEFAULT_MAX_CONNECTIONS_CONTAINER: usize = 3072;
+
+/// Compiled accepted-transport ceilings enforced by [`ConnectionRegistry`].
+///
+/// All four are hard safety ceilings, not tuning knobs: admission fairness and
+/// stream quotas key on connection-scoped state, so connection counts must be
+/// bounded for their churn/memory bounds to hold (admission design rev 1.1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectionCeilings {
+    /// Broker-wide bound across every listener.
+    pub maximum: usize,
+    /// Bound for one named listener.
+    pub maximum_per_listener: usize,
+    /// Bound across every host-type listener.
+    pub maximum_host: usize,
+    /// Bound across every container-type listener.
+    pub maximum_container: usize,
+}
+
+impl ConnectionCeilings {
+    /// The compiled production ceilings.
+    #[must_use]
+    pub const fn compiled() -> Self {
+        Self {
+            maximum: DEFAULT_MAX_CONNECTIONS,
+            maximum_per_listener: DEFAULT_MAX_CONNECTIONS_PER_LISTENER,
+            maximum_host: DEFAULT_MAX_CONNECTIONS_HOST,
+            maximum_container: DEFAULT_MAX_CONNECTIONS_CONTAINER,
+        }
+    }
+
+    /// Ceiling for one listener type.
+    #[must_use]
+    pub const fn maximum_for_type(&self, listener_type: ListenerType) -> usize {
+        match listener_type {
+            ListenerType::Host => self.maximum_host,
+            ListenerType::Container => self.maximum_container,
+        }
+    }
+
+    const fn is_coherent(&self) -> bool {
+        self.maximum != 0
+            && self.maximum_per_listener != 0
+            && self.maximum_host != 0
+            && self.maximum_container != 0
+            && self.maximum_per_listener <= self.maximum
+            && self.maximum_host <= self.maximum
+            && self.maximum_container <= self.maximum
+    }
+}
+
+/// Live per-listener-type connection counts.
+#[derive(Clone, Copy, Debug, Default)]
+struct TypeCounts {
+    host: usize,
+    container: usize,
+}
+
+impl TypeCounts {
+    const fn get(self, listener_type: ListenerType) -> usize {
+        match listener_type {
+            ListenerType::Host => self.host,
+            ListenerType::Container => self.container,
+        }
+    }
+
+    const fn count_mut(&mut self, listener_type: ListenerType) -> &mut usize {
+        match listener_type {
+            ListenerType::Host => &mut self.host,
+            ListenerType::Container => &mut self.container,
+        }
+    }
+}
+
 /// Stable, process-lifetime connection identifier.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ConnectionId(u64);
@@ -215,6 +298,9 @@ pub enum ConnectionRegistryError {
     /// One listener's accepted-transport ceiling has been reached.
     #[error("listener `{0}` connection limit reached")]
     ListenerLimit(String),
+    /// One listener type's accepted-transport ceiling has been reached.
+    #[error("listener type `{0}` connection limit reached")]
+    ListenerTypeLimit(ListenerType),
     /// The process-lifetime monotonic identifier space is exhausted.
     #[error("connection identifier space exhausted")]
     IdExhausted,
@@ -239,8 +325,7 @@ pub struct ConnectionRegistry {
 }
 
 struct RegistryInner {
-    maximum: usize,
-    maximum_per_listener: usize,
+    ceilings: ConnectionCeilings,
     state: Mutex<RegistryState>,
     rewire: super::rewire::RewireLedger,
 }
@@ -249,6 +334,7 @@ struct RegistryState {
     next_id: Option<u64>,
     entries: BTreeMap<ConnectionId, RegistryEntry>,
     listener_counts: BTreeMap<Arc<str>, usize>,
+    type_counts: TypeCounts,
     gated_listeners: BTreeSet<Arc<str>>,
 }
 
@@ -263,22 +349,14 @@ impl ConnectionRegistry {
     /// Construct a registry with the compiled safety ceilings.
     #[must_use]
     pub fn with_defaults() -> Self {
-        Self {
-            inner: Arc::new(RegistryInner {
-                maximum: DEFAULT_MAX_CONNECTIONS,
-                maximum_per_listener: DEFAULT_MAX_CONNECTIONS_PER_LISTENER,
-                state: Mutex::new(RegistryState {
-                    next_id: Some(1),
-                    entries: BTreeMap::new(),
-                    listener_counts: BTreeMap::new(),
-                    gated_listeners: BTreeSet::new(),
-                }),
-                rewire: super::rewire::RewireLedger::default(),
-            }),
-        }
+        Self::from_ceilings(ConnectionCeilings::compiled())
     }
 
     /// Construct a registry with hard global and per-listener limits.
+    ///
+    /// The per-listener-type ceilings coincide with the global limit, so this
+    /// constructor bounds only the global and per-listener dimensions; use
+    /// [`ConnectionRegistry::with_ceilings`] to bound listener types.
     ///
     /// # Errors
     ///
@@ -288,22 +366,42 @@ impl ConnectionRegistry {
         maximum: usize,
         maximum_per_listener: usize,
     ) -> Result<Self, ConnectionRegistryError> {
-        if maximum == 0 || maximum_per_listener == 0 || maximum_per_listener > maximum {
+        Self::with_ceilings(ConnectionCeilings {
+            maximum,
+            maximum_per_listener,
+            maximum_host: maximum,
+            maximum_container: maximum,
+        })
+    }
+
+    /// Construct a registry with explicit global, per-listener, and
+    /// per-listener-type ceilings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConnectionRegistryError::InvalidLimit`] when any ceiling is
+    /// zero or exceeds the global ceiling.
+    pub fn with_ceilings(ceilings: ConnectionCeilings) -> Result<Self, ConnectionRegistryError> {
+        if !ceilings.is_coherent() {
             return Err(ConnectionRegistryError::InvalidLimit);
         }
-        Ok(Self {
+        Ok(Self::from_ceilings(ceilings))
+    }
+
+    fn from_ceilings(ceilings: ConnectionCeilings) -> Self {
+        Self {
             inner: Arc::new(RegistryInner {
-                maximum,
-                maximum_per_listener,
+                ceilings,
                 state: Mutex::new(RegistryState {
                     next_id: Some(1),
                     entries: BTreeMap::new(),
                     listener_counts: BTreeMap::new(),
+                    type_counts: TypeCounts::default(),
                     gated_listeners: BTreeSet::new(),
                 }),
                 rewire: super::rewire::RewireLedger::default(),
             }),
-        })
+        }
     }
 
     /// Register an accepted stream before it is yielded to tonic.
@@ -329,13 +427,18 @@ impl ConnectionRegistry {
                 listener_name.to_string(),
             ));
         }
-        if state.entries.len() >= self.inner.maximum {
+        if state.entries.len() >= self.inner.ceilings.maximum {
             return Err(ConnectionRegistryError::GlobalLimit);
+        }
+        if state.type_counts.get(listener_type)
+            >= self.inner.ceilings.maximum_for_type(listener_type)
+        {
+            return Err(ConnectionRegistryError::ListenerTypeLimit(listener_type));
         }
         if state
             .listener_counts
             .get(&listener_name)
-            .is_some_and(|count| *count >= self.inner.maximum_per_listener)
+            .is_some_and(|count| *count >= self.inner.ceilings.maximum_per_listener)
         {
             return Err(ConnectionRegistryError::ListenerLimit(
                 listener_name.to_string(),
@@ -371,6 +474,10 @@ impl ConnectionRegistry {
             .entry(listener_name)
             .and_modify(|count| *count += 1)
             .or_insert(1);
+        {
+            let type_count = state.type_counts.count_mut(listener_type);
+            *type_count = type_count.saturating_add(1);
+        }
         drop(state);
 
         Ok(TrackedUnixStream {
@@ -508,6 +615,19 @@ impl ConnectionRegistry {
             .get(listener_name)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Active connection count across every listener of one type.
+    #[must_use]
+    pub fn active_for_type(&self, listener_type: ListenerType) -> usize {
+        let state = lock_state(&self.inner);
+        state.type_counts.get(listener_type)
+    }
+
+    /// The ceilings this registry enforces.
+    #[must_use]
+    pub fn ceilings(&self) -> ConnectionCeilings {
+        self.inner.ceilings
     }
 
     /// The process-lifetime persistent listener rewire diagnostics.
@@ -665,8 +785,7 @@ impl fmt::Debug for ConnectionRegistry {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ConnectionRegistry")
-            .field("maximum", &self.inner.maximum)
-            .field("maximum_per_listener", &self.inner.maximum_per_listener)
+            .field("ceilings", &self.inner.ceilings)
             .finish_non_exhaustive()
     }
 }
@@ -683,6 +802,10 @@ fn release(inner: &RegistryInner, id: ConnectionId) {
     let Some(entry) = state.entries.remove(&id) else {
         return;
     };
+    {
+        let type_count = state.type_counts.count_mut(entry.context.listener_type);
+        *type_count = type_count.saturating_sub(1);
+    }
     let listener_name = entry.context.listener_name;
     let remove_count = match state.listener_counts.get_mut(&listener_name) {
         Some(count) if *count > 1 => {
@@ -809,6 +932,112 @@ mod tests {
             ConnectionRegistry::new(1, 2),
             Err(ConnectionRegistryError::InvalidLimit)
         ));
+        for broken in [
+            ConnectionCeilings {
+                maximum_host: 0,
+                ..ConnectionCeilings::compiled()
+            },
+            ConnectionCeilings {
+                maximum_container: 0,
+                ..ConnectionCeilings::compiled()
+            },
+            ConnectionCeilings {
+                maximum_host: DEFAULT_MAX_CONNECTIONS + 1,
+                ..ConnectionCeilings::compiled()
+            },
+            ConnectionCeilings {
+                maximum_container: DEFAULT_MAX_CONNECTIONS + 1,
+                ..ConnectionCeilings::compiled()
+            },
+        ] {
+            assert!(matches!(
+                ConnectionRegistry::with_ceilings(broken),
+                Err(ConnectionRegistryError::InvalidLimit)
+            ));
+        }
+    }
+
+    /// The compiled defaults guarantee host/operator headroom: container
+    /// listeners can never occupy the whole global ceiling (basil-22pt).
+    #[test]
+    fn compiled_ceilings_reserve_host_headroom() {
+        let compiled = ConnectionCeilings::compiled();
+        assert!(compiled.is_coherent());
+        assert!(compiled.maximum_container < compiled.maximum);
+        assert!(
+            compiled.maximum - compiled.maximum_container >= DEFAULT_MAX_CONNECTIONS_HOST,
+            "container exhaustion must leave a full host ceiling admittable"
+        );
+        assert_eq!(
+            compiled.maximum_for_type(ListenerType::Host),
+            compiled.maximum_host
+        );
+        assert_eq!(
+            compiled.maximum_for_type(ListenerType::Container),
+            compiled.maximum_container
+        );
+        let registry = ConnectionRegistry::with_defaults();
+        assert_eq!(registry.ceilings(), compiled);
+    }
+
+    /// Listeners of one type share that type's ceiling even across distinct
+    /// listener names, and exhaustion is a typed rejection that releases with
+    /// the connections (basil-22pt).
+    #[tokio::test]
+    async fn listener_type_ceiling_is_shared_typed_and_released() {
+        let registry = ConnectionRegistry::with_ceilings(ConnectionCeilings {
+            maximum: 8,
+            maximum_per_listener: 8,
+            maximum_host: 1,
+            maximum_container: 2,
+        })
+        .expect("registry");
+
+        let (stream, _peer_a) = pair();
+        let first = registry
+            .register(stream, "c1", ListenerType::Container)
+            .expect("first container connection");
+        let (stream, _peer_b) = pair();
+        let second = registry
+            .register(stream, "c2", ListenerType::Container)
+            .expect("second container listener shares the type ceiling");
+        assert_eq!(registry.active_for_type(ListenerType::Container), 2);
+
+        // A third container listener name is still bounded by the type.
+        let (stream, _peer_c) = pair();
+        assert!(matches!(
+            registry.register(stream, "c3", ListenerType::Container),
+            Err(ConnectionRegistryError::ListenerTypeLimit(
+                ListenerType::Container
+            ))
+        ));
+
+        // Container exhaustion never starves the host type.
+        let (stream, _peer_d) = pair();
+        let host = registry
+            .register(stream, "host", ListenerType::Host)
+            .expect("host headroom survives container exhaustion");
+        assert_eq!(registry.active_for_type(ListenerType::Host), 1);
+        let (stream, _peer_e) = pair();
+        assert!(matches!(
+            registry.register(stream, "host2", ListenerType::Host),
+            Err(ConnectionRegistryError::ListenerTypeLimit(
+                ListenerType::Host
+            ))
+        ));
+
+        // Release restores type capacity.
+        drop(second);
+        assert_eq!(registry.active_for_type(ListenerType::Container), 1);
+        let (stream, _peer_f) = pair();
+        let third = registry
+            .register(stream, "c3", ListenerType::Container)
+            .expect("released type capacity is reusable");
+        drop(third);
+        drop(first);
+        drop(host);
+        assert_eq!(registry.active_for_type(ListenerType::Container), 0);
+        assert_eq!(registry.active_for_type(ListenerType::Host), 0);
     }
 
     #[tokio::test]

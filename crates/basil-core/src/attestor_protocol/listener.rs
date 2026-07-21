@@ -35,6 +35,7 @@ use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
 use thiserror::Error;
 
 use super::PeerCredentials;
+use super::lockdown::LockdownGuard;
 
 /// Declared measurement-authority facts the bind enforces.
 ///
@@ -92,10 +93,13 @@ pub struct AttestorListener {
 impl AttestorListener {
     /// Bind the realm control socket inside the installed runtime directory.
     ///
-    /// Call only after every thread and long-lived descriptor exists and the
-    /// lockdown boundary has been engaged (see the module documentation).
-    /// Must run inside a tokio runtime (the listener registers with the
-    /// reactor).
+    /// The `_lockdown` witness makes the ordered lockdown contract
+    /// (`basil-rslz`) a compile-time property: this socket cannot be created
+    /// unless [`crate::attestor_protocol::engage`] has already returned a
+    /// [`LockdownGuard`], i.e. every thread and long-lived descriptor already
+    /// exists, the process is non-dumpable, and the thread-synchronized
+    /// seccomp filters are installed and verified. Must run inside a tokio
+    /// runtime (the listener registers with the reactor).
     ///
     /// # Errors
     ///
@@ -105,6 +109,7 @@ impl AttestorListener {
     pub fn bind(
         path: &Path,
         options: &AttestorListenerOptions,
+        _lockdown: &LockdownGuard,
     ) -> Result<Self, AttestorListenerError> {
         let parent = path.parent().ok_or(AttestorListenerError::InvalidPath)?;
         let name = path.file_name().ok_or(AttestorListenerError::InvalidPath)?;
@@ -198,9 +203,23 @@ impl AttestorListener {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU64;
     use std::os::unix::fs::PermissionsExt as _;
 
+    use super::super::lockdown::{LockdownProfileId, LockdownProfileKind};
     use super::*;
+
+    /// A lockdown witness for bind tests, constructed without engaging seccomp
+    /// (engaging inside the shared cargo-test process would filter or kill it).
+    fn test_guard() -> LockdownGuard {
+        let profile = LockdownProfileId::new(
+            "basil-attestor-lockdown-g1",
+            NonZeroU64::new(1).expect("nonzero"),
+            LockdownProfileKind::AttestorV1,
+        )
+        .expect("valid test profile");
+        LockdownGuard::for_test(profile)
+    }
 
     fn unique_dir(mode: u32) -> PathBuf {
         use std::fmt::Write as _;
@@ -225,11 +244,28 @@ mod tests {
         }
     }
 
+    /// The ordered lockdown contract is a compile-time property: `bind`
+    /// requires a `&LockdownGuard`, so it is unreachable before
+    /// `engage` produced one. This test documents that the socket is created
+    /// only with a guard in hand (the guard type has no public constructor
+    /// outside `engage`).
+    #[tokio::test]
+    async fn bind_requires_the_lockdown_witness() {
+        let dir = unique_dir(0o700);
+        let path = dir.join("control.sock");
+        let guard = test_guard();
+        assert_eq!(guard.profile().kind(), LockdownProfileKind::AttestorV1);
+        let listener =
+            AttestorListener::bind(&path, &options(0o700), &guard).expect("bind with guard");
+        assert_eq!(listener.path(), path.as_path());
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
     #[tokio::test]
     async fn binds_accepts_and_reports_connecting_peer_credentials() {
         let dir = unique_dir(0o700);
         let path = dir.join("control.sock");
-        let listener = AttestorListener::bind(&path, &options(0o700)).expect("bind");
+        let listener = AttestorListener::bind(&path, &options(0o700), &test_guard()).expect("bind");
         assert_eq!(listener.path(), path.as_path());
         let socket_mode = std::fs::metadata(&path).expect("stat").permissions().mode();
         assert_eq!(socket_mode & 0o7777, 0o660);
@@ -255,16 +291,17 @@ mod tests {
     async fn rebind_replaces_only_a_verified_stale_socket() {
         let dir = unique_dir(0o700);
         let path = dir.join("control.sock");
-        let first = AttestorListener::bind(&path, &options(0o700)).expect("first bind");
+        let first =
+            AttestorListener::bind(&path, &options(0o700), &test_guard()).expect("first bind");
         drop(first);
         // Restart: the stale socket file is verified and replaced.
-        let second = AttestorListener::bind(&path, &options(0o700)).expect("rebind");
+        let second = AttestorListener::bind(&path, &options(0o700), &test_guard()).expect("rebind");
         drop(second);
         // A non-socket object at the path fails closed.
         std::fs::remove_file(&path).expect("clear");
         std::fs::write(&path, b"not a socket").expect("occupy");
         assert!(matches!(
-            AttestorListener::bind(&path, &options(0o700)),
+            AttestorListener::bind(&path, &options(0o700), &test_guard()),
             Err(AttestorListenerError::PathOccupied)
         ));
         std::fs::remove_dir_all(&dir).expect("cleanup");
@@ -276,7 +313,7 @@ mod tests {
         let path = dir.join("control.sock");
         // Declared mode mismatch (authority declares 0700, directory is 0755).
         assert!(matches!(
-            AttestorListener::bind(&path, &options(0o700)),
+            AttestorListener::bind(&path, &options(0o700), &test_guard()),
             Err(AttestorListenerError::UntrustedDirectory)
         ));
         // Declared owner mismatch.
@@ -284,13 +321,13 @@ mod tests {
         wrong_owner.required_directory_owner_uid =
             rustix::process::geteuid().as_raw().wrapping_add(1);
         assert!(matches!(
-            AttestorListener::bind(&path, &wrong_owner),
+            AttestorListener::bind(&path, &wrong_owner, &test_guard()),
             Err(AttestorListenerError::UntrustedDirectory)
         ));
         // Missing directory.
         let missing = dir.join("absent").join("control.sock");
         assert!(matches!(
-            AttestorListener::bind(&missing, &options(0o755)),
+            AttestorListener::bind(&missing, &options(0o755), &test_guard()),
             Err(AttestorListenerError::UntrustedDirectory)
         ));
         // A symlinked runtime directory is never followed.
@@ -298,7 +335,7 @@ mod tests {
         let link = dir.join("link");
         std::os::unix::fs::symlink(&real, &link).expect("symlink");
         assert!(matches!(
-            AttestorListener::bind(&link.join("control.sock"), &options(0o700)),
+            AttestorListener::bind(&link.join("control.sock"), &options(0o700), &test_guard()),
             Err(AttestorListenerError::UntrustedDirectory)
         ));
         std::fs::remove_dir_all(&dir).expect("cleanup");

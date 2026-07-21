@@ -26,6 +26,9 @@ use basil_core::attestor_protocol::helper::{
     AllowlistLoadOptions, HelperConnection, HelperEndpointOptions, HelperListener, HelperService,
     InstalledAllowlist, host, serve_connection,
 };
+use basil_core::attestor_protocol::{
+    LockdownProfile, LockdownProfileId, LockdownProfileKind, engage,
+};
 use clap::Parser;
 
 /// Root-owned measurement helper for Basil attestor realms.
@@ -61,6 +64,42 @@ struct Args {
     /// is intended only for unprivileged development hosts.
     #[arg(long, default_value_t = 0)]
     required_owner_uid: u32,
+
+    /// Authority generation that installed this helper's unit and lockdown
+    /// profile.
+    ///
+    /// Binds the engaged lockdown-profile identity to a generation, matching
+    /// the generation-versioned helper authority (`basil-ln84`). Required: the
+    /// helper fails closed rather than engage an unversioned lockdown.
+    #[arg(long)]
+    lockdown_generation: std::num::NonZeroU64,
+
+    /// Checked, generation-qualified lockdown-profile identity to engage.
+    ///
+    /// Defaults to the canonical
+    /// `basil-measure-helper-lockdown-g<lockdown-generation>`. An override must
+    /// still be canonical and embed the exact `g<lockdown-generation>`
+    /// qualifier for the helper body.
+    #[arg(long)]
+    lockdown_profile: Option<String>,
+}
+
+/// Resolve and validate the lockdown-profile identity this helper engages.
+fn lockdown_profile(args: &Args) -> Result<LockdownProfile, String> {
+    let identity = args.lockdown_profile.clone().unwrap_or_else(|| {
+        format!(
+            "{}-g{}",
+            LockdownProfileKind::MeasureHelperV1.identity_base(),
+            args.lockdown_generation
+        )
+    });
+    let id = LockdownProfileId::new(
+        &identity,
+        args.lockdown_generation,
+        LockdownProfileKind::MeasureHelperV1,
+    )
+    .map_err(|error| format!("invalid lockdown profile `{identity}`: {error}"))?;
+    Ok(LockdownProfile::new(id))
 }
 
 /// Parse a 1-to-4 digit octal mode granting at most owner and group
@@ -121,12 +160,38 @@ fn main() -> ExitCode {
         "loaded installed helper policy generations"
     );
 
+    // ----- basil-rslz lockdown boundary -------------------------------------
+    // Engage the post-init lockdown after the allowlist and every long-lived
+    // descriptor exist, and before the endpoint is bound. The returned guard is
+    // required by `HelperListener::bind`, so binding is unreachable until
+    // lockdown is engaged: PR_SET_DUMPABLE(0), TSYNC seccomp install, verify.
+    // ------------------------------------------------------------------------
+    let profile = match lockdown_profile(&args) {
+        Ok(profile) => profile,
+        Err(error) => {
+            tracing::error!(%error, "invalid lockdown profile");
+            return ExitCode::FAILURE;
+        }
+    };
+    let lockdown = match engage(&profile) {
+        Ok(guard) => guard,
+        Err(error) => {
+            tracing::error!(%error, "failed to engage post-init lockdown before bind");
+            return ExitCode::FAILURE;
+        }
+    };
+    tracing::info!(
+        profile = lockdown.profile().as_str(),
+        "post-init lockdown engaged"
+    );
+
     let listener = match HelperListener::bind(
         &args.endpoint,
         &HelperEndpointOptions {
             required_parent_owner_uid: args.required_owner_uid,
             socket_mode: args.socket_mode,
         },
+        &lockdown,
     ) {
         Ok(listener) => listener,
         Err(error) => {
@@ -179,11 +244,14 @@ mod tests {
 
     use clap::Parser;
 
-    use super::{Args, DEFAULT_MANIFEST_DIRECTORY, parse_octal_mode};
+    use super::{
+        Args, DEFAULT_MANIFEST_DIRECTORY, LockdownProfileKind, lockdown_profile, parse_octal_mode,
+    };
 
     #[test]
     fn manifest_dir_defaults_to_the_production_store() {
-        let args = Args::try_parse_from(["basil-measure-helper"]).unwrap();
+        let args =
+            Args::try_parse_from(["basil-measure-helper", "--lockdown-generation", "1"]).unwrap();
         assert_eq!(args.manifest_dir, Path::new(DEFAULT_MANIFEST_DIRECTORY));
         // The default trust anchor stays root; nothing is loosened implicitly.
         assert_eq!(args.required_owner_uid, 0);
@@ -193,6 +261,8 @@ mod tests {
     fn manifest_dir_and_required_owner_uid_override_together() {
         let args = Args::try_parse_from([
             "basil-measure-helper",
+            "--lockdown-generation",
+            "1",
             "--manifest-dir",
             "/home/dev/manifests",
             "--required-owner-uid",
@@ -201,6 +271,47 @@ mod tests {
         .unwrap();
         assert_eq!(args.manifest_dir, Path::new("/home/dev/manifests"));
         assert_eq!(args.required_owner_uid, 1000);
+    }
+
+    #[test]
+    fn lockdown_generation_is_required() {
+        assert!(Args::try_parse_from(["basil-measure-helper"]).is_err());
+    }
+
+    #[test]
+    fn lockdown_profile_defaults_to_the_canonical_generation_identity() {
+        let args =
+            Args::try_parse_from(["basil-measure-helper", "--lockdown-generation", "5"]).unwrap();
+        let profile = lockdown_profile(&args).expect("canonical profile");
+        assert_eq!(
+            profile.identity().as_str(),
+            "basil-measure-helper-lockdown-g5"
+        );
+        assert_eq!(profile.kind(), LockdownProfileKind::MeasureHelperV1);
+    }
+
+    #[test]
+    fn lockdown_profile_rejects_wrong_generation_or_body() {
+        // Override naming a different generation than declared.
+        let args = Args::try_parse_from([
+            "basil-measure-helper",
+            "--lockdown-generation",
+            "5",
+            "--lockdown-profile",
+            "basil-measure-helper-lockdown-g4",
+        ])
+        .unwrap();
+        assert!(lockdown_profile(&args).is_err());
+        // Override naming the attestor body.
+        let args = Args::try_parse_from([
+            "basil-measure-helper",
+            "--lockdown-generation",
+            "5",
+            "--lockdown-profile",
+            "basil-attestor-lockdown-g5",
+        ])
+        .unwrap();
+        assert!(lockdown_profile(&args).is_err());
     }
 
     #[test]

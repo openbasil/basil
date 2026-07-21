@@ -29,6 +29,7 @@ mod codec;
 pub mod helper;
 mod limits;
 pub mod listener;
+pub mod lockdown;
 mod session;
 
 /// Generated private protocol messages.
@@ -46,6 +47,10 @@ pub use limits::{
 };
 pub use listener::{
     AcceptedRealmPeer, AttestorListener, AttestorListenerError, AttestorListenerOptions,
+};
+pub use lockdown::{
+    LockdownArch, LockdownError, LockdownGuard, LockdownProfile, LockdownProfileId,
+    LockdownProfileKind, engage,
 };
 pub use session::{
     ABSOLUTE_MAX_MEASURED_EXECUTABLE_BYTES, AttestorRequest, AttestorSession, BrokerSession,

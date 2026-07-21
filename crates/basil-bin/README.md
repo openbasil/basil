@@ -48,8 +48,15 @@ This crate also builds `basil-measure-helper`, the root-owned, capability-minimi
 measurement helper for attestor realms (one per host, on a single shared
 `SOCK_SEQPACKET` endpoint). It serves broker measurement requests under a root-owned,
 generation-versioned allowlist and holds no runtime API, key, or policy authority; see
-`docs/attestor-realm-contract/` for the protocol contract. It is installed and confined
-by enrollment/packaging, not run by hand.
+`docs/attestor-realm-contract/` for the protocol contract. Startup follows the lockdown
+contract (`basil-rslz`): the allowlist and manifest stores load first, then the process
+engages the post-init lockdown (non-dumpable + thread-synchronized seccomp; the helper
+profile denies all `clone`), and only the returned guard can bind the endpoint. The
+required `--lockdown-generation` binds the engaged
+`basil-measure-helper-lockdown-g<gen>` profile identity to the installed authority
+generation (an explicit `--lockdown-profile` override must still validate as exactly
+that identity shape). It is installed and confined by enrollment/packaging, not run by
+hand.
 
 ## basil-attestor
 
@@ -57,7 +64,9 @@ This crate also builds `basil-attestor`, the per-realm, per-generation runtime-a
 process the generation-qualified `basil-attestor-<realm>-g<gen>.service` unit starts
 (packaged at `/usr/libexec/basil/basil-attestor`). Startup follows the lockdown
 contract: create every thread and long-lived descriptor, engage the post-init lockdown
-boundary (`basil-rslz`), then bind the realm control socket and advertise `Type=notify`
+boundary (`basil-rslz`: non-dumpable + thread-synchronized seccomp; the engaged
+`basil-attestor-lockdown-g<gen>` profile identity is generation-bound, and only the
+returned guard can bind), then bind the realm control socket and advertise `Type=notify`
 readiness — there is deliberately no socket unit, so `SO_PEERCRED`/`SO_PEERPIDFD` name
 the attestor process itself. The listener enforces the enrolled broker UID before any
 protocol byte; until attestor-side session authentication lands (`basil-daaf`) every

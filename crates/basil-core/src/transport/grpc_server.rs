@@ -67,6 +67,15 @@ impl FromStr for ListenerType {
     }
 }
 
+impl std::fmt::Display for ListenerType {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Host => "host",
+            Self::Container => "container",
+        })
+    }
+}
+
 /// Every gRPC service compiled into a Basil Unix listener.
 ///
 /// Keep this enum exhaustive and update [`ListenerType::exposes`] whenever a

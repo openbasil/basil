@@ -17,9 +17,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "proto/envoy/service/secret/v3/sds.proto",
     ];
 
+    let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
+
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
+        // Emit the compiled `FileDescriptorSet` so downstream crates can key
+        // compiled per-method registries (work-class classification, admission)
+        // on the same generated service/method names tonic routes by, instead
+        // of hand-typed path strings.
+        .file_descriptor_set_path(out_dir.join("basil_descriptor.bin"))
         // broker.proto uses proto3 `optional` fields. protoc stabilized these in
         // 3.15, but older toolchains (e.g. Ubuntu 22.04's apt protoc 3.12.4)
         // reject them unless this flag is set. Newer protoc accept it as a no-op,

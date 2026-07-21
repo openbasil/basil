@@ -28,7 +28,10 @@ use std::os::linux::net::SocketAddrExt as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use basil_core::attestor_protocol::{AttestorListener, AttestorListenerOptions};
+use basil_core::attestor_protocol::{
+    AttestorListener, AttestorListenerOptions, LockdownGuard, LockdownProfile, LockdownProfileId,
+    LockdownProfileKind, engage,
+};
 use basil_core::core::attestor_realm::RealmName;
 use clap::Parser;
 
@@ -75,6 +78,33 @@ struct Args {
     /// the only peer gate; when absent, every connection is rejected.
     #[arg(long)]
     broker_uid: Option<u32>,
+
+    /// Checked, generation-qualified lockdown-profile identity to engage.
+    ///
+    /// Defaults to the canonical `basil-attestor-lockdown-g<authority-generation>`.
+    /// An override must still be canonical and embed the exact
+    /// `g<authority-generation>` qualifier for the attestor body, so it can
+    /// never name a stale generation or the helper body.
+    #[arg(long)]
+    lockdown_profile: Option<String>,
+}
+
+/// Resolve and validate the lockdown-profile identity this process engages.
+fn lockdown_profile(args: &Args) -> Result<LockdownProfile, String> {
+    let identity = args.lockdown_profile.clone().unwrap_or_else(|| {
+        format!(
+            "{}-g{}",
+            LockdownProfileKind::AttestorV1.identity_base(),
+            args.authority_generation
+        )
+    });
+    let id = LockdownProfileId::new(
+        &identity,
+        args.authority_generation,
+        LockdownProfileKind::AttestorV1,
+    )
+    .map_err(|error| format!("invalid lockdown profile `{identity}`: {error}"))?;
+    Ok(LockdownProfile::new(id))
 }
 
 /// Validate the realm name against the closed realm grammar.
@@ -175,21 +205,43 @@ fn main() -> ExitCode {
 
     // ----- basil-rslz lockdown boundary -------------------------------------
     // The post-init lockdown primitive engages here, after every thread and
-    // long-lived descriptor exists and before the realm socket is bound:
-    // PR_SET_DUMPABLE(0), thread-synchronized (TSYNC) seccomp filter install,
-    // then filter verification. Tracked as basil-rslz; nothing is engaged
-    // today, and the manager-applied unit baseline filter is already active.
+    // long-lived descriptor exists (the current-thread runtime above and every
+    // fd opened by `bind` inside `serve` — note `bind` opens only the realm
+    // socket, which is the guarded operation itself) and before the realm
+    // socket is bound: PR_SET_DUMPABLE(0), thread-synchronized (TSYNC) seccomp
+    // filter install, then filter verification. The returned guard is required
+    // by `AttestorListener::bind`, so binding is unreachable until lockdown is
+    // engaged. The manager-applied unit baseline filter stacks additively.
     // ------------------------------------------------------------------------
+    let profile = match lockdown_profile(&args) {
+        Ok(profile) => profile,
+        Err(error) => {
+            tracing::error!(%error, "invalid lockdown profile");
+            return ExitCode::FAILURE;
+        }
+    };
+    let lockdown = match engage(&profile) {
+        Ok(guard) => guard,
+        Err(error) => {
+            tracing::error!(%error, "failed to engage post-init lockdown before bind");
+            return ExitCode::FAILURE;
+        }
+    };
+    tracing::info!(
+        profile = lockdown.profile().as_str(),
+        "post-init lockdown engaged"
+    );
 
-    runtime.block_on(serve(&args, &socket_path, &options))
+    runtime.block_on(serve(&args, &socket_path, &options, &lockdown))
 }
 
 async fn serve(
     args: &Args,
     socket_path: &std::path::Path,
     options: &AttestorListenerOptions,
+    lockdown: &LockdownGuard,
 ) -> ExitCode {
-    let listener = match AttestorListener::bind(socket_path, options) {
+    let listener = match AttestorListener::bind(socket_path, options, lockdown) {
         Ok(listener) => listener,
         Err(error) => {
             tracing::error!(%error, path = %socket_path.display(), "failed to bind the realm control socket");
