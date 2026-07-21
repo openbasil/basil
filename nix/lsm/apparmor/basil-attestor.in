@@ -29,10 +29,26 @@ profile basil-attestor-g@GEN@ flags=(attach_disconnected) {
   /run/podman/podman.sock rw,
   /run/user/[0-9]*/podman/podman.sock rw,
 
+  # Enrollment-installed broker trust anchor (SPEC.md rev 1.2): the anchor
+  # loader pins the parent directory and reads the leaf once; startup fails
+  # closed without it, so the confined lane must be able to read both.
+  /etc/basil/attestors/*/ r,
+  /etc/basil/attestors/*/broker.toml r,
+
   # Own /proc introspection for readiness and lockdown sequencing.
   /proc/self/ r,
   /proc/self/** r,
   /proc/sys/kernel/pid_max r,
+
+  # Broker peer verification evidence (SPEC.md rev 1.2): every accepted
+  # connection is verified against the anchor by reading the peer's
+  # status (UID slots), stat (start time), and cgroup (system unit)
+  # before any protocol byte. The peer PID is kernel-attested but
+  # arbitrary at this point, so the rules cover all PIDs; the deny on
+  # /proc/[0-9]*/mem below still wins.
+  /proc/[0-9]*/status r,
+  /proc/[0-9]*/stat r,
+  /proc/[0-9]*/cgroup r,
 
   # Executable, loader, and runtime.
   /usr/libexec/basil/basil-attestor mr,

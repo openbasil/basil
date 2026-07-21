@@ -16,7 +16,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::net::UnixStream;
 
 use super::attestor_realm::{
-    AuthenticatedRealmSession, RealmConfig, RealmConnection, RealmConnector, RealmError, RealmMode,
+    AuthenticatedRealmSession, RealmConfig, RealmConnection, RealmConnector, RealmError,
     RealmSession, SocketIdentity,
 };
 use super::catalog::evidence::SystemdEvidence;
@@ -480,6 +480,16 @@ fn parse_acl(bytes: &[u8]) -> Result<Vec<AclEntry>, RealmError> {
     Ok(parsed)
 }
 
+/// Verify the pinned attestor process's `systemd` placement against the
+/// protected measurement authority.
+///
+/// SPEC.md rev 1.2 requires an administrator-owned, generation-qualified
+/// SYSTEM service in **both** runtime modes: the evidence must name exactly
+/// `measurement.serviceUnit` under the system manager (`manager_user`
+/// absent), so a per-user-manager unit fails the exact comparison. Any
+/// `user.slice`, `user-<uid>.slice`, or `user@<uid>.service` cgroup
+/// placement additionally rejects in both modes; the pre-rev-1.2 rootless
+/// user-manager path no longer exists.
 fn verify_unit(config: &RealmConfig, pin: &PinnedProcess) -> Result<(), RealmError> {
     let expected = SystemdEvidence {
         unit: config.measurement.service_unit.clone(),
@@ -488,22 +498,21 @@ fn verify_unit(config: &RealmConfig, pin: &PinnedProcess) -> Result<(), RealmErr
             value.replace_range(at + 1..value.len() - ".service".len(), "");
             value
         }),
-        manager_user: match config.runtime_mode {
-            RealmMode::RootlessOwner => Some(config.attestor_user.uid()),
-            RealmMode::RootfulHost => None,
-        },
+        manager_user: None,
     };
     if pin.systemd_evidence() != Some(&expected) || pin.start_time_ticks() == 0 {
         return Err(RealmError::Authentication);
     }
-    if config.runtime_mode == RealmMode::RootlessOwner {
-        let component = format!("user-{}.slice", config.attestor_user.uid());
-        if !pin.cgroups().iter().any(|line| {
-            line.rsplit_once(':')
-                .is_some_and(|(_, path)| path.split('/').any(|actual| actual == component))
-        }) {
-            return Err(RealmError::Authentication);
-        }
+    // Independent of the resolved evidence above, any user-manager cgroup
+    // placement fails closed (a stale line could carry the placement even
+    // when unit resolution saw only the service component).
+    if pin.cgroups().iter().any(|line| {
+        line.rsplit_once(':').is_some_and(|(_, path)| {
+            path.split('/')
+                .any(crate::attestor_protocol::broker_trust::is_user_manager_component)
+        })
+    }) {
+        return Err(RealmError::Authentication);
     }
     Ok(())
 }
@@ -816,6 +825,209 @@ socketAcl = "basil-attestor-control-g1"
             .get(&RealmName::new("owner-podman").unwrap())
             .unwrap()
             .clone()
+    }
+
+    fn rootful_fixture_config(broker_uid: u32, attestor_uid: u32) -> RealmConfig {
+        let body = format!(
+            r#"
+schema = "agent"
+schemaVersion = 3
+[import]
+catalog = "catalog.json"
+policy = "policy.json"
+bundle = "bundle.json"
+[attestor.realms.production-docker]
+provider = "docker"
+runtimeMode = "rootful-host"
+brokerUser = "{broker_uid}"
+brokerUnit = "basil-agent.service"
+attestorUid = "{attestor_uid}"
+releaseRole = "docker-attestor"
+target = "x86_64-unknown-linux-gnu"
+protocol = 1
+capabilities = ["health", "query-instances", "resolve-peer"]
+[attestor.realms.production-docker.measurement]
+authorityGeneration = 1
+serviceUnit = "basil-attestor-production-docker-g1.service"
+helperEndpoint = "/run/basil/measure/control.sock"
+helperPolicy = "basil-measure-policy-g1"
+helperPolicyGeneration = 1
+lsmProfile = "selinux:basil_attestor_g1_t"
+lsmPolicy = "basil-attestor-policy-g1"
+lockdownProfile = "basil-attestor-lockdown-g1"
+runtimeDirectory = "/run/basil/attestors/production-docker/g1"
+runtimeDirectoryOwner = "0"
+runtimeDirectoryGroup = "{attestor_uid}"
+runtimeDirectoryMode = "0770"
+runtimeDirectoryAcl = "basil-attestor-bind-g1"
+socketPath = "/run/basil/attestors/production-docker/g1/control.sock"
+socketOwner = "{attestor_uid}"
+socketGroup = "{attestor_uid}"
+socketMode = "0660"
+socketAcl = "basil-attestor-control-g1"
+"#
+        );
+        let value: toml::Value = toml::from_str(&body).unwrap();
+        let realms = RealmSet::from_bootstrap(&value).unwrap();
+        realms
+            .get(&RealmName::new("production-docker").unwrap())
+            .unwrap()
+            .clone()
+    }
+
+    /// A pinned process whose `systemd` evidence and cgroup lines are
+    /// exactly the given fixtures (identity user-namespace mapping).
+    fn fixture_pin(
+        systemd: Option<crate::core::catalog::evidence::SystemdEvidence>,
+        cgroups: Vec<String>,
+    ) -> PinnedProcess {
+        use crate::core::catalog::evidence::CredentialSlots;
+        use crate::core::process_evidence::{
+            ExecutableObjectId, IdMapRange, NamespaceInodes, ProcessObservation,
+        };
+
+        let observation = ProcessObservation {
+            start_time_ticks: 10,
+            host_uids: CredentialSlots::uniform(800),
+            host_gids: CredentialSlots::uniform(800),
+            host_supplementary_gids: vec![800],
+            executable_digest: format!("sha256:{}", "a".repeat(64)),
+            executable_object: ExecutableObjectId {
+                device: 1,
+                inode: 7,
+                size: 10,
+                ctime_seconds: 1,
+                ctime_nanoseconds: 0,
+                mtime_seconds: 1,
+                mtime_nanoseconds: 0,
+            },
+            namespaces: NamespaceInodes {
+                user: 1,
+                pid: 2,
+                mount: 3,
+                network: 4,
+                ipc: 5,
+                uts: 6,
+            },
+            cgroups,
+            uid_map: vec![IdMapRange {
+                inside: 0,
+                outside: 0,
+                length: 65_536,
+            }],
+            gid_map: vec![IdMapRange {
+                inside: 0,
+                outside: 0,
+                length: 65_536,
+            }],
+            systemd,
+        };
+        PinnedProcess::capture_observation(
+            PeerCredentials {
+                pid: 42,
+                uid: 800,
+                gid: 800,
+            },
+            observation,
+        )
+        .unwrap()
+    }
+
+    fn system_evidence(unit: &str) -> SystemdEvidence {
+        SystemdEvidence {
+            unit: unit.to_string(),
+            template: None,
+            manager_user: None,
+        }
+    }
+
+    /// Rev 1.2: the exact administrator-owned generation-qualified system
+    /// unit is accepted in BOTH runtime modes.
+    #[test]
+    fn verify_unit_accepts_the_system_unit_in_both_modes() {
+        let cases = [
+            (
+                fixture_config(100, 200),
+                "basil-attestor-owner-podman-g1.service",
+            ),
+            (
+                rootful_fixture_config(100, 200),
+                "basil-attestor-production-docker-g1.service",
+            ),
+        ];
+        for (config, unit) in cases {
+            let pin = fixture_pin(
+                Some(system_evidence(unit)),
+                vec![format!("0::/system.slice/{unit}")],
+            );
+            assert_eq!(verify_unit(&config, &pin), Ok(()), "unit: {unit}");
+        }
+    }
+
+    /// A per-user-manager unit (`manager_user` present) rejects in both
+    /// modes; there is no rootless user-manager path in rev 1.2.
+    #[test]
+    fn verify_unit_rejects_user_manager_units() {
+        let config = fixture_config(100, 200);
+        let unit = "basil-attestor-owner-podman-g1.service";
+        let mut evidence = system_evidence(unit);
+        evidence.manager_user = Some(200);
+        let pin = fixture_pin(Some(evidence), vec![format!("0::/system.slice/{unit}")]);
+        assert_eq!(verify_unit(&config, &pin), Err(RealmError::Authentication));
+        // Rootful mode rejects a user-manager unit the same way.
+        let rootful = rootful_fixture_config(100, 200);
+        let mut evidence = system_evidence("basil-attestor-production-docker-g1.service");
+        evidence.manager_user = Some(200);
+        let pin = fixture_pin(
+            Some(evidence),
+            vec!["0::/system.slice/basil-attestor-production-docker-g1.service".to_string()],
+        );
+        assert_eq!(verify_unit(&rootful, &pin), Err(RealmError::Authentication));
+    }
+
+    /// User-manager cgroup placement rejects in both modes even when the
+    /// resolved unit evidence looks like the expected system unit.
+    #[test]
+    fn verify_unit_rejects_user_slice_cgroups() {
+        let unit = "basil-attestor-owner-podman-g1.service";
+        for placement in [
+            format!("0::/user.slice/user-200.slice/user@200.service/app.slice/{unit}"),
+            format!("0::/user.slice/{unit}"),
+            format!("0::/user-200.slice/{unit}"),
+        ] {
+            let config = fixture_config(100, 200);
+            let pin = fixture_pin(Some(system_evidence(unit)), vec![placement.clone()]);
+            assert_eq!(
+                verify_unit(&config, &pin),
+                Err(RealmError::Authentication),
+                "placement: {placement}"
+            );
+        }
+        // A second stale line carrying user-manager placement also rejects.
+        let config = rootful_fixture_config(100, 200);
+        let unit = "basil-attestor-production-docker-g1.service";
+        let pin = fixture_pin(
+            Some(system_evidence(unit)),
+            vec![
+                format!("0::/system.slice/{unit}"),
+                "1:name=systemd:/user.slice/user-200.slice".to_string(),
+            ],
+        );
+        assert_eq!(verify_unit(&config, &pin), Err(RealmError::Authentication));
+    }
+
+    /// A unit other than the pinned `measurement.serviceUnit` rejects.
+    #[test]
+    fn verify_unit_rejects_unit_mismatch() {
+        let config = fixture_config(100, 200);
+        let pin = fixture_pin(
+            Some(system_evidence("impostor.service")),
+            vec!["0::/system.slice/impostor.service".to_string()],
+        );
+        assert_eq!(verify_unit(&config, &pin), Err(RealmError::Authentication));
+        // Absent systemd evidence rejects.
+        let pin = fixture_pin(None, vec!["0::/system.slice".to_string()]);
+        assert_eq!(verify_unit(&config, &pin), Err(RealmError::Authentication));
     }
 
     #[test]

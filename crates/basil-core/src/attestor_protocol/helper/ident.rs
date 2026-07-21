@@ -66,22 +66,19 @@ pub fn is_valid_service_unit(unit: &str) -> bool {
         && unit.len() > ".service".len()
 }
 
-/// Check the generation-qualifier binding of an identity or unit name.
+/// Return every delimited `g<digits>` qualifier token embedded in `name`.
 ///
 /// A qualifier token is a `g` followed by one or more decimal digits with no
 /// ASCII-alphanumeric byte on either side (delimited by `-`, `_`, `:`, `.`,
-/// or a string edge). The name must embed at least one qualifier token, and
-/// every embedded token must equal the exact decimal `generation` with no
-/// leading zeros; a token naming any other generation fails closed.
+/// or a string edge).
 ///
 /// This mirrors the normative broker-loader grammar
 /// (`core::attestor_realm::generation_qualifiers`); the two scanners must
 /// stay behavior-identical so a helper policy identity is nameable by broker
 /// configuration exactly when the helper accepts it. Change both together.
-pub fn embeds_exact_generation(name: &str, generation: u64) -> bool {
-    let expected = format!("g{generation}");
+fn generation_qualifier_tokens(name: &str) -> Vec<&str> {
     let bytes = name.as_bytes();
-    let mut found = false;
+    let mut tokens = Vec::new();
     let mut previous: Option<u8> = None;
     let mut index = 0_usize;
     while let Some(&byte) = bytes.get(index) {
@@ -93,10 +90,9 @@ pub fn embeds_exact_generation(name: &str, generation: u64) -> bool {
             let has_digits = end > index.saturating_add(1);
             let delimited = !bytes.get(end).is_some_and(u8::is_ascii_alphanumeric);
             if has_digits && delimited {
-                if name.get(index..end) != Some(expected.as_str()) {
-                    return false;
+                if let Some(token) = name.get(index..end) {
+                    tokens.push(token);
                 }
-                found = true;
                 previous = Some(b'0');
                 index = end;
                 continue;
@@ -105,7 +101,27 @@ pub fn embeds_exact_generation(name: &str, generation: u64) -> bool {
         previous = Some(byte);
         index = index.saturating_add(1);
     }
-    found
+    tokens
+}
+
+/// Check the generation-qualifier binding of an identity or unit name.
+///
+/// The name must embed at least one qualifier token (see
+/// [`generation_qualifier_tokens`]), and every embedded token must equal the
+/// exact decimal `generation` with no leading zeros; a token naming any
+/// other generation fails closed.
+pub fn embeds_exact_generation(name: &str, generation: u64) -> bool {
+    let expected = format!("g{generation}");
+    let tokens = generation_qualifier_tokens(name);
+    !tokens.is_empty() && tokens.iter().all(|token| *token == expected)
+}
+
+/// Return whether `name` embeds any delimited generation-qualifier token.
+///
+/// Used to reject names the contract requires to be non-generation-qualified
+/// (for example `brokerUnit` in the attestor-side trust anchor).
+pub fn contains_generation_qualifier(name: &str) -> bool {
+    !generation_qualifier_tokens(name).is_empty()
 }
 
 /// Return whether `unit` ends in the exact `-g<generation>.service` qualifier.
@@ -190,6 +206,18 @@ mod tests {
         // A glued run is invisible, exactly like the broker loader; only the
         // delimited token binds.
         assert!(embeds_exact_generation("basil-g3x-g2", 2));
+    }
+
+    #[test]
+    fn qualifier_presence_matches_the_token_grammar() {
+        assert!(contains_generation_qualifier("basil-attestor-g1.service"));
+        assert!(contains_generation_qualifier("cfg.g2"));
+        assert!(contains_generation_qualifier("basil-g1-policy-g2"));
+        // Non-tokens: glued alphanumerics and bare names carry no qualifier.
+        assert!(!contains_generation_qualifier("basil-agent.service"));
+        assert!(!contains_generation_qualifier("config2"));
+        assert!(!contains_generation_qualifier("policy-g2x"));
+        assert!(!contains_generation_qualifier(""));
     }
 
     #[test]

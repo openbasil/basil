@@ -26,9 +26,12 @@
 # advertises readiness, so SO_PEERCRED/SO_PEERPIDFD name the attestor
 # process, never a launcher or PID 1.
 #
-# This is the rootful system-unit shape. The rootless-owner realm runs as a
-# user unit with a different entry mechanism; its confinement equivalence is
-# an open item recorded in nix/lsm/README.md.
+# Both runtime modes use this administrator-owned, generation-qualified
+# SYSTEM unit (SPEC.md rev 1.2 supersedes the earlier rootless user-manager
+# topology): a rootless-owner realm renders the same template with
+# User=@ATTESTOR_UID@ set to the non-root runtime owner plus the
+# generation-specific service-only supplementary bind group. User-manager
+# units are rejected by the broker's unit verification.
 #
 # LSM attachment is a distro-conditional drop-in rendered with the policy:
 #   10-selinux.conf:  [Service] SELinuxContext=system_u:system_r:basil_attestor_g@GEN@_t:s0
@@ -40,7 +43,13 @@ After=local-fs.target
 
 [Service]
 Type=notify
-ExecStart=@EXEC@ --realm @REALM@ --authority-generation @GEN@
+# The runtime directory is installed root-owned by the authority
+# transaction while the attestor account owns the socket it creates; the
+# broker trust anchor is the enrollment-installed root-owned broker.toml.
+ExecStart=@EXEC@ --realm @REALM@ --authority-generation @GEN@ \
+    --directory-owner-uid 0 \
+    --socket-owner-uid @ATTESTOR_UID@ \
+    --broker-trust-anchor /etc/basil/attestors/@REALM@/broker.toml
 Restart=on-failure
 RestartSec=1s
 
@@ -64,8 +73,13 @@ PrivateTmp=yes
 ReadWritePaths=@RUNTIME_DIR@
 ReadWritePaths=@CONTAINER_SOCKET@
 
-# Attestors never inspect other processes.
-ProtectProc=invisible
+# The attestor verifies its broker peer's procfs identity (UID slots,
+# start time, system unit) against the broker.toml trust anchor on every
+# accepted connection (SPEC.md rev 1.2), so other-user /proc entries must
+# stay visible: ProtectProc=invisible or =ptraceable would hide the broker
+# (the attestor holds no CAP_SYS_PTRACE). ProcSubset=pid still restricts
+# /proc to process directories only.
+ProtectProc=default
 ProcSubset=pid
 
 # Kernel and namespace surface.
