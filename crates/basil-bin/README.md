@@ -51,6 +51,19 @@ generation-versioned allowlist and holds no runtime API, key, or policy authorit
 `docs/attestor-realm-contract/` for the protocol contract. It is installed and confined
 by enrollment/packaging, not run by hand.
 
+## basil-attestor
+
+This crate also builds `basil-attestor`, the per-realm, per-generation runtime-attestor
+process the generation-qualified `basil-attestor-<realm>-g<gen>.service` unit starts
+(packaged at `/usr/libexec/basil/basil-attestor`). Startup follows the lockdown
+contract: create every thread and long-lived descriptor, engage the post-init lockdown
+boundary (`basil-rslz`), then bind the realm control socket and advertise `Type=notify`
+readiness — there is deliberately no socket unit, so `SO_PEERCRED`/`SO_PEERPIDFD` name
+the attestor process itself. The listener enforces the enrolled broker UID before any
+protocol byte; until attestor-side session authentication lands (`basil-daaf`) every
+accepted connection is then rejected fail-closed. Installed and confined by
+enrollment/packaging, not run by hand.
+
 ## Feature flags
 
 Features forward to `basil-core` and select which backends and unlock methods are compiled in.

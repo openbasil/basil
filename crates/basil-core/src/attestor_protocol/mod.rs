@@ -28,6 +28,7 @@
 mod codec;
 pub mod helper;
 mod limits;
+pub mod listener;
 mod session;
 
 /// Generated private protocol messages.
@@ -42,6 +43,9 @@ pub use limits::{
     ABSOLUTE_MAX_DIAGNOSTIC_BYTES, ABSOLUTE_MAX_FRAME_BYTES, ABSOLUTE_MAX_ID_MAP_RANGES,
     ABSOLUTE_MAX_INSTANCES, ABSOLUTE_MAX_INVENTORY_BYTES, ABSOLUTE_MAX_MOUNTS_PER_INSTANCE,
     ABSOLUTE_MAX_REQUEST_DEADLINE, ABSOLUTE_MAX_STRING_BYTES, LimitsError, ProtocolLimits,
+};
+pub use listener::{
+    AcceptedRealmPeer, AttestorListener, AttestorListenerError, AttestorListenerOptions,
 };
 pub use session::{
     ABSOLUTE_MAX_MEASURED_EXECUTABLE_BYTES, AttestorRequest, AttestorSession, BrokerSession,

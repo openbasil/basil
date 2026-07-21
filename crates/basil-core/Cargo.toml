@@ -131,6 +131,13 @@ proptest = { workspace = true }
 tokio-rustls = { workspace = true }
 tower = { workspace = true }
 
+# TEMPORARY bridge for the `SO_PEERPIDFD` sockopt (basil-2czo, per the
+# basil-xwiy maintainer decision): pinned to 0.30.x, declared in this crate
+# only, minimal `socket` feature, Linux-only. Removed once rustix grows the
+# sockopt (basil-cu2s).
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.30", default-features = false, features = ["socket"] }
+
 [build-dependencies]
 tonic-prost-build = { workspace = true }
 

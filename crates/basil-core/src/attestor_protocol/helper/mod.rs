@@ -23,13 +23,15 @@
 //!
 //! The helper holds no runtime API, key, or policy-decision authority; a
 //! helper outage fails only realms that need a new measurement. Host
-//! integration points that require facilities outside this crate's safe
-//! dependency set (the `SO_PEERPIDFD` socket option and the systemd D-Bus
-//! `GetUnitByPIDFD` transport) are dependency-injected behind traits in
-//! [`service`] with fail-closed production placeholders in [`host`].
+//! integration points are dependency-injected behind traits in [`service`]
+//! with production implementations in [`host`]: peer-pidfd acquisition is
+//! real (`SO_PEERPIDFD` via [`peer_pidfd`], kernel 6.5+, fail-closed
+//! below), while the systemd D-Bus `GetUnitByPIDFD` transport remains a
+//! fail-closed placeholder pending `basil-vww7`.
 
 pub mod allowlist;
 pub mod host;
+pub mod peer_pidfd;
 pub mod service;
 pub mod transport;
 pub mod wire;
@@ -38,6 +40,13 @@ pub(crate) mod ident;
 
 #[cfg(test)]
 mod conformance;
+
+/// Serializes tests that `fork`+`exec` a child against tests that assert a
+/// closed listener refuses connections: between `fork` and `exec` the child
+/// holds a copy of every parent descriptor (`CLOEXEC` closes only at
+/// `exec`), so a concurrently dropped listener can appear still-bound.
+#[cfg(test)]
+pub(crate) static CHILD_SPAWN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub use allowlist::{
     AllowlistError, AllowlistLoadOptions, AllowlistLookupError, InstalledAllowlist,

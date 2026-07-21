@@ -4,20 +4,17 @@
 
 //! Production host integrations for the measurement helper.
 //!
-//! Two integrations are fail-closed placeholders pending safe-wrapper
-//! availability (tracked as a follow-up to `basil-f215`):
-//!
-//! - [`KernelPeerPidfdSource`] must acquire the peer pidfd with the
-//!   `SO_PEERPIDFD` socket option. No crate in this workspace's safe
-//!   dependency set wraps that option yet (`unsafe_code` is forbidden, so a
-//!   raw `getsockopt` is not an option), and substituting
+//! - [`KernelPeerPidfdSource`] acquires the peer pidfd with the
+//!   `SO_PEERPIDFD` socket option via the bounded
+//!   [`peer_pidfd`](super::peer_pidfd) module (kernel 6.5+). There is no
+//!   fallback: on kernels without the option every measurement fails closed
+//!   with [`PeerPidfdError::Unsupported`], because substituting
 //!   `pidfd_open(SO_PEERCRED.pid)` would weaken the accepted revision-1.2
-//!   contract's race-free peer binding. Until the wrapper lands the source
-//!   returns [`PeerPidfdError::Unsupported`] and every measurement fails
-//!   closed.
-//! - [`SystemdUnitResolver`] must resolve `GetUnitByPIDFD` on the system
-//!   D-Bus. The workspace carries no D-Bus client; until a bounded transport
-//!   lands the resolver returns [`UnitResolveError::Unavailable`].
+//!   contract's race-free peer binding.
+//! - [`SystemdUnitResolver`] is a fail-closed placeholder: it must resolve
+//!   `GetUnitByPIDFD` on the system D-Bus, and the workspace carries no
+//!   D-Bus client. Until the bounded transport lands (`basil-vww7`) the
+//!   resolver returns [`UnitResolveError::Unavailable`].
 //!
 //! [`ProcfsProcessInspector`] and [`ProcExecutableOpener`] are real:
 //! identity comes from `/proc/<pid>/status` and `/proc/<pid>/stat`, and the
@@ -101,15 +98,16 @@ pub const UNPROVEN_LSM_PROFILE: &str = ":unproven-lsm";
 /// Same non-identity construction as [`UNPROVEN_LSM_PROFILE`].
 pub const UNPROVEN_LOCKDOWN_PROFILE: &str = ":unproven-lockdown";
 
-/// Fail-closed production source for the peer pidfd (`SO_PEERPIDFD`).
+/// Production source for the peer pidfd (`SO_PEERPIDFD`, kernel 6.5+).
+///
+/// Fail-closed on kernels without the option: the accepted contract
+/// requires the kernel's `SO_PEERPIDFD`, not a PID-derived pidfd.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct KernelPeerPidfdSource;
 
 impl PeerPidfdSource for KernelPeerPidfdSource {
-    fn peer_pidfd(&self, _stream: BorrowedFd<'_>) -> Result<OwnedFd, PeerPidfdError> {
-        // Fail closed: see the module documentation. The accepted contract
-        // requires the kernel's `SO_PEERPIDFD`, not a PID-derived pidfd.
-        Err(PeerPidfdError::Unsupported)
+    fn peer_pidfd(&self, stream: BorrowedFd<'_>) -> Result<OwnedFd, PeerPidfdError> {
+        super::peer_pidfd::acquire(stream)
     }
 }
 
@@ -876,7 +874,7 @@ lockdownProfile = "basil-attestor-lockdown-g1"
     }
 
     #[test]
-    fn placeholders_fail_closed() {
+    fn kernel_source_acquires_the_connected_peer_pidfd() {
         let (a, _b) = rustix::net::socketpair(
             rustix::net::AddressFamily::UNIX,
             rustix::net::SocketType::STREAM,
@@ -884,10 +882,26 @@ lockdownProfile = "basil-attestor-lockdown-g1"
             None,
         )
         .expect("socketpair");
-        assert_eq!(
-            KernelPeerPidfdSource.peer_pidfd(a.as_fd()).unwrap_err(),
-            PeerPidfdError::Unsupported
-        );
+        // The peer of a socketpair end is this test process; the production
+        // source must return a live pidfd for it on kernel 6.5+.
+        let pidfd = KernelPeerPidfdSource
+            .peer_pidfd(a.as_fd())
+            .expect("SO_PEERPIDFD supported");
+        let identity = ProcfsProcessInspector
+            .identity(std::process::id(), pidfd.as_fd())
+            .expect("identity");
+        assert_eq!(identity.uid, rustix::process::geteuid().as_raw());
+    }
+
+    #[test]
+    fn unit_resolver_placeholder_fails_closed() {
+        let (a, _b) = rustix::net::socketpair(
+            rustix::net::AddressFamily::UNIX,
+            rustix::net::SocketType::STREAM,
+            rustix::net::SocketFlags::CLOEXEC,
+            None,
+        )
+        .expect("socketpair");
         assert_eq!(
             SystemdUnitResolver.unit_by_pidfd(a.as_fd()).unwrap_err(),
             UnitResolveError::Unavailable

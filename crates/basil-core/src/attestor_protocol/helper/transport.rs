@@ -500,10 +500,15 @@ mod tests {
             b"ping"
         );
 
-        // Outage: with the listener gone, connect fails.
-        drop(listener);
-        drop(server);
-        assert!(HelperConnection::connect(&path).is_err());
+        // Outage: with the listener gone, connect fails. Serialized against
+        // child-spawning tests: a mid-`fork` child briefly holds a copy of
+        // the listening descriptor, which would keep the socket accepting.
+        {
+            let _spawn_guard = super::super::CHILD_SPAWN_TEST_LOCK.lock().unwrap();
+            drop(listener);
+            drop(server);
+            assert!(HelperConnection::connect(&path).is_err());
+        }
 
         // Restart: the stale socket file is unlinked and rebinding works.
         let listener = HelperListener::bind(&path, &options).expect("rebind");

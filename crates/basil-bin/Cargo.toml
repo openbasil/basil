@@ -65,6 +65,9 @@ clap = { workspace = true }
 clap_complete = { workspace = true }
 hex = { workspace = true }
 mimalloc = { workspace = true }
+# `basil-attestor` entrypoint: effective-UID default for the runtime-directory
+# owner check.
+rustix = { workspace = true }
 serde = { workspace = true, features = ["std"] }
 serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true }
