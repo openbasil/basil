@@ -67,7 +67,7 @@ clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 crypto_secretbox = { version = "0.1.1", default-features = false, features = ["alloc", "salsa20"] }
 data-encoding = { version = "2", default-features = false, features = ["alloc"] }
-db-keystore = "0.5.0-pre.2"
+db-keystore = "0.5.0"
 ed25519-dalek = { version = "3.0.0", default-features = false, features = ["zeroize"] }
 futures = "0.3"
 getrandom = { version = "0.4.3", default-features = false }
