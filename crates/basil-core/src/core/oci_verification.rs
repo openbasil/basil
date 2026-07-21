@@ -2659,11 +2659,20 @@ mod tests {
             executable: PathBuf,
             access: RegistryAccess,
         ) -> CosignVerifier {
+            self.verifier_with_registry_deadline(executable, access, Duration::from_secs(2))
+        }
+
+        fn verifier_with_registry_deadline(
+            &self,
+            executable: PathBuf,
+            access: RegistryAccess,
+            deadline: Duration,
+        ) -> CosignVerifier {
             let mut verifier = CosignVerifier::new(
                 CosignConfig {
                     executable,
                     temp_parent: self.root.clone(),
-                    deadline: Duration::from_secs(2),
+                    deadline,
                 },
                 access,
             )
@@ -3980,6 +3989,12 @@ printf '%s' '[{{"critical":{{"identity":{{"docker-reference":"registry.example/t
 
     #[tokio::test]
     async fn restart_rotation_reloads_the_registry_credential_snapshot() {
+        // Widen the cosign deadline well past the default 2s so a slow process
+        // spawn under full-suite parallel load cannot trip `Unavailable` before
+        // the fake executable returns its deterministic `Rejected`/success
+        // result (tracked as basil-mkcv). The script exits promptly, so the
+        // larger ceiling adds no wall-clock cost on the happy path.
+        let rotation_deadline = Duration::from_secs(30);
         let fixture = Fixture::new();
         let path = fixture.root.join("rotated-auth.json");
         fs::write(
@@ -4003,9 +4018,10 @@ case "$config" in
   *) printf 'UNAUTHORIZED: authentication required' >&2; exit 1 ;;
 esac"#
         );
-        let old_verifier = fixture.verifier_with_registry(
+        let old_verifier = fixture.verifier_with_registry_deadline(
             fixture.executable(&script_body),
             RegistryAccess::with_document(Some(old), BTreeMap::new()).unwrap(),
+            rotation_deadline,
         );
         assert_eq!(
             old_verifier
@@ -4017,9 +4033,10 @@ esac"#
                 .await,
             Err(OciVerificationError::Rejected)
         );
-        let new_verifier = fixture.verifier_with_registry(
+        let new_verifier = fixture.verifier_with_registry_deadline(
             fixture.executable(&script_body),
             RegistryAccess::with_document(Some(new), BTreeMap::new()).unwrap(),
+            rotation_deadline,
         );
         assert!(
             new_verifier

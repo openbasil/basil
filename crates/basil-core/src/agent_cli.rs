@@ -3375,6 +3375,14 @@ mod tests {
         });
 
         tracing::subscriber::with_default(subscriber, || {
+            // Callsite interest is cached process-wide. Under full-suite
+            // parallel load another test can register the
+            // `basil.configuration.source` callsite while only the global
+            // `NoSubscriber` default is active, caching `Interest::never()` so
+            // this scoped subscriber never sees the event (basil-yr0z). Setting
+            // a thread-local default does not rebuild that cache, so force a
+            // rebuild against the now-current subscriber before emitting.
+            tracing::callsite::rebuild_interest_cache();
             let result = finish_failed_config_load(
                 anyhow::anyhow!("original configuration error"),
                 std::slice::from_ref(&trace),
