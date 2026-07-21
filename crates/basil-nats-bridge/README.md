@@ -53,30 +53,30 @@ the broker authorizes the compound local ingress and verified signer:
 
 ```json
 {
-	"subjects": {
-		"content.publisher": {
-			"domain": "host-process",
-			"match": {
-				"all": [
-					{ "process.uid": 991 },
-					{
-						"invocation.signature-key": {
-							"algorithm": "nats-nkey",
-							"public": "UANATS_PUBLIC_NKEY"
-						}
-					}
-				]
-			}
-		}
-	},
-	"rules": [
-		{
-			"id": "publisher-can-use-invocation-signing",
-			"subjects": ["content.publisher"],
-			"action": ["op:decrypt", "op:sign"],
-			"target": ["broker.request_encryption.2026q3", "publisher.signing.2026q3"]
-		}
-	]
+  "subjects": {
+    "content.publisher": {
+      "domain": "host-process",
+      "match": {
+        "all": [
+          { "process.uid": 991 },
+          {
+            "invocation.signature-key": {
+              "algorithm": "nats-nkey",
+              "public": "UANATS_PUBLIC_NKEY"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "rules": [
+    {
+      "id": "publisher-can-use-invocation-signing",
+      "subjects": ["content.publisher"],
+      "action": ["op:decrypt", "op:sign"],
+      "target": ["broker.request_encryption.2026q3", "publisher.signing.2026q3"]
+    }
+  ]
 }
 ```
 
