@@ -21,6 +21,7 @@ require {
 	role system_r;
 	type init_t;
 	type proc_t;
+	type etc_t;
 	type basil_attestor_exec_t;
 	type basil_attestor_var_run_t;
 	class process { transition sigchld signull getattr };
@@ -72,6 +73,36 @@ allow basil_attestor_g@GEN@_t self:unix_stream_socket { create bind listen accep
 allow basil_attestor_g@GEN@_t proc_t:dir { search getattr read open };
 allow basil_attestor_g@GEN@_t proc_t:file { read open getattr };
 allow basil_attestor_g@GEN@_t self:process { getattr signull };
+
+########################################
+#
+# Enrollment-installed broker trust anchor (SPEC.md rev 1.2)
+#
+# /etc/basil/attestors/<realm>/broker.toml must load at startup (no
+# anchor-less mode; failure exits nonzero). The loader opens the pinned
+# parent directory and reads the leaf once. The anchor carries the default
+# /etc label; a dedicated anchor type is a follow-up alongside the broker
+# domain work (basil-9tj.28).
+#
+
+allow basil_attestor_g@GEN@_t etc_t:dir { search getattr read open };
+allow basil_attestor_g@GEN@_t etc_t:file { read open getattr };
+
+########################################
+#
+# Broker peer verification evidence (SPEC.md rev 1.2)
+#
+# Every accepted connection is verified against the anchor by reading the
+# peer's /proc/<pid>/{status,stat,cgroup} before any protocol byte. Those
+# entries are labeled with the peer's own domain, the peer is arbitrary
+# until verified, and the broker is not yet SELinux-confined (basil-9tj.28),
+# so the read is written against the domain attribute. Read-only process
+# metadata; the base module's neverallow keeps ptrace and capabilities off
+# every attestor domain.
+#
+
+allow basil_attestor_g@GEN@_t domain:dir { search getattr };
+allow basil_attestor_g@GEN@_t domain:file { read open getattr };
 
 ########################################
 #

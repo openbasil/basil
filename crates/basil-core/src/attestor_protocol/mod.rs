@@ -25,6 +25,7 @@
 //! point binding one session epoch's completed fact to its complete
 //! [`SessionPin`] token.
 
+pub mod broker_trust;
 mod codec;
 pub mod helper;
 mod limits;
@@ -38,6 +39,9 @@ pub mod wire {
     include!(concat!(env!("OUT_DIR"), "/basil.attestor.v1.rs"));
 }
 
+pub use broker_trust::{
+    BrokerTrustAnchor, BrokerTrustError, VerifiedBrokerPeer, verify_broker_peer,
+};
 pub use codec::{CapturedUnixStream, CodecError, FrameCodec, PeerCredentials, VerifiedPeerBinding};
 pub use limits::{
     ABSOLUTE_MAX_CAPABILITIES, ABSOLUTE_MAX_CAPABILITY_BYTES, ABSOLUTE_MAX_CHUNKS,

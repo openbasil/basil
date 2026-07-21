@@ -41,6 +41,10 @@ pub(crate) mod ident;
 #[cfg(test)]
 mod conformance;
 
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+mod cross_uid_proof;
+
 /// Serializes tests that `fork`+`exec` a child against tests that assert a
 /// closed listener refuses connections: between `fork` and `exec` the child
 /// holds a copy of every parent descriptor (`CLOEXEC` closes only at
