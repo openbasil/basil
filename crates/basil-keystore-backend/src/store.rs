@@ -102,7 +102,14 @@ enum StoreInner {
     #[cfg(not(any(feature = "db-keystore", feature = "onepassword")))]
     Unavailable,
     #[cfg(feature = "db-keystore")]
-    DbKeystore(Arc<CredentialStore>),
+    DbKeystore {
+        store: Arc<CredentialStore>,
+        /// Shared rekey advisory lock, held for the store's lifetime so an
+        /// offline `basil keystore rekey` cannot start while this store is
+        /// open (and vice versa). See `crate::rekey`.
+        #[cfg(target_os = "linux")]
+        _rekey_lock: std::os::fd::OwnedFd,
+    },
     #[cfg(feature = "onepassword")]
     OnePassword {
         provider: OnePasswordProvider,
@@ -134,6 +141,15 @@ impl SecretStore {
             }),
             #[cfg(feature = "db-keystore")]
             StoreConfig::DbKeystore { path, cipher, dek } => {
+                // Rekey fence + shared advisory lock (Linux): refuse to open
+                // while a rekey intent marker exists or a rekey holds the
+                // exclusive lock; otherwise hold the lock shared for the
+                // store's lifetime. Fail-closed, typed by message (the
+                // exhaustive `StoreError` mapping in basil-core pins the
+                // variant set; see basil-5n7b for a dedicated variant).
+                #[cfg(target_os = "linux")]
+                let rekey_lock = crate::rekey::guard_store_open(&path)
+                    .map_err(|e| StoreError::Backend(e.to_string()))?;
                 // Own the encoded DEK in zeroizing storage before writing its
                 // first byte, then lend it to db-keystore for decoding.
                 let hexkey = hex_key(dek.expose_secret());
@@ -146,7 +162,11 @@ impl SecretStore {
                 })
                 .map_err(|e| StoreError::Backend(keyring_error_summary(&e).to_owned()))?;
                 Ok(Self {
-                    inner: StoreInner::DbKeystore(store as Arc<CredentialStore>),
+                    inner: StoreInner::DbKeystore {
+                        store: store as Arc<CredentialStore>,
+                        #[cfg(target_os = "linux")]
+                        _rekey_lock: rekey_lock,
+                    },
                 })
             }
             #[cfg(feature = "onepassword")]
@@ -184,7 +204,7 @@ impl SecretStore {
                 Err(StoreError::Backend("no-keystore-backend-enabled".into()))
             }
             #[cfg(feature = "db-keystore")]
-            StoreInner::DbKeystore(store) => {
+            StoreInner::DbKeystore { store, .. } => {
                 let entry = store
                     .build(SERVICE, key, None)
                     .map_err(|e| StoreError::Backend(keyring_error_summary(&e).to_owned()))?;
@@ -222,7 +242,7 @@ impl SecretStore {
                 Err(StoreError::Backend("no-keystore-backend-enabled".into()))
             }
             #[cfg(feature = "db-keystore")]
-            StoreInner::DbKeystore(store) => {
+            StoreInner::DbKeystore { store, .. } => {
                 let entry = store
                     .build(SERVICE, key, None)
                     .map_err(|e| StoreError::Backend(keyring_error_summary(&e).to_owned()))?;
@@ -261,7 +281,7 @@ impl SecretStore {
                 Err(StoreError::Backend("no-keystore-backend-enabled".into()))
             }
             #[cfg(feature = "db-keystore")]
-            StoreInner::DbKeystore(store) => {
+            StoreInner::DbKeystore { store, .. } => {
                 let entry = store
                     .build(SERVICE, key, None)
                     .map_err(|e| StoreError::Backend(keyring_error_summary(&e).to_owned()))?;

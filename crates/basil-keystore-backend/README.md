@@ -38,6 +38,38 @@ module).
 - The crate holds storage adapters only. Policy, attestation, and auditing stay in `basil-core`;
   a store cannot be reached except through the broker's decision path.
 
+## Rekey boundary (`rekey` module, feature `db-keystore`, Linux)
+
+The `rekey` module is the adapter boundary for rotating the db-keystore DEK
+offline, built on db-keystore's descriptor-relative `rekey_at`/`verify_at`
+(the path-based `DbKeyStore::rekey` is forbidden in basil code). It provides:
+
+- **Zeroizing DEK pass-through**: DEKs travel as `SensitiveDek` (a
+  `Zeroizing` owner); `rekey_to_staging` consumes the old-key owner and
+  drops it before returning, so no old-key-bearing state survives staging.
+- **Verified staging**: the candidate is written into a fresh private `0700`
+  staging directory, verified record-exact by `rekey_at`, then re-verified
+  against the live source with `verify_at` before any marker exists.
+- **Intent-marker fence**: `<db>.rekey-intent` (created `O_EXCL`, `0600`,
+  read back through a validated descriptor) records the candidate **and**
+  pre-rekey database ciphertext BLAKE3 hashes plus the bundle epoch pair.
+  While it exists, `SecretStore::open` refuses, naming the marker and the
+  recovery command. The marker is a fence, not the commit point — the
+  bundle reseal/epoch advance (owned by `basil-core`) is.
+- **Advisory lock**: `SecretStore::open` holds `<db>.rekey-lock` shared for
+  the store's lifetime; a rekey run holds it exclusive (`RekeyLock`), and
+  every destructive primitive requires that witness value.
+- **Crash recovery primitives**: pre-epoch `roll_back` (verifies the live
+  database against the recorded hash first; needs no DEK) and post-epoch
+  `roll_forward` (hash-checked swap resume, or swap-completed detection).
+- **Typed, fail-closed errors** (`KeystoreRekeyError`): wrong-DEK by side,
+  verification, unsafe-destination, marker/staging/lock states, and
+  contained database-layer panics whose payload is withheld from `Display`
+  and `Debug` (audit sink only via `AuditPayload`).
+
+The `basil keystore rekey` command remains a fail-closed stub; it is
+re-enabled only after the adversarial review of this boundary.
+
 ## Using it
 
 Enable through `basil-core`/`basil-bin` features of the same names (`db-keystore`,
