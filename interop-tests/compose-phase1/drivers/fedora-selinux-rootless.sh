@@ -767,26 +767,58 @@ GUEST_EOF
   # The broker and rootless attestor run as distinct UIDs. The attestor-owned
   # socket grants only the broker traversal/connect ACL. Exact user-unit trust
   # is rechecked before protocol bytes on every connection.
-  local broker_uid attestor_uid extra_uid realm_unit wrong_unit ready unit_ok=0 wrong_ok=0 acl_ok=0
+  # Design 0001 rev 1.2: the attestor service unit is generation-qualified
+  # (`-g<authorityGeneration>.service`) and the control socket is pinned to
+  # `/run/basil/attestors/<realm>/g<gen>/control.sock` for both runtime modes;
+  # the old per-user `/run/user/<uid>/...` realm scope is gone. The realm
+  # fixture (`live_config`) hardcodes generation 1, so the unit and the
+  # provisioned runtime tree must match `-g1` / `.../owner-podman/g1`.
+  local broker_uid attestor_uid attestor_gid extra_uid realm_unit wrong_unit ready
+  local unit_ok=0 wrong_ok=0 acl_ok=0 gid_env="" gid_connect=""
   broker_uid=$(ssh_user phase1-b 'id -u')
   attestor_uid=$(ssh_user phase1-a 'id -u')
+  attestor_gid=$(ssh_user phase1-a 'id -g')
   extra_uid=$(ssh_user basil-ci 'id -u')
-  realm_unit=basil-attestor-owner-podman.service
+  realm_unit=basil-attestor-owner-podman-g1.service
   wrong_unit=basil-attestor-wrong.service
-  ready=/run/user/$attestor_uid/basil/attestors/owner-podman/server.ready
+  ready=/run/basil/attestors/owner-podman/server.ready
   if [[ ! $broker_uid =~ ^[1-9][0-9]*$ || ! $attestor_uid =~ ^[1-9][0-9]*$ \
-    || ! $extra_uid =~ ^[1-9][0-9]*$ || $broker_uid == "$attestor_uid" \
+    || ! $attestor_gid =~ ^[1-9][0-9]*$ || ! $extra_uid =~ ^[1-9][0-9]*$ \
+    || $broker_uid == "$attestor_uid" \
     || $broker_uid == "$extra_uid" || $attestor_uid == "$extra_uid" ]]; then
     set_res podman.unit-trust INFRA_ERROR PODMAN_SYSTEMD_USER_UIDS_INVALID \
-      "broker=$broker_uid attestor=$attestor_uid extra=$extra_uid"
+      "broker=$broker_uid attestor=$attestor_uid gid=$attestor_gid extra=$extra_uid"
   else
+    # The declared realm group defaults to the attestor UID (Fedora
+    # user-private-group). When the attestor's primary GID differs, both the
+    # server and the connector must derive the same declared group, so pass it
+    # explicitly on each side (BASIL_REALM_ATTESTOR_GID, round 6).
+    if [[ $attestor_gid != "$attestor_uid" ]]; then
+      gid_env="--setenv=BASIL_REALM_ATTESTOR_GID=$attestor_gid"
+      gid_connect="BASIL_REALM_ATTESTOR_GID=$attestor_gid"
+    fi
+    # rev-1.2 pins the socket under root-owned `/run/basil` rather than the
+    # attestor's `/run/user` scope, so the shared realm ancestors must be
+    # provisioned before the rootless server can bind. Root owns and world-
+    # traverses `/run/basil` and `/run/basil/attestors` (no ACL); the attestor
+    # owns `.../owner-podman` (its per-generation `g1` subdir, the socket, and
+    # the enrollment ACLs are installed by the test fixture itself).
+    if ! ssh_user basil-ci \
+      "sudo -n install -d -m 0755 /run/basil /run/basil/attestors && \
+       sudo -n install -d -o $attestor_uid -g $attestor_gid -m 0700 \
+         /run/basil/attestors/owner-podman" \
+      >"$SCRATCH/podman-runtime-provision.log" 2>&1; then
+      fail_all PODMAN_REALM_RUNTIME_PROVISION_FAILED \
+        "see retained podman-runtime-provision.log"
+      return 0
+    fi
   ssh_user phase1-a "rm -f '$ready'; export XDG_RUNTIME_DIR=/run/user/$attestor_uid; \
     systemd-run --user --unit=$realm_unit --collect \
       --setenv=BASIL_REALM_BROKER_UID=$broker_uid \
       --setenv=BASIL_REALM_ATTESTOR_UID=$attestor_uid \
       --setenv=BASIL_REALM_EXPECTED_UNIT=$realm_unit \
       --setenv=BASIL_REALM_READY=$ready \
-      --setenv=BASIL_REALM_SERVER_MODE=accept \
+      --setenv=BASIL_REALM_SERVER_MODE=accept $gid_env \
       $interpreter /opt/basil-core-test --ignored --exact \
       core::attestor_realm_unix::tests::live_unix_realm_systemd_server --nocapture" \
     >/dev/null 2>&1 || true
@@ -804,7 +836,7 @@ GUEST_EOF
   fi
   if output=$(ssh_user phase1-b \
     "BASIL_REALM_BROKER_UID=$broker_uid BASIL_REALM_ATTESTOR_UID=$attestor_uid \
-     BASIL_REALM_EXPECTED_UNIT=$realm_unit BASIL_REALM_EXPECT_RESULT=accept \
+     BASIL_REALM_EXPECTED_UNIT=$realm_unit BASIL_REALM_EXPECT_RESULT=accept $gid_connect \
      $interpreter /opt/basil-core-test --ignored --exact \
      core::attestor_realm_unix::tests::live_unix_realm_systemd_connector --nocapture" 2>&1); then
     unit_ok=1
@@ -819,7 +851,7 @@ GUEST_EOF
       --setenv=BASIL_REALM_ATTESTOR_UID=$attestor_uid \
       --setenv=BASIL_REALM_EXPECTED_UNIT=$realm_unit \
       --setenv=BASIL_REALM_READY=$ready \
-      --setenv=BASIL_REALM_SERVER_MODE=reject \
+      --setenv=BASIL_REALM_SERVER_MODE=reject $gid_env \
       $interpreter /opt/basil-core-test --ignored --exact \
       core::attestor_realm_unix::tests::live_unix_realm_systemd_server --nocapture" \
     >/dev/null 2>&1 || true
@@ -831,7 +863,7 @@ GUEST_EOF
   wrong_pid=$(ssh_user phase1-a "cat '$ready'" 2>/dev/null || true)
   if ssh_user phase1-b \
     "BASIL_REALM_BROKER_UID=$broker_uid BASIL_REALM_ATTESTOR_UID=$attestor_uid \
-     BASIL_REALM_EXPECTED_UNIT=$realm_unit BASIL_REALM_EXPECT_RESULT=reject \
+     BASIL_REALM_EXPECTED_UNIT=$realm_unit BASIL_REALM_EXPECT_RESULT=reject $gid_connect \
      $interpreter /opt/basil-core-test --ignored --exact \
      core::attestor_realm_unix::tests::live_unix_realm_systemd_connector --nocapture" \
     >/dev/null 2>&1; then
@@ -851,7 +883,7 @@ GUEST_EOF
       --setenv=BASIL_REALM_EXPECTED_UNIT=$realm_unit \
       --setenv=BASIL_REALM_EXTRA_ACL_UID=$extra_uid \
       --setenv=BASIL_REALM_READY=$ready \
-      --setenv=BASIL_REALM_SERVER_MODE=reject \
+      --setenv=BASIL_REALM_SERVER_MODE=reject $gid_env \
       $interpreter /opt/basil-core-test --ignored --exact \
       core::attestor_realm_unix::tests::live_unix_realm_systemd_server --nocapture" \
     >/dev/null 2>&1 || true
@@ -863,7 +895,7 @@ GUEST_EOF
   acl_pid=$(ssh_user phase1-a "cat '$ready'" 2>/dev/null || true)
   if ssh_user phase1-b \
     "BASIL_REALM_BROKER_UID=$broker_uid BASIL_REALM_ATTESTOR_UID=$attestor_uid \
-     BASIL_REALM_EXPECTED_UNIT=$realm_unit BASIL_REALM_EXPECT_RESULT=reject \
+     BASIL_REALM_EXPECTED_UNIT=$realm_unit BASIL_REALM_EXPECT_RESULT=reject $gid_connect \
      $interpreter /opt/basil-core-test --ignored --exact \
      core::attestor_realm_unix::tests::live_unix_realm_systemd_connector --nocapture" \
     >/dev/null 2>&1; then
