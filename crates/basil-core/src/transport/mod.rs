@@ -10,6 +10,7 @@
 
 #![allow(clippy::result_large_err)]
 
+pub mod admission;
 pub mod connection;
 pub mod grpc_server;
 pub mod listener;
@@ -341,8 +342,8 @@ pub fn attestation_unavailable_status(op: &'static str) -> Status {
 
 fn broker_status_with_details(
     code: Code,
-    reason: &'static str,
-    op: &'static str,
+    reason: &str,
+    op: &str,
     message: impl Into<String>,
     mut extra_details: Vec<prost_types::Any>,
 ) -> Status {
