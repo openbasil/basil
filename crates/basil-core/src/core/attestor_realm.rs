@@ -12,6 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::num::NonZeroU64;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -24,8 +25,9 @@ use tokio::sync::{Notify, watch};
 
 use crate::attestor_protocol::wire;
 use crate::attestor_protocol::{
-    InventoryResult, MOUNT_SECURITY_CAPABILITY, QueryScope, RequestBudget, ResolvePeerResult,
-    VerifiedPeerBinding,
+    FactUseError, GuardedSessionCell, InvalidationCause, InventoryResult,
+    MOUNT_SECURITY_CAPABILITY, PublicationRejection, QueryScope, RejectedPublication,
+    RequestBudget, ResolvePeerResult, SessionPin, VerifiedPeerBinding,
 };
 use crate::release_admission::{
     ActiveArtifact, ArtifactRole, CapabilityId, CapabilitySet, ProtocolVersion, ReleaseAdmission,
@@ -1144,6 +1146,10 @@ struct RealmEntry {
     transition: TransitionState,
     reason: RealmReason,
     session: Option<Arc<SessionSlot>>,
+    /// Pidfd-guarded publication cell for the live session attempt; owned by
+    /// the registry mutex so publication, monitor invalidation, and later
+    /// token-checked use linearize against every entry mutation above.
+    guarded: Option<GuardedSessionCell<ActiveArtifact>>,
     connecting: bool,
     supervisor_running: bool,
 }
@@ -1159,6 +1165,10 @@ struct RegistryState {
     tombstones: BTreeMap<RealmName, u64>,
     draining: BTreeMap<RealmName, DrainingEntry>,
     reservations: BTreeMap<RealmName, u128>,
+    /// Monotone session-handle allocator: every guarded-session installation
+    /// receives a distinct handle so two installs are never token-equal even
+    /// when every other pinned dimension coincides.
+    next_session_handle: u64,
 }
 
 struct RegistryInner {
@@ -1209,6 +1219,7 @@ impl RealmRegistry {
                         transition: TransitionState::None,
                         reason: RealmReason::SocketAbsent,
                         session: None,
+                        guarded: None,
                         connecting: false,
                         supervisor_running: false,
                     },
@@ -1223,6 +1234,7 @@ impl RealmRegistry {
                     tombstones: BTreeMap::new(),
                     draining: BTreeMap::new(),
                     reservations: BTreeMap::new(),
+                    next_session_handle: 0,
                 }),
                 changed: Notify::new(),
             }),
@@ -1651,6 +1663,71 @@ impl RealmRegistry {
         Ok(preparation)
     }
 
+    /// Install the pidfd-guarded publication cell for the live session
+    /// attempt of `name`, pinning the complete token from live registry
+    /// state under the registry mutex.
+    ///
+    /// `session_epoch` must be the attempt epoch allocated by the same
+    /// mutex (the entry's live `next_epoch`); a newer attempt makes this
+    /// installation stale. The pinned token captures the accepted
+    /// configuration generation, entry generation, realm revision, session
+    /// epoch, a freshly allocated session handle, and the actor version —
+    /// any later mutation of those dimensions happens under this same mutex
+    /// and therefore linearizes against publication, monitor invalidation,
+    /// and every later fact use through the returned handle.
+    ///
+    /// A predecessor cell for the realm is cancelled; its displaced fact is
+    /// returned for disposal outside the lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RealmError::Unavailable`] for an unknown realm,
+    /// [`RealmError::Stale`] when `session_epoch` is not the live attempt,
+    /// and [`RealmError::CounterExhausted`] when no session handle can be
+    /// allocated.
+    pub fn install_guarded_session(
+        &self,
+        name: &RealmName,
+        session_epoch: u64,
+        pidfd: OwnedFd,
+    ) -> Result<GuardedSessionInstall, RealmError> {
+        let (pin, displaced_cell) = {
+            let mut state = self.lock_state();
+            let handle_value = state
+                .next_session_handle
+                .checked_add(1)
+                .ok_or(RealmError::CounterExhausted)?;
+            state.next_session_handle = handle_value;
+            let configuration_generation = state.generation;
+            let entry = state.entries.get_mut(name).ok_or(RealmError::Unavailable)?;
+            if entry.next_epoch != session_epoch {
+                return Err(RealmError::Stale);
+            }
+            let pin = SessionPin {
+                configuration_generation,
+                entry_generation: entry.generation,
+                realm_revision: entry.revision,
+                session_epoch,
+                session_handle: handle_value,
+                actor_version: entry.actor_version,
+            };
+            let displaced = entry.guarded.replace(GuardedSessionCell::new(pidfd, pin));
+            drop(state);
+            (pin, displaced)
+        };
+        // The predecessor's cancellation fact — and the cell itself, whose
+        // drop closes its epoch-owned pidfd — are disposed outside the lock.
+        let displaced = displaced_cell.and_then(|mut cell| cell.cancel());
+        Ok(GuardedSessionInstall {
+            handle: GuardedSessionHandle {
+                inner: Arc::clone(&self.inner),
+                name: name.clone(),
+                pin,
+            },
+            displaced,
+        })
+    }
+
     fn advance_attempt(
         &self,
         name: &RealmName,
@@ -1751,6 +1828,247 @@ impl RealmRegistry {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// One completed guarded-session installation.
+///
+/// Carries the addressing handle plus any fact displaced from a cancelled
+/// predecessor cell; the displaced fact is already outside the registry
+/// mutex and must be dropped by the caller (its drop may release a
+/// release-admission reference).
+#[must_use = "keep the handle and dispose the displaced fact"]
+#[derive(Debug)]
+pub struct GuardedSessionInstall {
+    /// Handle addressing the installed cell under the exact registry mutex.
+    pub handle: GuardedSessionHandle,
+    /// Fact displaced from a cancelled predecessor cell, if any.
+    pub displaced: Option<ActiveArtifact>,
+}
+
+/// Addresses one installed pidfd-guarded session under the exact
+/// realm-registry mutex.
+///
+/// The handle carries the complete pinned token from installation. Every
+/// operation locks the one registry mutex, resolves the realm's live cell,
+/// requires the cell to still be this exact installation, and — for
+/// publication and fact use — compares the pinned token against **live**
+/// registry state (accepted configuration generation, entry generation,
+/// realm revision, live attempt epoch, actor version) under that same
+/// mutex. Any realm mutation since installation therefore wins the
+/// linearization race and rejects fail-closed.
+///
+/// A handle whose installation was displaced or whose realm is gone treats
+/// every operation as addressed to a cancelled session; a detached monitor
+/// holding a stale handle can never invalidate a replacement.
+#[derive(Clone)]
+pub struct GuardedSessionHandle {
+    inner: Arc<RegistryInner>,
+    name: RealmName,
+    pin: SessionPin,
+}
+
+impl fmt::Debug for GuardedSessionHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GuardedSessionHandle")
+            .field("realm", &self.name)
+            .field("pin", &self.pin)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GuardedSessionHandle {
+    /// The complete token pinned at installation.
+    #[must_use]
+    pub const fn pin(&self) -> SessionPin {
+        self.pin
+    }
+
+    /// Atomically publish the completed fact for this installation.
+    ///
+    /// Under the registry mutex this performs the nonblocking exit poll of
+    /// the epoch-owned pidfd and compares the pinned token against live
+    /// registry state, then either publishes or invalidates. Decode and
+    /// validation of response bytes must already have happened outside the
+    /// lock into the non-authoritative `fact`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RejectedPublication`] carrying `fact` back for out-of-lock
+    /// disposal when the session is invalidated, displaced, already
+    /// published, exited, or when the realm mutated since installation.
+    // The `Err` variant deliberately carries the losing fact back by value so
+    // its drop (which may release a release-admission reference) runs outside
+    // the registry mutex; boxing would only obscure that contract.
+    #[allow(clippy::result_large_err)]
+    pub fn publish(&self, fact: ActiveArtifact) -> Result<(), RejectedPublication<ActiveArtifact>> {
+        let mut state = lock_registry(&self.inner);
+        let configuration_generation = state.generation;
+        let Some(entry) = state.entries.get_mut(&self.name) else {
+            drop(state);
+            return Err(cancelled_publication(fact));
+        };
+        let token = live_token(configuration_generation, entry, self.pin);
+        let Some(cell) = entry.guarded.as_mut() else {
+            drop(state);
+            return Err(cancelled_publication(fact));
+        };
+        if cell.pin() != self.pin {
+            drop(state);
+            return Err(cancelled_publication(fact));
+        }
+        let result = cell.publish(token, fact);
+        drop(state);
+        result
+    }
+
+    /// Record the peer's exit under the registry mutex.
+    ///
+    /// First observation of a live installation also advances the realm's
+    /// actor version under the same mutex (waking the supervisor), so exit
+    /// ordered after publication is ordered after that completed fact and
+    /// every later token check fails. Idempotent; a stale handle observes
+    /// nothing.
+    #[must_use = "drop the returned fact outside the registry mutex"]
+    pub fn observe_exit(&self) -> Option<ActiveArtifact> {
+        let mut state = lock_registry(&self.inner);
+        let configuration_generation = state.generation;
+        let entry = state.entries.get_mut(&self.name)?;
+        let token = live_token(configuration_generation, entry, self.pin);
+        let cell = entry.guarded.as_mut()?;
+        if cell.pin() != self.pin {
+            return None;
+        }
+        let first = cell.invalidation().is_none();
+        let fact = cell.observe_exit();
+        let advance = first && token == self.pin;
+        if advance {
+            let _ = bump_actor(entry);
+        }
+        drop(state);
+        if advance {
+            self.inner.changed.notify_waiters();
+        }
+        fact
+    }
+
+    /// Cancel this installation at session close, drain, or teardown.
+    ///
+    /// Cancellation is owned by the session lifecycle, not the monitor; the
+    /// returned fact is dropped by the caller outside the lock. A stale
+    /// handle cancels nothing.
+    #[must_use = "drop the returned fact outside the registry mutex"]
+    pub fn cancel(&self) -> Option<ActiveArtifact> {
+        let mut state = lock_registry(&self.inner);
+        let entry = state.entries.get_mut(&self.name)?;
+        let cell = entry.guarded.as_mut()?;
+        if cell.pin() != self.pin {
+            return None;
+        }
+        let fact = cell.cancel();
+        drop(state);
+        fact
+    }
+
+    /// Use the published fact after rechecking the complete pinned token
+    /// against live registry state under the registry mutex.
+    ///
+    /// The closure runs under the mutex and must be lock-cheap: no I/O, no
+    /// await, no logging.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FactUseError`] when the session is invalidated or
+    /// displaced, when the realm mutated since installation
+    /// ([`FactUseError::PinMismatch`]), or when nothing was published.
+    pub fn with_fact<R>(&self, read: impl FnOnce(&ActiveArtifact) -> R) -> Result<R, FactUseError> {
+        let state = lock_registry(&self.inner);
+        let Some(entry) = state.entries.get(&self.name) else {
+            drop(state);
+            return Err(FactUseError::Invalidated(InvalidationCause::Cancelled));
+        };
+        let token = live_token(state.generation, entry, self.pin);
+        let Some(cell) = entry.guarded.as_ref() else {
+            drop(state);
+            return Err(FactUseError::Invalidated(InvalidationCause::Cancelled));
+        };
+        if cell.pin() != self.pin {
+            drop(state);
+            return Err(FactUseError::Invalidated(InvalidationCause::Cancelled));
+        }
+        let result = cell.with_fact(token, read);
+        drop(state);
+        result
+    }
+
+    /// Await the peer's exit and invalidate this installation when it
+    /// happens, returning any published fact for out-of-lock disposal.
+    ///
+    /// Cancelling this future never invalidates anything: cancellation is
+    /// owned by session close and drain, so no detached monitor can
+    /// invalidate a replacement installation (whose fresh pin this handle
+    /// can never address). A monitoring setup failure fails closed by
+    /// observing the exit immediately.
+    pub async fn run_monitor(&self) -> Option<ActiveArtifact> {
+        let Some(fd) = self.monitor_fd() else {
+            return self.observe_exit();
+        };
+        let Ok(async_fd) =
+            tokio::io::unix::AsyncFd::with_interest(fd, tokio::io::Interest::READABLE)
+        else {
+            return self.observe_exit();
+        };
+        // Readable or failed both mean the installation cannot be monitored
+        // further: fail closed by observing the exit.
+        let _readiness = async_fd.readable().await;
+        self.observe_exit()
+    }
+
+    /// Duplicate the epoch-owned pidfd under the registry mutex, or `None`
+    /// when this handle no longer addresses the live cell or the duplicate
+    /// fails (the caller then fails closed through [`Self::observe_exit`]).
+    fn monitor_fd(&self) -> Option<OwnedFd> {
+        let state = lock_registry(&self.inner);
+        let entry = state.entries.get(&self.name)?;
+        let cell = entry.guarded.as_ref()?;
+        if cell.pin() != self.pin {
+            return None;
+        }
+        let fd = cell.monitor_fd().ok();
+        drop(state);
+        fd
+    }
+}
+
+/// Typed rejection for a publication addressed to a cancelled or displaced
+/// installation, handing the fact back for out-of-lock disposal.
+const fn cancelled_publication(fact: ActiveArtifact) -> RejectedPublication<ActiveArtifact> {
+    RejectedPublication {
+        rejection: PublicationRejection::Invalidated(InvalidationCause::Cancelled),
+        fact,
+    }
+}
+
+/// The live registry token for one entry, carrying the handle's own session
+/// handle (which has no independent live source): the result equals `pin`
+/// exactly when no pinned registry dimension has mutated since installation.
+const fn live_token(
+    configuration_generation: u64,
+    entry: &RealmEntry,
+    pin: SessionPin,
+) -> SessionPin {
+    SessionPin {
+        configuration_generation,
+        entry_generation: entry.generation,
+        realm_revision: entry.revision,
+        session_epoch: entry.next_epoch,
+        session_handle: pin.session_handle,
+        actor_version: entry.actor_version,
+    }
+}
+
+fn lock_registry(inner: &RegistryInner) -> MutexGuard<'_, RegistryState> {
+    inner.state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[derive(Clone, Copy)]
@@ -2013,6 +2331,7 @@ impl PreparedReload {
                             transition: TransitionState::None,
                             reason: RealmReason::None,
                             session: Some(staged.slot),
+                            guarded: None,
                             connecting: false,
                             supervisor_running,
                         },
@@ -4251,5 +4570,379 @@ socketAcl = "basil-attestor-control-g{generation}"
                 ..
             }]
         ));
+    }
+
+    mod guarded_session {
+        //! Focused shared-lock token checks for the pidfd-guarded session:
+        //! installation pins the token from live registry state, and
+        //! publication, monitor invalidation, and later use all resolve the
+        //! cell and compare that token under the exact registry mutex. The
+        //! dedicated race suite contending threads on the real lock is a
+        //! sibling deliverable (`basil-qhyf`).
+
+        use std::os::fd::OwnedFd;
+        use std::process::{Child, Command, Stdio};
+
+        use rustix::process::{Pid, PidfdFlags, pidfd_open};
+
+        use super::*;
+        use crate::attestor_protocol::{FactUseError, InvalidationCause, PublicationRejection};
+
+        fn registry() -> (RealmRegistry, RealmName) {
+            let value = bootstrap(&rootful());
+            let realms = RealmSet::from_bootstrap(&value).expect("valid realm set");
+            let registry = RealmRegistry::new(&realms, 7).expect("registry");
+            let name = RealmName::new("production-docker").expect("name");
+            (registry, name)
+        }
+
+        fn self_pidfd() -> OwnedFd {
+            pidfd_open(rustix::process::getpid(), PidfdFlags::empty()).expect("self pidfd")
+        }
+
+        fn preflight(admission: &ReleaseAdmission) -> ActiveArtifact {
+            let requirement = ArtifactRequirement::new(
+                Sha256Digest::from_bytes([7; 32]),
+                ArtifactRole::new("docker-attestor").expect("role"),
+                TargetTriple::new("x86_64-unknown-linux-gnu").expect("target"),
+                ProtocolVersion::new(1).expect("protocol"),
+                CapabilitySet::try_from_iter(
+                    KNOWN_CAPABILITIES
+                        .iter()
+                        .map(|value| CapabilityId::new(value).expect("capability")),
+                )
+                .expect("capabilities"),
+            );
+            admission.begin_preflight(&requirement).expect("preflight")
+        }
+
+        /// A child that blocks on stdin until released, plus its pidfd.
+        fn blocking_child() -> (Child, OwnedFd) {
+            let child = Command::new("/bin/sh")
+                .args(["-c", "read _line"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn blocking child");
+            let raw = i32::try_from(child.id()).expect("child pid fits i32");
+            let pid = Pid::from_raw(raw).expect("nonzero child pid");
+            let pidfd = pidfd_open(pid, PidfdFlags::empty()).expect("child pidfd");
+            (child, pidfd)
+        }
+
+        fn exit_child(mut child: Child) {
+            drop(child.stdin.take());
+            let _status = child.wait().expect("wait");
+        }
+
+        #[test]
+        fn installation_pins_the_token_from_live_registry_state() {
+            let (registry, name) = registry();
+            let install = registry
+                .install_guarded_session(&name, 0, self_pidfd())
+                .expect("install");
+            assert!(install.displaced.is_none());
+            let pin = install.handle.pin();
+            assert_eq!(pin.configuration_generation, 7);
+            assert_eq!(pin.entry_generation, 7);
+            assert_eq!(pin.realm_revision, 1);
+            assert_eq!(pin.session_epoch, 0);
+            assert_eq!(pin.session_handle, 1);
+            assert_eq!(pin.actor_version, 1);
+            // A second installation allocates a distinct handle.
+            let second = registry
+                .install_guarded_session(&name, 0, self_pidfd())
+                .expect("reinstall");
+            assert_eq!(second.handle.pin().session_handle, 2);
+        }
+
+        #[test]
+        fn installation_rejects_a_stale_attempt_epoch_and_an_unknown_realm() {
+            let (registry, name) = registry();
+            assert!(matches!(
+                registry.install_guarded_session(&name, 5, self_pidfd()),
+                Err(RealmError::Stale)
+            ));
+            let unknown = RealmName::new("missing").expect("name");
+            assert!(matches!(
+                registry.install_guarded_session(&unknown, 0, self_pidfd()),
+                Err(RealmError::Unavailable)
+            ));
+        }
+
+        #[test]
+        fn publication_loses_against_every_registry_mutation_dimension() {
+            type Mutation = fn(&mut RegistryState, &RealmName);
+            let mutations: [(&str, Mutation); 5] = [
+                ("configuration generation", |state, _name| {
+                    state.generation += 1;
+                }),
+                ("entry generation", |state, name| {
+                    state.entries.get_mut(name).expect("entry").generation += 1;
+                }),
+                ("realm revision", |state, name| {
+                    state.entries.get_mut(name).expect("entry").revision += 1;
+                }),
+                ("session epoch", |state, name| {
+                    state.entries.get_mut(name).expect("entry").next_epoch += 1;
+                }),
+                ("actor version", |state, name| {
+                    state.entries.get_mut(name).expect("entry").actor_version += 1;
+                }),
+            ];
+            for (dimension, mutate) in mutations {
+                let (registry, name) = registry();
+                let admission = admission();
+                let install = registry
+                    .install_guarded_session(&name, 0, self_pidfd())
+                    .expect("install");
+                {
+                    let mut state = registry.lock_state();
+                    mutate(&mut state, &name);
+                }
+                let rejected = install
+                    .handle
+                    .publish(preflight(&admission))
+                    .expect_err(dimension);
+                assert_eq!(
+                    rejected.rejection,
+                    PublicationRejection::PinMismatch,
+                    "dimension: {dimension}"
+                );
+                drop(rejected);
+                assert_eq!(admission.snapshot().current.active_preflights, 0);
+                // The losing publication invalidated the installation.
+                assert!(matches!(
+                    install.handle.with_fact(|_fact| ()),
+                    Err(FactUseError::Invalidated(InvalidationCause::PinMismatch))
+                ));
+            }
+        }
+
+        #[test]
+        fn later_use_rechecks_the_token_against_live_registry_state() {
+            let (registry, name) = registry();
+            let admission = admission();
+            let install = registry
+                .install_guarded_session(&name, 0, self_pidfd())
+                .expect("install");
+            install
+                .handle
+                .publish(preflight(&admission))
+                .expect("publish");
+            install.handle.with_fact(|_fact| ()).expect("live use");
+            // A concurrent registry mutation under the same mutex makes the
+            // pinned token stale for every later use.
+            {
+                let mut state = registry.lock_state();
+                state.entries.get_mut(&name).expect("entry").actor_version += 1;
+            }
+            assert!(matches!(
+                install.handle.with_fact(|_fact| ()),
+                Err(FactUseError::PinMismatch)
+            ));
+            // Stale use does not invalidate: restoring the registry state
+            // (test-only) shows the cell itself is untouched.
+            {
+                let mut state = registry.lock_state();
+                state.entries.get_mut(&name).expect("entry").actor_version -= 1;
+            }
+            install.handle.with_fact(|_fact| ()).expect("live again");
+        }
+
+        #[test]
+        fn a_replacement_installation_displaces_and_cancels_the_predecessor() {
+            let (registry, name) = registry();
+            let admission = admission();
+            let first = registry
+                .install_guarded_session(&name, 0, self_pidfd())
+                .expect("install");
+            first
+                .handle
+                .publish(preflight(&admission))
+                .expect("publish");
+            assert_eq!(admission.snapshot().current.active_preflights, 1);
+
+            let second = registry
+                .install_guarded_session(&name, 0, self_pidfd())
+                .expect("reinstall");
+            // The predecessor's fact came back for out-of-lock disposal.
+            assert!(second.displaced.is_some());
+            drop(second.displaced);
+            assert_eq!(admission.snapshot().current.active_preflights, 0);
+
+            // The stale handle addresses a cancelled session and can never
+            // reach the replacement.
+            assert!(first.handle.observe_exit().is_none());
+            assert!(first.handle.cancel().is_none());
+            let rejected = first
+                .handle
+                .publish(preflight(&admission))
+                .expect_err("stale handle");
+            assert_eq!(
+                rejected.rejection,
+                PublicationRejection::Invalidated(InvalidationCause::Cancelled)
+            );
+            drop(rejected);
+            assert!(matches!(
+                first.handle.with_fact(|_fact| ()),
+                Err(FactUseError::Invalidated(InvalidationCause::Cancelled))
+            ));
+
+            // The replacement is live and unaffected.
+            second
+                .handle
+                .publish(preflight(&admission))
+                .expect("replacement publish");
+            second
+                .handle
+                .with_fact(|_fact| ())
+                .expect("replacement use");
+        }
+
+        #[test]
+        fn exit_observation_returns_the_fact_and_advances_the_actor_token() {
+            let (registry, name) = registry();
+            let admission = admission();
+            let install = registry
+                .install_guarded_session(&name, 0, self_pidfd())
+                .expect("install");
+            install
+                .handle
+                .publish(preflight(&admission))
+                .expect("publish");
+            let before = {
+                let state = registry.lock_state();
+                state.entries.get(&name).expect("entry").actor_version
+            };
+
+            let fact = install.handle.observe_exit();
+            assert!(fact.is_some());
+            drop(fact);
+            assert_eq!(admission.snapshot().current.active_preflights, 0);
+
+            // The exit advanced the actor token under the same mutex, so any
+            // other holder of the old token also fails closed.
+            let after = {
+                let state = registry.lock_state();
+                state.entries.get(&name).expect("entry").actor_version
+            };
+            assert_eq!(after, before + 1);
+            assert!(matches!(
+                install.handle.with_fact(|_fact| ()),
+                Err(FactUseError::Invalidated(InvalidationCause::PeerExited))
+            ));
+            // A second observation changes nothing further.
+            assert!(install.handle.observe_exit().is_none());
+            let unchanged = {
+                let state = registry.lock_state();
+                state.entries.get(&name).expect("entry").actor_version
+            };
+            assert_eq!(unchanged, after);
+        }
+
+        #[test]
+        fn cancellation_is_owned_by_the_session_lifecycle_and_keeps_the_actor_token() {
+            let (registry, name) = registry();
+            let admission = admission();
+            let install = registry
+                .install_guarded_session(&name, 0, self_pidfd())
+                .expect("install");
+            install
+                .handle
+                .publish(preflight(&admission))
+                .expect("publish");
+            let before = {
+                let state = registry.lock_state();
+                state.entries.get(&name).expect("entry").actor_version
+            };
+            let fact = install.handle.cancel();
+            assert!(fact.is_some());
+            drop(fact);
+            assert_eq!(admission.snapshot().current.active_preflights, 0);
+            // Close and drain own their own entry transitions; cancellation
+            // does not advance the actor token.
+            let after = {
+                let state = registry.lock_state();
+                state.entries.get(&name).expect("entry").actor_version
+            };
+            assert_eq!(after, before);
+            // A detached monitor firing late observes nothing to release.
+            assert!(install.handle.observe_exit().is_none());
+            assert!(matches!(
+                install.handle.with_fact(|_fact| ()),
+                Err(FactUseError::Invalidated(InvalidationCause::Cancelled))
+            ));
+        }
+
+        #[tokio::test]
+        async fn the_monitor_observes_a_real_exit_under_the_registry_mutex() {
+            let (child, pidfd) = {
+                let _spawn_guard = crate::attestor_protocol::helper::CHILD_SPAWN_TEST_LOCK
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                blocking_child()
+            };
+            let (registry, name) = registry();
+            let admission = admission();
+            let install = registry
+                .install_guarded_session(&name, 0, pidfd)
+                .expect("install");
+            install
+                .handle
+                .publish(preflight(&admission))
+                .expect("publish while alive");
+            let monitor = {
+                let handle = install.handle.clone();
+                tokio::spawn(async move { handle.run_monitor().await })
+            };
+            exit_child(child);
+            let taken = tokio::time::timeout(Duration::from_secs(30), monitor)
+                .await
+                .expect("monitor must observe the exit")
+                .expect("monitor task");
+            assert!(taken.is_some());
+            drop(taken);
+            assert_eq!(admission.snapshot().current.active_preflights, 0);
+            assert!(matches!(
+                install.handle.with_fact(|_fact| ()),
+                Err(FactUseError::Invalidated(InvalidationCause::PeerExited))
+            ));
+        }
+
+        #[tokio::test]
+        async fn cancelling_the_monitor_future_never_invalidates_the_installation() {
+            let (child, pidfd) = {
+                let _spawn_guard = crate::attestor_protocol::helper::CHILD_SPAWN_TEST_LOCK
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                blocking_child()
+            };
+            let (registry, name) = registry();
+            let admission = admission();
+            let install = registry
+                .install_guarded_session(&name, 0, pidfd)
+                .expect("install");
+            install
+                .handle
+                .publish(preflight(&admission))
+                .expect("publish");
+            let monitor = {
+                let handle = install.handle.clone();
+                tokio::spawn(async move { handle.run_monitor().await })
+            };
+            // Give the monitor a chance to register before it is cancelled.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            monitor.abort();
+            let _aborted = monitor.await;
+            // Cancellation is owned by session close and drain: the
+            // installation is untouched and still serving its fact.
+            install.handle.with_fact(|_fact| ()).expect("still live");
+            let fact = install.handle.cancel();
+            assert!(fact.is_some());
+            drop(fact);
+            exit_child(child);
+        }
     }
 }

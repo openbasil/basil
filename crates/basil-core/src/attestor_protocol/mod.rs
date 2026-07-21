@@ -21,9 +21,11 @@
 //! with the [`helper`] endpoint and cross-checks the returned record and
 //! descriptors against broker-held facts, yielding a [`VerifiedMeasurement`]
 //! whose executable digest feeds `ReleaseAdmission::begin_preflight`; and
-//! [`PidfdGuardedSession`] is the pidfd-monitored publication linearization
-//! point binding one session epoch's completed fact to its complete
-//! [`SessionPin`] token.
+//! [`GuardedSessionCell`] is the lock-free pidfd publication state machine
+//! binding one session epoch's completed fact to its complete [`SessionPin`]
+//! token. The cell deliberately owns no lock: `core::attestor_realm` stores
+//! it inside the realm registry so publication, monitor invalidation, and
+//! every later token-checked use share the exact realm-registry mutex.
 
 pub mod broker_trust;
 mod codec;
@@ -58,10 +60,10 @@ pub use lockdown::{
 };
 pub use session::{
     ABSOLUTE_MAX_MEASURED_EXECUTABLE_BYTES, AttestorRequest, AttestorSession, BrokerSession,
-    FactUseError, HealthResult, InvalidationCause, InventoryResult, MOUNT_SECURITY_CAPABILITY,
-    MeasurementError, PidfdGuardedSession, PinnedHelperPolicy, ProtocolError, PublicationRejection,
-    QueryScope, RejectedPublication, RequestBudget, ResolvePeerResult, SessionAuthentication,
-    SessionPin, VerifiedMeasurement, measure_attestor_stream, run_pidfd_monitor,
+    FactUseError, GuardedSessionCell, HealthResult, InvalidationCause, InventoryResult,
+    MOUNT_SECURITY_CAPABILITY, MeasurementError, PinnedHelperPolicy, ProtocolError,
+    PublicationRejection, QueryScope, RejectedPublication, RequestBudget, ResolvePeerResult,
+    SessionAuthentication, SessionPin, VerifiedMeasurement, measure_attestor_stream,
 };
 
 #[cfg(test)]

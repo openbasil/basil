@@ -4,9 +4,9 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::io::Read as _;
 use std::num::NonZeroU64;
 use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, OwnedFd};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use prost::Message;
@@ -2113,22 +2113,25 @@ fn bind_descriptors(
     Ok((pidfd, executable))
 }
 
+/// Byte ceiling for one `fdinfo` read of a helper-returned descriptor.
+///
+/// A real pidfd's `fdinfo` is a handful of short lines. The helper controls
+/// which descriptor arrives over `SCM_RIGHTS` and some descriptor kinds have
+/// expandable `fdinfo` (for example epoll), so the read is bounded before any
+/// descriptor-type trust is established.
+const MAX_PIDFD_FDINFO_BYTES: usize = 8192;
+
 /// Verify the descriptor is a pidfd whose process is exactly `peer_pid`.
 ///
 /// A pidfd's `fdinfo` carries a `Pid:` field; no other descriptor kind does.
-/// A reaped process reports `-1` and a process outside this PID namespace
-/// reports `0`; both fail closed.
+/// The read is bounded by [`MAX_PIDFD_FDINFO_BYTES`] and the parse is exact:
+/// the file must carry exactly one well-formed `Pid:` field. A reaped process
+/// reports `-1` and a process outside this PID namespace reports `0`; both
+/// fail closed.
 fn verify_pidfd_association(pidfd: BorrowedFd<'_>, peer_pid: u32) -> Result<(), MeasurementError> {
     let path = format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd());
-    let info = std::fs::read_to_string(path).map_err(|_| MeasurementError::PidfdType)?;
-    let value = info
-        .lines()
-        .find_map(|line| line.strip_prefix("Pid:"))
-        .ok_or(MeasurementError::PidfdType)?;
-    let pid: i64 = value
-        .trim()
-        .parse()
-        .map_err(|_| MeasurementError::PidfdType)?;
+    let info = read_bounded_fdinfo(std::path::Path::new(&path))?;
+    let pid = parse_single_fdinfo_pid(&info)?;
     if pid == -1 {
         return Err(MeasurementError::PeerExited);
     }
@@ -2136,6 +2139,49 @@ fn verify_pidfd_association(pidfd: BorrowedFd<'_>, peer_pid: u32) -> Result<(), 
         return Err(MeasurementError::PidfdAssociation);
     }
     Ok(())
+}
+
+/// Read one `fdinfo` file with a hard byte ceiling.
+///
+/// Reads the ceiling plus one byte and rejects oversize rather than silently
+/// truncating: a truncated read could drop trailing lines and change what the
+/// exact parser sees.
+fn read_bounded_fdinfo(path: &std::path::Path) -> Result<String, MeasurementError> {
+    let file = std::fs::File::open(path).map_err(|_| MeasurementError::PidfdType)?;
+    let mut bytes = Vec::new();
+    let limit = u64::try_from(MAX_PIDFD_FDINFO_BYTES).unwrap_or(u64::MAX);
+    std::io::Read::take(file, limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| MeasurementError::PidfdType)?;
+    if bytes.len() > MAX_PIDFD_FDINFO_BYTES {
+        return Err(MeasurementError::PidfdType);
+    }
+    String::from_utf8(bytes).map_err(|_| MeasurementError::PidfdType)
+}
+
+/// Exact single-`Pid:` parser over bounded `fdinfo` text.
+///
+/// Exactly one line may carry a `Pid:` prefix and its value must be one
+/// canonical signed decimal (an optional leading `-`, then ASCII digits).
+/// Missing, duplicate, malformed, and overflowing fields all reject; first
+/// match wins nothing here.
+fn parse_single_fdinfo_pid(info: &str) -> Result<i64, MeasurementError> {
+    let mut pid = None;
+    for line in info.lines() {
+        let Some(value) = line.strip_prefix("Pid:") else {
+            continue;
+        };
+        let trimmed = value.trim();
+        let digits = trimmed.strip_prefix('-').unwrap_or(trimmed);
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(MeasurementError::PidfdType);
+        }
+        let parsed: i64 = trimmed.parse().map_err(|_| MeasurementError::PidfdType)?;
+        if pid.replace(parsed).is_some() {
+            return Err(MeasurementError::PidfdType);
+        }
+    }
+    pid.ok_or(MeasurementError::PidfdType)
 }
 
 /// Nonblocking exit poll of one pidfd.
@@ -2281,104 +2327,103 @@ pub enum FactUseError {
     NotPublished,
 }
 
-struct GuardedSessionState<F> {
+/// One session epoch's guarded publication state machine.
+///
+/// The cell owns **no lock of its own**. It must be stored inside — and only
+/// ever touched under — the exact realm-registry mutex
+/// (`core::attestor_realm::RealmRegistry` keeps it in its registry state and
+/// wraps every operation), so guarded-session publication, pidfd-monitor
+/// invalidation, and the later-use token check on every use linearize against
+/// realm generation, revision, epoch, handle, and actor-version mutation
+/// under that one mutex. Exactly one publication or invalidation wins;
+/// buffered response state that loses the race never becomes authoritative.
+///
+/// Every method is lock-cheap by construction: no I/O beyond the nonblocking
+/// pidfd poll, no await, and no logging. Invalidation and cancellation hand
+/// the fact back so its drop runs outside the lock.
+///
+/// A replacement epoch is a fresh cell with a fresh pin: a detached monitor
+/// still addressing this cell's pin can never invalidate the replacement.
+pub struct GuardedSessionCell<F> {
     pidfd: OwnedFd,
     pin: SessionPin,
     published: Option<F>,
     invalidated: Option<InvalidationCause>,
 }
 
-/// One session epoch's pidfd monitor and publication linearization point.
-///
-/// The single internal mutex is the registry mutex from the design: the
-/// response path publishes under it, the monitor invalidates under it, and
-/// every later fact use rechecks the pinned token under it. Exactly one
-/// publication or invalidation wins; buffered response state that loses the
-/// race never becomes authoritative. No I/O beyond the nonblocking pidfd poll,
-/// no await, and no logging happens while the mutex is held; invalidation and
-/// cancellation hand the fact back so its drop runs outside the lock.
-///
-/// A replacement epoch is a fresh value with a fresh pin: a detached monitor
-/// still holding this value can never invalidate the replacement.
-pub struct PidfdGuardedSession<F> {
-    state: Arc<Mutex<GuardedSessionState<F>>>,
-}
-
-impl<F> Clone for PidfdGuardedSession<F> {
-    fn clone(&self) -> Self {
-        Self {
-            state: Arc::clone(&self.state),
-        }
-    }
-}
-
-impl<F> fmt::Debug for PidfdGuardedSession<F> {
+impl<F> fmt::Debug for GuardedSessionCell<F> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("PidfdGuardedSession")
+        formatter.write_str("GuardedSessionCell")
     }
 }
 
-impl<F> PidfdGuardedSession<F> {
+impl<F> GuardedSessionCell<F> {
     /// Bind one epoch-owned pidfd to its complete session pin.
     #[must_use]
-    pub fn new(pidfd: OwnedFd, pin: SessionPin) -> Self {
+    pub const fn new(pidfd: OwnedFd, pin: SessionPin) -> Self {
         Self {
-            state: Arc::new(Mutex::new(GuardedSessionState {
-                pidfd,
-                pin,
-                published: None,
-                invalidated: None,
-            })),
+            pidfd,
+            pin,
+            published: None,
+            invalidated: None,
         }
+    }
+
+    /// The complete token pinned at installation.
+    #[must_use]
+    pub const fn pin(&self) -> SessionPin {
+        self.pin
+    }
+
+    /// Why this cell stopped accepting publication and use, if it has.
+    #[must_use]
+    pub const fn invalidation(&self) -> Option<InvalidationCause> {
+        self.invalidated
     }
 
     /// Atomically publish the completed fact for this epoch.
     ///
-    /// Under the registry mutex this performs the nonblocking exit poll of the
-    /// epoch-owned pidfd and the complete token comparison, then either
-    /// publishes or invalidates the session. Decode and validation of response
-    /// bytes must already have happened outside the lock into the
-    /// non-authoritative `fact`.
+    /// The caller must hold the registry mutex. This performs the nonblocking
+    /// exit poll of the epoch-owned pidfd and the complete comparison of
+    /// `token` against the pinned one, then either publishes or invalidates
+    /// the session. Decode and validation of response bytes must already have
+    /// happened outside the lock into the non-authoritative `fact`; the
+    /// registry wrapper derives `token` from live registry state under the
+    /// same mutex, so a realm mutated since installation loses here.
     ///
     /// # Errors
     ///
     /// Returns [`RejectedPublication`] carrying `fact` back for out-of-lock
     /// disposal when the session is invalidated, already published, exited, or
     /// pinned to another token.
-    pub fn publish(&self, pin: SessionPin, fact: F) -> Result<(), RejectedPublication<F>> {
-        let mut state = self.lock_state();
-        if let Some(cause) = state.invalidated {
-            drop(state);
+    pub fn publish(&mut self, token: SessionPin, fact: F) -> Result<(), RejectedPublication<F>> {
+        if let Some(cause) = self.invalidated {
             return Err(RejectedPublication {
                 rejection: PublicationRejection::Invalidated(cause),
                 fact,
             });
         }
-        if state.published.is_some() {
-            drop(state);
+        if self.published.is_some() {
             return Err(RejectedPublication {
                 rejection: PublicationRejection::AlreadyPublished,
                 fact,
             });
         }
-        if pidfd_has_exited(state.pidfd.as_fd()).unwrap_or(true) {
-            state.invalidated = Some(InvalidationCause::PeerExited);
-            drop(state);
+        if pidfd_has_exited(self.pidfd.as_fd()).unwrap_or(true) {
+            self.invalidated = Some(InvalidationCause::PeerExited);
             return Err(RejectedPublication {
                 rejection: PublicationRejection::PeerExited,
                 fact,
             });
         }
-        if pin != state.pin {
-            state.invalidated = Some(InvalidationCause::PinMismatch);
-            drop(state);
+        if token != self.pin {
+            self.invalidated = Some(InvalidationCause::PinMismatch);
             return Err(RejectedPublication {
                 rejection: PublicationRejection::PinMismatch,
                 fact,
             });
         }
-        state.published = Some(fact);
-        drop(state);
+        self.published = Some(fact);
         Ok(())
     }
 
@@ -2389,35 +2434,31 @@ impl<F> PidfdGuardedSession<F> {
     /// rejects. Idempotent; a second observation (or one after cancellation)
     /// returns `None` and changes nothing.
     #[must_use = "drop the returned fact outside the registry mutex"]
-    pub fn observe_exit(&self) -> Option<F> {
-        let mut state = self.lock_state();
-        if state.invalidated.is_none() {
-            state.invalidated = Some(InvalidationCause::PeerExited);
+    pub const fn observe_exit(&mut self) -> Option<F> {
+        if self.invalidated.is_none() {
+            self.invalidated = Some(InvalidationCause::PeerExited);
         }
-        let fact = state.published.take();
-        drop(state);
-        fact
+        self.published.take()
     }
 
-    /// Cancel this epoch at session close or drain.
+    /// Cancel this epoch at session close, drain, or replacement.
     ///
     /// Cancellation is owned by the session lifecycle, not the monitor; the
     /// returned fact is dropped by the caller outside the lock.
     #[must_use = "drop the returned fact outside the registry mutex"]
-    pub fn cancel(&self) -> Option<F> {
-        let mut state = self.lock_state();
-        if state.invalidated.is_none() {
-            state.invalidated = Some(InvalidationCause::Cancelled);
+    pub const fn cancel(&mut self) -> Option<F> {
+        if self.invalidated.is_none() {
+            self.invalidated = Some(InvalidationCause::Cancelled);
         }
-        let fact = state.published.take();
-        drop(state);
-        fact
+        self.published.take()
     }
 
     /// Use the published fact after rechecking the complete pinned token.
     ///
     /// The closure runs under the registry mutex and must therefore be
-    /// lock-cheap: no I/O, no await, no logging.
+    /// lock-cheap: no I/O, no await, no logging. The registry wrapper derives
+    /// `token` from live registry state under the same mutex, so a realm
+    /// mutated since installation rejects every later use.
     ///
     /// # Errors
     ///
@@ -2425,25 +2466,19 @@ impl<F> PidfdGuardedSession<F> {
     /// not the pinned one, or nothing was published.
     pub fn with_fact<R>(
         &self,
-        pin: SessionPin,
+        token: SessionPin,
         read: impl FnOnce(&F) -> R,
     ) -> Result<R, FactUseError> {
-        let state = self.lock_state();
-        if let Some(cause) = state.invalidated {
-            drop(state);
+        if let Some(cause) = self.invalidated {
             return Err(FactUseError::Invalidated(cause));
         }
-        if pin != state.pin {
-            drop(state);
+        if token != self.pin {
             return Err(FactUseError::PinMismatch);
         }
-        let Some(fact) = state.published.as_ref() else {
-            drop(state);
+        let Some(fact) = self.published.as_ref() else {
             return Err(FactUseError::NotPublished);
         };
-        let result = read(fact);
-        drop(state);
-        Ok(result)
+        Ok(read(fact))
     }
 
     /// Duplicate the epoch-owned pidfd for an asynchronous exit monitor.
@@ -2453,40 +2488,8 @@ impl<F> PidfdGuardedSession<F> {
     /// Returns the underlying I/O error when the descriptor cannot be
     /// duplicated.
     pub fn monitor_fd(&self) -> Result<OwnedFd, std::io::Error> {
-        let state = self.lock_state();
-        let fd = state.pidfd.try_clone();
-        drop(state);
-        fd
+        self.pidfd.try_clone()
     }
-
-    fn lock_state(&self) -> MutexGuard<'_, GuardedSessionState<F>> {
-        // Poisoning is recovered: a panicked writer must not permanently
-        // strand session invalidation on this long-running broker.
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-/// Await the peer's exit and invalidate the session when it happens.
-///
-/// The returned fact (if a publication had completed) is handed to the caller
-/// for disposal outside the registry mutex — for example dropping the
-/// session's `ActiveArtifact` and triggering full reconnection. Cancelling
-/// this future never invalidates anything: cancellation is owned by session
-/// close and drain, so no detached monitor can invalidate a replacement
-/// epoch's fresh session value. A monitoring setup failure fails closed by
-/// invalidating immediately.
-pub async fn run_pidfd_monitor<F>(session: PidfdGuardedSession<F>) -> Option<F> {
-    let Ok(fd) = session.monitor_fd() else {
-        return session.observe_exit();
-    };
-    let Ok(async_fd) = tokio::io::unix::AsyncFd::with_interest(fd, tokio::io::Interest::READABLE)
-    else {
-        return session.observe_exit();
-    };
-    // Readable or failed both mean the epoch cannot be monitored further:
-    // fail closed by observing the exit.
-    let _readiness = async_fd.readable().await;
-    session.observe_exit()
 }
 
 #[cfg(test)]
@@ -3418,27 +3421,19 @@ mod broker_helper_conformance {
 
 #[cfg(test)]
 mod pidfd_publication_conformance {
-    //! Pidfd state-machine SPEC conformance test 17.
+    //! Pidfd state-machine SPEC conformance test 17: cell semantics.
     //!
-    //! Response bytes are always decoded and validated outside the registry
-    //! mutex into a non-authoritative fact; these tests race exit against
-    //! registry-lock acquisition, the nonblocking poll, the complete-token
-    //! comparison, atomic publication, later fact use, monitor cancellation,
-    //! drain, and replacement. Exactly one publication or invalidation wins,
-    //! every later use rechecks the pinned token, and no old monitor affects
-    //! a new session.
-
-    use std::time::Duration;
+    //! [`GuardedSessionCell`] is the lock-free state machine; the exact
+    //! realm-registry mutex that owns it — and the monitor, publication, and
+    //! later-use token checks against live registry mutation — are covered by
+    //! the guarded-session tests in `core::attestor_realm`. These tests prove
+    //! the cell's own transitions: the nonblocking poll, the complete-token
+    //! comparison, atomic publication, later fact use, cancellation,
+    //! idempotent exit observation, and replacement isolation via fresh pins.
 
     use super::pidfd_test_support::{blocking_child, exit_child, exited_child_pidfd, self_pidfd};
     use super::{
-        FactUseError, InvalidationCause, PidfdGuardedSession, PublicationRejection, SessionPin,
-        run_pidfd_monitor,
-    };
-    use crate::core::release_admission::{
-        ArtifactRequirement, ArtifactRole, CapabilityId, CapabilitySet,
-        HistoricalReleaseIdentityCheck, ProductId, ProtocolVersion, ReleaseAdmission,
-        ReleaseArtifact, ReleaseId, Sha256Digest, TargetTriple, VerifiedReleaseManifest,
+        FactUseError, GuardedSessionCell, InvalidationCause, PublicationRejection, SessionPin,
     };
 
     fn pin(session_epoch: u64) -> SessionPin {
@@ -3452,37 +3447,9 @@ mod pidfd_publication_conformance {
         }
     }
 
-    fn admission() -> (ReleaseAdmission, ArtifactRequirement) {
-        let digest = Sha256Digest::from_bytes([0x5A; 32]);
-        let role = ArtifactRole::new("attestor").expect("role");
-        let target = TargetTriple::new("x86_64-unknown-linux-gnu").expect("target");
-        let protocol = ProtocolVersion::new(1).expect("protocol");
-        let capabilities =
-            CapabilitySet::try_from_iter(
-                [CapabilityId::new("docker.rootful").expect("capability")],
-            )
-            .expect("capabilities");
-        let artifact = ReleaseArtifact::new(
-            role.clone(),
-            target.clone(),
-            digest,
-            protocol,
-            capabilities.clone(),
-        );
-        let manifest = VerifiedReleaseManifest::from_verified_parts(
-            HistoricalReleaseIdentityCheck::completed(),
-            ProductId::new("basil-attestor").expect("product"),
-            ReleaseId::new("1.0.0").expect("release"),
-            [artifact],
-        )
-        .expect("manifest");
-        let requirement = ArtifactRequirement::new(digest, role, target, protocol, capabilities);
-        (ReleaseAdmission::new(manifest), requirement)
-    }
-
     #[test]
     fn later_use_rechecks_every_pinned_token_dimension() {
-        let cell = PidfdGuardedSession::new(self_pidfd(), pin(1));
+        let mut cell = GuardedSessionCell::new(self_pidfd(), pin(1));
         assert!(matches!(
             cell.with_fact(pin(1), |fact: &u32| *fact),
             Err(FactUseError::NotPublished)
@@ -3528,7 +3495,7 @@ mod pidfd_publication_conformance {
 
     #[test]
     fn a_second_publication_never_wins() {
-        let cell = PidfdGuardedSession::new(self_pidfd(), pin(1));
+        let mut cell = GuardedSessionCell::new(self_pidfd(), pin(1));
         cell.publish(pin(1), 1_u32).expect("first publication");
         let rejected = cell.publish(pin(1), 2_u32).expect_err("second must lose");
         assert_eq!(rejected.rejection, PublicationRejection::AlreadyPublished);
@@ -3538,7 +3505,7 @@ mod pidfd_publication_conformance {
 
     #[test]
     fn a_stale_token_at_publication_invalidates_and_rejects_the_session() {
-        let cell = PidfdGuardedSession::new(self_pidfd(), pin(1));
+        let mut cell = GuardedSessionCell::new(self_pidfd(), pin(1));
         let rejected = cell.publish(pin(2), 7_u32).expect_err("stale token");
         assert_eq!(rejected.rejection, PublicationRejection::PinMismatch);
         assert_eq!(rejected.fact, 7);
@@ -3560,7 +3527,7 @@ mod pidfd_publication_conformance {
         // before the response path reaches the linearization point. The
         // nonblocking poll under the mutex rejects and invalidates.
         let (child, pidfd) = blocking_child();
-        let cell = PidfdGuardedSession::new(pidfd, pin(1));
+        let mut cell = GuardedSessionCell::new(pidfd, pin(1));
         exit_child(child);
         let rejected = cell.publish(pin(1), 7_u32).expect_err("exited peer");
         assert_eq!(rejected.rejection, PublicationRejection::PeerExited);
@@ -3573,76 +3540,30 @@ mod pidfd_publication_conformance {
 
     #[test]
     fn an_already_exited_pidfd_rejects_publication() {
-        let cell = PidfdGuardedSession::new(exited_child_pidfd(), pin(1));
+        let mut cell = GuardedSessionCell::new(exited_child_pidfd(), pin(1));
         let rejected = cell.publish(pin(1), 7_u32).expect_err("exited peer");
         assert_eq!(rejected.rejection, PublicationRejection::PeerExited);
     }
 
     #[test]
-    fn exit_after_publication_is_ordered_after_the_fact_and_releases_admission() {
-        let (release_admission, requirement) = admission();
-        let active = release_admission
-            .begin_preflight(&requirement)
-            .expect("preflight");
-        let cell = PidfdGuardedSession::new(self_pidfd(), pin(1));
-        cell.publish(pin(1), active).expect("publish");
-        assert_eq!(release_admission.snapshot().current.active_preflights, 1);
-
-        // The monitor observes exit under the same mutex; the completed fact
-        // is handed back and dropped outside the lock, releasing admission.
-        let taken = cell.observe_exit();
-        assert!(taken.is_some());
-        drop(taken);
-        assert_eq!(release_admission.snapshot().current.active_preflights, 0);
-
+    fn exit_observation_is_ordered_after_the_fact_and_idempotent() {
+        let mut cell = GuardedSessionCell::new(self_pidfd(), pin(1));
+        cell.publish(pin(1), 5_u8).expect("publish");
+        // The monitor observes exit under the registry mutex; the completed
+        // fact is handed back for disposal outside the lock.
+        assert_eq!(cell.observe_exit(), Some(5));
         // New work is rejected and a second observation changes nothing.
         assert!(matches!(
             cell.with_fact(pin(1), |_fact| ()),
             Err(FactUseError::Invalidated(InvalidationCause::PeerExited))
         ));
         assert!(cell.observe_exit().is_none());
-    }
-
-    #[test]
-    fn exactly_one_linearization_winner_under_a_racing_monitor() {
-        for _ in 0..64 {
-            let cell = PidfdGuardedSession::new(self_pidfd(), pin(1));
-            let publisher = {
-                let cell = cell.clone();
-                std::thread::spawn(move || cell.publish(pin(1), 1_u8))
-            };
-            let monitor = {
-                let cell = cell.clone();
-                std::thread::spawn(move || cell.observe_exit())
-            };
-            let attempt = publisher.join().expect("racing publication");
-            let taken = monitor.join().expect("monitor");
-            let visible = cell.with_fact(pin(1), |fact| *fact).is_ok();
-            match attempt {
-                // The publication won the lock first; the monitor either ran
-                // later and took the fact, or the fact is still visible.
-                Ok(()) => assert!(
-                    taken.is_some() ^ visible,
-                    "the fact must be in exactly one place"
-                ),
-                // The monitor won: the fact came back to the response path
-                // and nothing was ever published.
-                Err(rejected) => {
-                    assert_eq!(
-                        rejected.rejection,
-                        PublicationRejection::Invalidated(InvalidationCause::PeerExited)
-                    );
-                    assert_eq!(rejected.fact, 1);
-                    assert!(taken.is_none());
-                    assert!(!visible);
-                }
-            }
-        }
+        assert_eq!(cell.invalidation(), Some(InvalidationCause::PeerExited));
     }
 
     #[test]
     fn drain_cancellation_is_owned_by_close_and_never_touches_a_replacement() {
-        let old = PidfdGuardedSession::new(self_pidfd(), pin(1));
+        let mut old = GuardedSessionCell::new(self_pidfd(), pin(1));
         old.publish(pin(1), 1_u8).expect("publish");
         // Drain: session close cancels the epoch and disposes the fact.
         assert_eq!(old.cancel(), Some(1));
@@ -3655,7 +3576,7 @@ mod pidfd_publication_conformance {
 
         // The replacement epoch is a fresh cell with a fresh pin; the old
         // session's monitor and invalidation cannot reach it.
-        let replacement = PidfdGuardedSession::new(self_pidfd(), pin(2));
+        let mut replacement = GuardedSessionCell::new(self_pidfd(), pin(2));
         replacement.publish(pin(2), 2_u8).expect("publish");
         assert_eq!(replacement.with_fact(pin(2), |fact| *fact).expect("use"), 2);
         // The old pin never matches the replacement.
@@ -3665,38 +3586,149 @@ mod pidfd_publication_conformance {
         ));
     }
 
-    #[tokio::test]
-    async fn the_async_monitor_observes_a_real_exit_and_invalidates() {
+    #[test]
+    fn the_monitor_descriptor_is_an_independent_duplicate() {
+        // Serialize with tests asserting a dropped listener refuses
+        // connections: the fork window would keep their fds alive.
+        let _spawn_guard = crate::attestor_protocol::helper::CHILD_SPAWN_TEST_LOCK
+            .lock()
+            .unwrap();
         let (child, pidfd) = blocking_child();
-        let cell = PidfdGuardedSession::new(pidfd, pin(1));
-        cell.publish(pin(1), 5_u8).expect("publish while alive");
-        let monitor = tokio::spawn(run_pidfd_monitor(cell.clone()));
+        let cell = GuardedSessionCell::<u32>::new(pidfd, pin(1));
+        let monitor_fd = cell.monitor_fd().expect("duplicate pidfd");
+        drop(cell);
+        // The duplicate outlives the cell and still observes the process.
         exit_child(child);
-        let taken = tokio::time::timeout(Duration::from_secs(30), monitor)
-            .await
-            .expect("monitor must observe the exit")
-            .expect("monitor task");
-        assert_eq!(taken, Some(5));
+        let mut fds = [rustix::event::PollFd::new(
+            &monitor_fd,
+            rustix::event::PollFlags::IN,
+        )];
+        let zero = rustix::event::Timespec::default();
+        let ready = rustix::event::poll(&mut fds, Some(&zero)).expect("poll");
+        assert_eq!(ready, 1);
+    }
+}
+
+#[cfg(test)]
+mod pidfd_fdinfo_validation {
+    //! Broker-side pidfd `fdinfo` validation: the bounded read and the exact
+    //! single-`Pid:` parser (security-review finding SR-3). The helper
+    //! controls which descriptor arrives, so the read is capped before any
+    //! descriptor-type trust exists and the parse accepts exactly one
+    //! well-formed field.
+
+    use super::pidfd_test_support::{exited_child_pidfd, self_pidfd};
+    use super::{
+        MAX_PIDFD_FDINFO_BYTES, MeasurementError, parse_single_fdinfo_pid, read_bounded_fdinfo,
+        verify_pidfd_association,
+    };
+    use std::os::fd::AsFd as _;
+
+    #[test]
+    fn exact_parser_accepts_exactly_one_well_formed_pid_field() {
+        let info = "pos:\t0\nflags:\t02000002\nmnt_id:\t14\nino:\t1091\nPid:\t42\nNSpid:\t42\n";
+        assert_eq!(parse_single_fdinfo_pid(info).expect("single field"), 42);
+        assert_eq!(parse_single_fdinfo_pid("Pid:\t-1\n").expect("reaped"), -1);
+    }
+
+    #[test]
+    fn exact_parser_rejects_missing_duplicate_and_malformed_pid_fields() {
+        let cases = [
+            // Missing entirely (a non-pidfd descriptor's fdinfo shape).
+            "pos:\t0\nflags:\t02000002\nmnt_id:\t14\n",
+            // Duplicate, even when the values agree.
+            "Pid:\t42\nPid:\t42\n",
+            // Duplicate with a conflicting second value.
+            "Pid:\t42\nPid:\t7\n",
+            // Malformed values.
+            "Pid:\t\n",
+            "Pid:\tx7\n",
+            "Pid:\t7x\n",
+            "Pid:\t+7\n",
+            "Pid:\t7 7\n",
+            "Pid:\t--7\n",
+            "Pid:\t-\n",
+            // Overflow past i64.
+            "Pid:\t9223372036854775808\n",
+            "Pid:\t-9223372036854775809\n",
+        ];
+        for info in cases {
+            assert!(
+                matches!(
+                    parse_single_fdinfo_pid(info),
+                    Err(MeasurementError::PidfdType)
+                ),
+                "must reject: {info:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_read_rejects_oversize_before_parsing() {
+        let path = std::env::temp_dir().join(format!(
+            "basil-fdinfo-oversize-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut oversized = vec![b'#'; MAX_PIDFD_FDINFO_BYTES];
+        oversized.extend_from_slice(b"\nPid:\t42\n");
+        std::fs::write(&path, &oversized).expect("write oversized fixture");
+        let result = read_bounded_fdinfo(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(result, Err(MeasurementError::PidfdType)));
+    }
+
+    #[test]
+    fn bounded_read_accepts_content_at_the_ceiling() {
+        let path = std::env::temp_dir().join(format!(
+            "basil-fdinfo-bounded-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let exact = vec![b'#'; MAX_PIDFD_FDINFO_BYTES];
+        std::fs::write(&path, &exact).expect("write bounded fixture");
+        let result = read_bounded_fdinfo(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            result.expect("at the ceiling").len(),
+            MAX_PIDFD_FDINFO_BYTES
+        );
+    }
+
+    #[test]
+    fn association_accepts_the_exact_peer_and_rejects_a_mismatch() {
+        let pidfd = self_pidfd();
+        let own_pid =
+            u32::try_from(rustix::process::getpid().as_raw_nonzero().get()).expect("pid fits u32");
+        verify_pidfd_association(pidfd.as_fd(), own_pid).expect("own pidfd");
         assert!(matches!(
-            cell.with_fact(pin(1), |fact| *fact),
-            Err(FactUseError::Invalidated(InvalidationCause::PeerExited))
+            verify_pidfd_association(pidfd.as_fd(), own_pid.wrapping_add(1)),
+            Err(MeasurementError::PidfdAssociation)
+        ));
+        // An expected PID of zero can never be accepted: even if a foreign
+        // descriptor claimed `Pid: 0` (a process outside this PID
+        // namespace), the explicit zero guard rejects the pair.
+        assert!(matches!(
+            verify_pidfd_association(pidfd.as_fd(), 0),
+            Err(MeasurementError::PidfdAssociation)
         ));
     }
 
-    #[tokio::test]
-    async fn cancelling_the_monitor_future_never_invalidates_the_session() {
-        let (child, pidfd) = blocking_child();
-        let cell = PidfdGuardedSession::new(pidfd, pin(1));
-        cell.publish(pin(1), 5_u8).expect("publish");
-        let monitor = tokio::spawn(run_pidfd_monitor(cell.clone()));
-        // Give the monitor a chance to register before it is cancelled.
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        monitor.abort();
-        let _aborted = monitor.await;
-        // Cancellation is owned by session close and drain: the session is
-        // untouched and still serving its published fact.
-        assert_eq!(cell.with_fact(pin(1), |fact| *fact).expect("use"), 5);
-        assert_eq!(cell.cancel(), Some(5));
-        exit_child(child);
+    #[test]
+    fn association_reports_a_reaped_peer_as_exited() {
+        let pidfd = exited_child_pidfd();
+        assert!(matches!(
+            verify_pidfd_association(pidfd.as_fd(), 42),
+            Err(MeasurementError::PeerExited)
+        ));
+    }
+
+    #[test]
+    fn association_rejects_a_descriptor_that_is_not_a_pidfd() {
+        let file = std::fs::File::open("/proc/self/status").expect("open");
+        assert!(matches!(
+            verify_pidfd_association(file.as_fd(), 42),
+            Err(MeasurementError::PidfdType)
+        ));
     }
 }

@@ -1251,4 +1251,232 @@ socketAcl = "basil-attestor-control-g1"
             }
         }
     }
+
+    mod declared_authority {
+        //! `authenticate_socket_path` consumes the pinned measurement
+        //! authority (basil-43if): each live component must match the
+        //! declared owner, group, mode, and path exactly. These tests build
+        //! a real runtime directory and socket owned by the test user under
+        //! the workspace `target/` directory (whose ancestors satisfy the
+        //! ancestor walk) with a shared broker/attestor account so no
+        //! enrollment ACL is expected, then verify each declared-versus-live
+        //! mismatch rejects fail-closed.
+
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::net::UnixListener as StdUnixListener;
+
+        use super::super::{PathPosition, authenticate_socket_path, expected_access_acl};
+        use super::{PathBuf, RealmConfig, RealmError, fixture_body, fs};
+        use crate::core::attestor_realm::{MeasurementAuthority, RealmName, RealmSet};
+
+        fn euid() -> u32 {
+            rustix::process::geteuid().as_raw()
+        }
+
+        fn egid() -> u32 {
+            rustix::process::getegid().as_raw()
+        }
+
+        /// Parse one fixture body into its measurement authority so tests can
+        /// swap in individually mismatched declared values without bypassing
+        /// the type system.
+        fn parsed_measurement(broker_uid: u32, owner_uid: u32, group: u32) -> MeasurementAuthority {
+            let body = fixture_body(
+                broker_uid,
+                owner_uid,
+                group,
+                "basil-attestor-owner-podman-g1.service",
+            );
+            let value: toml::Value = toml::from_str(&body).expect("fixture parses");
+            let realms = RealmSet::from_bootstrap(&value).expect("fixture validates");
+            realms
+                .get(&RealmName::new("owner-podman").expect("name"))
+                .expect("realm")
+                .clone()
+                .measurement
+        }
+
+        /// Install a live runtime directory and socket exactly as declared
+        /// (shared broker/attestor account, so no access ACL is expected)
+        /// under the workspace `target/` directory.
+        fn live_fixture(case: &str) -> (RealmConfig, StdUnixListener, PathBuf) {
+            let target = fs::canonicalize("../../target").expect("workspace target dir");
+            let root = target.join(format!("realm-authn-{}-{case}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            let dir = root.join("g1");
+            fs::create_dir_all(&dir).expect("create runtime dir");
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o770)).expect("dir mode");
+
+            let body = fixture_body(
+                euid(),
+                euid(),
+                egid(),
+                "basil-attestor-owner-podman-g1.service",
+            );
+            let value: toml::Value = toml::from_str(&body).expect("fixture parses");
+            let realms = RealmSet::from_bootstrap(&value).expect("fixture validates");
+            let mut config = realms
+                .get(&RealmName::new("owner-podman").expect("name"))
+                .expect("realm")
+                .clone();
+            config.measurement.runtime_directory.clone_from(&dir);
+            config.measurement.socket_path = dir.join("control.sock");
+            let listener =
+                StdUnixListener::bind(&config.measurement.socket_path).expect("bind socket");
+            fs::set_permissions(
+                &config.measurement.socket_path,
+                fs::Permissions::from_mode(0o660),
+            )
+            .expect("socket mode");
+            (config, listener, root)
+        }
+
+        #[test]
+        fn accepts_the_exactly_declared_authority_and_echoes_the_identity() {
+            let (config, _listener, _root) = live_fixture("accept");
+            // The fixture is shared-account: every access ACL must be absent.
+            for position in [
+                PathPosition::Ancestor,
+                PathPosition::RuntimeDirectory,
+                PathPosition::Socket,
+            ] {
+                assert_eq!(expected_access_acl(&config, euid(), position), None);
+            }
+            let identity = authenticate_socket_path(&config).expect("declared authority matches");
+            assert_eq!(identity.owner, euid());
+            assert_eq!(identity.group, egid());
+            assert_eq!(identity.mode & 0o7777, 0o660);
+        }
+
+        #[test]
+        fn rejects_a_socket_owner_mismatch_against_the_declared_authority() {
+            let (mut config, _listener, _root) = live_fixture("sock-owner");
+            let foreign =
+                parsed_measurement(euid().wrapping_add(1), euid().wrapping_add(1), egid());
+            config.measurement.socket_owner = foreign.socket_owner;
+            assert_eq!(
+                authenticate_socket_path(&config),
+                Err(RealmError::Authentication)
+            );
+        }
+
+        #[test]
+        fn rejects_a_socket_group_mismatch_against_the_declared_authority() {
+            let (mut config, _listener, _root) = live_fixture("sock-group");
+            let foreign = parsed_measurement(euid(), euid(), egid().wrapping_add(1));
+            config.measurement.socket_group = foreign.socket_group;
+            assert_eq!(
+                authenticate_socket_path(&config),
+                Err(RealmError::Authentication)
+            );
+        }
+
+        #[test]
+        fn rejects_a_socket_mode_mismatch_against_the_declared_authority() {
+            let (config, _listener, _root) = live_fixture("sock-mode");
+            fs::set_permissions(
+                &config.measurement.socket_path,
+                fs::Permissions::from_mode(0o600),
+            )
+            .expect("narrow socket mode");
+            assert_eq!(
+                authenticate_socket_path(&config),
+                Err(RealmError::Authentication)
+            );
+            // Control: restoring the declared mode restores authentication.
+            fs::set_permissions(
+                &config.measurement.socket_path,
+                fs::Permissions::from_mode(0o660),
+            )
+            .expect("declared socket mode");
+            authenticate_socket_path(&config).expect("restored");
+        }
+
+        #[test]
+        fn rejects_a_runtime_directory_owner_mismatch() {
+            let (mut config, _listener, _root) = live_fixture("dir-owner");
+            let foreign =
+                parsed_measurement(euid().wrapping_add(1), euid().wrapping_add(1), egid());
+            config.measurement.runtime_directory_owner = foreign.runtime_directory_owner;
+            assert_eq!(
+                authenticate_socket_path(&config),
+                Err(RealmError::Authentication)
+            );
+        }
+
+        #[test]
+        fn rejects_a_runtime_directory_group_mismatch() {
+            let (mut config, _listener, _root) = live_fixture("dir-group");
+            let foreign = parsed_measurement(euid(), euid(), egid().wrapping_add(1));
+            config.measurement.runtime_directory_group = foreign.runtime_directory_group;
+            assert_eq!(
+                authenticate_socket_path(&config),
+                Err(RealmError::Authentication)
+            );
+        }
+
+        #[test]
+        fn rejects_a_runtime_directory_mode_mismatch() {
+            let (config, _listener, _root) = live_fixture("dir-mode");
+            fs::set_permissions(
+                &config.measurement.runtime_directory,
+                fs::Permissions::from_mode(0o700),
+            )
+            .expect("narrow dir mode");
+            assert_eq!(
+                authenticate_socket_path(&config),
+                Err(RealmError::Authentication)
+            );
+        }
+
+        #[test]
+        fn a_walk_missing_the_declared_runtime_directory_rejects() {
+            // The declared runtime directory is not on the socket path: the
+            // live 0770 directory is then judged as an ancestor, whose
+            // group-writable bit rejects, so a socket outside its declared
+            // runtime directory can never authenticate.
+            let (mut config, _listener, root) = live_fixture("dir-path");
+            config.measurement.runtime_directory = root.join("elsewhere");
+            assert_eq!(
+                authenticate_socket_path(&config),
+                Err(RealmError::Authentication)
+            );
+        }
+
+        #[test]
+        fn an_absent_socket_reports_socket_absent() {
+            let (mut config, _listener, root) = live_fixture("absent");
+            config.measurement.socket_path = root.join("g1").join("missing.sock");
+            assert_eq!(
+                authenticate_socket_path(&config),
+                Err(RealmError::SocketAbsent)
+            );
+        }
+
+        #[test]
+        fn a_symlinked_path_component_rejects() {
+            let (mut config, _listener, root) = live_fixture("symlink");
+            let alias = root.join("g1-alias");
+            std::os::unix::fs::symlink(root.join("g1"), &alias).expect("symlink");
+            config.measurement.runtime_directory.clone_from(&alias);
+            config.measurement.socket_path = alias.join("control.sock");
+            assert_eq!(
+                authenticate_socket_path(&config),
+                Err(RealmError::Authentication)
+            );
+        }
+
+        #[test]
+        fn ancestors_writable_to_group_or_other_reject() {
+            let (config, _listener, root) = live_fixture("ancestor");
+            // Loosen the ancestor above the runtime directory.
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o775)).expect("loose ancestor");
+            assert_eq!(
+                authenticate_socket_path(&config),
+                Err(RealmError::Authentication)
+            );
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).expect("tight ancestor");
+            authenticate_socket_path(&config).expect("restored");
+        }
+    }
 }

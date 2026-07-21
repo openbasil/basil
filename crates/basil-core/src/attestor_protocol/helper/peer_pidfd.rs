@@ -154,12 +154,13 @@ mod tests {
         for _ in 0..256 {
             assert_eq!(acquire(stream.as_fd()).unwrap_err(), PeerPidfdError::Io);
         }
-        // Parallel tests in this binary open and close a handful of
-        // descriptors concurrently, so the count is compared with slack: a
-        // real leak here would add one descriptor per iteration (+256).
+        // Parallel tests in this binary open and close descriptors
+        // concurrently (pidfds, sockets, runtime-directory fixtures), so the
+        // count is compared with generous slack: a real leak here would add
+        // one descriptor per iteration (+256), far above any transient churn.
         let after = open_fd_count();
         assert!(
-            after <= before + 16,
+            after <= before + 96,
             "descriptor leak: {before} fds before, {after} after"
         );
     }
