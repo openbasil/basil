@@ -409,9 +409,22 @@ mod tests {
         frontend: &Frontend,
         invocation: &Invocation,
     ) -> Result<EffectiveModel, ProjectionError> {
+        project_with_timeout_retrying_etxtbsy(frontend, invocation, DEFAULT_TIMEOUT).await
+    }
+
+    /// [`project_with_timeout`] with the same `ETXTBSY` spawn retry as
+    /// [`project_retrying_etxtbsy`]. Deadline-sensitive tests must retry the
+    /// transient parallel-fork `ExecutableFileBusy` themselves; the spawn
+    /// failure surfaces as `Execution` well before the deadline and would
+    /// otherwise mask the intended timeout outcome under load.
+    async fn project_with_timeout_retrying_etxtbsy(
+        frontend: &Frontend,
+        invocation: &Invocation,
+        timeout: Duration,
+    ) -> Result<EffectiveModel, ProjectionError> {
         let mut attempts = 0_u32;
         loop {
-            match project(frontend, invocation).await {
+            match project_with_timeout(frontend, invocation, timeout).await {
                 Err(ProjectionError::Execution(error))
                     if error.raw_os_error() == Some(26) && attempts < 50 =>
                 {
@@ -726,7 +739,7 @@ printf '%s' 'SENSITIVE-FRONTEND-DIAGNOSTIC' >&2"#,
             "printf '%s' $$ > {}\nexec sleep 30",
             pid_file.display()
         ));
-        let error = project_with_timeout(
+        let error = project_with_timeout_retrying_etxtbsy(
             &Frontend::Docker {
                 executable: frontend.0.clone(),
             },
