@@ -78,10 +78,7 @@ def main() -> None:
     # 1. AdminService.Status: prove we are speaking the broker protocol.
     admin = broker_pb2_grpc.AdminServiceStub(channel)
     status = admin.Status(broker_pb2.StatusRequest())
-    print(
-        f"PASS status backend={status.backend} version={status.version} "
-        f"protocol={status.protocol}"
-    )
+    print(f"PASS status backend={status.backend} version={status.version} protocol={status.protocol}")
 
     # 2. SigningService.Sign: the Ed25519 key signs IN PLACE in the backend;
     #    only the detached signature crosses the socket.
@@ -92,22 +89,14 @@ def main() -> None:
     print(f"PASS sign {KEY_ID} signature_len={len(sig.signature)}")
 
     # 3. SigningService.Verify: the broker confirms the signature ...
-    ok = signing.Verify(
-        broker_pb2.VerifyRequest(
-            key_id=KEY_ID, message=message, signature=sig.signature
-        )
-    )
+    ok = signing.Verify(broker_pb2.VerifyRequest(key_id=KEY_ID, message=message, signature=sig.signature))
     assert ok.valid, "broker reported the signature as INVALID"
     print("PASS verify valid=true")
 
     # ... and authoritatively rejects a one-bit tamper (valid=False is an
     # answer, not an error).
     tampered = bytes([message[0] ^ 1]) + message[1:]
-    bad = signing.Verify(
-        broker_pb2.VerifyRequest(
-            key_id=KEY_ID, message=tampered, signature=sig.signature
-        )
-    )
+    bad = signing.Verify(broker_pb2.VerifyRequest(key_id=KEY_ID, message=tampered, signature=sig.signature))
     assert not bad.valid, "tampered message unexpectedly verified"
     print("PASS verify tampered=rejected")
 
