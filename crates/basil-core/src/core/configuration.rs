@@ -1088,6 +1088,14 @@ fn extract_sources(
             })?;
         Ok(resolve_path(parent, raw))
     };
+    if let Some(name) = imports
+        .keys()
+        .find(|name| !matches!(name.as_str(), "catalog" | "policy" | "bundle" | "compose"))
+    {
+        return Err(ConfigurationError::InvalidCorpus(format!(
+            "unsupported configuration import slot `import.{name}`"
+        )));
+    }
     let compose_table = match imports.get("compose") {
         Some(value) => value.as_table().ok_or_else(|| {
             ConfigurationError::InvalidCorpus("`import.compose` must be a table".to_string())
@@ -1500,6 +1508,17 @@ web = "web.yaml"
         assert_eq!(
             loaded.sources.compose.get("web"),
             Some(&dir.join("web.yaml"))
+        );
+
+        write(
+            &config,
+            "schema = \"agent\"\nschemaVersion = 3\n[import]\ncatalog = \"a\"\npolicy = \"b\"\nbundle = \"c\"\nworkload = {}\n",
+        );
+        let error = load_bootstrap(Some(&config), &[]).expect_err("unknown import rejects");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported configuration import")
         );
 
         write(
