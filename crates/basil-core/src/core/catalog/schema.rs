@@ -4,10 +4,9 @@
 
 //! Catalog schema types: the key inventory + backend routing table (design §2).
 //!
-//! These are `serde`-derived and deserialized from the **exported JSON** the
-//! broker loads at startup. JSON keys are camelCase (the mechanical projection of
-//! the authored Nix, §2.3); enum string values are kebab-case (`ed25519-nkey`,
-//! `ascii-printable`, …).
+//! These are `serde`-derived and deserialized from the catalog slot in corpus
+//! schema `3`. Field names are camelCase; enum string values are kebab-case
+//! (`ed25519-nkey`, `ascii-printable`, …).
 
 use std::collections::BTreeMap;
 
@@ -23,12 +22,20 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Catalog {
-    /// Schema version of this document.
-    pub schema_version: u32,
+    /// Required corpus-slot discriminator.
+    pub schema: CatalogSchema,
     /// Backend instances, keyed by the name a [`KeyEntry::backend`] references.
     pub backends: BTreeMap<String, BackendRef>,
     /// Key inventory, keyed by dotted-lowercase key name.
     pub keys: BTreeMap<String, KeyEntry>,
+}
+
+/// The only discriminator accepted in the catalog slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum CatalogSchema {
+    /// A catalog document governed by the bootstrap's corpus version.
+    #[serde(rename = "catalog")]
+    Catalog,
 }
 
 /// A backend instance the catalog routes keys to.

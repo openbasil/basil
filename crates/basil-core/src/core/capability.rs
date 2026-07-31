@@ -345,7 +345,7 @@ mod tests {
     fn catalog_json(provides: &str, keys: &str) -> String {
         format!(
             r#"{{
-              "schemaVersion": 1,
+              "schema": "catalog",
               "backends": {{ "bao": {{ "kind": "vault", "addr": "http://127.0.0.1:8200"{provides} }} }},
               "keys": {{ {keys} }}
             }}"#

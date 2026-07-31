@@ -206,6 +206,11 @@ impl DoctorReport {
 /// handed here so the check logic is free of clap/config-file plumbing.
 #[derive(Debug, Clone)]
 pub struct DoctorInputs {
+    /// Non-secret startup overrides applied to the selected corpus.
+    pub overrides: Vec<crate::OverrideProvenance>,
+    /// Catalog already validated with document overrides, when the shared corpus
+    /// loader ran before doctor. Direct library callers may leave this absent.
+    pub validated_catalog: Option<crate::Catalog>,
     /// Path to the exported catalog JSON.
     pub catalog: std::path::PathBuf,
     /// Path to the exported policy JSON.
@@ -280,8 +285,12 @@ impl EnabledFeatures {
 pub async fn run_doctor(inputs: &DoctorInputs, features: EnabledFeatures) -> DoctorReport {
     let mut checks = Vec::new();
 
+    checks.push(override_provenance_check(&inputs.overrides));
     // Load the catalog/policy once; the result drives downstream checks.
-    let loaded = load_catalog_policy(&inputs.catalog, &inputs.policy);
+    let loaded = inputs
+        .validated_catalog
+        .clone()
+        .map_or_else(|| load_catalog_policy(&inputs.catalog, &inputs.policy), Ok);
     checks.push(catalog_policy_check(&loaded));
 
     // Offline config lints that need the loaded catalog (no unlock, no backend I/O).
@@ -310,6 +319,21 @@ pub async fn run_doctor(inputs: &DoctorInputs, features: EnabledFeatures) -> Doc
     checks.push(backend_reachability_check(backends.as_ref()).await);
 
     DoctorReport::from_checks(checks)
+}
+
+fn override_provenance_check(overrides: &[crate::OverrideProvenance]) -> CheckResult {
+    if overrides.is_empty() {
+        return CheckResult::ok("startup_overrides", "no startup overrides are active");
+    }
+    let detail = overrides
+        .iter()
+        .map(|item| format!("{} masks {}", item.path, item.masked_source.display()))
+        .collect::<Vec<_>>()
+        .join("; ");
+    CheckResult::ok(
+        "startup_overrides",
+        format!("{} active override(s): {detail}", overrides.len()),
+    )
 }
 
 /// A stable "skipped: catalog did not load" advisory row for a check that needs
@@ -1039,6 +1063,8 @@ mod tests {
 
     fn base_inputs(dir: &Path) -> DoctorInputs {
         DoctorInputs {
+            overrides: Vec::new(),
+            validated_catalog: None,
             catalog: dir.join("catalog.json"),
             policy: dir.join("policy.json"),
             bundle: dir.join("bundle.sealed"),
@@ -1051,6 +1077,18 @@ mod tests {
             unlock_bip39_selected: false,
             unlock_age_yubikey_selected: false,
         }
+    }
+
+    #[test]
+    fn override_provenance_is_non_secret_and_names_masked_source() {
+        let row = override_provenance_check(&[crate::OverrideProvenance {
+            path: "catalog.keys.web.signer.writable".to_string(),
+            masked_source: "/etc/basil/catalog.json".into(),
+        }]);
+        assert_eq!(row.name, "startup_overrides");
+        assert!(row.detail.contains("catalog.keys.web.signer.writable"));
+        assert!(row.detail.contains("/etc/basil/catalog.json"));
+        assert!(!row.detail.contains("=true"));
     }
 
     fn key_check(name: &str, status: KeyStatus) -> KeyCheck {

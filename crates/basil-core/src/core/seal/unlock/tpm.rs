@@ -51,6 +51,15 @@ mod reserved {
         ) -> Result<(MethodParams, KekWrap), UnlockError> {
             Err(UnlockError::NotImplemented(MethodKind::Tpm))
         }
+
+        fn rewrap_kek(
+            &self,
+            _slot: &Slot,
+            _kek: &MasterKek,
+            _header_aad: &[u8],
+        ) -> Result<(MethodParams, KekWrap), UnlockError> {
+            Err(UnlockError::NotImplemented(MethodKind::Tpm))
+        }
     }
 
     #[cfg(test)]
@@ -209,6 +218,22 @@ mod active {
             };
             Ok((params, wrap))
         }
+
+        fn rewrap_kek(
+            &self,
+            slot: &Slot,
+            kek: &MasterKek,
+            header_aad: &[u8],
+        ) -> Result<(MethodParams, KekWrap), UnlockError> {
+            Self::new(rewrap_pcr_selection(slot)?).wrap_kek(kek, header_aad, slot.slot_id)
+        }
+    }
+
+    fn rewrap_pcr_selection(slot: &Slot) -> Result<TpmPcrSelection, UnlockError> {
+        let MethodParams::Tpm { pcrs, .. } = &slot.params else {
+            return Err(UnlockError::ParamsMismatch("expected tpm params".into()));
+        };
+        Ok(pcrs.clone())
     }
 
     /// AES-256-GCM-wrap the master `kek` under the TPM-sealed 32-byte `slot_key`.
@@ -981,6 +1006,32 @@ mod active {
                 unwrap_with_slot_key(&slot_key, &wrap, &aad, 2),
                 Err(UnlockError::AuthFailed)
             ));
+        }
+
+        #[test]
+        fn epoch_rewrap_uses_recorded_custom_pcr_selection() {
+            let custom = TpmPcrSelection {
+                bank: "sha256".into(),
+                pcrs: vec![1, 5, 8, 14],
+            };
+            let slot = Slot {
+                slot_id: 7,
+                method: MethodKind::Tpm,
+                label: "custom".into(),
+                created_unix: 0,
+                params: MethodParams::Tpm {
+                    public: B64Bytes(Vec::new()),
+                    private: B64Bytes(Vec::new()),
+                    pcrs: custom.clone(),
+                    name_alg: NAME_ALG.into(),
+                    srk_template: SRK_TEMPLATE_ID.into(),
+                },
+                wrap: KekWrap {
+                    nonce: B64Bytes(Vec::new()),
+                    ciphertext: B64Bytes(Vec::new()),
+                },
+            };
+            assert_eq!(rewrap_pcr_selection(&slot).unwrap(), custom);
         }
 
         /// On a host without a TPM device, the method reports unavailable and

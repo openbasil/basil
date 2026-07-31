@@ -156,6 +156,20 @@ impl UnlockMethod for AgeYubikeyMethod {
         };
         Ok((params, wrap))
     }
+
+    fn rewrap_kek(
+        &self,
+        slot: &Slot,
+        kek: &MasterKek,
+        header_aad: &[u8],
+    ) -> Result<(MethodParams, KekWrap), UnlockError> {
+        let MethodParams::AgeYubikey { recipient } = &slot.params else {
+            return Err(UnlockError::ParamsMismatch(
+                "expected age-yubikey params".into(),
+            ));
+        };
+        Self::for_recipient(recipient.clone()).wrap_kek(kek, header_aad, slot.slot_id)
+    }
 }
 
 #[cfg(test)]

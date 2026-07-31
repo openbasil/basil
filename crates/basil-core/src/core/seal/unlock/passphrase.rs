@@ -40,6 +40,32 @@ impl PassphraseMethod {
     pub const fn with_params(passphrase: Zeroizing<Vec<u8>>, argon2: Argon2Params) -> Self {
         Self { passphrase, argon2 }
     }
+
+    fn wrap_with_argon2(
+        &self,
+        kek: &MasterKek,
+        header_aad: &[u8],
+        slot_id: u32,
+        argon2: Argon2Params,
+    ) -> Result<(MethodParams, KekWrap), UnlockError> {
+        let mut salt = [0u8; SALT_LEN];
+        rand::rngs::OsRng.fill_bytes(&mut salt);
+        let slot_key = derive_slot_key(&self.passphrase, &salt, argon2)?;
+        let nonce = aead::fresh_nonce();
+        let aad = wrap_aad(header_aad, slot_id);
+        let ciphertext = aead::seal(&slot_key, &nonce, &aad, kek.as_bytes())
+            .map_err(|e| UnlockError::Crypto(e.to_string()))?;
+        Ok((
+            MethodParams::Passphrase {
+                salt: B64Bytes(salt.to_vec()),
+                argon2,
+            },
+            KekWrap {
+                nonce: B64Bytes(nonce.to_vec()),
+                ciphertext: B64Bytes(ciphertext),
+            },
+        ))
+    }
 }
 
 impl UnlockMethod for PassphraseMethod {
@@ -78,22 +104,21 @@ impl UnlockMethod for PassphraseMethod {
         header_aad: &[u8],
         slot_id: u32,
     ) -> Result<(MethodParams, KekWrap), UnlockError> {
-        let mut salt = [0u8; SALT_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut salt);
-        let slot_key = derive_slot_key(&self.passphrase, &salt, self.argon2)?;
-        let nonce = aead::fresh_nonce();
-        let aad = wrap_aad(header_aad, slot_id);
-        let ciphertext = aead::seal(&slot_key, &nonce, &aad, kek.as_bytes())
-            .map_err(|e| UnlockError::Crypto(e.to_string()))?;
-        let params = MethodParams::Passphrase {
-            salt: B64Bytes(salt.to_vec()),
-            argon2: self.argon2,
+        self.wrap_with_argon2(kek, header_aad, slot_id, self.argon2)
+    }
+
+    fn rewrap_kek(
+        &self,
+        slot: &Slot,
+        kek: &MasterKek,
+        header_aad: &[u8],
+    ) -> Result<(MethodParams, KekWrap), UnlockError> {
+        let MethodParams::Passphrase { argon2, .. } = &slot.params else {
+            return Err(UnlockError::ParamsMismatch(
+                "expected passphrase params".into(),
+            ));
         };
-        let wrap = KekWrap {
-            nonce: B64Bytes(nonce.to_vec()),
-            ciphertext: B64Bytes(ciphertext),
-        };
-        Ok((params, wrap))
+        self.wrap_with_argon2(kek, header_aad, slot.slot_id, *argon2)
     }
 }
 

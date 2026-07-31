@@ -34,7 +34,7 @@ Online docs: **[CLI overview](https://docs.openbasil.org/cli/overview/)** and **
 
 Client commands take the socket from `--socket` or `BASIL_SOCKET`. `basil --help` is the
 authoritative command reference; man pages are rendered from this crate's library surface
-([`cli()`]) by the workspace `xtask`, so the shipped documentation should always be in sync with the from the parser.
+([`cli()`]) by the workspace `xtask`, so the shipped documentation should always be in sync with the parser.
 
 ## Feature flags
 

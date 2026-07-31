@@ -27,8 +27,6 @@ let
   caps = import ../../nix/backend-capabilities.nix;
 
   catalog = {
-    schemaVersion = 1;
-
     backends.bao = {
       # `implementation` declares what the backend PROVIDES (kind + engines +
       # capabilities + mintKeyTypes). Basil derives what the catalog requires
@@ -91,9 +89,6 @@ let
     };
   };
 
-  # No `schemaVersion` here: the `services.basil.policy` option set does not
-  # declare one (nix/basil-agent.nix stamps `schemaVersion = 2` when it projects
-  # the policy to JSON), so the direct `run` path below stamps it the same way.
   policy = {
     # Named subjects: each maps a stable name to a typed principal selector, here
     # a Unix uid proven by `SO_PEERCRED`. Rules below grant to these names.
@@ -215,21 +210,36 @@ let
   # capabilities/mintKeyTypes at the backend top level, beside addr). The NixOS
   # `module` projects this via nix/basil-agent.nix; the direct `run` path
   # serializes the catalog itself, so it applies the same projection here.
-  projectBackend = b: b.implementation // { inherit (b) addr; };
+  projectBackend =
+    b:
+    b.implementation
+    // {
+      inherit (b) addr;
+      requires = b.requires or [ ];
+    };
   projectedCatalog = catalog // {
+    schema = "catalog";
     backends = builtins.mapAttrs (_: projectBackend) catalog.backends;
   };
   catalogJson = pkgs.writeText "basil-example-catalog.json" (builtins.toJSON projectedCatalog);
   policyJson = pkgs.writeText "basil-example-policy.json" (
-    builtins.toJSON (policy // { schemaVersion = 2; })
+    builtins.toJSON (policy // { schema = "policy"; })
   );
 
-  # `--transit-mount` and `--strict-bundle-perms` are no longer `basil agent` CLI
-  # flags; they are TOML startup-config settings. This minimal config carries
-  # them; the wrapper still passes catalog/policy/bundle/socket/vault-addr as
-  # flags, which override / fill in the config file at load time.
+  # The bootstrap selects corpus schema 3 and references every external source.
+  # The runner overrides deployment-specific leaves without changing the
+  # catalog or policy documents in the Nix store.
   agentRunConfig = pkgs.writeText "basil-example-agent.toml" ''
+    schema = "agent"
+    schemaVersion = 3
+    socket = "/tmp/basil-example.sock"
+    vault-addr = "https://127.0.0.1:8200"
     transit-mount = "transit"
+
+    [import]
+    catalog = "${catalogJson}"
+    policy = "${policyJson}"
+    bundle = "/var/lib/basil/bundle.sealed"
 
     [unlock]
     strict-bundle-perms = true
@@ -244,11 +254,9 @@ let
 
       exec env -u VAULT_TOKEN ${basilPackage}/bin/basil agent \
         --config ${agentRunConfig} \
-        --catalog ${catalogJson} \
-        --policy ${policyJson} \
-        --bundle "$BASIL_EXAMPLE_BUNDLE" \
-        --socket "$BASIL_EXAMPLE_SOCKET" \
-        --vault-addr "$BASIL_EXAMPLE_VAULT_ADDR"
+        -o "import.bundle=$BASIL_EXAMPLE_BUNDLE" \
+        -o "socket=$BASIL_EXAMPLE_SOCKET" \
+        -o "vault-addr=$BASIL_EXAMPLE_VAULT_ADDR"
     '';
   };
 

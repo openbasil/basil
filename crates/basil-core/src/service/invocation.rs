@@ -1046,7 +1046,7 @@ mod tests {
     fn catalog_json() -> String {
         format!(
             r#"{{
-              "schemaVersion": 1,
+              "schema": "catalog",
               "backends": {{
                 "test": {{ "kind": "vault", "addr": "https://127.0.0.1:8200" }}
               }},
@@ -1086,7 +1086,7 @@ mod tests {
         let mallory_public = policy_public(mallory_signer);
         format!(
             r#"{{
-              "schemaVersion": 2,
+              "schema": "policy",
               "subjects": {{
                 "{CLIENT_SUBJECT}": {{
                   "allOf": [

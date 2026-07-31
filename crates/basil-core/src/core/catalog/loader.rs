@@ -8,6 +8,7 @@
 //! [`load`] is the single entry point. It validates **all** of §5's hard errors
 //! up front so a bad export fails fast at startup rather than at request time.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 
@@ -73,20 +74,6 @@ pub enum LoadError {
         rule: String,
         /// The unknown role name.
         role: String,
-    },
-
-    /// The policy schema version is not supported by this loader.
-    #[error("policy schemaVersion `{version}` is unsupported (expected 2)")]
-    UnsupportedPolicySchema {
-        /// The unsupported version.
-        version: u32,
-    },
-
-    /// The catalog schema version is not supported by this loader.
-    #[error("catalog schemaVersion `{version}` is unsupported (expected 1)")]
-    UnsupportedCatalogSchema {
-        /// The unsupported version.
-        version: u32,
     },
 
     /// A subject name is empty after trimming.
@@ -406,9 +393,8 @@ pub enum LoadError {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawPolicy {
-    /// Policy schema version. The subject registry schema is version 2.
-    #[serde(rename = "schemaVersion", default = "default_policy_schema_version")]
-    pub schema_version: u32,
+    /// Required corpus-slot discriminator.
+    pub schema: PolicySchema,
     /// Named subject registry.
     #[serde(
         default,
@@ -438,8 +424,12 @@ pub struct RawPolicy {
     pub config: Config,
 }
 
-const fn default_policy_schema_version() -> u32 {
-    2
+/// The only discriminator accepted in the policy slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum PolicySchema {
+    /// A policy document governed by the bootstrap's corpus version.
+    #[serde(rename = "policy")]
+    Policy,
 }
 
 fn deserialize_unique_btree_map<'de, D, K, V>(deserializer: D) -> Result<BTreeMap<K, V>, D::Error>
@@ -532,7 +522,8 @@ pub struct RawRule {
 
 // ---- Public entry point -----------------------------------------------------
 
-/// Load + validate the exported catalog & policy JSON.
+/// Load and validate canonical JSON projections of corpus-schema-3 catalog and
+/// policy documents.
 ///
 /// Returns the parsed [`Catalog`], the ready-for-PDP [`ResolvedPolicy`] index,
 /// and the [`Config`] tables, plus any non-fatal [`LoadWarning`]s. Validates the
@@ -541,20 +532,20 @@ pub fn load(
     catalog_json: &str,
     policy_json: &str,
 ) -> Result<(Catalog, ResolvedPolicy, Config, Vec<LoadWarning>), LoadError> {
+    let catalog_json = normalize_legacy_document(catalog_json, LegacyDocument::Catalog)?;
+    let policy_json = normalize_legacy_document(policy_json, LegacyDocument::Policy)?;
     let catalog: Catalog =
-        serde_json::from_str(catalog_json).map_err(|source| LoadError::Json {
+        serde_json::from_str(catalog_json.as_ref()).map_err(|source| LoadError::Json {
             what: "catalog",
             source,
         })?;
     let raw_policy: RawPolicy =
-        serde_json::from_str(policy_json).map_err(|source| LoadError::Json {
+        serde_json::from_str(policy_json.as_ref()).map_err(|source| LoadError::Json {
             what: "policy",
             source,
         })?;
 
-    validate_catalog_schema(catalog.schema_version)?;
     let warnings = validate_catalog(&catalog)?;
-    validate_policy_schema(raw_policy.schema_version)?;
     let subjects = parse_subjects(
         raw_policy.subjects,
         raw_policy.unauthenticated_subject.as_ref(),
@@ -572,17 +563,127 @@ pub fn load(
     Ok((catalog, resolved, raw_policy.config, warnings))
 }
 
-// ---- Catalog validation (§2, §5) --------------------------------------------
-
-/// Hard-require the one catalog schema version this loader understands,
-/// mirroring [`validate_policy_schema`]: a future incompatible catalog must
-/// fail closed at load instead of parsing silently.
-const fn validate_catalog_schema(version: u32) -> Result<(), LoadError> {
-    if version == 1 {
-        return Ok(());
-    }
-    Err(LoadError::UnsupportedCatalogSchema { version })
+#[derive(Debug, Clone, Copy)]
+enum LegacyDocument {
+    Catalog,
+    Policy,
 }
+
+fn normalize_legacy_document(
+    raw: &str,
+    document: LegacyDocument,
+) -> Result<Cow<'_, str>, LoadError> {
+    let what = match document {
+        LegacyDocument::Catalog => "catalog",
+        LegacyDocument::Policy => "policy",
+    };
+    let value = serde_json::from_str::<serde_json::Value>(raw)
+        .map_err(|source| LoadError::Json { what, source })?;
+    let Some(object) = value.as_object() else {
+        return Ok(Cow::Borrowed(raw));
+    };
+    let (legacy_version, discriminator, required_shape) = match document {
+        LegacyDocument::Catalog => (
+            1,
+            "catalog",
+            object
+                .get("backends")
+                .is_some_and(serde_json::Value::is_object)
+                && object.get("keys").is_some_and(serde_json::Value::is_object),
+        ),
+        LegacyDocument::Policy => (
+            2,
+            "policy",
+            object
+                .get("subjects")
+                .is_some_and(serde_json::Value::is_object)
+                && object.get("rules").is_some_and(serde_json::Value::is_array),
+        ),
+    };
+    let is_unambiguous_legacy = object.get("schema").is_none()
+        && object
+            .get("schemaVersion")
+            .and_then(serde_json::Value::as_u64)
+            == Some(legacy_version)
+        && required_shape;
+    if is_unambiguous_legacy {
+        return rewrite_legacy_schema_version(raw, legacy_version, discriminator)
+            .map(Cow::Owned)
+            .ok_or_else(|| LoadError::Json {
+                what,
+                source: serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "could not locate the top-level legacy schema discriminator",
+                )),
+            });
+    }
+    Ok(Cow::Borrowed(raw))
+}
+
+fn rewrite_legacy_schema_version(
+    raw: &str,
+    expected_version: u64,
+    discriminator: &str,
+) -> Option<String> {
+    let mut object_depth = 0_u32;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut string_start = 0;
+    let mut key_span = None;
+    for (index, character) in raw.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+                let key = raw.get(string_start..index)?;
+                if object_depth == 1 && key == "schemaVersion" {
+                    key_span = Some((string_start.saturating_sub(1), index + 1));
+                    break;
+                }
+            }
+            continue;
+        }
+        match character {
+            '"' => {
+                in_string = true;
+                string_start = index + 1;
+            }
+            '{' => object_depth = object_depth.saturating_add(1),
+            '}' => object_depth = object_depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    let (key_start, key_end) = key_span?;
+    let after_key = raw.get(key_end..)?;
+    let after_whitespace = after_key.trim_start();
+    let colon = after_whitespace.strip_prefix(':')?;
+    let value_tail = colon.trim_start();
+    let value_start = raw.len().checked_sub(value_tail.len())?;
+    let expected = expected_version.to_string();
+    let remainder = value_tail.strip_prefix(&expected)?;
+    if remainder
+        .chars()
+        .next()
+        .is_some_and(|character| !character.is_whitespace() && !matches!(character, ',' | '}'))
+    {
+        return None;
+    }
+    let value_end = value_start.checked_add(expected.len())?;
+    let mut rewritten = String::with_capacity(raw.len() + discriminator.len());
+    rewritten.push_str(raw.get(..key_start)?);
+    rewritten.push_str("\"schema\"");
+    rewritten.push_str(raw.get(key_end..value_start)?);
+    rewritten.push('"');
+    rewritten.push_str(discriminator);
+    rewritten.push('"');
+    rewritten.push_str(raw.get(value_end..)?);
+    Some(rewritten)
+}
+
+// ---- Catalog validation (§2, §5) --------------------------------------------
 
 fn validate_catalog(catalog: &Catalog) -> Result<Vec<LoadWarning>, LoadError> {
     // Duplicate key names cannot occur (BTreeMap dedups on deserialize), so the
@@ -985,13 +1086,6 @@ const fn class_str(class: Class) -> &'static str {
 
 // ---- Policy parsing + validation (§3, §5) -----------------------------------
 
-const fn validate_policy_schema(version: u32) -> Result<(), LoadError> {
-    if version == 2 {
-        return Ok(());
-    }
-    Err(LoadError::UnsupportedPolicySchema { version })
-}
-
 fn parse_subjects(
     raw: BTreeMap<SubjectName, RawSubjectDefinition>,
     unauthenticated_subject: Option<&SubjectName>,
@@ -1321,7 +1415,7 @@ mod tests {
     fn catalog_json(keys: &str) -> String {
         format!(
             r#"{{
-              "schemaVersion": 1,
+              "schema": "catalog",
               "backends": {{ "bao": {{ "kind": "vault", "addr": "https://127.0.0.1:8200" }} }},
               "keys": {{ {keys} }}
             }}"#
@@ -1338,7 +1432,7 @@ mod tests {
     fn policy_json(roles_body: &str, rules_array: &str) -> String {
         format!(
             r#"{{
-              "schemaVersion": 2,
+              "schema": "policy",
               "subjects": {{
                 "svc.nats": {{ "allOf": [ {{ "kind": "unix", "uid": 9002 }} ] }},
                 "ops.wheel": {{ "allOf": [ {{ "kind": "unix", "gid": 10 }} ] }},
@@ -1365,7 +1459,7 @@ mod tests {
             r#"{ "id": "r1", "subjects": ["svc.nats"], "action": ["role:reader"], "target": ["nats.account"] }"#,
         );
         let (catalog, resolved, _cfg, warnings) = load(&cat, &pol).expect("loads");
-        assert_eq!(catalog.schema_version, 1);
+        assert_eq!(catalog.schema, crate::catalog::CatalogSchema::Catalog);
         assert!(warnings.is_empty());
         // reader = get/list/get_public_key over nats.account, rule for uid 9002.
         let rule = resolved
@@ -1380,20 +1474,41 @@ mod tests {
     // ---- Catalog hard errors ------------------------------------------------
 
     #[test]
-    fn unsupported_catalog_schema_version_is_a_hard_error() {
-        // Mirror of the strict policy schemaVersion check: a future incompatible
-        // catalog must fail closed at load instead of parsing silently.
+    fn wrong_catalog_discriminator_is_a_hard_error() {
         let cat =
-            catalog_json(ASYM_KEY).replacen("\"schemaVersion\": 1", "\"schemaVersion\": 7", 1);
+            catalog_json(ASYM_KEY).replacen("\"schema\": \"catalog\"", "\"schema\": \"other\"", 1);
         let pol = policy_json(
             READER_ROLE,
             r#"{ "id": "r1", "subjects": ["svc.nats"], "action": ["role:reader"], "target": ["nats.account"] }"#,
         );
-        let err = load(&cat, &pol).expect_err("catalog schemaVersion 7 refused");
+        let err = load(&cat, &pol).expect_err("wrong catalog discriminator refused");
         assert!(matches!(
             err,
-            LoadError::UnsupportedCatalogSchema { version: 7 }
+            LoadError::Json {
+                what: "catalog",
+                ..
+            }
         ));
+    }
+
+    #[test]
+    fn legacy_catalog_v1_remains_supported() {
+        let cat =
+            catalog_json(ASYM_KEY).replacen("\"schema\": \"catalog\"", "\"schemaVersion\": 1", 1);
+        let pol = policy_json(READER_ROLE, "");
+        let (catalog, _, _, _) = load(&cat, &pol).expect("catalog v1 remains accepted");
+        assert_eq!(catalog.schema, crate::catalog::CatalogSchema::Catalog);
+    }
+
+    #[test]
+    fn legacy_policy_v2_remains_supported() {
+        let cat = catalog_json(ASYM_KEY);
+        let pol = policy_json(READER_ROLE, "").replacen(
+            "\"schema\": \"policy\"",
+            "\"schemaVersion\": 2",
+            1,
+        );
+        let (_, _, _, _) = load(&cat, &pol).expect("policy v2 remains accepted");
     }
 
     #[test]
@@ -1428,7 +1543,7 @@ mod tests {
     fn subject_name_with_control_char_is_fatal() {
         let cat = catalog_json(ASYM_KEY);
         let pol = r#"{
-          "schemaVersion": 2,
+          "schema": "policy",
           "subjects": { "svc.\nnats": { "allOf": [ { "kind": "unix", "uid": 9002 } ] } },
           "roles": {},
           "rules": [],
@@ -1480,7 +1595,7 @@ mod tests {
         let cat = catalog_json(ASYM_KEY);
         // `breakGlas` (typo) silently defaulting breakGlass=false must not load.
         let pol = r#"{
-          "schemaVersion": 2,
+          "schema": "policy",
           "subjects": { "svc.nats": { "breakGlas": true, "allOf": [ { "kind": "unix", "uid": 9002 } ] } },
           "roles": {},
           "rules": [],
@@ -1965,7 +2080,7 @@ mod tests {
     fn duplicate_subject_key_is_fatal() {
         let cat = catalog_json(ASYM_KEY);
         let pol = r#"{
-          "schemaVersion": 2,
+          "schema": "policy",
           "subjects": {
             "svc.nats": { "allOf": [ { "kind": "unix", "uid": 9002 } ] },
             "svc.nats": { "allOf": [ { "kind": "unix", "uid": 9003 } ] }
@@ -1989,7 +2104,7 @@ mod tests {
     fn duplicate_role_key_is_fatal() {
         let cat = catalog_json(ASYM_KEY);
         let pol = r#"{
-          "schemaVersion": 2,
+          "schema": "policy",
           "subjects": {
             "svc.nats": { "allOf": [ { "kind": "unix", "uid": 9002 } ] }
           },
@@ -2154,7 +2269,7 @@ mod tests {
         for field in ["allOf", "anyOf"] {
             let pol = format!(
                 r#"{{
-                  "schemaVersion": 2,
+                  "schema": "policy",
                   "subjects": {{ "svc.empty": {{ "{field}": [] }} }},
                   "roles": {{ }},
                   "rules": [],
@@ -2172,7 +2287,7 @@ mod tests {
     fn unix_principal_requires_uid_or_gid() {
         let cat = catalog_json(ASYM_KEY);
         let pol = r#"{
-          "schemaVersion": 2,
+          "schema": "policy",
           "subjects": { "svc.bad": { "allOf": [ { "kind": "unix" } ] } },
           "roles": {},
           "rules": [],
@@ -2188,7 +2303,7 @@ mod tests {
     fn unauthenticated_principal_must_match_configured_subject() {
         let cat = catalog_json(ASYM_KEY);
         let pol = r#"{
-          "schemaVersion": 2,
+          "schema": "policy",
           "unauthenticatedSubject": "guest",
           "subjects": { "other": { "allOf": [ { "kind": "unauthenticated" } ] } },
           "roles": {},
@@ -2205,7 +2320,7 @@ mod tests {
     fn unauthenticated_subject_must_be_defined() {
         let cat = catalog_json(ASYM_KEY);
         let pol = r#"{
-          "schemaVersion": 2,
+          "schema": "policy",
           "unauthenticatedSubject": "guest",
           "subjects": {},
           "roles": {},
@@ -2222,7 +2337,7 @@ mod tests {
     fn unsupported_principal_kind_and_signature_algorithm_are_fatal() {
         let cat = catalog_json(ASYM_KEY);
         let bad_kind = r#"{
-          "schemaVersion": 2,
+          "schema": "policy",
           "subjects": { "svc.bad": { "allOf": [ { "kind": "process", "sha256": "00" } ] } },
           "roles": {},
           "rules": [],
@@ -2231,7 +2346,7 @@ mod tests {
         assert!(matches!(load(&cat, bad_kind), Err(LoadError::Json { .. })));
 
         let bad_alg = r#"{
-          "schemaVersion": 2,
+          "schema": "policy",
           "subjects": {
             "svc.bad": {
               "allOf": [ { "kind": "signature-key", "algorithm": "ssh-ed25519", "public": "x" } ]
@@ -2248,7 +2363,7 @@ mod tests {
     fn malformed_signature_key_public_material_is_fatal() {
         let cat = catalog_json(ASYM_KEY);
         let bad_ed25519 = r#"{
-          "schemaVersion": 2,
+          "schema": "policy",
           "subjects": {
             "svc.bad": {
               "allOf": [ { "kind": "signature-key", "algorithm": "ed25519", "public": "not-base64url" } ]
@@ -2267,7 +2382,7 @@ mod tests {
         ));
 
         let bad_nkey = r#"{
-          "schemaVersion": 2,
+          "schema": "policy",
           "subjects": {
             "svc.bad": {
               "allOf": [ { "kind": "signature-key", "algorithm": "nats-nkey", "public": "not-an-nkey" } ]
@@ -2374,6 +2489,7 @@ mod tests {
         let cat = catalog_json(ASYM_KEY);
         let pol = format!(
             r#"{{
+              "schema": "policy",
               "roles": {{ {READER_ROLE} }},
               "rules": [],
               "config": {{

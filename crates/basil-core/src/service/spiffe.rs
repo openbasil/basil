@@ -1050,7 +1050,7 @@ mod tests {
     use crate::state::{BrokerLimits, DEFAULT_SVID_TTL_SECS};
 
     const CATALOG: &str = r#"{
-      "schemaVersion": 1,
+      "schema": "catalog",
       "backends": { "bao": { "kind": "vault", "addr": "https://127.0.0.1:8200" } },
       "keys": {
         "spire.jwt": {
@@ -1069,7 +1069,7 @@ mod tests {
     }"#;
 
     const POLICY: &str = r#"{
-      "schemaVersion": 2,
+      "schema": "policy",
       "subjects": {
         "svc.api": { "allOf": [ { "kind": "unix", "uid": 9100 } ] }
       },
@@ -1522,7 +1522,7 @@ mod tests {
         // Reload policy: same catalog (routing shape unchanged), config renames
         // uid 9100 → "renamed".
         const RENAMED_POLICY: &str = r#"{
-          "schemaVersion": 2,
+          "schema": "policy",
           "subjects": {
             "svc.api": { "allOf": [ { "kind": "unix", "uid": 9100 } ] }
           },
