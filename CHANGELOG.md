@@ -6,6 +6,36 @@ SPDX-License-Identifier: Apache-2.0
 
 # Changelog
 
+## 0.7.2 2026-07-31
+
+### Configuration and policy
+
+- Adds corpus schema 3 as the canonical agent, catalog, and policy format. A
+  schema-3 agent bootstrap names its catalog, policy, and sealed bundle under
+  `[import]`; typed `-o PATH=VALUE` startup overrides are validated, bounded,
+  reapplied on reload, and reported without logging their values.
+- Keeps the 0.7.1 top-level config keys, direct `--catalog`/`--policy`/`--bundle`
+  flags, catalog v1, and policy v2 working. Existing installations can upgrade
+  without migrating their configuration; new and generated configuration uses
+  schema 3.
+- Startup, offline validation, and reload use bounded, race-checked reads and
+  emit source provenance with the resolved path, size, modification time, and
+  SHA-256 digest. A rejected reload leaves the active generation serving.
+
+### Security and reliability
+
+- Unix sockets are created inside a private mode-`0700` staging directory,
+  changed to mode `0600`, and published without replacement. Concurrent starts
+  cannot expose a permissive socket or change the process-wide umask.
+- Sealed-bundle maintenance now uses a lock and durable pinned-file writes, and
+  replacing one unlock method preserves the other configured methods.
+- A wrong data-encryption key or corrupt `db-keystore` is contained at the
+  adapter boundary and fails closed with a stable, secret-free startup error
+  instead of unwinding through the broker.
+- Adds focused `just` check/test targets and makes Go interop checkout discovery
+  work from Jujutsu workspaces while keeping the sandbox sealed from unrelated
+  host paths.
+
 ## 0.7.1 2026-07-08
 
 ### `basil demo`: a zero-dependency guided tour

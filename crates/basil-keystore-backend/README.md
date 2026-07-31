@@ -35,6 +35,9 @@ module).
   plain `Vec`s, or holds material past the operation.
 - Errors are reduced to stable, leak-safe summaries before they leave the crate: no secret bytes
   ride in any error.
+- Opening a `db-keystore` is contained behind a panic boundary. A corrupt store or wrong
+  data-encryption key therefore fails startup with a stable error instead of unwinding through the
+  long-running broker.
 - The crate holds storage adapters only. Policy, attestation, and auditing stay in `basil-core`;
   a store cannot be reached except through the broker's decision path.
 

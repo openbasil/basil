@@ -165,6 +165,10 @@
           tpm-unlock-test = import ./nix/tests/tpm-unlock-test.nix {
             inherit pkgs basilTpm;
           };
+          basil-agent-schema3-test = import ./nix/tests/basil-agent-schema3-test.nix {
+            inherit pkgs basil;
+            nixosSystem = inputs.nixpkgs.lib.nixosSystem;
+          };
 
           # Distribution build for the `.deb`: the two shipped binaries plus the
           # roff man pages the `xtask` crate emits (via `clap_mangen`). Scoped to
@@ -349,6 +353,7 @@
         # linux systems. Keep it outside `checks` so `nix flake check` remains
         # lightweight; run it explicitly as `nix build .#tests.<sys>.tpm-unlock`.
         // lib.optionalAttrs (lib.hasSuffix "linux" system) {
+          checks.basil-agent-schema3 = basil-agent-schema3-test;
           tests.tpm-unlock = tpm-unlock-test;
         }
       );

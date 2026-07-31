@@ -202,7 +202,7 @@ mod tests {
     use crate::manager::BackendManager;
 
     const CATALOG: &str = r#"{
-      "schemaVersion": 1,
+      "schema": "catalog",
       "backends": { "bao": { "kind": "vault", "addr": "https://127.0.0.1:8200" } },
       "keys": {
         "app.secret": {
@@ -214,7 +214,7 @@ mod tests {
     }"#;
 
     const POLICY: &str = r#"{
-      "schemaVersion": 2,
+      "schema": "policy",
       "subjects": {
         "svc.app": { "allOf": [ { "kind": "unix", "uid": 42 } ] }
       },
@@ -229,7 +229,7 @@ mod tests {
     }"#;
 
     const DENY_POLICY: &str = r#"{
-      "schemaVersion": 2,
+      "schema": "policy",
       "subjects": {
         "svc.app": { "allOf": [ { "kind": "unix", "uid": 42 } ] }
       },

@@ -22,7 +22,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,9 +31,10 @@ use crate::seal::{BackendCred, CredBundle};
 use crate::service::broker::{BrokerIdentityRuntimeConfig, InvocationRuntimeConfig};
 use crate::{
     AuditLog, Backend, BackendKind, BackendManager, BrokerLimits, BrokerState, CapabilityPolicy,
-    DEFAULT_MAX_ENCRYPT_SIZE, DEFAULT_MAX_PAYLOAD_SIZE, DEFAULT_ROTATION_GRACE_VERSIONS,
-    DEFAULT_SOCKET_MODE, DEFAULT_SVID_TTL_SECS, JwtRevocationStore, ReloadActor, ReloadInputs,
-    ServerConfig, SpiffeConfig, SpiffeVaultBackend, VaultBackend, enforce_capabilities, load,
+    ConfigOverride, ConfigurationTraceContext, DEFAULT_MAX_ENCRYPT_SIZE, DEFAULT_MAX_PAYLOAD_SIZE,
+    DEFAULT_ROTATION_GRACE_VERSIONS, DEFAULT_SOCKET_MODE, DEFAULT_SVID_TTL_SECS,
+    JwtRevocationStore, ReloadActor, ReloadInputs, ServerConfig, SpiffeConfig, SpiffeVaultBackend,
+    VaultBackend, enforce_capabilities, load_documents_with_overrides_and_context,
     reload_generation, run_grpc,
 };
 use crate::{bundle_cli, doctor, init, unlock};
@@ -483,40 +484,50 @@ async fn build_manager(
 }
 
 /// The only startup settings that may be supplied outside the config file.
-#[derive(Debug, Clone, clap::Args)]
+#[derive(Debug, Clone, Default, clap::Args)]
 pub struct ConfigOverrides {
     /// Path to the TOML daemon config file.
-    #[arg(short = 'c', long, env = "BASIL_CONFIG")]
+    #[arg(short = 'c', long = "config", env = "BASIL_CONFIG")]
     pub(crate) config: Option<PathBuf>,
 
-    /// Path to the exported **catalog** JSON (the key inventory + routing table).
+    /// Legacy path to the exported catalog JSON.
     #[arg(long, env = "BASIL_CATALOG")]
     pub(crate) catalog: Option<PathBuf>,
 
-    /// Path to the exported **policy** JSON (the authorization allow-list).
+    /// Legacy path to the exported policy JSON.
     #[arg(long, env = "BASIL_POLICY")]
     pub(crate) policy: Option<PathBuf>,
 
-    /// Path to the `0600` sealed credential bundle (vault-vh1).
+    /// Legacy path to the sealed credential bundle.
     #[arg(long, env = "BASIL_BUNDLE")]
     pub(crate) bundle: Option<PathBuf>,
 
-    /// Unix socket to listen on.
+    /// Legacy Unix socket override.
     #[arg(long, env = "BASIL_SOCKET")]
     pub(crate) socket: Option<String>,
 
-    /// Default Vault address (used when a cred pins no `addr`).
+    /// Legacy default Vault address override.
     #[arg(long, env = "VAULT_ADDR")]
     pub(crate) vault_addr: Option<String>,
+
+    /// Typed immutable startup override. Repeat for multiple scalar leaves or
+    /// explicit source paths.
+    #[arg(short = 'o', value_name = "PATH=VALUE")]
+    pub(crate) values: Vec<ConfigOverride>,
 }
 
 /// TOML startup config for `run` and `check`.
 ///
 /// Top-level keys intentionally mirror the former long flag names, e.g.
 /// `vault-addr`, `max-encrypt-size`, and `capability-policy`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub(crate) struct AgentConfigFile {
+    #[serde(rename = "schema")]
+    schema: String,
+    #[serde(rename = "schemaVersion")]
+    schema_version: i64,
+    pub(crate) import: ImportFiles,
     pub(crate) catalog: Option<PathBuf>,
     pub(crate) policy: Option<PathBuf>,
     pub(crate) bundle: Option<PathBuf>,
@@ -550,6 +561,57 @@ pub(crate) struct AgentConfigFile {
     pub(crate) broker_identity: BrokerIdentityConfigFile,
     pub(crate) invocation: InvocationConfigFile,
     pub(crate) jwks: JwksConfigFile,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct ImportFiles {
+    pub(crate) catalog: PathBuf,
+    pub(crate) policy: PathBuf,
+    pub(crate) bundle: PathBuf,
+}
+
+impl Default for AgentConfigFile {
+    fn default() -> Self {
+        Self {
+            schema: "agent".to_string(),
+            schema_version: crate::CORPUS_SCHEMA_VERSION,
+            import: ImportFiles::default(),
+            catalog: None,
+            policy: None,
+            bundle: None,
+            socket: None,
+            socket_mode: None,
+            socket_group: None,
+            vault_addr: None,
+            transit_mount: None,
+            jwt_auth_mount: None,
+            jwt_role: None,
+            jwt_audience: None,
+            svid_ttl_secs: None,
+            capability_policy: None,
+            #[cfg(feature = "keystore-backend")]
+            db_keystore_cipher: None,
+            #[cfg(feature = "keystore-backend")]
+            onepassword_provider_uri: None,
+            #[cfg(feature = "keystore-backend")]
+            onepassword_project: None,
+            #[cfg(feature = "keystore-backend")]
+            onepassword_profile: None,
+            max_encrypt_size: None,
+            max_payload_size: None,
+            grace_versions: None,
+            retain_versions: None,
+            retention_sweep_secs: None,
+            audit_log: None,
+            no_reconcile: None,
+            logging: LoggingConfigFile::default(),
+            unlock: UnlockConfigFile::default(),
+            broker_identity: BrokerIdentityConfigFile::default(),
+            invocation: InvocationConfigFile::default(),
+            jwks: JwksConfigFile::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -852,6 +914,9 @@ struct JwksConfig {
 /// [`BackendManager`].
 #[derive(Debug, Clone)]
 struct SetupArgs {
+    reload_inputs: ReloadInputs,
+    document_overrides: Vec<ConfigOverride>,
+    override_provenance: Vec<crate::OverrideProvenance>,
     catalog: PathBuf,
     policy: PathBuf,
     bundle: PathBuf,
@@ -897,14 +962,15 @@ fn parse_capability_policy(s: &str) -> Result<CapabilityPolicy, String> {
 }
 
 fn load_run_config(overrides: &ConfigOverrides) -> Result<RunConfig> {
-    let file = load_config_file(overrides)?;
-    let setup = build_setup(&file, overrides)?;
+    let (file, bootstrap) =
+        load_agent_config_with_context(overrides, ConfigurationTraceContext::Startup)?;
+    let setup = build_setup(&file, overrides, &bootstrap)?;
     #[cfg(feature = "http")]
     let jwks = resolve_jwks_config(&file.jwks)?;
     #[cfg(not(feature = "http"))]
     reject_jwks_config(&file.jwks)?;
     Ok(RunConfig {
-        socket: overrides.socket.clone().or(file.socket),
+        socket: file.socket,
         socket_mode: file.socket_mode.map_or(DEFAULT_SOCKET_MODE, |mode| mode.0),
         socket_group: file.socket_group,
         max_encrypt_size: file.max_encrypt_size.unwrap_or(DEFAULT_MAX_ENCRYPT_SIZE),
@@ -1266,19 +1332,164 @@ fn is_plaintext_non_loopback_http(addr: &str) -> bool {
 /// a preflight read; it must not consume a passphrase file that the subsequent
 /// agent start needs, so it sets `passphrase_no_wipe`.
 fn load_key_probe_config(overrides: &ConfigOverrides) -> Result<SetupArgs> {
-    let file = load_config_file(overrides)?;
-    let mut setup = build_setup(&file, overrides)?;
+    let (file, bootstrap) = load_agent_config(overrides)?;
+    let mut setup = build_setup(&file, overrides, &bootstrap)?;
     setup.unlock.passphrase_no_wipe = true;
     Ok(setup)
 }
 
+#[cfg(test)]
 pub(crate) fn load_config_file(overrides: &ConfigOverrides) -> Result<AgentConfigFile> {
-    let Some(path) = &overrides.config else {
-        return Ok(AgentConfigFile::default());
+    load_agent_config(overrides).map(|(file, _)| file)
+}
+
+fn load_agent_config(
+    overrides: &ConfigOverrides,
+) -> Result<(AgentConfigFile, crate::LoadedBootstrap)> {
+    load_agent_config_with_context(overrides, ConfigurationTraceContext::Offline)
+}
+
+fn load_agent_config_with_context(
+    overrides: &ConfigOverrides,
+    context: ConfigurationTraceContext,
+) -> Result<(AgentConfigFile, crate::LoadedBootstrap)> {
+    let mut traces = Vec::new();
+    let result = load_agent_config_with_trace_collector(overrides, &mut traces);
+    for trace in &traces {
+        crate::configuration::emit_configuration_source_trace(trace, context, result.is_ok());
+    }
+    result
+}
+
+fn load_agent_config_with_trace_collector(
+    overrides: &ConfigOverrides,
+    traces: &mut Vec<crate::configuration::ConfigurationSourceTrace>,
+) -> Result<(AgentConfigFile, crate::LoadedBootstrap)> {
+    let default_path = PathBuf::from(crate::configuration::DEFAULT_CONFIG_PATH);
+    let selected = overrides.config.clone().or_else(|| {
+        (default_path.exists() || !overrides.values.is_empty()).then_some(default_path.clone())
+    });
+    let Some(path) = selected else {
+        return load_legacy_agent_config(overrides, None, None);
     };
-    let raw = std::fs::read_to_string(path)
+    let (bytes, trace) = crate::configuration::read_configuration_source("agent", None, &path)
         .with_context(|| format!("reading config from {}", path.display()))?;
-    toml::from_str(&raw).with_context(|| format!("parsing config from {}", path.display()))
+    traces.push(trace);
+    let raw = std::str::from_utf8(&bytes)
+        .with_context(|| format!("decoding config from {} as UTF-8", path.display()))?;
+    let mut value: toml::Value =
+        toml::from_str(raw).with_context(|| format!("parsing config from {}", path.display()))?;
+    let schema3 = value.as_table().is_some_and(|table| {
+        table.contains_key("schema")
+            || table.contains_key("schemaVersion")
+            || table.contains_key("import")
+    });
+    if !schema3 && overrides.values.is_empty() {
+        return load_legacy_agent_config(overrides, Some(path), Some(value));
+    }
+    anyhow::ensure!(
+        overrides.catalog.is_none() && overrides.policy.is_none() && overrides.bundle.is_none(),
+        "`--catalog`, `--policy`, and `--bundle` are legacy options; use schema-3 `-o import.<slot>=PATH` overrides"
+    );
+    let bootstrap =
+        crate::configuration::build_loaded_bootstrap(path, &mut value, &overrides.values)
+            .context("loading configuration corpus bootstrap")?;
+    let mut file: AgentConfigFile = bootstrap
+        .value
+        .clone()
+        .try_into()
+        .with_context(|| format!("parsing config from {}", bootstrap.path.display()))?;
+    file.import.catalog.clone_from(&bootstrap.sources.catalog);
+    file.import.policy.clone_from(&bootstrap.sources.policy);
+    file.import.bundle.clone_from(&bootstrap.sources.bundle);
+    if let Some(socket) = &overrides.socket {
+        file.socket = Some(socket.clone());
+    }
+    if let Some(vault_addr) = &overrides.vault_addr {
+        file.vault_addr = Some(vault_addr.clone());
+    }
+    resolve_agent_relative_paths(&mut file, &bootstrap.path);
+    Ok((file, bootstrap))
+}
+
+fn load_legacy_agent_config(
+    overrides: &ConfigOverrides,
+    path: Option<PathBuf>,
+    value: Option<toml::Value>,
+) -> Result<(AgentConfigFile, crate::LoadedBootstrap)> {
+    let mut file = value
+        .clone()
+        .map_or_else(|| Ok(AgentConfigFile::default()), toml::Value::try_into)
+        .with_context(|| {
+            path.as_ref().map_or_else(
+                || "parsing legacy command-line configuration".to_string(),
+                |path| format!("parsing config from {}", path.display()),
+            )
+        })?;
+    let catalog = required_path(
+        overrides.catalog.clone().or_else(|| file.catalog.clone()),
+        "catalog",
+    )?;
+    let policy = required_path(
+        overrides.policy.clone().or_else(|| file.policy.clone()),
+        "policy",
+    )?;
+    let bundle = required_path(
+        overrides.bundle.clone().or_else(|| file.bundle.clone()),
+        "bundle",
+    )?;
+    file.import.catalog.clone_from(&catalog);
+    file.import.policy.clone_from(&policy);
+    file.import.bundle.clone_from(&bundle);
+    if let Some(socket) = &overrides.socket {
+        file.socket = Some(socket.clone());
+    }
+    if let Some(vault_addr) = &overrides.vault_addr {
+        file.vault_addr = Some(vault_addr.clone());
+    }
+    let bootstrap_path =
+        path.unwrap_or_else(|| PathBuf::from(crate::configuration::DEFAULT_CONFIG_PATH));
+    resolve_agent_relative_paths(&mut file, &bootstrap_path);
+    Ok((
+        file,
+        crate::LoadedBootstrap {
+            path: bootstrap_path,
+            value: value.unwrap_or_else(|| toml::Value::Table(toml::Table::new())),
+            sources: crate::configuration::CorpusSources {
+                catalog,
+                policy,
+                bundle,
+            },
+            overrides: Vec::new(),
+            document_overrides: Vec::new(),
+        },
+    ))
+}
+
+fn required_path(path: Option<PathBuf>, name: &str) -> Result<PathBuf> {
+    path.filter(|path| !path.as_os_str().is_empty())
+        .with_context(|| {
+            format!("{name} path is required; set `{name}` in the config file or pass `--{name}`")
+        })
+}
+
+fn resolve_agent_relative_paths(file: &mut AgentConfigFile, bootstrap_path: &Path) {
+    let parent = bootstrap_path.parent().unwrap_or_else(|| Path::new("."));
+    resolve_optional_path(parent, &mut file.audit_log);
+    resolve_optional_path(parent, &mut file.logging.file.dir);
+    resolve_optional_path(parent, &mut file.unlock.bip39_phrase_file);
+    resolve_optional_path(parent, &mut file.unlock.unlock_passphrase_file);
+    resolve_optional_path(parent, &mut file.jwks.tls.cert_file);
+    resolve_optional_path(parent, &mut file.jwks.tls.key_file);
+}
+
+fn resolve_optional_path(parent: &Path, path: &mut Option<PathBuf>) {
+    let Some(current) = path.as_ref() else {
+        return;
+    };
+    if current.is_relative() {
+        *path = Some(parent.join(current));
+    }
 }
 
 struct LoggingGuards {
@@ -1500,23 +1711,14 @@ fn required_otel_endpoint(config: &OpenTelemetryLoggingConfigFile) -> Result<Str
     Ok(parse_public_http_url("logging.opentelemetry.endpoint", endpoint)?.to_string())
 }
 
-fn build_setup(file: &AgentConfigFile, overrides: &ConfigOverrides) -> Result<SetupArgs> {
-    let catalog = required_path(
-        overrides.catalog.clone().or_else(|| file.catalog.clone()),
-        "catalog",
-    )?;
-    let policy = required_path(
-        overrides.policy.clone().or_else(|| file.policy.clone()),
-        "policy",
-    )?;
-    let bundle = required_path(
-        overrides.bundle.clone().or_else(|| file.bundle.clone()),
-        "bundle",
-    )?;
-    let vault_addr = overrides
+fn build_setup(
+    file: &AgentConfigFile,
+    overrides: &ConfigOverrides,
+    bootstrap: &crate::LoadedBootstrap,
+) -> Result<SetupArgs> {
+    let vault_addr = file
         .vault_addr
         .clone()
-        .or_else(|| file.vault_addr.clone())
         .unwrap_or_else(|| "http://127.0.0.1:8200".to_string());
     let capability_policy = file
         .capability_policy
@@ -1525,9 +1727,24 @@ fn build_setup(file: &AgentConfigFile, overrides: &ConfigOverrides) -> Result<Se
         .map_err(|err| anyhow::anyhow!("parsing config key `capability-policy`: {err}"))?;
 
     Ok(SetupArgs {
-        catalog,
-        policy,
-        bundle,
+        reload_inputs: if bootstrap.value.get("schema").and_then(toml::Value::as_str)
+            == Some("agent")
+        {
+            ReloadInputs::Corpus {
+                config_path: bootstrap.path.clone(),
+                overrides: overrides.values.clone(),
+            }
+        } else {
+            ReloadInputs::Direct {
+                catalog_path: bootstrap.sources.catalog.clone(),
+                policy_path: bootstrap.sources.policy.clone(),
+            }
+        },
+        document_overrides: bootstrap.document_overrides.clone(),
+        override_provenance: bootstrap.overrides.clone(),
+        catalog: file.import.catalog.clone(),
+        policy: file.import.policy.clone(),
+        bundle: file.import.bundle.clone(),
         vault_addr,
         transit_mount: file
             .transit_mount
@@ -1566,15 +1783,6 @@ fn build_setup(file: &AgentConfigFile, overrides: &ConfigOverrides) -> Result<Se
     })
 }
 
-fn required_path(path: Option<PathBuf>, name: &str) -> Result<PathBuf> {
-    path.with_context(|| {
-        format!(
-            "`{name}` is required; set it in the config file or pass --{name} / the BASIL_{} env var",
-            name.to_ascii_uppercase()
-        )
-    })
-}
-
 /// The loaded, validated catalog/policy plus a live [`BackendManager`] over the
 /// unlocked creds: the common ground both `run` (serve) and `check` (lint)
 /// stand on.
@@ -1584,6 +1792,30 @@ struct Prepared {
     config: crate::Config,
     manager: BackendManager,
     backend_label: String,
+    override_provenance: Vec<crate::OverrideProvenance>,
+}
+
+fn load_setup_documents(
+    setup: &SetupArgs,
+    context: ConfigurationTraceContext,
+) -> Result<crate::CorpusDocuments> {
+    let sources = crate::CorpusSources {
+        catalog: setup.catalog.clone(),
+        policy: setup.policy.clone(),
+        bundle: setup.bundle.clone(),
+    };
+    match &setup.reload_inputs {
+        ReloadInputs::Corpus { .. } => load_documents_with_overrides_and_context(
+            &sources,
+            &setup.document_overrides,
+            setup.override_provenance.clone(),
+            context,
+        ),
+        ReloadInputs::Direct { .. } => {
+            crate::configuration::load_direct_documents_with_context(&sources, context)
+        }
+    }
+    .context("loading configuration corpus documents")
 }
 
 /// Load + validate the exported catalog/policy, unlock the sealed bundle, and
@@ -1591,18 +1823,22 @@ struct Prepared {
 /// startup pipeline for `run` and `check`; fails closed (clean non-zero, no
 /// panic) at every step. The plaintext [`CredBundle`] is zeroized before return;
 /// each backend holds only its own cred.
-async fn prepare_manager(setup: &SetupArgs) -> Result<Prepared> {
+async fn prepare_manager(
+    setup: &SetupArgs,
+    trace_context: ConfigurationTraceContext,
+) -> Result<Prepared> {
     if is_plaintext_non_loopback_http(&setup.vault_addr) {
         warn!(addr = %setup.vault_addr, "talking to vault over plaintext HTTP");
     }
 
-    // Load + validate the exported catalog & policy.
-    let catalog_json = std::fs::read_to_string(&setup.catalog)
-        .with_context(|| format!("reading catalog from {}", setup.catalog.display()))?;
-    let policy_json = std::fs::read_to_string(&setup.policy)
-        .with_context(|| format!("reading policy from {}", setup.policy.display()))?;
-    let (catalog, policy, config, warnings) =
-        load(&catalog_json, &policy_json).context("loading catalog/policy")?;
+    let documents = load_setup_documents(setup, trace_context)?;
+    let crate::CorpusDocuments {
+        catalog,
+        policy,
+        policy_config: config,
+        warnings,
+        overrides: override_provenance,
+    } = documents;
     for w in &warnings {
         warn!(warning = %w, "catalog/policy load warning");
     }
@@ -1613,8 +1849,9 @@ async fn prepare_manager(setup: &SetupArgs) -> Result<Prepared> {
     );
 
     // Unlock the sealed bundle -> CredBundle (KEK zeroized inside `open`).
-    let creds = unlock::open_bundle_at_startup(&setup.bundle, &setup.unlock)
-        .context("unlocking sealed credential bundle")?;
+    let creds =
+        unlock::open_bundle_at_startup_with_context(&setup.bundle, &setup.unlock, trace_context)
+            .context("unlocking sealed credential bundle")?;
     info!(
         backend_creds = creds.backends.len(),
         "sealed bundle unlocked",
@@ -1647,6 +1884,7 @@ async fn prepare_manager(setup: &SetupArgs) -> Result<Prepared> {
         config,
         manager,
         backend_label,
+        override_provenance,
     })
 }
 
@@ -1674,7 +1912,8 @@ async fn run_daemon(args: RunArgs, version: &'static str) -> Result<()> {
         config,
         manager,
         backend_label,
-    } = prepare_manager(&run_config.setup).await?;
+        override_provenance,
+    } = prepare_manager(&run_config.setup, ConfigurationTraceContext::Startup).await?;
 
     validate_invocation_catalog_bindings(&run_config.invocation, &catalog)
         .context("validating invocation broker identity and keys")?;
@@ -1716,16 +1955,14 @@ async fn run_daemon(args: RunArgs, version: &'static str) -> Result<()> {
         .context("loading JWT-SVID revocation deny-list")?;
     let mut state =
         BrokerState::with_limits(catalog, policy, config, manager, backend_label, limits)
+            .with_override_provenance(override_provenance)
             // Report the shipped binary's version in `status`/`health`, not this
             // library crate's (they coincide today via the workspace version).
             .with_version(version)
             .with_jwt_revocations(jwt_revocations)
             // The SIGHUP reload engine (basil-y3e.2) re-reads from the SAME
-            // configured catalog/policy paths startup used, never the wire.
-            .with_reload_inputs(ReloadInputs {
-                catalog_path: run_config.setup.catalog.clone(),
-                policy_path: run_config.setup.policy.clone(),
-            });
+            // selected bootstrap and immutable overrides startup used.
+            .with_reload_inputs(run_config.setup.reload_inputs.clone());
 
     // Optional JSONL audit sink (`vault-vq5`): open the append-only file ONCE at
     // startup so a permissions/path error fails closed here rather than per-op. A
@@ -1913,13 +2150,12 @@ fn spawn_retention_sweep(state: Arc<BrokerState>, interval_secs: u64) {
 /// (catalog/policy/bundle) is a clean config error (non-zero exit): that is a
 /// usage error, distinct from a diagnostic failure.
 fn load_doctor_inputs(overrides: &ConfigOverrides) -> Result<doctor::DoctorInputs> {
-    let file = load_config_file(overrides)?;
+    let (file, bootstrap) = load_agent_config(overrides)?;
     let invocation = resolve_invocation_config(&file.broker_identity, &file.invocation)?;
-    let setup = build_setup(&file, overrides)?;
-    let socket = overrides
+    let setup = build_setup(&file, overrides, &bootstrap)?;
+    let documents = load_setup_documents(&setup, ConfigurationTraceContext::Offline)?;
+    let socket = file
         .socket
-        .clone()
-        .or(file.socket)
         .unwrap_or_else(|| crate::DEFAULT_SOCKET_PATH.to_string());
     let socket_mode = file.socket_mode.map_or(DEFAULT_SOCKET_MODE, |mode| mode.0);
     let capability_policy = setup.capability_policy;
@@ -1928,6 +2164,8 @@ fn load_doctor_inputs(overrides: &ConfigOverrides) -> Result<doctor::DoctorInput
     let unlock_age_yubikey_selected = setup.unlock.age_yubikey;
 
     Ok(doctor::DoctorInputs {
+        overrides: documents.overrides,
+        validated_catalog: Some(documents.catalog),
         catalog: setup.catalog,
         policy: setup.policy,
         bundle: setup.bundle,
@@ -1983,14 +2221,15 @@ async fn doctor_key_material_rows(overrides: &ConfigOverrides) -> Vec<doctor::Ch
             )));
         }
     };
-    let Prepared { manager, .. } = match prepare_manager(&setup).await {
-        Ok(prepared) => prepared,
-        Err(err) => {
-            return doctor::key_material_rows(Err(format!(
-                "could not build authenticated backend manager: {err:#}"
-            )));
-        }
-    };
+    let Prepared { manager, .. } =
+        match prepare_manager(&setup, ConfigurationTraceContext::Offline).await {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                return doctor::key_material_rows(Err(format!(
+                    "could not build authenticated backend manager: {err:#}"
+                )));
+            }
+        };
     match manager.check().await {
         Ok(report) => doctor::key_material_rows(Ok(&report)),
         Err(err) => doctor::key_material_rows(Err(err.to_string())),
@@ -2009,28 +2248,15 @@ async fn doctor_key_material_rows(overrides: &ConfigOverrides) -> Vec<doctor::Ch
 pub fn run_explain(args: &ExplainArgs) -> Result<()> {
     use crate::catalog::Pdp;
 
-    let file = load_config_file(&args.overrides)?;
-    let catalog_path = required_path(
-        args.overrides
-            .catalog
-            .clone()
-            .or_else(|| file.catalog.clone()),
-        "catalog",
-    )?;
-    let policy_path = required_path(
-        args.overrides
-            .policy
-            .clone()
-            .or_else(|| file.policy.clone()),
-        "policy",
-    )?;
-
-    let catalog_json = std::fs::read_to_string(&catalog_path)
-        .with_context(|| format!("reading catalog from {}", catalog_path.display()))?;
-    let policy_json = std::fs::read_to_string(&policy_path)
-        .with_context(|| format!("reading policy from {}", policy_path.display()))?;
-    let (catalog, policy, config, warnings) =
-        load(&catalog_json, &policy_json).context("loading catalog/policy")?;
+    let (file, bootstrap) = load_agent_config(&args.overrides)?;
+    let setup = build_setup(&file, &args.overrides, &bootstrap)?;
+    let crate::CorpusDocuments {
+        catalog,
+        policy,
+        policy_config: config,
+        warnings,
+        overrides,
+    } = load_setup_documents(&setup, ConfigurationTraceContext::Offline)?;
     for w in &warnings {
         warn!(warning = %w, "catalog/policy load warning");
     }
@@ -2038,7 +2264,7 @@ pub fn run_explain(args: &ExplainArgs) -> Result<()> {
     let pdp = Pdp::new(&catalog, &policy, &config);
 
     if args.effective {
-        return print_effective(&pdp, &args.subject, args.json);
+        return print_effective(&pdp, &args.subject, &overrides, args.json);
     }
 
     // Single-tuple explain. clap guarantees op/key are present here (required
@@ -2046,13 +2272,18 @@ pub fn run_explain(args: &ExplainArgs) -> Result<()> {
     let (Some(op), Some(key)) = (args.op, args.key.as_deref()) else {
         bail!("--op and --key are required unless --effective is given");
     };
-    print_explanation(&pdp, &args.subject, op, key, args.json)
+    print_explanation(&pdp, &args.subject, op, key, &overrides, args.json)
 }
 
 /// Print the "preview effective permissions" view for an identity to stdout.
-fn print_effective(pdp: &crate::catalog::Pdp, subject: &str, json: bool) -> Result<()> {
+fn print_effective(
+    pdp: &crate::catalog::Pdp,
+    subject: &str,
+    overrides: &[crate::OverrideProvenance],
+    json: bool,
+) -> Result<()> {
     let mut out = std::io::stdout().lock();
-    render_effective(&mut out, pdp, subject, json)
+    render_effective_with_overrides(&mut out, pdp, subject, overrides, json)
 }
 
 /// Render the "preview effective permissions" view into `out`.
@@ -2060,10 +2291,21 @@ fn print_effective(pdp: &crate::catalog::Pdp, subject: &str, json: bool) -> Resu
 /// The render seam (separate from [`print_effective`]) so the stable `--json`
 /// shape and the human text can be asserted without capturing the process's real
 /// stdout. Production simply renders into a locked `stdout`.
+#[cfg(test)]
 fn render_effective(
     out: &mut impl std::io::Write,
     pdp: &crate::catalog::Pdp,
     subject: &str,
+    json: bool,
+) -> Result<()> {
+    render_effective_with_overrides(out, pdp, subject, &[], json)
+}
+
+fn render_effective_with_overrides(
+    out: &mut impl std::io::Write,
+    pdp: &crate::catalog::Pdp,
+    subject: &str,
+    overrides: &[crate::OverrideProvenance],
     json: bool,
 ) -> Result<()> {
     let grants = pdp.effective(subject);
@@ -2079,7 +2321,11 @@ fn render_effective(
                 })
             })
             .collect();
-        let doc = serde_json::json!({ "subject": subject, "effective": rows });
+        let doc = serde_json::json!({
+            "subject": subject,
+            "effective": rows,
+            "overrides": overrides,
+        });
         writeln!(out, "{}", serde_json::to_string_pretty(&doc)?)?;
         return Ok(());
     }
@@ -2088,6 +2334,7 @@ fn render_effective(
         "effective permissions for subject {subject}: {} grant(s)",
         grants.len()
     )?;
+    render_override_provenance(out, overrides)?;
     for g in &grants {
         let rule = g.rule_id.as_deref().unwrap_or("<public-class>");
         writeln!(
@@ -2111,22 +2358,36 @@ fn print_explanation(
     subject: &str,
     op: crate::catalog::Op,
     key: &str,
+    overrides: &[crate::OverrideProvenance],
     json: bool,
 ) -> Result<()> {
     let mut out = std::io::stdout().lock();
-    render_explanation(&mut out, pdp, subject, op, key, json)
+    render_explanation_with_overrides(&mut out, pdp, subject, op, key, overrides, json)
 }
 
 /// Render a single-tuple explanation into `out`.
 ///
 /// The render seam (separate from [`print_explanation`]) so the stable `--json`
 /// allow/deny shape can be asserted without the process's real stdout.
+#[cfg(test)]
 fn render_explanation(
     out: &mut impl std::io::Write,
     pdp: &crate::catalog::Pdp,
     subject: &str,
     op: crate::catalog::Op,
     key: &str,
+    json: bool,
+) -> Result<()> {
+    render_explanation_with_overrides(out, pdp, subject, op, key, &[], json)
+}
+
+fn render_explanation_with_overrides(
+    out: &mut impl std::io::Write,
+    pdp: &crate::catalog::Pdp,
+    subject: &str,
+    op: crate::catalog::Op,
+    key: &str,
+    overrides: &[crate::OverrideProvenance],
     json: bool,
 ) -> Result<()> {
     use crate::catalog::Decision;
@@ -2137,6 +2398,7 @@ fn render_explanation(
         obj.insert("subject".into(), subject.into());
         obj.insert("op".into(), op.token().into());
         obj.insert("key".into(), key.into());
+        obj.insert("overrides".into(), serde_json::to_value(overrides)?);
         match &ex.decision {
             Decision::Allow { via } => {
                 obj.insert("decision".into(), "allow".into());
@@ -2197,6 +2459,26 @@ fn render_explanation(
             writeln!(out, "  {}", deny_explanation(*reason))?;
         }
     }
+    render_override_provenance(out, overrides)?;
+    Ok(())
+}
+
+fn render_override_provenance(
+    out: &mut impl std::io::Write,
+    overrides: &[crate::OverrideProvenance],
+) -> Result<()> {
+    if overrides.is_empty() {
+        return Ok(());
+    }
+    writeln!(out, "startup overrides: {}", overrides.len())?;
+    for item in overrides {
+        writeln!(
+            out,
+            "  {} masks {}",
+            item.path,
+            item.masked_source.display()
+        )?;
+    }
     Ok(())
 }
 
@@ -2247,6 +2529,8 @@ pub async fn run_agent(args: RunArgs, version: &'static str) -> Result<()> {
     // a once-per-process cold path, so the heap indirection is free.
     Box::pin(run_with_config_logging(
         &overrides,
+        ConfigurationTraceContext::Startup,
+        false,
         run_daemon(args, version),
     ))
     .await
@@ -2255,16 +2539,14 @@ pub async fn run_agent(args: RunArgs, version: &'static str) -> Result<()> {
 /// Run the preflight doctor behind `basil doctor`.
 pub async fn run_doctor_command(args: DoctorArgs) -> Result<()> {
     let overrides = args.overrides.clone();
-    if args.json {
-        let mut logging = logging_config_for_overrides(&overrides)?;
-        logging.stdout.enable = Some(false);
-        let logging_guards = init_logging(&logging)?;
-        let result = run_doctor(args).await;
-        logging_guards.shutdown();
-        result
-    } else {
-        Box::pin(run_with_config_logging(&overrides, run_doctor(args))).await
-    }
+    let suppress_stdout_logging = args.json;
+    Box::pin(run_with_config_logging(
+        &overrides,
+        ConfigurationTraceContext::Offline,
+        suppress_stdout_logging,
+        run_doctor(args),
+    ))
+    .await
 }
 
 /// Run first-run config scaffolding behind top-level `basil init`.
@@ -2289,26 +2571,135 @@ pub fn run_bundle(command: bundle_cli::BundleCommand) -> Result<()> {
 
 async fn run_with_config_logging(
     overrides: &ConfigOverrides,
+    trace_context: ConfigurationTraceContext,
+    suppress_stdout_logging: bool,
     fut: impl std::future::Future<Output = Result<()>>,
 ) -> Result<()> {
-    let logging = logging_config_for_overrides(overrides)?;
-    let logging_guards = init_logging(&logging)?;
+    let mut preflight_traces = Vec::new();
+    let mut logging = match load_agent_config_with_trace_collector(overrides, &mut preflight_traces)
+    {
+        Ok((file, _)) => file.logging,
+        Err(error) => {
+            return finish_failed_config_load(error, &preflight_traces, trace_context, || {
+                best_effort_fallback_logging(suppress_stdout_logging)
+            });
+        }
+    };
+    if suppress_stdout_logging {
+        logging.stdout.enable = Some(false);
+    }
+    let logging_guards = match init_logging(&logging) {
+        Ok(guards) => guards,
+        Err(error) => {
+            return finish_failed_config_load(error, &preflight_traces, trace_context, || {
+                best_effort_fallback_logging(suppress_stdout_logging)
+            });
+        }
+    };
     let result = fut.await;
     logging_guards.shutdown();
     result
 }
 
-fn logging_config_for_overrides(overrides: &ConfigOverrides) -> Result<LoggingConfigFile> {
-    Ok(load_config_file(overrides)?.logging)
+fn finish_failed_config_load(
+    error: anyhow::Error,
+    traces: &[crate::configuration::ConfigurationSourceTrace],
+    trace_context: ConfigurationTraceContext,
+    init_fallback: impl FnOnce() -> Option<LoggingGuards>,
+) -> Result<()> {
+    let fallback_guards = init_fallback();
+    for trace in traces {
+        crate::configuration::emit_configuration_source_trace(trace, trace_context, false);
+    }
+    if let Some(guards) = fallback_guards {
+        guards.shutdown();
+    }
+    Err(error)
+}
+
+fn best_effort_fallback_logging(suppress_stdout_logging: bool) -> Option<LoggingGuards> {
+    let result = if suppress_stdout_logging {
+        init_stderr_logging()
+    } else {
+        init_logging(&LoggingConfigFile::default())
+    };
+    match result {
+        Ok(guards) => Some(guards),
+        Err(error) => {
+            eprintln!("fallback logging unavailable; using any existing subscriber: {error}");
+            None
+        }
+    }
+}
+
+fn init_stderr_logging() -> Result<LoggingGuards> {
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let subscriber = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt::layer().with_writer(std::io::stderr));
+    subscriber
+        .try_init()
+        .context("initializing stderr fallback tracing subscriber")?;
+    Ok(LoggingGuards {
+        file_guard: None,
+        #[cfg(feature = "otlp")]
+        otel_provider: None,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
     use crate::catalog::MissingPolicy;
     use clap::Parser as _;
+
+    struct SourceEventLayer {
+        fallback_attempted: Arc<AtomicBool>,
+        event_count: Arc<AtomicUsize>,
+        observed_after_fallback: Arc<AtomicBool>,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for SourceEventLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = SourceEventVisitor {
+                fallback_attempted: &self.fallback_attempted,
+                event_count: &self.event_count,
+                observed_after_fallback: &self.observed_after_fallback,
+            };
+            event.record(&mut visitor);
+        }
+    }
+
+    struct SourceEventVisitor<'a> {
+        fallback_attempted: &'a AtomicBool,
+        event_count: &'a AtomicUsize,
+        observed_after_fallback: &'a AtomicBool,
+    }
+
+    impl tracing::field::Visit for SourceEventVisitor<'_> {
+        fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "event" && value == "basil.configuration.source" {
+                self.event_count.fetch_add(1, Ordering::Relaxed);
+                self.observed_after_fallback.store(
+                    self.fallback_attempted.load(Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
+            }
+        }
+    }
 
     fn temp_config(contents: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -2316,8 +2707,67 @@ mod tests {
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
-        std::fs::write(&path, contents).expect("write temp config");
+        let mut sources = Vec::new();
+        let mut settings = Vec::new();
+        for line in contents.lines() {
+            if ["catalog =", "policy =", "bundle ="]
+                .iter()
+                .any(|prefix| line.trim_start().starts_with(prefix))
+            {
+                sources.push(line);
+            } else {
+                settings.push(line);
+            }
+        }
+        let body = if contents.contains("schemaVersion") {
+            contents.to_string()
+        } else {
+            format!(
+                "schema = \"agent\"\nschemaVersion = 3\n{}\n[import]\n{}\n",
+                settings.join("\n"),
+                sources.join("\n")
+            )
+        };
+        std::fs::write(&path, body).expect("write temp config");
         path
+    }
+
+    #[test]
+    fn failed_fallback_preserves_original_error_and_emits_once_after_attempt() {
+        let path = temp_config("jwt-role = \"test\"");
+        let (_, trace) = crate::configuration::read_configuration_source("agent", None, &path)
+            .expect("read configuration source trace");
+        let fallback_attempted = Arc::new(AtomicBool::new(false));
+        let event_count = Arc::new(AtomicUsize::new(0));
+        let observed_after_fallback = Arc::new(AtomicBool::new(false));
+        let subscriber = tracing_subscriber::registry().with(SourceEventLayer {
+            fallback_attempted: Arc::clone(&fallback_attempted),
+            event_count: Arc::clone(&event_count),
+            observed_after_fallback: Arc::clone(&observed_after_fallback),
+        });
+
+        tracing::subscriber::with_default(subscriber, || {
+            let result = finish_failed_config_load(
+                anyhow::anyhow!("original configuration error"),
+                std::slice::from_ref(&trace),
+                ConfigurationTraceContext::Offline,
+                || {
+                    fallback_attempted.store(true, Ordering::Relaxed);
+                    None
+                },
+            );
+
+            assert_eq!(
+                result
+                    .expect_err("configuration load must fail")
+                    .to_string(),
+                "original configuration error"
+            );
+        });
+
+        assert_eq!(event_count.load(Ordering::Relaxed), 1);
+        assert!(observed_after_fallback.load(Ordering::Relaxed));
+        std::fs::remove_file(path).ok();
     }
 
     #[test]
@@ -2351,11 +2801,8 @@ mod tests {
     fn overrides_for(config: PathBuf) -> ConfigOverrides {
         ConfigOverrides {
             config: Some(config),
-            catalog: None,
-            policy: None,
-            bundle: None,
-            socket: None,
-            vault_addr: None,
+            values: Vec::new(),
+            ..ConfigOverrides::default()
         }
     }
 
@@ -2379,7 +2826,7 @@ mod tests {
         keys.insert("broker.response".to_string(), response_signing);
         keys.insert("broker.request".to_string(), request_encryption);
         crate::Catalog {
-            schema_version: 1,
+            schema: crate::catalog::CatalogSchema::Catalog,
             backends,
             keys,
         }
@@ -2463,11 +2910,8 @@ strict-bundle-perms = true
         );
         let args = ConfigOverrides {
             config: Some(config.clone()),
-            catalog: None,
-            policy: None,
-            bundle: None,
-            socket: None,
-            vault_addr: None,
+            values: Vec::new(),
+            ..ConfigOverrides::default()
         };
 
         let loaded_file = load_config_file(&args).expect("load config file");
@@ -2558,11 +3002,8 @@ socket-group = "basil-edge"
         );
         let args = ConfigOverrides {
             config: Some(config.clone()),
-            catalog: None,
-            policy: None,
-            bundle: None,
-            socket: None,
-            vault_addr: None,
+            values: Vec::new(),
+            ..ConfigOverrides::default()
         };
 
         let loaded = load_run_config(&args).expect("load run config");
@@ -2584,11 +3025,8 @@ bundle = "/cfg/bundle.sealed"
         );
         let args = ConfigOverrides {
             config: Some(config.clone()),
-            catalog: None,
-            policy: None,
-            bundle: None,
-            socket: None,
-            vault_addr: None,
+            values: Vec::new(),
+            ..ConfigOverrides::default()
         };
 
         let loaded = load_run_config(&args).expect("load run config");
@@ -2749,11 +3187,8 @@ bundle = "/cfg/bundle.sealed"
         );
         let args = ConfigOverrides {
             config: Some(config.clone()),
-            catalog: None,
-            policy: None,
-            bundle: None,
-            socket: None,
-            vault_addr: None,
+            values: Vec::new(),
+            ..ConfigOverrides::default()
         };
         let loaded = load_run_config(&args).expect("load run config");
         assert!(
@@ -3014,11 +3449,8 @@ listen = "0.0.0.0:9443"
         );
         let args = ConfigOverrides {
             config: Some(config.clone()),
-            catalog: None,
-            policy: None,
-            bundle: None,
-            socket: None,
-            vault_addr: None,
+            values: Vec::new(),
+            ..ConfigOverrides::default()
         };
         let loaded = load_run_config(&args).expect("load run config");
         assert!(loaded.jwks.enable);
@@ -3235,11 +3667,18 @@ vault-addr = "http://cfg-vault:8200"
         );
         let args = ConfigOverrides {
             config: Some(config.clone()),
-            catalog: Some(PathBuf::from("/cli/catalog.json")),
-            policy: Some(PathBuf::from("/cli/policy.json")),
-            bundle: Some(PathBuf::from("/cli/bundle.sealed")),
-            socket: Some("/cli/basil.sock".to_string()),
-            vault_addr: Some("http://cli-vault:8200".to_string()),
+            values: [
+                "import.catalog=/cli/catalog.json",
+                "import.policy=/cli/policy.json",
+                "import.bundle=/cli/bundle.sealed",
+                "socket=/cli/basil.sock",
+                "vault-addr=http://cli-vault:8200",
+            ]
+            .into_iter()
+            .map(ConfigOverride::parse)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("valid overrides"),
+            ..ConfigOverrides::default()
         };
 
         let loaded = load_run_config(&args).expect("load run config");
@@ -3254,14 +3693,14 @@ vault-addr = "http://cfg-vault:8200"
     }
 
     #[test]
-    fn run_cli_rejects_removed_startup_overrides() {
+    fn run_cli_keeps_legacy_source_overrides() {
         #[derive(Debug, clap::Parser)]
         struct TestCli {
             #[command(flatten)]
             args: RunArgs,
         }
 
-        let err = TestCli::try_parse_from([
+        let parsed = TestCli::try_parse_from([
             "basil-agent-run",
             "--catalog",
             "/tmp/catalog.json",
@@ -3269,11 +3708,67 @@ vault-addr = "http://cfg-vault:8200"
             "/tmp/policy.json",
             "--bundle",
             "/tmp/bundle.sealed",
-            "--capability-policy",
-            "off",
         ])
-        .expect_err("removed flag rejected");
-        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+        .expect("0.7.1 source flags remain accepted");
+        assert_eq!(
+            parsed.args.overrides.catalog.as_deref(),
+            Some(Path::new("/tmp/catalog.json"))
+        );
+    }
+
+    #[test]
+    fn legacy_config_remains_a_direct_reload_source() {
+        let config = std::env::temp_dir().join(format!(
+            "basil-agent-legacy-config-{}-{}.toml",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &config,
+            r#"
+catalog = "/legacy/catalog.json"
+policy = "/legacy/policy.json"
+bundle = "/legacy/bundle.age"
+socket = "/legacy/basil.sock"
+vault-addr = "https://vault.example"
+"#,
+        )
+        .expect("write legacy config");
+        let overrides = ConfigOverrides {
+            config: Some(config.clone()),
+            ..ConfigOverrides::default()
+        };
+
+        let loaded = load_run_config(&overrides).expect("legacy config remains accepted");
+
+        assert_eq!(loaded.setup.catalog, Path::new("/legacy/catalog.json"));
+        assert_eq!(loaded.setup.policy, Path::new("/legacy/policy.json"));
+        assert_eq!(loaded.setup.bundle, Path::new("/legacy/bundle.age"));
+        assert!(matches!(
+            loaded.setup.reload_inputs,
+            ReloadInputs::Direct { .. }
+        ));
+        std::fs::remove_file(config).expect("remove legacy config");
+    }
+
+    #[test]
+    fn legacy_source_flags_work_without_a_config_file() {
+        let overrides = ConfigOverrides {
+            catalog: Some("/legacy/catalog.json".into()),
+            policy: Some("/legacy/policy.json".into()),
+            bundle: Some("/legacy/bundle.age".into()),
+            socket: Some("/legacy/basil.sock".to_string()),
+            vault_addr: Some("https://vault.example".to_string()),
+            ..ConfigOverrides::default()
+        };
+
+        let loaded = load_run_config(&overrides).expect("legacy flags remain accepted");
+
+        assert_eq!(loaded.setup.catalog, Path::new("/legacy/catalog.json"));
+        assert_eq!(loaded.setup.policy, Path::new("/legacy/policy.json"));
+        assert_eq!(loaded.setup.bundle, Path::new("/legacy/bundle.age"));
+        assert_eq!(loaded.socket.as_deref(), Some("/legacy/basil.sock"));
+        assert_eq!(loaded.setup.vault_addr, "https://vault.example");
     }
 
     // ---- explain / effective CLI rendering (basil-4vf) ----------------------
@@ -3287,7 +3782,7 @@ vault-addr = "http://cfg-vault:8200"
         use crate::catalog::{Op, Pdp, load};
 
         const CATALOG: &str = r#"{
-          "schemaVersion": 1,
+          "schema": "catalog",
           "backends": { "bao": { "kind": "vault", "addr": "https://127.0.0.1:8200" } },
           "keys": {
             "grafana.admin_password": {
@@ -3299,7 +3794,7 @@ vault-addr = "http://cfg-vault:8200"
         }"#;
 
         const POLICY: &str = r#"{
-          "schemaVersion": 2,
+          "schema": "policy",
           "subjects": {
             "svc.grafana": { "allOf": [ { "kind": "unix", "uid": 9002 } ] },
             "ops.wheel": { "allOf": [ { "kind": "unix", "gid": 10 } ] }
@@ -3359,6 +3854,44 @@ vault-addr = "http://cfg-vault:8200"
             assert_eq!(doc["matched_rule"]["via"], "subject:svc.grafana");
             assert!(doc["matched_rule"]["action"].is_string());
             assert!(doc["matched_rule"]["target"].is_string());
+        }
+
+        #[test]
+        fn effective_and_explain_render_non_secret_override_provenance() {
+            let (c, p, cfg) = loaded();
+            let pdp = Pdp::new(&c, &p, &cfg);
+            let overrides = [crate::OverrideProvenance {
+                path: "catalog.keys.grafana.admin_password.writable".to_string(),
+                masked_source: PathBuf::from("/etc/basil/catalog.json"),
+            }];
+
+            let mut effective = Vec::new();
+            render_effective_with_overrides(&mut effective, &pdp, "svc.grafana", &overrides, true)
+                .expect("render effective");
+            let doc: serde_json::Value =
+                serde_json::from_slice(&effective).expect("effective JSON");
+            assert_eq!(doc["overrides"][0]["path"], overrides[0].path);
+            assert_eq!(
+                doc["overrides"][0]["masked_source"],
+                "/etc/basil/catalog.json"
+            );
+            assert!(!String::from_utf8_lossy(&effective).contains("=true"));
+
+            let mut explanation = Vec::new();
+            render_explanation_with_overrides(
+                &mut explanation,
+                &pdp,
+                "svc.grafana",
+                Op::Get,
+                "grafana.admin_password",
+                &overrides,
+                false,
+            )
+            .expect("render explanation");
+            let output = String::from_utf8(explanation).expect("utf8");
+            assert!(output.contains("startup overrides: 1"));
+            assert!(output.contains("masks /etc/basil/catalog.json"));
+            assert!(!output.contains("=true"));
         }
 
         #[test]
@@ -3462,8 +3995,18 @@ vault-addr = "http://cfg-vault:8200"
             let stamp = format!("{}-{}", std::process::id(), uuid::Uuid::new_v4());
             let catalog_path = dir.join(format!("basil-explain-cat-{stamp}.json"));
             let policy_path = dir.join(format!("basil-explain-pol-{stamp}.json"));
+            let config_path = dir.join(format!("basil-explain-config-{stamp}.toml"));
             std::fs::write(&catalog_path, CATALOG).expect("write catalog");
             std::fs::write(&policy_path, POLICY).expect("write policy");
+            std::fs::write(
+                &config_path,
+                format!(
+                    "schema = \"agent\"\nschemaVersion = 3\n[import]\ncatalog = {:?}\npolicy = {:?}\nbundle = \"unused.age\"\n",
+                    catalog_path.display().to_string(),
+                    policy_path.display().to_string()
+                ),
+            )
+            .expect("write config");
 
             let args = ExplainArgs {
                 subject: "svc.grafana".to_string(),
@@ -3473,12 +4016,9 @@ vault-addr = "http://cfg-vault:8200"
                 live: false,
                 json: true,
                 overrides: ConfigOverrides {
-                    config: None,
-                    catalog: Some(catalog_path.clone()),
-                    policy: Some(policy_path.clone()),
-                    bundle: None,
-                    socket: None,
-                    vault_addr: None,
+                    config: Some(config_path.clone()),
+                    values: Vec::new(),
+                    ..ConfigOverrides::default()
                 },
             };
 
@@ -3490,6 +4030,7 @@ vault-addr = "http://cfg-vault:8200"
 
             std::fs::remove_file(&catalog_path).ok();
             std::fs::remove_file(&policy_path).ok();
+            std::fs::remove_file(&config_path).ok();
         }
     }
 }

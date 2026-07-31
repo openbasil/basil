@@ -35,6 +35,7 @@ let
     inherit (b) addr requires;
   };
   projectedCatalog = cfg.catalog // {
+    schema = "catalog";
     backends = lib.mapAttrs (_: projectBackend) cfg.catalog.backends;
   };
   normalizePrincipal =
@@ -121,7 +122,7 @@ let
     lib.nameValuePair (toString gid) spec.group
   ) (lib.filterAttrs (_: spec: spec.group != null) cfg.policy.unixSubjects);
   projectedPolicy = cfg.policy // {
-    schemaVersion = 2;
+    schema = "policy";
     unixSubjects = null;
     subjects = (lib.mapAttrs (_: normalizeSubject) cfg.policy.subjects) // generatedSubjects;
     config = cfg.policy.config // {
@@ -144,9 +145,13 @@ let
   # every other setting here still flows into ExecStart and triggers a restart.
   agentConfig = cleanJson (
     {
-      catalog = "/etc/basil/catalog.json";
-      policy = "/etc/basil/policy.json";
-      bundle = toString cfg.bundle;
+      schema = "agent";
+      schemaVersion = 3;
+      import = {
+        catalog = "/etc/basil/catalog.json";
+        policy = "/etc/basil/policy.json";
+        bundle = toString cfg.bundle;
+      };
       "vault-addr" = settings.vaultAddr;
       "transit-mount" = settings.transitMount;
       "jwt-auth-mount" = settings.jwtAuthMount;

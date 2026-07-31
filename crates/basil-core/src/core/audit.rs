@@ -43,6 +43,8 @@ use std::time::Duration;
 use std::time::SystemTime;
 
 use serde_json::json;
+
+use crate::configuration::OverrideProvenance;
 use tracing::{error, info};
 
 use crate::decision::{DecisionRecord, Outcome, op_token};
@@ -147,8 +149,34 @@ impl AuditLog {
         reason: &str,
         actor: ReloadActor,
     ) {
-        let line =
-            serialize_reload_line(previous_generation, new_generation, outcome, reason, actor);
+        self.append_reload_with_overrides(
+            previous_generation,
+            new_generation,
+            outcome,
+            reason,
+            actor,
+            &[],
+        );
+    }
+
+    /// Append one reload audit line including non-secret override provenance.
+    pub fn append_reload_with_overrides(
+        &self,
+        previous_generation: u64,
+        new_generation: u64,
+        outcome: &str,
+        reason: &str,
+        actor: ReloadActor,
+        overrides: &[OverrideProvenance],
+    ) {
+        let line = serialize_reload_line_with_overrides(
+            previous_generation,
+            new_generation,
+            outcome,
+            reason,
+            actor,
+            overrides,
+        );
         self.try_send(AuditCommand::Line(line));
     }
 
@@ -372,12 +400,31 @@ impl ReloadActor {
 /// attested RPC caller uid) while every other field is byte-identical across the
 /// two paths. The hand-rolled fallback keeps a non-panic floor on the
 /// (impossible) serde error.
+#[cfg(test)]
 fn serialize_reload_line(
     previous_generation: u64,
     new_generation: u64,
     outcome: &str,
     reason: &str,
     actor: ReloadActor,
+) -> String {
+    serialize_reload_line_with_overrides(
+        previous_generation,
+        new_generation,
+        outcome,
+        reason,
+        actor,
+        &[],
+    )
+}
+
+fn serialize_reload_line_with_overrides(
+    previous_generation: u64,
+    new_generation: u64,
+    outcome: &str,
+    reason: &str,
+    actor: ReloadActor,
+    overrides: &[OverrideProvenance],
 ) -> String {
     let (actor_kind, actor_id) = actor.kind_and_id();
     let obj = json!({
@@ -394,6 +441,7 @@ fn serialize_reload_line(
         "generation": new_generation,
         "outcome": outcome,
         "reason": reason,
+        "overrides": overrides,
     });
     serde_json::to_string(&obj).unwrap_or_else(|_| {
         format!(
@@ -542,6 +590,29 @@ mod tests {
         assert_eq!(r["generation"], 5);
         assert_eq!(r["outcome"], "rejected");
         assert_eq!(r["reason"], "validation_failed");
+    }
+
+    #[test]
+    fn reload_line_reports_override_provenance_without_values() {
+        let overrides = [OverrideProvenance {
+            path: "catalog.keys.web.signer.writable".to_string(),
+            masked_source: "/etc/basil/catalog.json".into(),
+        }];
+        let line = serialize_reload_line_with_overrides(
+            1,
+            2,
+            "applied",
+            "signal",
+            ReloadActor::Sighup,
+            &overrides,
+        );
+        let value: serde_json::Value = serde_json::from_str(&line).expect("audit JSON");
+        assert_eq!(value["overrides"][0]["path"], overrides[0].path);
+        assert_eq!(
+            value["overrides"][0]["masked_source"],
+            "/etc/basil/catalog.json"
+        );
+        assert!(!line.contains("=true"));
     }
 
     /// The RPC reload path attributes the line to the attested caller uid

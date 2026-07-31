@@ -11,14 +11,14 @@
 //! 64 MiB / t=3 / p=1); the passphrase/bip39 method tests note the same.
 
 use super::cred::{BackendCred, CredBundle};
-use super::format::{Argon2Params, MethodKind};
+use super::format::{Argon2Params, MethodKind, MethodParams};
 use super::unlock::bip39::Bip39Method;
 use super::unlock::passphrase::PassphraseMethod;
 use super::{
     DepositContributor, DepositStatus, MethodRegistry, SealError, SlotSpec, add_slot,
-    apply_authorized_deposits, create_signed_record, format, open_bundle, promote_deposits,
-    remove_slot, reseal_payload, reseal_payload_bump_epoch, seal, verify_epoch_sidecar,
-    write_epoch_sidecar,
+    apply_authorized_deposits, atomic_write_0600_with_fill, atomic_write_0600_with_fill_and_hook,
+    create_signed_record, format, open_bundle, promote_deposits, remove_slot, reseal_payload,
+    reseal_payload_bump_epoch, seal, verify_epoch_sidecar, write_epoch_sidecar,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use zero_secrets::{SecretBytes, SecretString};
@@ -381,6 +381,53 @@ fn epoch_bump_full_reseal_rewraps_slots() {
 }
 
 #[test]
+fn epoch_bump_preserves_independent_same_kind_slots_and_argon2_profiles() {
+    let first_params = Argon2Params {
+        m_cost_kib: 256,
+        t_cost: 1,
+        p_cost: 1,
+    };
+    let second_params = Argon2Params {
+        m_cost_kib: 512,
+        t_cost: 2,
+        p_cost: 1,
+    };
+    let first = PassphraseMethod::with_params(Zeroizing::new(b"first".to_vec()), first_params);
+    let second = PassphraseMethod::with_params(Zeroizing::new(b"second".to_vec()), second_params);
+    let file = seal(
+        &sample_payload(),
+        &[
+            SlotSpec {
+                method: &first,
+                label: "first".into(),
+            },
+            SlotSpec {
+                method: &second,
+                label: "second".into(),
+            },
+        ],
+    )
+    .unwrap();
+    let parsed = format::decode(&file).unwrap();
+    let registry = MethodRegistry::new().with(&second).with(&first);
+    let file2 = reseal_payload_bump_epoch(&parsed, &registry, &sample_payload()).unwrap();
+    let parsed2 = format::decode(&file2).unwrap();
+
+    let profiles = parsed2
+        .body
+        .slots
+        .iter()
+        .map(|slot| match &slot.params {
+            MethodParams::Passphrase { argon2, .. } => *argon2,
+            other => panic!("unexpected slot params: {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(profiles, vec![first_params, second_params]);
+    assert!(open_bundle(&parsed2, &MethodRegistry::new().with(&first)).is_ok());
+    assert!(open_bundle(&parsed2, &MethodRegistry::new().with(&second)).is_ok());
+}
+
+#[test]
 fn epoch_sidecar_refuses_stale_bundle() {
     let passphrase = PassphraseMethod::with_params(Zeroizing::new(b"p".to_vec()), FAST);
     let file = seal(
@@ -402,6 +449,152 @@ fn epoch_sidecar_refuses_stale_bundle() {
     let err = verify_epoch_sidecar(&parsed, &path).expect_err("stale bundle refused");
     let _ = std::fs::remove_file(&path);
     assert!(matches!(err, SealError::Format(msg) if msg.contains("epoch rollback")));
+}
+
+#[test]
+fn atomic_writer_propagates_randomness_failure_without_altering_destination() {
+    let dir = std::env::temp_dir().join(format!(
+        "basil-rng-failure-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let destination = dir.join("bundle.sealed");
+    std::fs::write(&destination, b"old-bytes").unwrap();
+
+    let error = atomic_write_0600_with_fill(&destination, b"new-bytes", &mut |_| {
+        Err(SealError::Format("injected randomness failure".into()))
+    })
+    .expect_err("randomness failure must propagate");
+
+    assert!(
+        matches!(error, SealError::Format(message) if message.contains("injected randomness failure"))
+    );
+    assert_eq!(std::fs::read(&destination).unwrap(), b"old-bytes");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_writer_replaces_final_symlink_without_touching_target() {
+    use std::os::unix::fs::symlink;
+
+    let dir = std::env::temp_dir().join(format!(
+        "basil-final-symlink-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let destination = dir.join("bundle.sealed");
+    let victim = dir.join("victim");
+    std::fs::write(&victim, b"do-not-touch").unwrap();
+    symlink(&victim, &destination).unwrap();
+    let entropy = [0x31; 8];
+
+    atomic_write_0600_with_fill(&destination, b"new-bytes", &mut |bytes| {
+        bytes.copy_from_slice(&entropy);
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(std::fs::read(&victim).unwrap(), b"do-not-touch");
+    assert_eq!(std::fs::read(&destination).unwrap(), b"new-bytes");
+    assert!(
+        !std::fs::symlink_metadata(&destination)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_writer_skips_preplaced_temp_symlink_without_touching_target() {
+    use std::os::unix::fs::symlink;
+
+    let dir = std::env::temp_dir().join(format!(
+        "basil-temp-symlink-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let destination = dir.join("bundle.sealed");
+    let victim = dir.join("victim");
+    std::fs::write(&victim, b"do-not-touch").unwrap();
+    let first_entropy = [0x41; 8];
+    let second_entropy = [0x42; 8];
+    let temporary = super::temporary_name(destination.file_name().unwrap(), &mut |bytes| {
+        bytes.copy_from_slice(&first_entropy);
+        Ok(())
+    })
+    .unwrap();
+    let preplaced = dir.join(temporary);
+    symlink(&victim, &preplaced).unwrap();
+    let mut fill_count = 0_u8;
+
+    atomic_write_0600_with_fill(&destination, b"new-bytes", &mut |bytes| {
+        let entropy = if fill_count == 0 {
+            first_entropy
+        } else {
+            second_entropy
+        };
+        fill_count = fill_count.saturating_add(1);
+        bytes.copy_from_slice(&entropy);
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(fill_count, 2);
+    assert_eq!(std::fs::read(&victim).unwrap(), b"do-not-touch");
+    assert_eq!(std::fs::read(&destination).unwrap(), b"new-bytes");
+    assert!(
+        std::fs::symlink_metadata(&preplaced)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_writer_uses_pinned_parent_after_ancestor_symlink_substitution() {
+    use std::os::unix::fs::symlink;
+
+    let root = std::env::temp_dir().join(format!(
+        "basil-pinned-parent-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let active = root.join("active");
+    let pinned = root.join("pinned");
+    let alternate = root.join("alternate");
+    std::fs::create_dir_all(&active).unwrap();
+    std::fs::create_dir_all(&alternate).unwrap();
+    let destination = active.join("bundle.sealed");
+    let entropy = [0x51; 8];
+
+    atomic_write_0600_with_fill_and_hook(
+        &destination,
+        b"new-bytes",
+        &mut |bytes| {
+            bytes.copy_from_slice(&entropy);
+            Ok(())
+        },
+        &mut || {
+            std::fs::rename(&active, &pinned).unwrap();
+            symlink(&alternate, &active).unwrap();
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read(pinned.join("bundle.sealed")).unwrap(),
+        b"new-bytes"
+    );
+    assert!(!alternate.join("bundle.sealed").exists());
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

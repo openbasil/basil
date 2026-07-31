@@ -23,6 +23,7 @@ extend-ignore-identifiers-re = [
 AOTHER = "AOTHER"
 HashiCorp = "HashiCorp"
 PNGs = "PNGs"
+WRONLY = "WRONLY"
 encrypter = "encrypter"
 fals = "fals"
 keyedhash_parms = "keyedhash_parms"

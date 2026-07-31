@@ -102,6 +102,11 @@ whose dry-run `explain` shares one matcher with enforcement, oracle-free
 errors, zeroized secret paths, and an append-only audit trail. The
 [threat model](https://docs.openbasil.org/introduction/threat-model/) spells
 out what Basil defends against and, just as importantly, what it does not.
+Startup and reload logs also trace each configuration source by slot, resolved
+path, modification time, byte size, and SHA-256 hash. Rejected reloads keep and
+identify the active generation. New configurations use the schema-3 corpus
+bootstrap; Basil 0.7.2 continues to accept the 0.7.1 config, catalog, policy,
+and direct source flags during migration.
 
 To report a vulnerability, please use the private channels described in
 [SECURITY.md](SECURITY.md): email security@openbasil.org or GitHub private

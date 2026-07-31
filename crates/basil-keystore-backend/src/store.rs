@@ -134,13 +134,20 @@ impl SecretStore {
             }),
             #[cfg(feature = "db-keystore")]
             StoreConfig::DbKeystore { path, cipher, dek } => {
-                let hexkey = hex_key(dek.expose_secret());
-                let store = DbKeyStore::new(DbKeyStoreConfig {
-                    path,
-                    encryption_opts: Some(EncryptionOpts::new(cipher, hexkey.as_str())),
-                    ..Default::default()
-                })
-                .map_err(|e| StoreError::Backend(keyring_error_summary(&e).to_owned()))?;
+                // A database/DEK mismatch may panic inside the database layer.
+                // Contain the complete open path so startup fails closed
+                // without unwinding through the broker. Moving the DEK into the
+                // closure also guarantees its zeroizing owner is dropped on
+                // both the error and panic paths.
+                let store = contained_open(move || {
+                    let hexkey = hex_key(dek.expose_secret());
+                    DbKeyStore::new(DbKeyStoreConfig {
+                        path,
+                        encryption_opts: Some(EncryptionOpts::new(cipher, hexkey.as_str())),
+                        ..Default::default()
+                    })
+                    .map_err(|e| StoreError::Backend(keyring_error_summary(&e).to_owned()))
+                })?;
                 Ok(Self {
                     inner: StoreInner::DbKeystore(store as Arc<CredentialStore>),
                 })
@@ -275,6 +282,26 @@ impl SecretStore {
     }
 }
 
+/// Stable summary for a contained database-layer panic during store open.
+#[cfg(feature = "db-keystore")]
+const CONTAINED_PANIC_SUMMARY: &str = "db-keystore-open-panic-contained";
+
+/// Run the db-keystore open path with panic containment.
+///
+/// The payload originates in the database layer and is discarded because it
+/// may contain buffer contents or key encodings. Only a stable, secret-free
+/// discriminator crosses the adapter boundary.
+#[cfg(feature = "db-keystore")]
+fn contained_open<T>(f: impl FnOnce() -> Result<T, StoreError>) -> Result<T, StoreError> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(payload) => {
+            drop(payload);
+            Err(StoreError::Backend(CONTAINED_PANIC_SUMMARY.to_owned()))
+        }
+    }
+}
+
 #[cfg(feature = "db-keystore")]
 fn hex_key(dek: &[u8]) -> Zeroizing<String> {
     let mut out = String::with_capacity(64);
@@ -350,6 +377,29 @@ mod tests {
         assert!(!rendered.contains("ab"));
     }
 
+    #[cfg(feature = "db-keystore")]
+    #[test]
+    fn contained_open_converts_panics_into_backend_errors() {
+        assert!(matches!(super::contained_open(|| Ok(7_u32)), Ok(7)));
+        let passthrough: Result<(), _> =
+            super::contained_open(|| Err(super::StoreError::Backend("invalid".to_owned())));
+        assert!(matches!(
+            passthrough,
+            Err(super::StoreError::Backend(summary)) if summary == "invalid"
+        ));
+
+        let contained: Result<(), super::StoreError> =
+            super::contained_open(|| panic!("payload-with-material-abad1dea"));
+        match contained {
+            Err(super::StoreError::Backend(summary)) => {
+                assert_eq!(summary, super::CONTAINED_PANIC_SUMMARY);
+                assert!(!summary.contains("abad1dea"));
+            }
+            Err(other) => panic!("unexpected error variant: {other}"),
+            Ok(()) => panic!("a panicking open must fail"),
+        }
+    }
+
     /// A unique, absolute temp path so parallel tests never share a store file.
     #[cfg(feature = "db-keystore")]
     fn unique_temp_path(stem: &str, ext: &str) -> std::path::PathBuf {
@@ -360,6 +410,61 @@ mod tests {
             "basil-keystore-{stem}-{}-{n}.{ext}",
             std::process::id()
         ))
+    }
+
+    #[cfg(feature = "db-keystore")]
+    #[test]
+    fn wrong_dek_startup_is_contained_and_fails_closed() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use zero_secrets::SecretArray;
+
+        let path = unique_temp_path("wrong-dek", "db");
+        let provisioning_dek = [0x11_u8; 32];
+        {
+            let store = super::SecretStore::open(super::StoreConfig::DbKeystore {
+                path: path.clone(),
+                cipher: "aegis256".to_string(),
+                dek: SecretArray::new(provisioning_dek),
+            })
+            .expect("open with the provisioning DEK");
+            store
+                .put("kv2/qualification", b"wrong-dek startup qualification")
+                .expect("store value");
+        }
+
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            super::SecretStore::open(super::StoreConfig::DbKeystore {
+                path: path.clone(),
+                cipher: "aegis256".to_string(),
+                dek: SecretArray::new([0x22_u8; 32]),
+            })
+            .and_then(|store| store.get("kv2/qualification"))
+        }));
+        match outcome {
+            Ok(Err(err)) => {
+                let rendered = format!("{err}");
+                assert!(!rendered.contains(&"11".repeat(32)));
+                assert!(!rendered.contains(&"22".repeat(32)));
+            }
+            Ok(Ok(_)) => panic!("wrong DEK must not open and read the store"),
+            Err(unwound) => {
+                drop(unwound);
+                panic!("wrong-DEK startup unwound out of SecretStore::open");
+            }
+        }
+
+        let store = super::SecretStore::open(super::StoreConfig::DbKeystore {
+            path: path.clone(),
+            cipher: "aegis256".to_string(),
+            dek: SecretArray::new(provisioning_dek),
+        })
+        .expect("reopen with the correct DEK");
+        assert_eq!(
+            store.get("kv2/qualification").expect("read value back"),
+            b"wrong-dek startup qualification"
+        );
+        drop(store);
+        let _ = std::fs::remove_file(path);
     }
 
     /// Functional coverage for the db-keystore materialize-to-use path over a

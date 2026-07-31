@@ -710,6 +710,7 @@ policy = "$POLICY"
 bundle = "$BUNDLE"
 vault-addr = "$ADDR"
 capability-policy = "strict"
+socket = "$SOCKET"
 EOF
 if [ "$SPIFFE_BOOT" -eq 1 ]; then
   cat >> "$AGENT_CONFIG" <<EOF

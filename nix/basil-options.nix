@@ -380,13 +380,6 @@ let
 
   catalogType = types.submodule {
     options = {
-      schemaVersion = mkOption {
-        type = types.ints.positive;
-        default = 1;
-        example = 1;
-        description = "Catalog schema version. The current exported JSON schema is version 1.";
-      };
-
       backends = mkOption {
         type = types.attrsOf backendRefType;
         default = { };
@@ -691,7 +684,6 @@ in
       default = { };
       example = lib.literalExpression ''
         {
-          schemaVersion = 1;
           backends.bao = {
             implementation = (import ./nix/backend-capabilities.nix).OPENBAO_2_5;
             addr = "https://127.0.0.1:8200";
@@ -707,8 +699,8 @@ in
         }
       '';
       description = ''
-        Basil catalog document, authored in Nix and projected to the exported JSON
-        shape described by designs/catalog-policy-schema.html.
+        Basil catalog document authored in Nix. The module adds the required
+        schema-3 catalog discriminator when it exports the JSON document.
       '';
     };
 
@@ -734,8 +726,8 @@ in
         }
       '';
       description = ''
-        Basil policy document, authored in Nix and projected to the exported JSON
-        shape described by designs/catalog-policy-schema.html.
+        Basil policy document authored in Nix. The module adds the required
+        schema-3 policy discriminator when it exports the JSON document.
       '';
     };
 

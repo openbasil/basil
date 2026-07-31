@@ -82,6 +82,7 @@ stop_pid() {
 GRACE0_PIDFILE="$WORKDIR/broker-grace0.pid"
 GRACE0_SOCKET="$WORKDIR/agent-grace0.sock"
 
+# shellcheck disable=SC2329
 cleanup() {
   # Stop the broker (graceful SIGINT -> drain).
   [ -f "$BROKER_PIDFILE" ] && stop_pid "$(cat "$BROKER_PIDFILE" 2>/dev/null)"
