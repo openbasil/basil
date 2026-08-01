@@ -55,6 +55,9 @@ pub struct GithubActionsRule {
     pub events: Vec<String>,
     /// Allowed runner environments.
     pub runner_environments: Vec<String>,
+    /// Optional exact protected deployment environment.
+    #[serde(default)]
+    pub environment: Option<String>,
     /// Maximum accepted token age in seconds.
     pub max_token_age_secs: u64,
     /// Maximum clock skew allowed for `iat`, `nbf`, and `exp`.
@@ -147,6 +150,8 @@ pub struct GithubSelection<'a> {
     pub event_name: &'a str,
     /// Runner environment from the verified token.
     pub runner_environment: &'a str,
+    /// Protected deployment environment from the verified token.
+    pub environment: Option<&'a str>,
 }
 
 /// One unambiguous selected provider rule.
@@ -215,6 +220,7 @@ impl ProviderCatalog {
                     .runner_environments
                     .iter()
                     .any(|value| value == selection.runner_environment)
+                && github.environment.as_deref() == selection.environment
         });
         let Some(rule) = matches.next() else {
             return Err(FederationError::NoMatchingRule);
@@ -247,6 +253,8 @@ pub struct GithubEvidence {
     pub event_name: String,
     /// Runner trust class.
     pub runner_environment: String,
+    /// Protected deployment environment, when configured.
+    pub environment: Option<String>,
     /// Required non-empty GitHub token ID.
     pub jti_digest: [u8; 32],
     /// Keyed-independent token correlation digest (never the raw token).
@@ -269,6 +277,7 @@ struct GithubClaims {
     job_workflow_ref: String,
     job_workflow_sha: String,
     runner_environment: String,
+    environment: Option<String>,
     jti: String,
     iat: u64,
     nbf: Option<u64>,
@@ -601,6 +610,7 @@ pub fn verify_github(
             .runner_environments
             .iter()
             .any(|v| v == &claims.runner_environment)
+        || rule.environment.as_deref() != claims.environment.as_deref()
         || claims.job_workflow_ref != rule.job_workflow_ref
         || claims.job_workflow_sha != rule.job_workflow_sha
     {
@@ -619,6 +629,7 @@ pub fn verify_github(
         ref_name: claims.ref_field,
         event_name: claims.event_name,
         runner_environment: claims.runner_environment,
+        environment: claims.environment,
         jti_digest: jti,
         token_digest: Sha256::digest(token.as_bytes()).into(),
     })
@@ -686,6 +697,7 @@ mod tests {
                 protected_refs: refs.iter().map(ToString::to_string).collect(),
                 events: events.iter().map(ToString::to_string).collect(),
                 runner_environments: vec!["github-hosted".to_string()],
+                environment: None,
                 max_token_age_secs: 900,
                 clock_skew_secs: 30,
             }),
@@ -780,6 +792,7 @@ mod tests {
                 ref_name: "main",
                 event_name: "push",
                 runner_environment: "github-hosted",
+                environment: None,
             })
             .expect("exact rule selected");
         assert_eq!(selected.rule.id, "release");
@@ -797,6 +810,7 @@ mod tests {
             ref_name: "main",
             event_name: "push",
             runner_environment: "github-hosted",
+            environment: None,
         };
         assert!(matches!(
             catalog.select_github(&near_miss),
@@ -838,6 +852,7 @@ mod tests {
             ref_name: "main",
             event_name: "schedule",
             runner_environment: "github-hosted",
+            environment: None,
         };
         assert!(matches!(
             catalog.select_github(&unknown),
