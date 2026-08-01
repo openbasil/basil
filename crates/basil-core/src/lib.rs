@@ -62,8 +62,9 @@ pub use core::identity;
 pub use core::ml_dsa_sign;
 pub use core::{
     actor, attestor_realm, attestor_realm_unix, audit, authority_install, backend, capability,
-    catalog, configuration, decision, ed25519_sign, event, manager, minter, ml_kem_envelope, peer,
-    reconcile, release_admission, reload, revocation, seal, state, x25519_seal,
+    catalog, ci_federation, configuration, decision, ed25519_sign, event, manager, minter,
+    ml_kem_envelope, peer, reconcile, release_admission, reload, revocation, seal, state,
+    x25519_seal,
 };
 pub use service::broker as grpc;
 #[cfg(feature = "http")]

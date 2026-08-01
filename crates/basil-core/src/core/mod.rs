@@ -12,6 +12,7 @@ pub mod authority_install;
 pub mod backend;
 pub mod capability;
 pub mod catalog;
+pub mod ci_federation;
 pub mod configuration;
 pub mod crypto_provider;
 pub mod decision;
