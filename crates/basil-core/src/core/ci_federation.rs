@@ -22,6 +22,10 @@ use url::Url;
 const MAX_TOKEN_BYTES: usize = 32 * 1024;
 const MAX_CLAIM_BYTES: usize = 8 * 1024;
 const GITHUB_ISSUER: &str = "https://token.actions.githubusercontent.com";
+const MAX_RULE_ID_BYTES: usize = 128;
+const MAX_SUBJECT_BYTES: usize = 256;
+const MAX_AUDIENCE_BYTES: usize = 256;
+const MAX_OPERATION_PROFILES: usize = 32;
 
 /// Trusted configuration for one GitHub Actions identity rule.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -51,6 +55,169 @@ pub struct GithubActionsRule {
     pub runner_environments: Vec<String>,
     /// Maximum accepted token age in seconds.
     pub max_token_age_secs: u64,
+}
+
+/// The provider families understood by this closed federation interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProviderKind {
+    /// GitHub Actions OIDC.
+    GithubActions,
+}
+
+/// A typed provider rule in the trusted federation catalog.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderRule {
+    /// Stable operator-selected rule identifier.
+    pub id: String,
+    /// Fixed Basil subject granted by this rule.
+    pub subject: String,
+    /// Broker audience accepted by this rule.
+    pub audience: String,
+    /// Typed operation profiles enabled by this rule.
+    pub operation_profiles: Vec<String>,
+    /// Maximum accepted token age in seconds for this rule.
+    pub max_token_age_secs: u64,
+    /// Allowed clock skew in seconds for this rule.
+    pub clock_skew_secs: u64,
+    /// Provider-specific configuration.
+    pub provider: ProviderConfig,
+}
+
+/// Closed provider-specific configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum ProviderConfig {
+    /// GitHub Actions configuration.
+    GithubActions(GithubActionsRule),
+}
+
+impl ProviderConfig {
+    /// Return the closed provider kind without consulting token claims.
+    #[must_use]
+    pub const fn kind(&self) -> ProviderKind {
+        match self {
+            Self::GithubActions(_) => ProviderKind::GithubActions,
+        }
+    }
+
+    const fn github(&self) -> &GithubActionsRule {
+        match self {
+            Self::GithubActions(rule) => rule,
+        }
+    }
+}
+
+/// A trusted, validated catalog of provider rules.
+#[derive(Debug, Clone, Serialize)]
+#[serde(transparent)]
+pub struct ProviderCatalog {
+    rules: Vec<ProviderRule>,
+}
+
+impl<'de> Deserialize<'de> for ProviderCatalog {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let rules = Vec::<ProviderRule>::deserialize(deserializer)?;
+        Self::new(rules).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Typed evidence used to select one GitHub provider rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GithubSelection<'a> {
+    /// Stable numeric repository ID from the verified token.
+    pub repository_id: u64,
+    /// Stable numeric owner ID from the verified token.
+    pub repository_owner_id: u64,
+    /// Exact reusable workflow identity from the verified token.
+    pub workflow_ref: &'a str,
+    /// Exact workflow commit from the verified token.
+    pub workflow_sha: &'a str,
+    /// Protected ref or tag from the verified token.
+    pub ref_name: &'a str,
+    /// Event name from the verified token.
+    pub event_name: &'a str,
+    /// Runner environment from the verified token.
+    pub runner_environment: &'a str,
+}
+
+/// One unambiguous selected provider rule.
+#[derive(Debug, Clone, Copy)]
+pub struct SelectedProvider<'a> {
+    /// The catalog rule selected by trusted typed evidence.
+    pub rule: &'a ProviderRule,
+}
+
+impl ProviderCatalog {
+    /// Validate and construct a catalog before it can be used for selection.
+    pub fn new(rules: Vec<ProviderRule>) -> Result<Self, FederationError> {
+        let mut ids = std::collections::BTreeSet::new();
+        for rule in &rules {
+            validate_common_rule(rule)?;
+            if !ids.insert(rule.id.as_str()) {
+                return Err(FederationError::DuplicateRuleId);
+            }
+            let github = rule.provider.github();
+            validate_github_rule(github)?;
+            validate_urls(&github.issuer, &github.discovery_url, &github.jwks_url)?;
+            if rule.max_token_age_secs != github.max_token_age_secs {
+                return Err(FederationError::ProviderRejected);
+            }
+        }
+        for (index, left) in rules.iter().enumerate() {
+            for right in rules.iter().skip(index + 1) {
+                if rules_overlap(left, right) {
+                    return Err(FederationError::OverlappingRules);
+                }
+            }
+        }
+        Ok(Self { rules })
+    }
+
+    /// Return the validated rules in deterministic catalog order.
+    #[must_use]
+    pub fn rules(&self) -> &[ProviderRule] {
+        &self.rules
+    }
+
+    /// Select exactly one GitHub rule from already typed and verified evidence.
+    pub fn select_github(
+        &self,
+        selection: &GithubSelection<'_>,
+    ) -> Result<SelectedProvider<'_>, FederationError> {
+        let mut matches = self.rules.iter().filter(|rule| {
+            let github = rule.provider.github();
+            let repository_matches = github.repository_id == selection.repository_id
+                && github.repository_owner_id == selection.repository_owner_id;
+            let workflow_matches = github.job_workflow_ref == selection.workflow_ref
+                && github.job_workflow_sha == selection.workflow_sha;
+            repository_matches
+                && workflow_matches
+                && github
+                    .protected_refs
+                    .iter()
+                    .any(|value| value == selection.ref_name)
+                && github
+                    .events
+                    .iter()
+                    .any(|value| value == selection.event_name)
+                && github
+                    .runner_environments
+                    .iter()
+                    .any(|value| value == selection.runner_environment)
+        });
+        let Some(rule) = matches.next() else {
+            return Err(FederationError::NoMatchingRule);
+        };
+        if matches.next().is_some() {
+            return Err(FederationError::AmbiguousRule);
+        }
+        Ok(SelectedProvider { rule })
+    }
 }
 
 /// A validated, typed GitHub Actions certificate.
@@ -203,6 +370,66 @@ pub enum FederationError {
     /// Configuration URL validation failed.
     #[error("invalid provider URL")]
     InvalidUrl,
+    /// Two catalog rules used the same trusted identifier.
+    #[error("duplicate provider rule ID")]
+    DuplicateRuleId,
+    /// Two catalog rules could authorize the same typed evidence.
+    #[error("overlapping provider rules")]
+    OverlappingRules,
+    /// No trusted rule matched the typed evidence.
+    #[error("no provider rule matched")]
+    NoMatchingRule,
+    /// More than one trusted rule matched the typed evidence.
+    #[error("ambiguous provider rule selection")]
+    AmbiguousRule,
+}
+
+fn validate_common_rule(rule: &ProviderRule) -> Result<(), FederationError> {
+    if rule.id.is_empty()
+        || rule.id.len() > MAX_RULE_ID_BYTES
+        || rule.subject.is_empty()
+        || rule.subject.len() > MAX_SUBJECT_BYTES
+        || rule.audience.is_empty()
+        || rule.audience.len() > MAX_AUDIENCE_BYTES
+        || rule.operation_profiles.is_empty()
+        || rule.operation_profiles.len() > MAX_OPERATION_PROFILES
+        || rule.max_token_age_secs == 0
+        || rule.max_token_age_secs > 15 * 60
+        || rule.clock_skew_secs > 5 * 60
+    {
+        return Err(FederationError::ProviderRejected);
+    }
+    let mut profiles = std::collections::BTreeSet::new();
+    for profile in &rule.operation_profiles {
+        if profile.is_empty() || profile.len() > MAX_RULE_ID_BYTES || !profiles.insert(profile) {
+            return Err(FederationError::ProviderRejected);
+        }
+    }
+    Ok(())
+}
+
+fn rules_overlap(left: &ProviderRule, right: &ProviderRule) -> bool {
+    if left.provider.kind() != right.provider.kind() {
+        return false;
+    }
+    let left = left.provider.github();
+    let right = right.provider.github();
+    left.repository_id == right.repository_id
+        && left.repository_owner_id == right.repository_owner_id
+        && left.job_workflow_ref == right.job_workflow_ref
+        && left.job_workflow_sha == right.job_workflow_sha
+        && left
+            .protected_refs
+            .iter()
+            .any(|value| right.protected_refs.iter().any(|other| other == value))
+        && left
+            .events
+            .iter()
+            .any(|value| right.events.iter().any(|other| other == value))
+        && left
+            .runner_environments
+            .iter()
+            .any(|value| right.runner_environments.iter().any(|other| other == value))
 }
 
 fn string_field(
@@ -350,6 +577,32 @@ fn validate_urls(issuer: &str, discovery: &str, jwks: &str) -> Result<(), Federa
 mod tests {
     use super::*;
 
+    fn github_rule(id: &str, refs: &[&str], events: &[&str]) -> ProviderRule {
+        ProviderRule {
+            id: id.to_string(),
+            subject: "ci/release".to_string(),
+            audience: "urn:basil:ci".to_string(),
+            operation_profiles: vec!["artifact-sign".to_string()],
+            max_token_age_secs: 900,
+            clock_skew_secs: 30,
+            provider: ProviderConfig::GithubActions(GithubActionsRule {
+                issuer: GITHUB_ISSUER.to_string(),
+                discovery_url: format!("{GITHUB_ISSUER}/.well-known/openid-configuration"),
+                jwks_url: format!("{GITHUB_ISSUER}/.well-known/jwks"),
+                audience_prefix: "urn:basil:ci:jkt:".to_string(),
+                repository_id: 42,
+                repository_owner_id: 7,
+                job_workflow_ref: "openbasil/basil/.github/workflows/release.yml@refs/heads/main"
+                    .to_string(),
+                job_workflow_sha: "a".repeat(40),
+                protected_refs: refs.iter().map(ToString::to_string).collect(),
+                events: events.iter().map(ToString::to_string).collect(),
+                runner_environments: vec!["github-hosted".to_string()],
+                max_token_age_secs: 900,
+            }),
+        }
+    }
+
     #[test]
     fn proof_audience_is_rfc7638_thumbprint() {
         let audience = proof_audience(&[7; 32]);
@@ -379,5 +632,83 @@ mod tests {
             GenerationJwks::parse(1, body).unwrap().generation(),
             GenerationJwks::parse(2, body).unwrap().generation()
         );
+    }
+
+    #[test]
+    fn catalog_selects_one_exact_typed_rule() {
+        let catalog = ProviderCatalog::new(vec![github_rule("release", &["main"], &["push"])])
+            .expect("valid catalog");
+        let selected = catalog
+            .select_github(&GithubSelection {
+                repository_id: 42,
+                repository_owner_id: 7,
+                workflow_ref: "openbasil/basil/.github/workflows/release.yml@refs/heads/main",
+                workflow_sha: &"a".repeat(40),
+                ref_name: "main",
+                event_name: "push",
+                runner_environment: "github-hosted",
+            })
+            .expect("exact rule selected");
+        assert_eq!(selected.rule.id, "release");
+    }
+
+    #[test]
+    fn catalog_denies_no_match_and_near_miss() {
+        let catalog = ProviderCatalog::new(vec![github_rule("release", &["main"], &["push"])])
+            .expect("valid catalog");
+        let near_miss = GithubSelection {
+            repository_id: 42,
+            repository_owner_id: 7,
+            workflow_ref: "openbasil/basil/.github/workflows/release.yml@refs/heads/main",
+            workflow_sha: &"b".repeat(40),
+            ref_name: "main",
+            event_name: "push",
+            runner_environment: "github-hosted",
+        };
+        assert!(matches!(
+            catalog.select_github(&near_miss),
+            Err(FederationError::NoMatchingRule)
+        ));
+    }
+
+    #[test]
+    fn catalog_denies_duplicate_and_overlapping_rules() {
+        let duplicate_id = ProviderCatalog::new(vec![
+            github_rule("same", &["main"], &["push"]),
+            github_rule("same", &["tag"], &["push"]),
+        ]);
+        assert!(matches!(
+            duplicate_id,
+            Err(FederationError::DuplicateRuleId)
+        ));
+
+        let overlap = ProviderCatalog::new(vec![
+            github_rule("one", &["main", "tag"], &["push"]),
+            github_rule("two", &["tag"], &["push", "workflow_dispatch"]),
+        ]);
+        assert!(matches!(overlap, Err(FederationError::OverlappingRules)));
+    }
+
+    #[test]
+    fn catalog_allows_disjoint_rules_but_never_unions_them() {
+        let catalog = ProviderCatalog::new(vec![
+            github_rule("push", &["main"], &["push"]),
+            github_rule("dispatch", &["main"], &["workflow_dispatch"]),
+        ])
+        .expect("disjoint rules");
+        assert_eq!(catalog.rules().len(), 2);
+        let unknown = GithubSelection {
+            repository_id: 42,
+            repository_owner_id: 7,
+            workflow_ref: "openbasil/basil/.github/workflows/release.yml@refs/heads/main",
+            workflow_sha: &"a".repeat(40),
+            ref_name: "main",
+            event_name: "schedule",
+            runner_environment: "github-hosted",
+        };
+        assert!(matches!(
+            catalog.select_github(&unknown),
+            Err(FederationError::NoMatchingRule)
+        ));
     }
 }
