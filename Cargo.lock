@@ -923,6 +923,7 @@ dependencies = [
  "google-cloud-kms",
  "hex",
  "hkdf 0.13.0",
+ "hmac 0.13.0",
  "hyper 1.11.0",
  "hyper-util",
  "jsonwebtoken 10.4.0",

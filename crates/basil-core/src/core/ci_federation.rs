@@ -12,15 +12,17 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use hmac::digest::KeyInit as _;
+use hmac::{Hmac, Mac as _};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::Url;
+use zeroize::Zeroizing;
 
 const MAX_TOKEN_BYTES: usize = 32 * 1024;
-const MAX_CLAIM_BYTES: usize = 8 * 1024;
 const GITHUB_ISSUER: &str = "https://token.actions.githubusercontent.com";
 const MAX_RULE_ID_BYTES: usize = 128;
 const MAX_SUBJECT_BYTES: usize = 256;
@@ -28,7 +30,10 @@ const MAX_AUDIENCE_BYTES: usize = 256;
 const MAX_OPERATION_PROFILES: usize = 32;
 const MIN_RSA_MODULUS_BYTES: usize = 256;
 const MAX_RSA_MODULUS_BYTES: usize = 512;
-const MAX_JWKS_BODY_BYTES: usize = 8 * 1024;
+/// GitHub's production JWKS carries `x5c` certificate chains per key and is
+/// above 5 KiB before any rotation overlap; 64 KiB bounds the fetch while
+/// leaving headroom for overlapping key sets.
+const MAX_JWKS_BODY_BYTES: usize = 64 * 1024;
 
 /// The only redirect behavior accepted by the federation fetch boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,7 +49,13 @@ pub struct JwksCachePolicy {
     pub max_body_bytes: usize,
     /// Minimum interval between refresh attempts for an unknown key ID.
     pub refresh_cooldown: Duration,
-    /// Maximum time an existing key set may serve during a fetch outage.
+    /// Positive freshness window: maximum age of a fetched key set before a
+    /// cached (known) key ID must revalidate against the provider. Rotating a
+    /// key out of the provider JWKS is the provider's only revocation
+    /// mechanism, so this bounds how long a revoked key keeps verifying.
+    pub max_age: Duration,
+    /// Grace beyond `max_age` during which the existing key set may still
+    /// serve while revalidation fails or is cooldown-gated (fetch outage).
     pub stale_if_error: Duration,
     /// Redirect behavior enforced for every fetched document.
     pub redirect_policy: RedirectPolicy,
@@ -55,6 +66,8 @@ impl Default for JwksCachePolicy {
         Self {
             max_body_bytes: MAX_JWKS_BODY_BYTES,
             refresh_cooldown: Duration::from_secs(1),
+            // Five minutes (`Duration::from_mins` needs 1.91; MSRV is 1.88).
+            max_age: Duration::from_secs(300),
             stale_if_error: Duration::from_secs(30),
             redirect_policy: RedirectPolicy::Reject,
         }
@@ -321,6 +334,48 @@ impl ProviderCatalog {
     }
 }
 
+/// Broker-local secret keying the token and `jti` correlation digests.
+///
+/// The audit correlation identity of a verified token is a keyed digest so an
+/// observer holding a raw token cannot confirm it against audit records. The
+/// key never leaves broker memory and is zeroized on drop; a fresh random key
+/// per broker process is sufficient, because correlation is only meaningful
+/// within one audit stream.
+#[derive(Clone)]
+pub struct TokenCorrelationKey(Zeroizing<[u8; 32]>);
+
+impl std::fmt::Debug for TokenCorrelationKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenCorrelationKey")
+            .finish_non_exhaustive()
+    }
+}
+
+impl TokenCorrelationKey {
+    /// Wrap broker-local key bytes for correlation digests.
+    ///
+    /// Takes already-`Zeroizing` bytes so generating callers never hold an
+    /// un-scrubbed copy of the key material.
+    #[must_use]
+    pub const fn new(key: Zeroizing<[u8; 32]>) -> Self {
+        Self(key)
+    }
+
+    /// Domain-separated keyed digest: `HMAC-SHA256(key, len(domain) || domain || data)`.
+    ///
+    /// HMAC accepts any key length, so the error arm is unreachable for the
+    /// fixed 32-byte key; it still fails closed instead of panicking.
+    fn digest(&self, domain: &str, data: &[u8]) -> Result<[u8; 32], FederationError> {
+        let mut mac = Hmac::<Sha256>::new_from_slice(self.0.as_slice())
+            .map_err(|_| FederationError::CorrelationUnavailable)?;
+        let domain_length = u8::try_from(domain.len()).unwrap_or(u8::MAX);
+        mac.update(&[domain_length]);
+        mac.update(domain.as_bytes());
+        mac.update(data);
+        Ok(mac.finalize().into_bytes().into())
+    }
+}
+
 /// A validated, typed GitHub Actions certificate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GithubEvidence {
@@ -344,9 +399,9 @@ pub struct GithubEvidence {
     pub runner_environment: String,
     /// Protected deployment environment, when configured.
     pub environment: Option<String>,
-    /// Required non-empty GitHub token ID.
+    /// Keyed digest of the required non-empty GitHub token ID.
     pub jti_digest: [u8; 32],
-    /// Keyed-independent token correlation digest (never the raw token).
+    /// Keyed token correlation digest (never the raw token).
     pub token_digest: [u8; 32],
 }
 
@@ -408,7 +463,7 @@ pub struct GenerationJwks {
 impl GenerationJwks {
     /// Parse a strict RSA signing JWKS for one immutable serving generation.
     pub fn parse(generation: u64, body: &[u8]) -> Result<Self, FederationError> {
-        if body.len() > MAX_CLAIM_BYTES {
+        if body.len() > MAX_JWKS_BODY_BYTES {
             return Err(FederationError::Oversized("JWKS"));
         }
         let root: Value = serde_json::from_slice(body).map_err(|_| FederationError::Malformed)?;
@@ -420,7 +475,12 @@ impl GenerationJwks {
         let mut out = BTreeMap::new();
         for key in keys {
             let object = key.as_object().ok_or(FederationError::Malformed)?;
-            let allowed = ["kty", "kid", "alg", "use", "key_ops", "n", "e"];
+            // `x5c`, `x5t`, and `x5t#S256` appear in GitHub's production JWKS.
+            // They are tolerated so the real document parses, and ignored:
+            // verification uses only the checked RSA components below.
+            let allowed = [
+                "kty", "kid", "alg", "use", "key_ops", "n", "e", "x5c", "x5t", "x5t#S256",
+            ];
             if object.keys().any(|name| !allowed.contains(&name.as_str()))
                 || object.get("kty").and_then(Value::as_str) != Some("RSA")
                 || object.get("alg").and_then(Value::as_str) != Some("RS256")
@@ -463,6 +523,25 @@ impl GenerationJwks {
     pub const fn generation(&self) -> u64 {
         self.generation
     }
+}
+
+/// Serving-path decision for one presented key ID against a generation cache.
+#[derive(Debug)]
+pub enum ServeDecision {
+    /// The key ID is cached and the set is within its freshness window.
+    Fresh(GenerationJwks),
+    /// The key ID is cached but the set exceeded `max_age`: revalidate.
+    Revalidate {
+        /// Whether the cooldown admitted (and recorded) a refresh attempt.
+        refresh_allowed: bool,
+        /// The stale set, present only within the bounded stale window.
+        stale: Option<GenerationJwks>,
+    },
+    /// The key ID is not in the cached set (or the cache is empty).
+    UnknownKid {
+        /// Whether the cooldown admitted (and recorded) a refresh attempt.
+        refresh_allowed: bool,
+    },
 }
 
 /// One immutable-generation discovery/JWKS cache.
@@ -520,6 +599,20 @@ impl GenerationJwksCache {
         })
     }
 
+    /// Gate a refresh performed outside this cache (an async fetch): if the
+    /// cooldown permits a refresh now, record the attempt and return `true`.
+    ///
+    /// Callers that fetch with their own client must call this before the
+    /// fetch so an unknown key ID causes at most one bounded refresh per
+    /// cooldown window, and a failed fetch still consumes the attempt.
+    pub fn try_begin_refresh(&mut self, now: SystemTime) -> bool {
+        if !self.should_refresh_on_unknown_kid(now) {
+            return false;
+        }
+        self.last_refresh_attempt = Some(now);
+        true
+    }
+
     /// Refresh discovery and JWKS, retaining boundedly stale keys on outage.
     pub fn refresh<F: ProviderDocumentFetcher>(
         &mut self,
@@ -534,7 +627,7 @@ impl GenerationJwksCache {
                 self.fetched_at = Some(now);
                 Ok(RefreshOutcome::Fresh)
             }
-            Err(_error) if self.keys_are_stale(now) => Ok(RefreshOutcome::Stale),
+            Err(_error) if self.keys_within_stale_window(now) => Ok(RefreshOutcome::Stale),
             Err(error) => Err(error),
         }
     }
@@ -573,11 +666,53 @@ impl GenerationJwksCache {
         self.fetched_at = Some(now);
     }
 
-    fn keys_are_stale(&self, now: SystemTime) -> bool {
-        self.fetched_at.is_some_and(|fetched| {
-            now.duration_since(fetched)
-                .is_ok_and(|age| age <= self.policy.stale_if_error)
-        }) && self.keys.is_some()
+    /// Decide how the serving path may use this cache for one presented key ID.
+    ///
+    /// A cached key ID serves directly only while the set is within its
+    /// positive freshness window (`max_age`). Past it, the caller must
+    /// revalidate through the cooldown gate, and may serve the stale set only
+    /// within `max_age + stale_if_error` of the last successful fetch — so a
+    /// key the provider rotates out of its JWKS stops verifying within a
+    /// bounded interval instead of persisting for the generation lifetime.
+    /// Any admitted refresh attempt is recorded here, before the fetch, so a
+    /// failed fetch still consumes the attempt.
+    pub fn serve_or_revalidate(&mut self, kid: &str, now: SystemTime) -> ServeDecision {
+        match self.cached_keys() {
+            Some(keys) if keys.key(kid).is_some() => {
+                if self.keys_are_fresh(now) {
+                    return ServeDecision::Fresh(keys);
+                }
+                let refresh_allowed = self.try_begin_refresh(now);
+                let stale = self.keys_within_stale_window(now).then_some(keys);
+                ServeDecision::Revalidate {
+                    refresh_allowed,
+                    stale,
+                }
+            }
+            _ => ServeDecision::UnknownKid {
+                refresh_allowed: self.try_begin_refresh(now),
+            },
+        }
+    }
+
+    fn keys_are_fresh(&self, now: SystemTime) -> bool {
+        self.keys.is_some()
+            && self.fetched_at.is_some_and(|fetched| {
+                now.duration_since(fetched)
+                    .is_ok_and(|age| age <= self.policy.max_age)
+            })
+    }
+
+    fn keys_within_stale_window(&self, now: SystemTime) -> bool {
+        self.keys.is_some()
+            && self.fetched_at.is_some_and(|fetched| {
+                now.duration_since(fetched).is_ok_and(|age| {
+                    age <= self
+                        .policy
+                        .max_age
+                        .saturating_add(self.policy.stale_if_error)
+                })
+            })
     }
 
     fn fetch_and_parse<F: ProviderDocumentFetcher>(
@@ -668,6 +803,9 @@ pub enum FederationError {
     /// More than one trusted rule matched the typed evidence.
     #[error("ambiguous provider rule selection")]
     AmbiguousRule,
+    /// The broker-local correlation digest could not be computed.
+    #[error("correlation digest unavailable")]
+    CorrelationUnavailable,
 }
 
 fn validate_common_rule(rule: &ProviderRule) -> Result<(), FederationError> {
@@ -831,6 +969,7 @@ pub fn verify_github(
     jwks: &GenerationJwks,
     token: &str,
     proof_public_key: &[u8; 32],
+    correlation: &TokenCorrelationKey,
     now: SystemTime,
 ) -> Result<GithubEvidence, FederationError> {
     if token.len() > MAX_TOKEN_BYTES {
@@ -847,6 +986,13 @@ pub fn verify_github(
     let mut validation = Validation::new(Algorithm::RS256);
     validation.set_audience(&[proof_audience(proof_public_key)]);
     validation.set_issuer(&[rule.issuer.as_str()]);
+    // The rule's `clock_skew_secs` is the single time-boundary authority: the
+    // library's own leeway (default 60 s) and temporal checks are disabled and
+    // the explicit `iat`/`nbf`/`exp` checks below apply exactly the rule skew.
+    validation.leeway = 0;
+    validation.validate_exp = false;
+    validation.validate_nbf = false;
+    validation.set_required_spec_claims(&["exp", "iss", "aud"]);
     let data = decode::<Value>(
         token,
         &DecodingKey::from_rsa_components(&key.n, &key.e)
@@ -885,9 +1031,11 @@ pub fn verify_github(
     {
         return Err(FederationError::ProviderRejected);
     }
-    let jti = (!claims.jti.is_empty())
-        .then(|| Sha256::digest(claims.jti.as_bytes()).into())
-        .ok_or(FederationError::ProviderRejected)?;
+    if claims.jti.is_empty() {
+        return Err(FederationError::ProviderRejected);
+    }
+    let jti = correlation.digest("basil-ci-jti", claims.jti.as_bytes())?;
+    let token_digest = correlation.digest("basil-ci-token", token.as_bytes())?;
     Ok(GithubEvidence {
         repository_id: decimal(&claims.repository_id)?,
         repository_owner_id: decimal(&claims.repository_owner_id)?,
@@ -900,7 +1048,7 @@ pub fn verify_github(
         runner_environment: claims.runner_environment,
         environment: claims.environment,
         jti_digest: jti,
-        token_digest: Sha256::digest(token.as_bytes()).into(),
+        token_digest,
     })
 }
 
@@ -1135,6 +1283,99 @@ mod tests {
     }
 
     #[test]
+    fn jwks_tolerates_github_x5c_members_but_rejects_unknown_members() {
+        let modulus = URL_SAFE_NO_PAD.encode([0x80; 256]);
+        // GitHub's production JWKS carries x5c/x5t alongside the RSA components.
+        let github_shaped = format!(
+            r#"{{"keys":[{{"kty":"RSA","kid":"a","alg":"RS256","use":"sig","n":"{modulus}","e":"AQAB","x5c":["MIIB"],"x5t":"thumb","x5t#S256":"thumb256"}}]}}"#
+        );
+        let parsed = GenerationJwks::parse(1, github_shaped.as_bytes()).expect("real-shape JWKS");
+        assert!(parsed.key("a").is_some());
+
+        let unknown_member = format!(
+            r#"{{"keys":[{{"kty":"RSA","kid":"a","alg":"RS256","use":"sig","n":"{modulus}","e":"AQAB","jku":"https://evil.example"}}]}}"#
+        );
+        assert!(matches!(
+            GenerationJwks::parse(1, unknown_member.as_bytes()),
+            Err(FederationError::InvalidKey)
+        ));
+    }
+
+    #[test]
+    fn jwks_rejects_rsa_components_outside_bounds() {
+        let case = |n: &[u8], e: &str| {
+            let n = URL_SAFE_NO_PAD.encode(n);
+            let body = format!(
+                r#"{{"keys":[{{"kty":"RSA","kid":"a","alg":"RS256","use":"sig","n":"{n}","e":"{e}"}}]}}"#
+            );
+            GenerationJwks::parse(1, body.as_bytes())
+        };
+        // 1024-bit modulus is below the floor.
+        assert!(matches!(
+            case(&[0x80; 128], "AQAB"),
+            Err(FederationError::InvalidKey)
+        ));
+        // Above the 4096-bit ceiling.
+        assert!(matches!(
+            case(&[0x80; 513], "AQAB"),
+            Err(FederationError::InvalidKey)
+        ));
+        // High bit clear means the declared modulus width is padded.
+        assert!(matches!(
+            case(&[0x7F; 256], "AQAB"),
+            Err(FederationError::InvalidKey)
+        ));
+        // Exponent must be exactly 65537.
+        assert!(matches!(
+            case(&[0x80; 256], "Aw"),
+            Err(FederationError::InvalidKey)
+        ));
+        // 4096-bit modulus with e=65537 is accepted.
+        assert!(case(&[0x80; 512], "AQAB").is_ok());
+    }
+
+    #[test]
+    fn oversized_jwks_body_is_rejected() {
+        let mut body = br#"{"keys":[]}"#.to_vec();
+        body.resize(64 * 1024 + 1, b' ');
+        assert!(matches!(
+            GenerationJwks::parse(1, &body),
+            Err(FederationError::Oversized("JWKS"))
+        ));
+    }
+
+    #[test]
+    fn correlation_digests_are_keyed_and_domain_separated() {
+        let key = TokenCorrelationKey::new(Zeroizing::new([1; 32]));
+        let other = TokenCorrelationKey::new(Zeroizing::new([2; 32]));
+        let token = b"header.payload.signature";
+        let first = key.digest("basil-ci-token", token).expect("digest");
+        assert_eq!(key.digest("basil-ci-token", token).expect("digest"), first);
+        assert_ne!(
+            other.digest("basil-ci-token", token).expect("digest"),
+            first
+        );
+        assert_ne!(key.digest("basil-ci-jti", token).expect("digest"), first);
+        assert!(!format!("{key:?}").contains('1'));
+    }
+
+    #[test]
+    fn try_begin_refresh_enforces_the_cooldown_window() {
+        let rule = cache_rule();
+        let policy = JwksCachePolicy {
+            refresh_cooldown: Duration::from_secs(10),
+            ..JwksCachePolicy::default()
+        };
+        let mut cache = GenerationJwksCache::new(1, &rule, policy).expect("cache");
+        let start = UNIX_EPOCH + Duration::from_secs(100);
+        assert!(cache.try_begin_refresh(start));
+        // The attempt is consumed even though no fetch succeeded.
+        assert!(!cache.try_begin_refresh(start));
+        assert!(!cache.try_begin_refresh(start + Duration::from_secs(9)));
+        assert!(cache.try_begin_refresh(start + Duration::from_secs(10)));
+    }
+
+    #[test]
     fn jwks_rejects_duplicate_and_wrong_metadata() {
         let modulus = URL_SAFE_NO_PAD.encode([0x80; 256]);
         let duplicate = format!(
@@ -1226,6 +1467,8 @@ mod tests {
     fn stale_keys_survive_only_within_outage_grace() {
         let rule = cache_rule();
         let policy = JwksCachePolicy {
+            // Zero freshness so the outage grace alone bounds staleness.
+            max_age: Duration::ZERO,
             stale_if_error: Duration::from_secs(5),
             ..JwksCachePolicy::default()
         };
@@ -1255,6 +1498,82 @@ mod tests {
                 .refresh(&mut fetcher, start + Duration::from_secs(6))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn serving_decision_enforces_positive_ttl_and_bounded_staleness() {
+        let rule = cache_rule();
+        let policy = JwksCachePolicy {
+            max_age: Duration::from_secs(100),
+            stale_if_error: Duration::from_secs(20),
+            refresh_cooldown: Duration::from_secs(10),
+            ..JwksCachePolicy::default()
+        };
+        let mut cache = GenerationJwksCache::new(1, &rule, policy).expect("cache");
+        let parsed = GenerationJwks::parse(1, &jwks("kid").body).expect("valid JWKS");
+        let fetch_time = UNIX_EPOCH + Duration::from_secs(1000);
+        cache.install(parsed, fetch_time);
+
+        // Within max_age: a cached kid serves fresh, no refresh recorded.
+        let fresh_now = fetch_time + Duration::from_secs(100);
+        assert!(matches!(
+            cache.serve_or_revalidate("kid", fresh_now),
+            ServeDecision::Fresh(_)
+        ));
+        assert!(cache.should_refresh_on_unknown_kid(fresh_now));
+
+        // Past max_age but within the stale window: revalidation admitted
+        // once per cooldown; the stale set stays available meanwhile.
+        let stale_now = fetch_time + Duration::from_secs(110);
+        match cache.serve_or_revalidate("kid", stale_now) {
+            ServeDecision::Revalidate {
+                refresh_allowed,
+                stale,
+            } => {
+                assert!(refresh_allowed);
+                assert!(stale.is_some());
+            }
+            other => panic!("expected revalidate, got {other:?}"),
+        }
+        match cache.serve_or_revalidate("kid", stale_now) {
+            ServeDecision::Revalidate {
+                refresh_allowed,
+                stale,
+            } => {
+                assert!(!refresh_allowed, "cooldown must gate the second attempt");
+                assert!(stale.is_some());
+            }
+            other => panic!("expected revalidate, got {other:?}"),
+        }
+
+        // Past max_age + stale_if_error: no stale serving; only a successful
+        // revalidation may serve, so a revoked key fails closed boundedly.
+        let expired_now = fetch_time + Duration::from_secs(121);
+        match cache.serve_or_revalidate("kid", expired_now) {
+            ServeDecision::Revalidate {
+                refresh_allowed,
+                stale,
+            } => {
+                assert!(refresh_allowed);
+                assert!(stale.is_none(), "stale set must not outlive the window");
+            }
+            other => panic!("expected revalidate, got {other:?}"),
+        }
+
+        // An unknown kid records the (cooldown-gated) refresh attempt.
+        let unknown_now = expired_now + Duration::from_secs(10);
+        assert!(matches!(
+            cache.serve_or_revalidate("other", unknown_now),
+            ServeDecision::UnknownKid {
+                refresh_allowed: true
+            }
+        ));
+        assert!(matches!(
+            cache.serve_or_revalidate("other", unknown_now),
+            ServeDecision::UnknownKid {
+                refresh_allowed: false
+            }
+        ));
     }
 
     #[test]

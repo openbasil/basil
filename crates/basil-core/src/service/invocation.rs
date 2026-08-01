@@ -604,6 +604,75 @@ impl BrokerGrpc {
             .map_err(|e| invalid_request(INVOKE_OP, e.to_string()))
     }
 
+    /// Resolve the JWKS to verify against for one federation rule.
+    ///
+    /// Classifies the presented key ID under one cache lock (fresh hit,
+    /// positive-TTL expiry needing revalidation, or unknown key ID), then
+    /// performs at most one bounded fetch per cooldown window; any admitted
+    /// refresh attempt is recorded before the fetch so a failed fetch still
+    /// consumes it. Past `max_age`, a cached key ID serves the stale set only
+    /// within `stale_if_error`, after which the rule fails closed until a
+    /// fetch succeeds — so a provider-side key rotation (its only revocation
+    /// mechanism) takes effect boundedly instead of persisting for the
+    /// generation lifetime. `Ok(None)` means this rule cannot serve the key
+    /// ID right now: no generation cache entry (never fetches, fails closed),
+    /// cooldown-gated, fetch failed, or staleness bound exceeded.
+    async fn resolve_rule_jwks(
+        &self,
+        generation: &std::sync::Arc<crate::state::Generation>,
+        rule_id: &str,
+        github: &crate::core::ci_federation::GithubActionsRule,
+        client: &reqwest::Client,
+        token_kid: &str,
+        now: std::time::SystemTime,
+    ) -> Result<Option<crate::core::ci_federation::GenerationJwks>, Status> {
+        use crate::core::ci_federation::ServeDecision;
+        let decision = generation
+            .jwks_caches()
+            .lock()
+            .map_err(|_| unauthorized_invocation())?
+            .get_mut(rule_id)
+            .map(|cache| cache.serve_or_revalidate(token_kid, now));
+        let Some(decision) = decision else {
+            return Ok(None);
+        };
+        match decision {
+            ServeDecision::Fresh(keys) => Ok(Some(keys)),
+            ServeDecision::Revalidate {
+                refresh_allowed,
+                stale,
+            } => {
+                let fetched = if refresh_allowed {
+                    crate::ci_federation::fetch_generation_jwks(client, generation.id(), github)
+                        .await
+                        .ok()
+                } else {
+                    None
+                };
+                match fetched {
+                    Some(keys) => {
+                        install_generation_jwks(generation, rule_id, &keys, now)?;
+                        Ok(Some(keys))
+                    }
+                    None => Ok(stale),
+                }
+            }
+            ServeDecision::UnknownKid { refresh_allowed } => {
+                if !refresh_allowed {
+                    return Ok(None);
+                }
+                let Ok(keys) =
+                    crate::ci_federation::fetch_generation_jwks(client, generation.id(), github)
+                        .await
+                else {
+                    return Ok(None);
+                };
+                install_generation_jwks(generation, rule_id, &keys, now)?;
+                Ok(Some(keys))
+            }
+        }
+    }
+
     async fn verify_provider_evidence(
         &self,
         generation: &std::sync::Arc<crate::state::Generation>,
@@ -640,38 +709,23 @@ impl BrokerGrpc {
             .ok()
             .and_then(|header| header.kid)
             .ok_or_else(unauthorized_invocation)?;
+        let correlation = token_correlation_key()?;
         for rule in catalog.rules() {
             let crate::core::ci_federation::ProviderConfig::GithubActions(github) = &rule.provider;
-            let cached_keys = generation
-                .jwks_caches()
-                .lock()
-                .map_err(|_| unauthorized_invocation())?
-                .get(&rule.id)
-                .and_then(|cache| {
-                    cache
-                        .cached_key(&token_kid)
-                        .and_then(|_| cache.cached_keys())
-                });
-            let keys = if let Some(keys) = cached_keys {
-                keys
-            } else {
-                let keys =
-                    crate::ci_federation::fetch_generation_jwks(&client, generation.id(), github)
-                        .await
-                        .map_err(|_| unauthorized_invocation())?;
-                let mut cache_map = generation
-                    .jwks_caches()
-                    .lock()
-                    .map_err(|_| unauthorized_invocation())?;
-                if let Some(cache) = cache_map.get_mut(&rule.id) {
-                    cache.install(keys.clone(), now);
-                }
-                drop(cache_map);
-                keys
+            let Some(keys) = self
+                .resolve_rule_jwks(generation, &rule.id, github, &client, &token_kid, now)
+                .await?
+            else {
+                continue;
             };
-            if let Ok(evidence) =
-                crate::core::ci_federation::verify_github(github, &keys, token, &public, now)
-            {
+            if let Ok(evidence) = crate::core::ci_federation::verify_github(
+                github,
+                &keys,
+                token,
+                &public,
+                correlation,
+                now,
+            ) {
                 return Ok(crate::core::ci_federation::VerifiedProviderEvidence {
                     provider: rule.provider.kind(),
                     rule_id: rule.id.clone(),
@@ -682,6 +736,44 @@ impl BrokerGrpc {
         }
         Err(unauthorized_invocation())
     }
+}
+
+/// Install a freshly fetched JWKS into the generation's cache for one rule.
+fn install_generation_jwks(
+    generation: &std::sync::Arc<crate::state::Generation>,
+    rule_id: &str,
+    keys: &crate::core::ci_federation::GenerationJwks,
+    now: std::time::SystemTime,
+) -> Result<(), Status> {
+    let mut cache_map = generation
+        .jwks_caches()
+        .lock()
+        .map_err(|_| unauthorized_invocation())?;
+    if let Some(cache) = cache_map.get_mut(rule_id) {
+        cache.install(keys.clone(), now);
+    }
+    drop(cache_map);
+    Ok(())
+}
+
+/// The broker-local key for CI token/`jti` correlation digests.
+///
+/// A fresh random key per broker process: correlation identity is only
+/// meaningful within one audit stream, and keeping the key ephemeral means a
+/// captured audit record can never be matched against a raw token offline
+/// after the process exits. Fails closed if entropy is unavailable.
+fn token_correlation_key()
+-> Result<&'static crate::core::ci_federation::TokenCorrelationKey, Status> {
+    static KEY: std::sync::OnceLock<crate::core::ci_federation::TokenCorrelationKey> =
+        std::sync::OnceLock::new();
+    if let Some(key) = KEY.get() {
+        return Ok(key);
+    }
+    // Zeroizing end-to-end: the generated bytes move into the key (or are
+    // scrubbed on the race-loser path) without leaving a plain stack copy.
+    let mut bytes = zeroize::Zeroizing::new([0_u8; 32]);
+    getrandom::fill(&mut *bytes).map_err(|_| unauthorized_invocation())?;
+    Ok(KEY.get_or_init(move || crate::core::ci_federation::TokenCorrelationKey::new(bytes)))
 }
 
 fn prepared_content_type(prepared: &PreparedInvocation) -> &str {

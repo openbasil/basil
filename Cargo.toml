@@ -80,6 +80,7 @@ google-cloud-gax = "0.19.2"
 google-cloud-kms = { version = "=0.6.0", default-features = false, features = ["auth", "rustls-tls"] }
 hex = "0.4"
 hkdf = { version = "0.13.0", default-features = false }
+hmac = { version = "0.13.0", default-features = false }
 hyper = { version = "1.11.0", default-features = false, features = ["http1", "server"] }
 hyper-util = { version = "0.1.20", default-features = false, features = ["http1", "server-auto", "service", "tokio"] }
 # jsonwebtoken 10 requires selecting a crypto backend; `rust_crypto` uses the

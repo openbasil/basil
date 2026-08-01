@@ -69,12 +69,14 @@ google-cloud-gax = { workspace = true, optional = true }
 google-cloud-kms = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
 hkdf = { workspace = true }
+# Keyed CI token/jti correlation digests (already in-graph via jsonwebtoken).
+hmac = { workspace = true }
 hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
 jsonwebtoken = { workspace = true }
+minicbor = { workspace = true }
 ml-dsa = { workspace = true }
 ml-kem = { workspace = true }
-minicbor = { workspace = true }
 opentelemetry-appender-tracing = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
@@ -130,6 +132,7 @@ nkeys = { workspace = true }
 proptest = { workspace = true }
 tokio-rustls = { workspace = true }
 tower = { workspace = true }
+zeroize = { workspace = true }
 
 # TEMPORARY bridge for the `SO_PEERPIDFD` sockopt (basil-2czo, per the
 # basil-xwiy maintainer decision): pinned to 0.30.x, declared in this crate
