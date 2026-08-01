@@ -74,6 +74,7 @@ hyper-util = { workspace = true, optional = true }
 jsonwebtoken = { workspace = true }
 ml-dsa = { workspace = true }
 ml-kem = { workspace = true }
+minicbor = { workspace = true }
 opentelemetry-appender-tracing = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
@@ -125,7 +126,6 @@ zeroize = { workspace = true }
 basil = { workspace = true }
 basil-cose = { workspace = true, features = ["fixtures"] }
 hyper-util = { workspace = true }
-minicbor = { workspace = true }
 nkeys = { workspace = true }
 proptest = { workspace = true }
 tokio-rustls = { workspace = true }

@@ -137,6 +137,7 @@ fn signed_round_trip_with_signer_certificate_headers() {
             "eyJhbGciOiJFZERTQSJ9.cert.one.sig".to_string(),
             "eyJhbGciOiJFZERTQSJ9.cert.two.sig".to_string(),
         ],
+        signer_public_key_cose: None,
     };
     let msg = block_on(build_signed_with_headers(
         &SignParams {
@@ -622,6 +623,47 @@ fn sealed_round_trip_both_algorithms() {
         assert_eq!(opened.plaintext.as_slice(), b"secret payload");
         assert_eq!(opened.content_type, ct());
     }
+}
+
+#[test]
+fn sealed_proof_key_header_round_trips_and_is_critical() {
+    let public = Ed25519Signer::from_secret_bytes(kid("proof-kid"), &Zeroizing::new([11u8; 32]))
+        .public_key_bytes();
+    let mut cose_key = Vec::new();
+    Encoder::new(&mut cose_key)
+        .map(3)
+        .unwrap()
+        .i64(1)
+        .unwrap()
+        .i64(1)
+        .unwrap()
+        .i64(-1)
+        .unwrap()
+        .i64(6)
+        .unwrap()
+        .i64(-2)
+        .unwrap()
+        .bytes(&public)
+        .unwrap();
+    let signer = Ed25519Signer::from_secret_bytes(kid("proof-kid"), &Zeroizing::new([11u8; 32]));
+    let mut params = seal_params(b"proof", ContentAlgorithm::A256Gcm, recipient().public());
+    params.claims.sender_key_id = Some(signer.key_id().clone());
+    params.claims.audience = Some(Subject::new("urn:basil:ci:jkt:test".to_string()).unwrap());
+    let headers = ProtectedHeaders {
+        signer_certificates_jwt: vec!["token".to_string()],
+        signer_public_key_cose: Some(cose_key),
+    };
+    let message = block_on(build_sealed_with_headers(&params, &headers, &signer)).unwrap();
+    let verified = block_on(verify_sealed(
+        message.as_bytes(),
+        &verifier_for(&signer),
+        &VerifySealedParams {
+            signature_aad: ExternalAad::empty(),
+            validation: &validation(MessageRole::Peer),
+        },
+    ))
+    .unwrap();
+    assert_eq!(verified.protected_headers, headers);
 }
 
 #[test]

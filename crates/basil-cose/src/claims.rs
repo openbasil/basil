@@ -53,13 +53,15 @@ pub struct Claims {
 pub struct ProtectedHeaders {
     /// `-70006`: compact trusted-signer certificate JWTs for the signer `kid`.
     pub signer_certificates_jwt: Vec<String>,
+    /// `-70007`: deterministic public Ed25519 proof `COSE_Key` bytes.
+    pub signer_public_key_cose: Option<Vec<u8>>,
 }
 
 impl ProtectedHeaders {
     /// Return true when no optional protected headers are present.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.signer_certificates_jwt.is_empty()
+        self.signer_certificates_jwt.is_empty() && self.signer_public_key_cose.is_none()
     }
 }
 

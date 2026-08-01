@@ -20,6 +20,8 @@ pub const RESPONSE_KEY_ID: i64 = -70004;
 pub const RESPONSE_SUBJECT: i64 = -70005;
 /// Compact signer certificate JWT chain (array of tstr).
 pub const SIGNER_CERTIFICATES_JWT: i64 = -70006;
+/// Deterministic public Ed25519 proof `COSE_Key` (bstr).
+pub const SIGNER_PUBLIC_KEY_COSE: i64 = -70007;
 
 /// COSE header parameter: algorithm.
 pub(crate) const HDR_ALG: i64 = 1;

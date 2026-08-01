@@ -100,10 +100,21 @@ fn crit_labels(claims: Option<&Claims>, protected_headers: Option<&ProtectedHead
         crit.push(label::HDR_CWT_CLAIMS);
         crit.extend(basil_labels(c));
     }
-    if protected_headers.is_some_and(|headers| !headers.signer_certificates_jwt.is_empty()) {
-        crit.push(label::SIGNER_CERTIFICATES_JWT);
-    }
+    crit.extend(protected_header_crit_labels(protected_headers));
+    crit.sort_by_key(|value| label::canonical_sort_key(*value));
     crit
+}
+
+fn protected_header_crit_labels(protected_headers: Option<&ProtectedHeaders>) -> Vec<i64> {
+    let mut labels = Vec::new();
+    if protected_headers.is_some_and(|headers| !headers.signer_certificates_jwt.is_empty()) {
+        labels.push(label::SIGNER_CERTIFICATES_JWT);
+    }
+    if protected_headers.is_some_and(|headers| headers.signer_public_key_cose.is_some()) {
+        labels.push(label::SIGNER_PUBLIC_KEY_COSE);
+    }
+    labels.sort_by_key(|value| label::canonical_sort_key(*value));
+    labels
 }
 
 /// Write the CWT claims map (header 15 value).
@@ -179,6 +190,11 @@ fn write_claims_capable_tail(
             e.str(jwt)?;
         }
     }
+    if let Some(headers) = protected_headers
+        && let Some(key) = &headers.signer_public_key_cose
+    {
+        e.i64(label::SIGNER_PUBLIC_KEY_COSE)?.bytes(key)?;
+    }
     Ok(())
 }
 
@@ -191,6 +207,9 @@ fn claims_capable_tail_len(
     2 + claims.map_or(0, |c| 1 + basil_labels(c).len() as u64)
         + u64::from(
             protected_headers.is_some_and(|headers| !headers.signer_certificates_jwt.is_empty()),
+        )
+        + u64::from(
+            protected_headers.is_some_and(|headers| headers.signer_public_key_cose.is_some()),
         )
 }
 
@@ -217,10 +236,48 @@ pub fn encode_sign1_protected_sealed_outer(
     algorithm: SignatureAlgorithm,
     kid: &KeyId,
 ) -> Result<Vec<u8>, CodecError> {
+    encode_sign1_protected_sealed_outer_with_headers(algorithm, kid, None)
+}
+
+/// Serialize a sealed outer header with optional critical proof headers.
+pub fn encode_sign1_protected_sealed_outer_with_headers(
+    algorithm: SignatureAlgorithm,
+    kid: &KeyId,
+    protected_headers: Option<&ProtectedHeaders>,
+) -> Result<Vec<u8>, CodecError> {
     encode_with(|e| {
-        e.map(2)?;
+        let has_crit = protected_headers.is_some_and(|h| !h.is_empty());
+        let has_jwt = protected_headers.is_some_and(|h| !h.signer_certificates_jwt.is_empty());
+        let has_key = protected_headers.is_some_and(|h| h.signer_public_key_cose.is_some());
+        e.map(2 + u64::from(has_crit) + u64::from(has_jwt) + u64::from(has_key))?;
         e.i64(label::HDR_ALG)?.i64(algorithm.codepoint())?;
+        if let Some(headers) = protected_headers
+            && has_crit
+        {
+            let crit = protected_header_crit_labels(Some(headers));
+            e.i64(label::HDR_CRIT)?.array(crit.len() as u64)?;
+            for value in crit {
+                e.i64(value)?;
+            }
+        }
         e.i64(label::HDR_KID)?.bytes(kid.as_bytes())?;
+        if let Some(headers) = protected_headers {
+            if has_jwt {
+                e.i64(label::SIGNER_CERTIFICATES_JWT)?
+                    .array(headers.signer_certificates_jwt.len() as u64)?;
+                for jwt in &headers.signer_certificates_jwt {
+                    e.str(jwt)?;
+                }
+            }
+            if has_key {
+                e.i64(label::SIGNER_PUBLIC_KEY_COSE)?.bytes(
+                    headers
+                        .signer_public_key_cose
+                        .as_deref()
+                        .unwrap_or_default(),
+                )?;
+            }
+        }
         Ok(())
     })
 }
@@ -775,6 +832,9 @@ fn parse_claims_capable_header(
             label::SIGNER_CERTIFICATES_JWT if allow_kid => {
                 protected_headers.signer_certificates_jwt = read_string_array(&mut d, l)?;
             }
+            label::SIGNER_PUBLIC_KEY_COSE if allow_kid => {
+                protected_headers.signer_public_key_cose = Some(read_bytes(&mut d, l)?);
+            }
             other => {
                 if !parse_basil_label(&mut d, other, &mut parts)? {
                     return Err(DecodeError::UnknownLabel { label: other });
@@ -920,17 +980,11 @@ pub fn decode_sign1_strict(bytes: &[u8], layer: Sign1Layer) -> Result<DecodedSig
             )
         }
         Sign1Layer::SealedOuter => {
-            let (algorithm, kid) = parse_sealed_outer_protected(&protected)?;
-            let rebuilt = encode_sign1_protected_sealed_outer(algorithm, &kid)
-                .map_err(|CodecError| DecodeError::NonDeterministicEncoding)?;
-            (
-                algorithm,
-                kid,
-                None,
-                None,
-                ProtectedHeaders::default(),
-                rebuilt,
-            )
+            let (algorithm, kid, headers) = parse_sealed_outer_protected(&protected)?;
+            let rebuilt =
+                encode_sign1_protected_sealed_outer_with_headers(algorithm, &kid, Some(&headers))
+                    .map_err(|CodecError| DecodeError::NonDeterministicEncoding)?;
+            (algorithm, kid, None, None, headers, rebuilt)
         }
     };
 
@@ -954,7 +1008,9 @@ pub fn decode_sign1_strict(bytes: &[u8], layer: Sign1Layer) -> Result<DecodedSig
 
 /// Parse the sealed-outer protected header: exactly `{1: alg, 4: kid}`, where
 /// `alg` is a profile signature algorithm. Returns the algorithm and key id.
-fn parse_sealed_outer_protected(bytes: &[u8]) -> Result<(SignatureAlgorithm, KeyId), DecodeError> {
+fn parse_sealed_outer_protected(
+    bytes: &[u8],
+) -> Result<(SignatureAlgorithm, KeyId, ProtectedHeaders), DecodeError> {
     if bytes.is_empty() {
         return Err(DecodeError::MissingHeader {
             label: label::HDR_ALG,
@@ -966,6 +1022,8 @@ fn parse_sealed_outer_protected(bytes: &[u8]) -> Result<(SignatureAlgorithm, Key
     let mut prev = None;
     let mut alg = None;
     let mut kid = None;
+    let mut crit = None;
+    let mut headers = ProtectedHeaders::default();
     for _ in 0..n {
         let l = read_label(&mut d)?;
         check_order(prev, l)?;
@@ -973,6 +1031,13 @@ fn parse_sealed_outer_protected(bytes: &[u8]) -> Result<(SignatureAlgorithm, Key
         match l {
             label::HDR_ALG => alg = Some(read_int(&mut d, l)?),
             label::HDR_KID => kid = Some(KeyId::from_bytes(read_bytes(&mut d, l)?)?),
+            label::HDR_CRIT => crit = Some(parse_crit(&mut d)?),
+            label::SIGNER_CERTIFICATES_JWT => {
+                headers.signer_certificates_jwt = read_string_array(&mut d, l)?;
+            }
+            label::SIGNER_PUBLIC_KEY_COSE => {
+                headers.signer_public_key_cose = Some(read_bytes(&mut d, l)?);
+            }
             other => return Err(DecodeError::UnknownLabel { label: other }),
         }
     }
@@ -984,7 +1049,16 @@ fn parse_sealed_outer_protected(bytes: &[u8]) -> Result<(SignatureAlgorithm, Key
     let kid = kid.ok_or(DecodeError::MissingHeader {
         label: label::HDR_KID,
     })?;
-    Ok((algorithm, kid))
+    if headers.is_empty() {
+        if crit.is_some() {
+            return Err(DecodeError::CritIncomplete {
+                label: label::HDR_CRIT,
+            });
+        }
+    } else {
+        check_crit(crit.as_ref(), &protected_header_crit_labels(Some(&headers)))?;
+    }
+    Ok((algorithm, kid, headers))
 }
 
 /// Parse the recipient protected header:

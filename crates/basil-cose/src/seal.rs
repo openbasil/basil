@@ -68,6 +68,7 @@ async fn build_sealed_inner<S: Signer>(
     signer: &S,
     ephemeral_private: &Zeroizing<[u8; 32]>,
     nonce: [u8; NONCE_LEN],
+    protected_headers: Option<&crate::claims::ProtectedHeaders>,
 ) -> Result<CoseBytes, BuildError> {
     check_seal_claims(params, signer)?;
     let encrypt_bytes = build_encrypt_core(
@@ -83,7 +84,17 @@ async fn build_sealed_inner<S: Signer>(
         ephemeral_private,
         nonce,
     )?;
-    let protected = codec::encode_sign1_protected_sealed_outer(signer.algorithm(), signer.key_id())
+    let protected = protected_headers
+        .map_or_else(
+            || codec::encode_sign1_protected_sealed_outer(signer.algorithm(), signer.key_id()),
+            |headers| {
+                codec::encode_sign1_protected_sealed_outer_with_headers(
+                    signer.algorithm(),
+                    signer.key_id(),
+                    Some(headers),
+                )
+            },
+        )
         .map_err(|codec::CodecError| BuildError::Codec)?;
     let sig_structure =
         codec::sig_structure(&protected, params.aad.signature.as_bytes(), &encrypt_bytes)
@@ -112,7 +123,18 @@ pub async fn build_sealed<S: Signer>(
 ) -> Result<CoseBytes, BuildError> {
     let ephemeral = random_array::<32>()?;
     let nonce = random_array::<NONCE_LEN>()?;
-    build_sealed_inner(params, signer, &ephemeral, *nonce).await
+    build_sealed_inner(params, signer, &ephemeral, *nonce, None).await
+}
+
+/// Build a sealed message with additional critical protected headers.
+pub async fn build_sealed_with_headers<S: Signer>(
+    params: &SealParams<'_>,
+    protected_headers: &crate::claims::ProtectedHeaders,
+    signer: &S,
+) -> Result<CoseBytes, BuildError> {
+    let ephemeral = random_array::<32>()?;
+    let nonce = random_array::<NONCE_LEN>()?;
+    build_sealed_inner(params, signer, &ephemeral, *nonce, Some(protected_headers)).await
 }
 
 /// [`build_sealed`] with caller-supplied ephemeral/nonce parts, for
@@ -126,7 +148,7 @@ pub async fn build_sealed_with_parts<S: Signer>(
     signer: &S,
     parts: &SealParts,
 ) -> Result<CoseBytes, BuildError> {
-    build_sealed_inner(params, signer, &parts.ephemeral_private, parts.nonce).await
+    build_sealed_inner(params, signer, &parts.ephemeral_private, parts.nonce, None).await
 }
 
 /// Parameters for [`verify_sealed`].
@@ -149,6 +171,8 @@ pub struct VerifiedSealed {
     pub content_type: ContentType,
     /// The outer `kid`; equals `claims.sender_key_id` (checked).
     pub signer_key_id: KeyId,
+    /// Additional critical protected headers on the outer signature.
+    pub protected_headers: crate::claims::ProtectedHeaders,
     /// The recipient static key id from the recipient structure.
     pub recipient_key_id: KeyId,
     /// The content-encryption algorithm.
@@ -221,6 +245,7 @@ pub async fn verify_sealed<V: Verifier>(
         claims,
         content_type: embedded.content_type,
         signer_key_id: outer.kid,
+        protected_headers: outer.protected_headers,
         recipient_key_id: embedded.recipient_kid,
         content_algorithm: embedded.content_algorithm,
         parties: embedded.parties,

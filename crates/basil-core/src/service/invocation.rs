@@ -152,6 +152,31 @@ impl BrokerGrpc {
             }
         };
 
+        if !sealed.protected_headers.signer_certificates_jwt.is_empty()
+            && sealed.protected_headers.signer_public_key_cose.is_none()
+        {
+            return Err(invalid_request(INVOKE_OP, "missing proof key"));
+        }
+        if let Some(proof_key) = &sealed.protected_headers.signer_public_key_cose {
+            let public = crate::ci_federation::decode_proof_key_cose(proof_key)
+                .map_err(|_| invalid_request(INVOKE_OP, "malformed proof key"))?;
+            let expected_audience = crate::ci_federation::proof_audience(&public);
+            if sealed.claims.audience.as_ref().map(Subject::as_str)
+                != Some(expected_audience.as_str())
+            {
+                return Err(invalid_request(INVOKE_OP, "proof key audience mismatch"));
+            }
+            if sealed.protected_headers.signer_certificates_jwt.is_empty() {
+                return Err(invalid_request(INVOKE_OP, "missing signer certificate"));
+            }
+            // The provider catalog/JWKS resolver is not yet attached to
+            // BrokerState. Never treat an unverified certificate as identity.
+            return Err(invalid_request(
+                INVOKE_OP,
+                "federated signer evidence is not configured",
+            ));
+        }
+
         let Some(uid) = peer.uid else {
             self.state
                 .record_decision(&DecisionRecord::from_resolution_error(
@@ -592,10 +617,34 @@ impl Verifier for PolicyVerifier<'_> {
         &self,
         key_id: &KeyId,
         algorithm: SignatureAlgorithm,
-        _protected_headers: &basil_cose::ProtectedHeaders,
+        protected_headers: &basil_cose::ProtectedHeaders,
         sig_structure: &[u8],
         signature: &Signature,
     ) -> Result<(), VerifyError> {
+        if let Some(proof_key) = &protected_headers.signer_public_key_cose {
+            let public = crate::ci_federation::decode_proof_key_cose(proof_key)
+                .map_err(|_| VerifyError::SignatureInvalid)?;
+            let expected_kid = crate::ci_federation::proof_key_kid(&public);
+            if key_id.as_bytes() != expected_kid.as_bytes()
+                || algorithm != SignatureAlgorithm::EdDsa
+                || !crate::ed25519_sign::verify(&public, sig_structure, signature.as_bytes())
+                    .unwrap_or(false)
+            {
+                return Err(VerifyError::SignatureInvalid);
+            }
+            let mut verified = self
+                .verified_key
+                .lock()
+                .map_err(|_| VerifyError::Provider {
+                    message: "signature verifier state unavailable".to_string(),
+                })?;
+            *verified = Some(SignatureKeyEvidence {
+                algorithm: SignatureKeyAlgorithm::Ed25519,
+                public: URL_SAFE_NO_PAD.encode(public),
+            });
+            drop(verified);
+            return Ok(());
+        }
         // The broker verifies invocation signatures against EdDSA subject keys
         // only; any other wire algorithm fails closed.
         if algorithm != SignatureAlgorithm::EdDsa {

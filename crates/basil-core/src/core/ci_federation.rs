@@ -465,6 +465,63 @@ pub fn proof_audience(public_key: &[u8; 32]) -> String {
     format!("urn:basil:ci:jkt:{}", thumbprint(public_key))
 }
 
+/// Return the RFC 7638 thumbprint (`jkt`) for an Ed25519 proof key.
+#[must_use]
+pub fn proof_key_kid(public_key: &[u8; 32]) -> String {
+    thumbprint(public_key)
+}
+
+/// Decode the only `COSE_Key` shape accepted for a remote proof key.
+///
+/// The input must be deterministic CBOR for exactly `{1: 1, -1: 6, -2: x}`;
+/// unknown members, alternate encodings, and wrong key sizes are rejected.
+pub fn decode_proof_key_cose(bytes: &[u8]) -> Result<[u8; 32], FederationError> {
+    let mut decoder = minicbor::Decoder::new(bytes);
+    let Some(length) = decoder.map().map_err(|_| FederationError::Malformed)? else {
+        return Err(FederationError::Malformed);
+    };
+    if length != 3 {
+        return Err(FederationError::InvalidKey);
+    }
+    let mut key_type = None;
+    let mut curve = None;
+    let mut public = None;
+    let mut previous = None;
+    for _ in 0..length {
+        let label = decoder.i64().map_err(|_| FederationError::Malformed)?;
+        let order = |value: i64| {
+            if value >= 0 {
+                (0_u8, value.cast_unsigned())
+            } else {
+                (1_u8, !value.cast_unsigned())
+            }
+        };
+        if previous.is_some_and(|prior| order(label) <= order(prior)) {
+            return Err(FederationError::Malformed);
+        }
+        previous = Some(label);
+        match label {
+            1 => key_type = Some(decoder.i64().map_err(|_| FederationError::Malformed)?),
+            -1 => curve = Some(decoder.i64().map_err(|_| FederationError::Malformed)?),
+            -2 => {
+                let value = decoder.bytes().map_err(|_| FederationError::Malformed)?;
+                public = Some(value.to_vec());
+            }
+            _ => return Err(FederationError::InvalidKey),
+        }
+    }
+    if decoder.position() != bytes.len() {
+        return Err(FederationError::Malformed);
+    }
+    if key_type != Some(1) || curve != Some(6) {
+        return Err(FederationError::InvalidKey);
+    }
+    public
+        .ok_or(FederationError::InvalidKey)?
+        .try_into()
+        .map_err(|_| FederationError::InvalidKey)
+}
+
 /// Verify a GitHub Actions token against one trusted rule and one generation's
 /// isolated JWKS cache.
 pub fn verify_github(
@@ -608,6 +665,47 @@ mod tests {
         let audience = proof_audience(&[7; 32]);
         assert_eq!(audience.len(), "urn:basil:ci:jkt:".len() + 43);
         assert!(audience.starts_with("urn:basil:ci:jkt:"));
+    }
+
+    #[test]
+    fn proof_key_decoder_rejects_substitution_and_noncanonical_shapes() {
+        let mut canonical = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut canonical);
+        encoder
+            .map(3)
+            .unwrap()
+            .i64(1)
+            .unwrap()
+            .i64(1)
+            .unwrap()
+            .i64(-1)
+            .unwrap()
+            .i64(6)
+            .unwrap()
+            .i64(-2)
+            .unwrap()
+            .bytes(&[7; 32])
+            .unwrap();
+        assert_eq!(decode_proof_key_cose(&canonical), Ok([7; 32]));
+
+        let mut substituted = canonical.clone();
+        substituted.pop();
+        assert!(matches!(
+            decode_proof_key_cose(&substituted),
+            Err(FederationError::Malformed | FederationError::InvalidKey)
+        ));
+
+        let mut unknown = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut unknown);
+        encoder.map(4).unwrap();
+        encoder.i64(1).unwrap().i64(1).unwrap();
+        encoder.i64(-1).unwrap().i64(6).unwrap();
+        encoder.i64(-2).unwrap().bytes(&[7; 32]).unwrap();
+        encoder.i64(-3).unwrap().i64(0).unwrap();
+        assert!(matches!(
+            decode_proof_key_cose(&unknown),
+            Err(FederationError::InvalidKey)
+        ));
     }
 
     #[test]

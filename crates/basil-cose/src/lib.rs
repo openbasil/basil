@@ -91,7 +91,10 @@ pub use keys::{
 };
 #[cfg(feature = "fixtures")]
 pub use seal::build_sealed_with_parts;
-pub use seal::{SealParams, VerifiedSealed, VerifySealedParams, build_sealed, verify_sealed};
+pub use seal::{
+    SealParams, VerifiedSealed, VerifySealedParams, build_sealed, build_sealed_with_headers,
+    verify_sealed,
+};
 pub use sign::{
     SignParams, VerifiedSigned, VerifySignedParams, build_signed, build_signed_with_headers,
     verify_signed,
