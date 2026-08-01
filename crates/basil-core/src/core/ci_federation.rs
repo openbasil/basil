@@ -26,6 +26,8 @@ const MAX_RULE_ID_BYTES: usize = 128;
 const MAX_SUBJECT_BYTES: usize = 256;
 const MAX_AUDIENCE_BYTES: usize = 256;
 const MAX_OPERATION_PROFILES: usize = 32;
+const MIN_RSA_MODULUS_BYTES: usize = 256;
+const MAX_RSA_MODULUS_BYTES: usize = 512;
 
 /// Trusted configuration for one GitHub Actions identity rule.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -55,6 +57,8 @@ pub struct GithubActionsRule {
     pub runner_environments: Vec<String>,
     /// Maximum accepted token age in seconds.
     pub max_token_age_secs: u64,
+    /// Maximum clock skew allowed for `iat`, `nbf`, and `exp`.
+    pub clock_skew_secs: u64,
 }
 
 /// The provider families understood by this closed federation interface.
@@ -164,7 +168,9 @@ impl ProviderCatalog {
             let github = rule.provider.github();
             validate_github_rule(github)?;
             validate_urls(&github.issuer, &github.discovery_url, &github.jwks_url)?;
-            if rule.max_token_age_secs != github.max_token_age_secs {
+            if rule.max_token_age_secs != github.max_token_age_secs
+                || rule.clock_skew_secs != github.clock_skew_secs
+            {
                 return Err(FederationError::ProviderRejected);
             }
         }
@@ -265,6 +271,7 @@ struct GithubClaims {
     runner_environment: String,
     jti: String,
     iat: u64,
+    nbf: Option<u64>,
     exp: u64,
 }
 
@@ -323,6 +330,7 @@ impl GenerationJwks {
                 n: string_field(object, "n")?,
                 e: string_field(object, "e")?,
             };
+            validate_rsa_jwk(&jwk)?;
             if out.insert(kid, jwk).is_some() {
                 return Err(FederationError::DuplicateKid);
             }
@@ -444,6 +452,22 @@ fn string_field(
         .ok_or(FederationError::Malformed)
 }
 
+fn validate_rsa_jwk(jwk: &RsaJwk) -> Result<(), FederationError> {
+    let modulus = URL_SAFE_NO_PAD
+        .decode(&jwk.n)
+        .map_err(|_| FederationError::InvalidKey)?;
+    let exponent = URL_SAFE_NO_PAD
+        .decode(&jwk.e)
+        .map_err(|_| FederationError::InvalidKey)?;
+    if !(MIN_RSA_MODULUS_BYTES..=MAX_RSA_MODULUS_BYTES).contains(&modulus.len())
+        || modulus.first().is_none_or(|byte| byte & 0x80 == 0)
+        || exponent != [1, 0, 1]
+    {
+        return Err(FederationError::InvalidKey);
+    }
+    Ok(())
+}
+
 fn decimal(value: &str) -> Result<u64, FederationError> {
     (!value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
         .then(|| value.parse().ok())
@@ -561,9 +585,15 @@ pub fn verify_github(
     if claims.iss != rule.issuer
         || claims.aud != proof_audience(proof_public_key)
         || claims.sub.is_empty()
+        || claims.repository.is_empty()
         || decimal(&claims.repository_id)? != rule.repository_id
         || decimal(&claims.repository_owner_id)? != rule.repository_owner_id
         || claims.exp < claims.iat
+        || claims.iat > now_secs.saturating_add(rule.clock_skew_secs)
+        || claims
+            .nbf
+            .is_some_and(|nbf| nbf > now_secs.saturating_add(rule.clock_skew_secs))
+        || claims.exp.saturating_add(rule.clock_skew_secs) < now_secs
         || now_secs.saturating_sub(claims.iat) > rule.max_token_age_secs
         || !rule.protected_refs.iter().any(|v| v == &claims.ref_field)
         || !rule.events.iter().any(|v| v == &claims.event_name)
@@ -606,6 +636,7 @@ fn validate_github_rule(rule: &GithubActionsRule) -> Result<(), FederationError>
         || rule.runner_environments.is_empty()
         || rule.max_token_age_secs == 0
         || rule.max_token_age_secs > 15 * 60
+        || rule.clock_skew_secs > 5 * 60
     {
         return Err(FederationError::ProviderRejected);
     }
@@ -656,6 +687,7 @@ mod tests {
                 events: events.iter().map(ToString::to_string).collect(),
                 runner_environments: vec!["github-hosted".to_string()],
                 max_token_age_secs: 900,
+                clock_skew_secs: 30,
             }),
         }
     }
@@ -710,9 +742,12 @@ mod tests {
 
     #[test]
     fn jwks_rejects_duplicate_and_wrong_metadata() {
-        let duplicate = br#"{"keys":[{"kty":"RSA","kid":"a","alg":"RS256","use":"sig","n":"n","e":"e"},{"kty":"RSA","kid":"a","alg":"RS256","use":"sig","n":"n","e":"e"}]}"#;
+        let modulus = URL_SAFE_NO_PAD.encode([0x80; 256]);
+        let duplicate = format!(
+            r#"{{"keys":[{{"kty":"RSA","kid":"a","alg":"RS256","use":"sig","n":"{modulus}","e":"AQAB"}},{{"kty":"RSA","kid":"a","alg":"RS256","use":"sig","n":"{modulus}","e":"AQAB"}}]}}"#
+        );
         assert!(matches!(
-            GenerationJwks::parse(1, duplicate),
+            GenerationJwks::parse(1, duplicate.as_bytes()),
             Err(FederationError::DuplicateKid)
         ));
         let wrong =
