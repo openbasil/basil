@@ -4,12 +4,12 @@
 
 # Workspace supply-chain gate (cargo-deny), adopted per basil-0npm.
 #
-# Decision record: untrack/reviews/0npm-supply-chain-gate-decision.md
+# Decision record: docs/reviews/0npm-supply-chain-gate-decision.md
 # Run: `cargo deny check` (advisories need network to refresh the DB;
 # `cargo deny check bans licenses sources` runs fully offline).
 #
 # The [bans].deny ceilings below are the mechanical half of the review
-# conditions from untrack/R1-20260718 (basil-xwiy, basil-pb33, basil-zy3d):
+# conditions from docs/R1-20260718 (basil-xwiy, basil-pb33, basil-zy3d):
 # the three crates that entered the security core in that round are held at
 # their reviewed versions. Bumping one REQUIRES editing this file in the same
 # change, which is the trigger for the recorded dependency-diff review.
