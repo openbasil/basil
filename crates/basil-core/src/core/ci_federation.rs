@@ -350,6 +350,19 @@ pub struct GithubEvidence {
     pub token_digest: [u8; 32],
 }
 
+/// Verified provider evidence attached to one sealed invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedProviderEvidence {
+    /// Provider family selected by trusted configuration.
+    pub provider: ProviderKind,
+    /// Stable configured rule identifier.
+    pub rule_id: String,
+    /// Policy subject granted by the rule.
+    pub subject: String,
+    /// Provider-specific verified claims.
+    pub github: GithubEvidence,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct GithubClaims {
@@ -540,6 +553,24 @@ impl GenerationJwksCache {
             let _ = self.refresh(fetcher, now)?;
         }
         Ok(self.keys.as_ref().and_then(|keys| keys.key(kid)).cloned())
+    }
+
+    /// Return a cached key without changing refresh state.
+    #[must_use]
+    pub fn cached_key(&self, kid: &str) -> Option<RsaJwk> {
+        self.keys.as_ref().and_then(|keys| keys.key(kid)).cloned()
+    }
+
+    /// Return the complete cached key set for verification, when present.
+    #[must_use]
+    pub fn cached_keys(&self) -> Option<GenerationJwks> {
+        self.keys.clone()
+    }
+
+    /// Install a freshly fetched key set for this generation.
+    pub fn install(&mut self, keys: GenerationJwks, now: SystemTime) {
+        self.keys = Some(keys);
+        self.fetched_at = Some(now);
     }
 
     fn keys_are_stale(&self, now: SystemTime) -> bool {
@@ -873,6 +904,73 @@ pub fn verify_github(
     })
 }
 
+/// Fetch and strictly parse one configured provider JWKS for a serving generation.
+///
+/// Redirects are disabled at the HTTP boundary and the response URL is checked
+/// again here, so endpoint identity cannot change between configuration and use.
+pub async fn fetch_generation_jwks(
+    client: &reqwest::Client,
+    generation: u64,
+    rule: &GithubActionsRule,
+) -> Result<GenerationJwks, FederationError> {
+    validate_github_rule(rule)?;
+    validate_urls(&rule.issuer, &rule.discovery_url, &rule.jwks_url)?;
+    let discovery_url = Url::parse(&rule.discovery_url).map_err(|_| FederationError::InvalidUrl)?;
+    let jwks_url = Url::parse(&rule.jwks_url).map_err(|_| FederationError::InvalidUrl)?;
+    let discovery = client
+        .get(discovery_url.clone())
+        .send()
+        .await
+        .map_err(|_| FederationError::FetchRejected)?;
+    if discovery.url() != &discovery_url || !discovery.status().is_success() {
+        return Err(FederationError::FetchRejected);
+    }
+    let discovery_body = bounded_response_body(discovery).await?;
+    let discovered: Value =
+        serde_json::from_slice(&discovery_body).map_err(|_| FederationError::Malformed)?;
+    if discovered
+        .get("jwks_uri")
+        .and_then(Value::as_str)
+        .and_then(|url| Url::parse(url).ok())
+        != Some(jwks_url.clone())
+    {
+        return Err(FederationError::InvalidUrl);
+    }
+    let jwks = client
+        .get(jwks_url.clone())
+        .send()
+        .await
+        .map_err(|_| FederationError::FetchRejected)?;
+    if jwks.url() != &jwks_url || !jwks.status().is_success() {
+        return Err(FederationError::FetchRejected);
+    }
+    let body = bounded_response_body(jwks).await?;
+    GenerationJwks::parse(generation, &body)
+}
+
+async fn bounded_response_body(
+    mut response: reqwest::Response,
+) -> Result<Vec<u8>, FederationError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_JWKS_BODY_BYTES as u64)
+    {
+        return Err(FederationError::Oversized("provider document"));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| FederationError::FetchRejected)?
+    {
+        if chunk.len() > MAX_JWKS_BODY_BYTES.saturating_sub(body.len()) {
+            return Err(FederationError::Oversized("provider document"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 fn validate_github_rule(rule: &GithubActionsRule) -> Result<(), FederationError> {
     if rule.issuer != GITHUB_ISSUER
         || rule.audience_prefix != "urn:basil:ci:jkt:"
@@ -1079,6 +1177,21 @@ mod tests {
         assert!(first.keys.as_ref().unwrap().key("first").is_some());
         assert!(second.keys.is_none());
         assert_ne!(first.generation(), second.generation());
+    }
+
+    #[test]
+    fn installed_keys_are_available_only_from_their_generation_cache() {
+        let rule = cache_rule();
+        let parsed = GenerationJwks::parse(7, &jwks("kid").body).expect("valid JWKS");
+        let now = UNIX_EPOCH + Duration::from_secs(7);
+        let mut first =
+            GenerationJwksCache::new(7, &rule, JwksCachePolicy::default()).expect("cache");
+        first.install(parsed, now);
+        assert!(first.cached_key("kid").is_some());
+        assert_eq!(first.cached_keys().expect("keys").generation(), 7);
+
+        let second = GenerationJwksCache::new(8, &rule, JwksCachePolicy::default()).expect("cache");
+        assert!(second.cached_key("kid").is_none());
     }
 
     #[test]

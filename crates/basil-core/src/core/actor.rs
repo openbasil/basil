@@ -83,6 +83,8 @@ pub enum ProofKind {
     Container,
     /// Verified sealed-invocation signature key.
     SignatureKey,
+    /// Verified provider-issued workload JWT.
+    ProviderJwt,
 }
 
 /// Information about the process or bridge that presented the request.

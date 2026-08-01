@@ -27,6 +27,7 @@ use tonic::{Code, Request, Response, Status};
 use zeroize::Zeroizing;
 
 use crate::actor::{AuthenticatedActor, host_process_snapshot, resolve_evidence_actor};
+use crate::actor::{PresenterInfo, ProofKind, ProofSummary, TransportInfo};
 use crate::catalog::Class;
 use crate::catalog::evidence::{
     EvidencePredicate, EvidenceState, EvidenceValue, SignatureKeyEvidence,
@@ -125,7 +126,7 @@ impl BrokerGrpc {
         let config = generation.config().clone();
 
         let policy_verifier = PolicyVerifier::new(&policy);
-        let validation = self.request_validation_params()?;
+        let validation = self.request_validation_params(generation.federation().is_some())?;
         let sealed = match verify_sealed(
             &message.message,
             &policy_verifier,
@@ -152,6 +153,40 @@ impl BrokerGrpc {
             }
         };
 
+        let provider_evidence = if sealed.protected_headers.signer_certificates_jwt.is_empty() {
+            None
+        } else {
+            Some(
+                self.verify_provider_evidence(
+                    &generation,
+                    &sealed.protected_headers.signer_certificates_jwt,
+                    sealed.protected_headers.signer_public_key_cose.as_deref(),
+                    &sealed.claims,
+                )
+                .await?,
+            )
+        };
+        if provider_evidence.is_some()
+            && sealed
+                .claims
+                .audience
+                .as_ref()
+                .map(Subject::as_str)
+                .is_none()
+        {
+            return Err(invalid_request(INVOKE_OP, "missing provider audience"));
+        }
+        if provider_evidence.is_none()
+            && !self.invocation.audiences.is_empty()
+            && !sealed.claims.audience.as_ref().is_some_and(|audience| {
+                self.invocation
+                    .audiences
+                    .iter()
+                    .any(|allowed| allowed == audience.as_str())
+            })
+        {
+            return Err(invalid_request(INVOKE_OP, "invocation audience rejected"));
+        }
         if !sealed.protected_headers.signer_certificates_jwt.is_empty()
             && sealed.protected_headers.signer_public_key_cose.is_none()
         {
@@ -169,12 +204,6 @@ impl BrokerGrpc {
             if sealed.protected_headers.signer_certificates_jwt.is_empty() {
                 return Err(invalid_request(INVOKE_OP, "missing signer certificate"));
             }
-            // The provider catalog/JWKS resolver is not yet attached to
-            // BrokerState. Never treat an unverified certificate as identity.
-            return Err(invalid_request(
-                INVOKE_OP,
-                "federated signer evidence is not configured",
-            ));
         }
 
         let Some(uid) = peer.uid else {
@@ -190,21 +219,35 @@ impl BrokerGrpc {
                 ));
             return Err(unauthorized_invocation());
         };
-        let mut evidence = host_process_snapshot(&config, &peer, uid);
-        evidence.invocation_signature_key =
-            EvidenceValue::Available(policy_verifier.verified_key()?);
-        let actor = resolve_evidence_actor(&policy, &evidence, &peer).map_err(|error| {
-            self.state
-                .record_decision(&DecisionRecord::from_subject_resolution_error(
-                    generation_id,
-                    &peer,
-                    Op::Decrypt,
-                    key_id_for_audit(&sealed.recipient_key_id),
-                    &error,
-                    "invalid_actor_proof",
-                ));
-            unauthorized_invocation()
-        })?;
+        let actor = if let Some(provider) = provider_evidence {
+            let Some(mut actor) = generation.pdp().resolve_subject_actor(&provider.subject) else {
+                return Err(unauthorized_invocation());
+            };
+            actor.authenticated_by.push(ProofSummary {
+                kind: ProofKind::ProviderJwt,
+                subject: provider.subject,
+                fingerprint: Some(encode_id(&provider.github.token_digest)),
+            });
+            actor.presenter = PresenterInfo::from(&peer);
+            actor.transport = TransportInfo::default();
+            actor
+        } else {
+            let mut evidence = host_process_snapshot(&config, &peer, uid);
+            evidence.invocation_signature_key =
+                EvidenceValue::Available(policy_verifier.verified_key()?);
+            resolve_evidence_actor(&policy, &evidence, &peer).map_err(|error| {
+                self.state
+                    .record_decision(&DecisionRecord::from_subject_resolution_error(
+                        generation_id,
+                        &peer,
+                        Op::Decrypt,
+                        key_id_for_audit(&sealed.recipient_key_id),
+                        &error,
+                        "invalid_actor_proof",
+                    ));
+                unauthorized_invocation()
+            })?
+        };
         if sealed
             .claims
             .issuer
@@ -514,13 +557,19 @@ impl BrokerGrpc {
         })
     }
 
-    fn request_validation_params(&self) -> Result<ValidationParams, Status> {
+    fn request_validation_params(
+        &self,
+        allow_provider_audience: bool,
+    ) -> Result<ValidationParams, Status> {
         let mut allowed_audiences = BTreeSet::new();
         for audience in &self.invocation.audiences {
             allowed_audiences.insert(
                 Subject::new(audience.clone())
                     .map_err(|e| invalid_request(INVOKE_OP, e.to_string()))?,
             );
+        }
+        if allow_provider_audience {
+            allowed_audiences.clear();
         }
         Ok(ValidationParams {
             now: UnixTime(i64::from(self.invocation_now_unix())),
@@ -553,6 +602,85 @@ impl BrokerGrpc {
                 self.invocation_now_unix(),
             )
             .map_err(|e| invalid_request(INVOKE_OP, e.to_string()))
+    }
+
+    async fn verify_provider_evidence(
+        &self,
+        generation: &std::sync::Arc<crate::state::Generation>,
+        tokens: &[String],
+        proof_key: Option<&[u8]>,
+        claims: &Claims,
+    ) -> Result<crate::core::ci_federation::VerifiedProviderEvidence, Status> {
+        let proof_key = proof_key.ok_or_else(|| invalid_request(INVOKE_OP, "missing proof key"))?;
+        let public = crate::ci_federation::decode_proof_key_cose(proof_key)
+            .map_err(|_| invalid_request(INVOKE_OP, "malformed proof key"))?;
+        if claims.audience.as_ref().map(Subject::as_str)
+            != Some(crate::ci_federation::proof_audience(&public).as_str())
+        {
+            return Err(invalid_request(INVOKE_OP, "proof key audience mismatch"));
+        }
+        let catalog = generation
+            .federation()
+            .ok_or_else(unauthorized_invocation)?;
+        let token = tokens
+            .first()
+            .ok_or_else(|| invalid_request(INVOKE_OP, "missing signer certificate"))?;
+        if tokens.len() != 1 {
+            return Err(invalid_request(INVOKE_OP, "multiple signer certificates"));
+        }
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|_| unauthorized_invocation())?;
+        let now = std::time::UNIX_EPOCH
+            .checked_add(Duration::from_secs(u64::from(self.invocation_now_unix())))
+            .ok_or_else(unauthorized_invocation)?;
+        let token_kid = jsonwebtoken::decode_header(token)
+            .ok()
+            .and_then(|header| header.kid)
+            .ok_or_else(unauthorized_invocation)?;
+        for rule in catalog.rules() {
+            let crate::core::ci_federation::ProviderConfig::GithubActions(github) = &rule.provider;
+            let cached_keys = generation
+                .jwks_caches()
+                .lock()
+                .map_err(|_| unauthorized_invocation())?
+                .get(&rule.id)
+                .and_then(|cache| {
+                    cache
+                        .cached_key(&token_kid)
+                        .and_then(|_| cache.cached_keys())
+                });
+            let keys = if let Some(keys) = cached_keys {
+                keys
+            } else {
+                let keys =
+                    crate::ci_federation::fetch_generation_jwks(&client, generation.id(), github)
+                        .await
+                        .map_err(|_| unauthorized_invocation())?;
+                let mut cache_map = generation
+                    .jwks_caches()
+                    .lock()
+                    .map_err(|_| unauthorized_invocation())?;
+                if let Some(cache) = cache_map.get_mut(&rule.id) {
+                    cache.install(keys.clone(), now);
+                }
+                drop(cache_map);
+                keys
+            };
+            if let Ok(evidence) =
+                crate::core::ci_federation::verify_github(github, &keys, token, &public, now)
+            {
+                return Ok(crate::core::ci_federation::VerifiedProviderEvidence {
+                    provider: rule.provider.kind(),
+                    rule_id: rule.id.clone(),
+                    subject: rule.subject.clone(),
+                    github: evidence,
+                });
+            }
+        }
+        Err(unauthorized_invocation())
     }
 }
 

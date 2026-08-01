@@ -326,6 +326,7 @@ fn authenticated_by(actor: &AuthenticatedActor) -> Vec<String> {
                 ProofKind::SystemdUnit => "systemd-unit",
                 ProofKind::Container => "container",
                 ProofKind::SignatureKey => "signature-key",
+                ProofKind::ProviderJwt => "provider-jwt",
             };
             proof.fingerprint.as_ref().map_or_else(
                 || format!("{kind}:{}", proof.subject),
