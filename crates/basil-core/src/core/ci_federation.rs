@@ -9,7 +9,7 @@
 //! configuration; the token supplies evidence only.
 
 use std::collections::BTreeMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
@@ -28,6 +28,95 @@ const MAX_AUDIENCE_BYTES: usize = 256;
 const MAX_OPERATION_PROFILES: usize = 32;
 const MIN_RSA_MODULUS_BYTES: usize = 256;
 const MAX_RSA_MODULUS_BYTES: usize = 512;
+const MAX_JWKS_BODY_BYTES: usize = 8 * 1024;
+
+/// The only redirect behavior accepted by the federation fetch boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedirectPolicy {
+    /// Reject redirects so configured endpoint identity remains exact.
+    Reject,
+}
+
+/// Bounds and outage behavior for one provider cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JwksCachePolicy {
+    /// Maximum response body size for either discovery or JWKS.
+    pub max_body_bytes: usize,
+    /// Minimum interval between refresh attempts for an unknown key ID.
+    pub refresh_cooldown: Duration,
+    /// Maximum time an existing key set may serve during a fetch outage.
+    pub stale_if_error: Duration,
+    /// Redirect behavior enforced for every fetched document.
+    pub redirect_policy: RedirectPolicy,
+}
+
+impl Default for JwksCachePolicy {
+    fn default() -> Self {
+        Self {
+            max_body_bytes: MAX_JWKS_BODY_BYTES,
+            refresh_cooldown: Duration::from_secs(1),
+            stale_if_error: Duration::from_secs(30),
+            redirect_policy: RedirectPolicy::Reject,
+        }
+    }
+}
+
+/// A response supplied by a provider document fetcher.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedDocument {
+    /// URL reached by the request.
+    pub url: Url,
+    /// HTTP status code.
+    pub status: u16,
+    /// Whether the HTTP client followed a redirect.
+    pub redirected: bool,
+    /// Response body, bounded again by the cache before parsing.
+    pub body: Vec<u8>,
+}
+
+/// Construct a typed response for the cache boundary.
+impl FetchedDocument {
+    pub fn new(
+        url: &str,
+        status: u16,
+        redirected: bool,
+        body: Vec<u8>,
+    ) -> Result<Self, FederationError> {
+        let url = Url::parse(url).map_err(|_| FederationError::InvalidUrl)?;
+        if url.scheme() != "https"
+            || url.username() != ""
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(FederationError::InvalidUrl);
+        }
+        Ok(Self {
+            url,
+            status,
+            redirected,
+            body,
+        })
+    }
+}
+
+/// Minimal provider fetch contract. Network clients remain outside this module.
+pub trait ProviderDocumentFetcher {
+    /// Fetch one exact configured HTTPS endpoint.
+    fn fetch(
+        &mut self,
+        url: &Url,
+        max_body_bytes: usize,
+    ) -> Result<FetchedDocument, FederationError>;
+}
+
+/// Result of refreshing a generation-owned key set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshOutcome {
+    /// A newly fetched key set is active.
+    Fresh,
+    /// The previous key set remains active inside its outage grace period.
+    Stale,
+}
 
 /// Trusted configuration for one GitHub Actions identity rule.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -363,6 +452,146 @@ impl GenerationJwks {
     }
 }
 
+/// One immutable-generation discovery/JWKS cache.
+///
+/// The cache owns its key set and is intentionally not shared between
+/// generations. A caller may retain the old cache while a reload is serving
+/// it, but a new cache always starts empty.
+#[derive(Debug)]
+pub struct GenerationJwksCache {
+    generation: u64,
+    discovery_url: Url,
+    jwks_url: Url,
+    policy: JwksCachePolicy,
+    keys: Option<GenerationJwks>,
+    fetched_at: Option<SystemTime>,
+    last_refresh_attempt: Option<SystemTime>,
+}
+
+impl GenerationJwksCache {
+    /// Create an empty cache after validating the configured provider URLs.
+    pub fn new(
+        generation: u64,
+        rule: &GithubActionsRule,
+        policy: JwksCachePolicy,
+    ) -> Result<Self, FederationError> {
+        validate_github_rule(rule)?;
+        validate_urls(&rule.issuer, &rule.discovery_url, &rule.jwks_url)?;
+        if policy.max_body_bytes == 0 || policy.max_body_bytes > MAX_JWKS_BODY_BYTES {
+            return Err(FederationError::InvalidCachePolicy);
+        }
+        Ok(Self {
+            generation,
+            discovery_url: Url::parse(&rule.discovery_url)
+                .map_err(|_| FederationError::InvalidUrl)?,
+            jwks_url: Url::parse(&rule.jwks_url).map_err(|_| FederationError::InvalidUrl)?,
+            policy,
+            keys: None,
+            fetched_at: None,
+            last_refresh_attempt: None,
+        })
+    }
+
+    /// Return the generation that owns this cache.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Decide whether an unknown key ID is allowed to trigger a fetch.
+    #[must_use]
+    pub fn should_refresh_on_unknown_kid(&self, now: SystemTime) -> bool {
+        self.last_refresh_attempt.is_none_or(|attempt| {
+            now.duration_since(attempt)
+                .is_ok_and(|elapsed| elapsed >= self.policy.refresh_cooldown)
+        })
+    }
+
+    /// Refresh discovery and JWKS, retaining boundedly stale keys on outage.
+    pub fn refresh<F: ProviderDocumentFetcher>(
+        &mut self,
+        fetcher: &mut F,
+        now: SystemTime,
+    ) -> Result<RefreshOutcome, FederationError> {
+        self.last_refresh_attempt = Some(now);
+        let result = self.fetch_and_parse(fetcher);
+        match result {
+            Ok(keys) => {
+                self.keys = Some(keys);
+                self.fetched_at = Some(now);
+                Ok(RefreshOutcome::Fresh)
+            }
+            Err(_error) if self.keys_are_stale(now) => Ok(RefreshOutcome::Stale),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Resolve a key, making at most one refresh attempt for an unknown ID.
+    pub fn key_or_refresh<F: ProviderDocumentFetcher>(
+        &mut self,
+        kid: &str,
+        fetcher: &mut F,
+        now: SystemTime,
+    ) -> Result<Option<RsaJwk>, FederationError> {
+        if let Some(key) = self.keys.as_ref().and_then(|keys| keys.key(kid)) {
+            return Ok(Some(key.clone()));
+        }
+        if self.should_refresh_on_unknown_kid(now) {
+            let _ = self.refresh(fetcher, now)?;
+        }
+        Ok(self.keys.as_ref().and_then(|keys| keys.key(kid)).cloned())
+    }
+
+    fn keys_are_stale(&self, now: SystemTime) -> bool {
+        self.fetched_at.is_some_and(|fetched| {
+            now.duration_since(fetched)
+                .is_ok_and(|age| age <= self.policy.stale_if_error)
+        }) && self.keys.is_some()
+    }
+
+    fn fetch_and_parse<F: ProviderDocumentFetcher>(
+        &self,
+        fetcher: &mut F,
+    ) -> Result<GenerationJwks, FederationError> {
+        let discovery = self.fetch_document(fetcher, &self.discovery_url)?;
+        let discovery_json: Value =
+            serde_json::from_slice(&discovery.body).map_err(|_| FederationError::Malformed)?;
+        let discovered_jwks = discovery_json
+            .as_object()
+            .and_then(|object| object.get("jwks_uri"))
+            .and_then(Value::as_str)
+            .ok_or(FederationError::Malformed)?;
+        let discovered_jwks =
+            Url::parse(discovered_jwks).map_err(|_| FederationError::InvalidUrl)?;
+        if discovered_jwks != self.jwks_url {
+            return Err(FederationError::InvalidUrl);
+        }
+        let jwks = self.fetch_document(fetcher, &self.jwks_url)?;
+        GenerationJwks::parse(self.generation, &jwks.body)
+    }
+
+    fn fetch_document<F: ProviderDocumentFetcher>(
+        &self,
+        fetcher: &mut F,
+        expected: &Url,
+    ) -> Result<FetchedDocument, FederationError> {
+        let response = fetcher.fetch(expected, self.policy.max_body_bytes)?;
+        if response.url != *expected {
+            return Err(FederationError::InvalidUrl);
+        }
+        if response.redirected && self.policy.redirect_policy == RedirectPolicy::Reject {
+            return Err(FederationError::RedirectRejected);
+        }
+        if response.body.len() > self.policy.max_body_bytes {
+            return Err(FederationError::Oversized("provider document"));
+        }
+        if !(200..300).contains(&response.status) {
+            return Err(FederationError::FetchRejected);
+        }
+        Ok(response)
+    }
+}
+
 /// Errors from closed CI federation parsing and verification.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum FederationError {
@@ -387,6 +616,15 @@ pub enum FederationError {
     /// Configuration URL validation failed.
     #[error("invalid provider URL")]
     InvalidUrl,
+    /// A provider document exceeded the configured cache bounds.
+    #[error("invalid JWKS cache policy")]
+    InvalidCachePolicy,
+    /// A provider fetch followed a forbidden redirect.
+    #[error("provider redirect rejected")]
+    RedirectRejected,
+    /// A provider document returned a non-success status.
+    #[error("provider fetch rejected")]
+    FetchRejected,
     /// Two catalog rules used the same trusted identifier.
     #[error("duplicate provider rule ID")]
     DuplicateRuleId,
@@ -675,6 +913,7 @@ fn validate_urls(issuer: &str, discovery: &str, jwks: &str) -> Result<(), Federa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
 
     fn github_rule(id: &str, refs: &[&str], events: &[&str]) -> ProviderRule {
         ProviderRule {
@@ -702,6 +941,51 @@ mod tests {
                 clock_skew_secs: 30,
             }),
         }
+    }
+
+    struct FakeFetcher {
+        responses: VecDeque<FetchedDocument>,
+        calls: usize,
+    }
+
+    impl ProviderDocumentFetcher for FakeFetcher {
+        fn fetch(
+            &mut self,
+            _url: &Url,
+            _max_body_bytes: usize,
+        ) -> Result<FetchedDocument, FederationError> {
+            self.calls += 1;
+            self.responses
+                .pop_front()
+                .ok_or(FederationError::FetchRejected)
+        }
+    }
+
+    fn cache_rule() -> GithubActionsRule {
+        match github_rule("cache", &["main"], &["push"]).provider {
+            ProviderConfig::GithubActions(rule) => rule,
+        }
+    }
+
+    fn discovery(rule: &GithubActionsRule) -> FetchedDocument {
+        FetchedDocument::new(
+            &rule.discovery_url,
+            200,
+            false,
+            format!(r#"{{"jwks_uri":"{}"}}"#, rule.jwks_url).into_bytes(),
+        )
+        .expect("valid discovery response")
+    }
+
+    fn jwks(kid: &str) -> FetchedDocument {
+        let modulus = URL_SAFE_NO_PAD.encode([0x80; 256]);
+        FetchedDocument::new(
+            &format!("{GITHUB_ISSUER}/.well-known/jwks"),
+            200,
+            false,
+            format!(r#"{{"keys":[{{"kty":"RSA","kid":"{kid}","alg":"RS256","use":"sig","n":"{modulus}","e":"AQAB"}}]}}"#).into_bytes(),
+        )
+        .expect("valid JWKS response")
     }
 
     #[test]
@@ -776,6 +1060,87 @@ mod tests {
         assert_ne!(
             GenerationJwks::parse(1, body).unwrap().generation(),
             GenerationJwks::parse(2, body).unwrap().generation()
+        );
+    }
+
+    #[test]
+    fn cache_is_empty_and_isolated_per_generation() {
+        let rule = cache_rule();
+        let mut first = GenerationJwksCache::new(1, &rule, JwksCachePolicy::default()).unwrap();
+        let second = GenerationJwksCache::new(2, &rule, JwksCachePolicy::default()).unwrap();
+        let mut fetcher = FakeFetcher {
+            responses: VecDeque::from([discovery(&rule), jwks("first")]),
+            calls: 0,
+        };
+        assert_eq!(
+            first.refresh(&mut fetcher, UNIX_EPOCH).unwrap(),
+            RefreshOutcome::Fresh
+        );
+        assert!(first.keys.as_ref().unwrap().key("first").is_some());
+        assert!(second.keys.is_none());
+        assert_ne!(first.generation(), second.generation());
+    }
+
+    #[test]
+    fn unknown_kid_refreshes_once_and_cooldown_suppresses_retry() {
+        let rule = cache_rule();
+        let mut cache = GenerationJwksCache::new(1, &rule, JwksCachePolicy::default()).unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(10);
+        let mut fetcher = FakeFetcher {
+            responses: VecDeque::from([discovery(&rule), jwks("new")]),
+            calls: 0,
+        };
+        assert_eq!(
+            cache
+                .key_or_refresh("new", &mut fetcher, now)
+                .unwrap()
+                .unwrap()
+                .kid,
+            "new"
+        );
+        assert_eq!(fetcher.calls, 2);
+        assert!(!cache.should_refresh_on_unknown_kid(now));
+        assert!(
+            cache
+                .key_or_refresh("missing", &mut fetcher, now)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(fetcher.calls, 2);
+    }
+
+    #[test]
+    fn stale_keys_survive_only_within_outage_grace() {
+        let rule = cache_rule();
+        let policy = JwksCachePolicy {
+            stale_if_error: Duration::from_secs(5),
+            ..JwksCachePolicy::default()
+        };
+        let mut cache = GenerationJwksCache::new(1, &rule, policy).unwrap();
+        let mut fetcher = FakeFetcher {
+            responses: VecDeque::from([
+                discovery(&rule),
+                jwks("old"),
+                FetchedDocument::new(&rule.discovery_url, 503, false, Vec::new()).unwrap(),
+                FetchedDocument::new(&rule.discovery_url, 503, false, Vec::new()).unwrap(),
+            ]),
+            calls: 0,
+        };
+        let start = UNIX_EPOCH + Duration::from_secs(20);
+        assert_eq!(
+            cache.refresh(&mut fetcher, start).unwrap(),
+            RefreshOutcome::Fresh
+        );
+        assert_eq!(
+            cache
+                .refresh(&mut fetcher, start + Duration::from_secs(5))
+                .unwrap(),
+            RefreshOutcome::Stale
+        );
+        assert!(
+            cache
+                .refresh(&mut fetcher, start + Duration::from_secs(6))
+                .is_err()
         );
     }
 
