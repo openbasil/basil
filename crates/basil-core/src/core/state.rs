@@ -28,7 +28,7 @@
 //! Today there is exactly one generation (id `1`); this iteration lands only the
 //! pinning plumbing: there is no reload trigger yet (`basil-y3e.2`).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -113,6 +113,8 @@ pub struct Generation {
     overrides: Vec<OverrideProvenance>,
     oci: Option<Arc<OciVerificationGeneration>>,
     listeners: Arc<ListenerConfigSet>,
+    federation: Option<Arc<crate::core::ci_federation::ProviderCatalog>>,
+    jwks_caches: Arc<Mutex<BTreeMap<String, crate::core::ci_federation::GenerationJwksCache>>>,
 }
 
 impl Generation {
@@ -171,6 +173,46 @@ impl Generation {
         oci: Option<Arc<OciVerificationGeneration>>,
         listeners: impl Into<Arc<ListenerConfigSet>>,
     ) -> Self {
+        Self::new_with_overrides_oci_listeners_and_federation(
+            id, catalog, policy, config, overrides, oci, listeners, None,
+        )
+    }
+
+    /// Bundle a generation with its trusted CI federation catalog.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_overrides_oci_listeners_and_federation(
+        id: u64,
+        catalog: impl Into<Arc<Catalog>>,
+        policy: ResolvedPolicy,
+        config: Config,
+        overrides: Vec<OverrideProvenance>,
+        oci: Option<Arc<OciVerificationGeneration>>,
+        listeners: impl Into<Arc<ListenerConfigSet>>,
+        federation: Option<Arc<crate::core::ci_federation::ProviderCatalog>>,
+    ) -> Self {
+        let jwks_caches = federation
+            .as_ref()
+            .map(|catalog| {
+                catalog
+                    .rules()
+                    .iter()
+                    .filter_map(|rule| {
+                        crate::core::ci_federation::GenerationJwksCache::new(
+                            id,
+                            match &rule.provider {
+                                crate::core::ci_federation::ProviderConfig::GithubActions(rule) => {
+                                    rule
+                                }
+                            },
+                            crate::core::ci_federation::JwksCachePolicy::default(),
+                        )
+                        .ok()
+                        .map(|cache| (rule.id.clone(), cache))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
             id,
             catalog: catalog.into(),
@@ -179,6 +221,8 @@ impl Generation {
             overrides,
             oci,
             listeners: listeners.into(),
+            federation,
+            jwks_caches: Arc::new(Mutex::new(jwks_caches)),
         }
     }
 
@@ -236,6 +280,21 @@ impl Generation {
     #[must_use]
     pub fn listeners(&self) -> &ListenerConfigSet {
         &self.listeners
+    }
+
+    /// Trusted CI federation rules for this generation, when enabled.
+    #[must_use]
+    pub const fn federation(&self) -> Option<&Arc<crate::core::ci_federation::ProviderCatalog>> {
+        self.federation.as_ref()
+    }
+
+    /// Generation-isolated JWKS caches. The lock is held only while selecting
+    /// or updating cache state; network fetches are performed by the caller.
+    #[must_use]
+    pub const fn jwks_caches(
+        &self,
+    ) -> &Arc<Mutex<BTreeMap<String, crate::core::ci_federation::GenerationJwksCache>>> {
+        &self.jwks_caches
     }
 }
 
@@ -667,6 +726,27 @@ impl BrokerState {
             current.overrides.clone(),
             Some(oci),
             Arc::clone(&current.listeners),
+        );
+        self.generation.store(Arc::new(generation));
+        self
+    }
+
+    /// Attach the trusted CI federation catalog to the active generation.
+    #[must_use]
+    pub fn with_federation_catalog(
+        self,
+        federation: Option<Arc<crate::core::ci_federation::ProviderCatalog>>,
+    ) -> Self {
+        let current = self.generation.load_full();
+        let generation = Generation::new_with_overrides_oci_listeners_and_federation(
+            current.id,
+            Arc::clone(&current.catalog),
+            current.policy.clone(),
+            current.config.clone(),
+            current.overrides.clone(),
+            current.oci.clone(),
+            Arc::clone(&current.listeners),
+            federation,
         );
         self.generation.store(Arc::new(generation));
         self

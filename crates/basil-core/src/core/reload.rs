@@ -414,12 +414,20 @@ fn read_reload_inputs_with_observer_and_context(
 ) -> Result<CorpusDocuments, ReloadError> {
     let mut traces = Vec::new();
     let result = read_reload_inputs_with_observer_and_collector(inputs, observer, &mut traces)
-        .map(|(documents, _, _, _)| documents);
+        .map(|(documents, _, _, _, _)| documents);
     for trace in &traces {
         emit_configuration_source_trace(trace, trace_context, result.is_ok());
     }
     result
 }
+
+type ReloadInputsResult = (
+    CorpusDocuments,
+    crate::agent_cli::OciConfigFile,
+    crate::transport::listener::ListenerConfigSet,
+    Option<Arc<crate::core::ci_federation::ProviderCatalog>>,
+    ReloadFingerprintSnapshot,
+);
 
 #[cfg(test)]
 fn read_reload_inputs_with_bootstrap_observer(
@@ -428,22 +436,14 @@ fn read_reload_inputs_with_bootstrap_observer(
 ) -> Result<CorpusDocuments, ReloadError> {
     let mut traces = Vec::new();
     read_reload_inputs_with_observers_and_collector(inputs, observer, || {}, &mut traces)
-        .map(|(documents, _, _, _)| documents)
+        .map(|(documents, _, _, _, _)| documents)
 }
 
 fn read_reload_inputs_with_observer_and_collector(
     inputs: &ReloadInputs,
     observer: impl FnOnce(),
     traces: &mut Vec<ConfigurationSourceTrace>,
-) -> Result<
-    (
-        CorpusDocuments,
-        crate::agent_cli::OciConfigFile,
-        crate::transport::listener::ListenerConfigSet,
-        ReloadFingerprintSnapshot,
-    ),
-    ReloadError,
-> {
+) -> Result<ReloadInputsResult, ReloadError> {
     read_reload_inputs_with_observers_and_collector(inputs, || {}, observer, traces)
 }
 
@@ -452,15 +452,7 @@ fn read_reload_inputs_with_observers_and_collector(
     bootstrap_observer: impl FnOnce(),
     observer: impl FnOnce(),
     traces: &mut Vec<ConfigurationSourceTrace>,
-) -> Result<
-    (
-        CorpusDocuments,
-        crate::agent_cli::OciConfigFile,
-        crate::transport::listener::ListenerConfigSet,
-        ReloadFingerprintSnapshot,
-    ),
-    ReloadError,
-> {
+) -> Result<ReloadInputsResult, ReloadError> {
     // Seed the snapshot before reading the bootstrap. Keeping this exact
     // fingerprint through the final verification closes the gap where an atomic
     // replacement after parsing could otherwise pair old listener/OCI values
@@ -470,6 +462,12 @@ fn read_reload_inputs_with_observers_and_collector(
         load_bootstrap_with_trace_collector(Some(&inputs.config_path), &inputs.overrides, traces)?;
     let oci = crate::agent_cli::parse_reload_oci_config(&bootstrap.value)
         .map_err(|error| ReloadError::OciConfiguration(error.to_string()))?;
+    let federation =
+        crate::agent_cli::parse_reload_federation_config(&bootstrap.value).map_err(|error| {
+            ReloadError::Configuration(crate::configuration::ConfigurationError::InvalidCorpus(
+                error.to_string(),
+            ))
+        })?;
     let listeners = crate::agent_cli::parse_reload_listener_config(&bootstrap.value)
         .map_err(|error| ReloadError::ListenerConfiguration(error.to_string()))?;
     // Verify immediately after every source and bootstrap-owned serving value is
@@ -515,7 +513,7 @@ fn read_reload_inputs_with_observers_and_collector(
     // and fingerprinted but before trust bytes are captured for the candidate.
     observer();
     snapshot.verify_unchanged()?;
-    Ok((documents, oci, listeners, snapshot))
+    Ok((documents, oci, listeners, federation, snapshot))
 }
 
 fn fingerprint(path: &Path) -> Result<FileFingerprint, ReloadError> {
@@ -540,6 +538,7 @@ struct ValidatedCandidate {
     config: Config,
     overrides: Vec<OverrideProvenance>,
     oci: Option<Arc<crate::state::OciVerificationGeneration>>,
+    federation: Option<Arc<crate::core::ci_federation::ProviderCatalog>>,
     listeners: crate::transport::listener::ListenerConfigSet,
     outcome: ReloadOutcome,
     bundle_changed_trust_domains: Vec<String>,
@@ -598,6 +597,7 @@ fn validate_candidate_with_trace_collector_and_observer(
         },
         oci_config,
         listeners,
+        federation,
         input_snapshot,
     ) = read_reload_inputs_with_observer_and_collector(inputs, || {}, traces)?;
     for w in &warnings {
@@ -639,6 +639,7 @@ fn validate_candidate_with_trace_collector_and_observer(
         config,
         overrides,
         oci,
+        federation,
         listeners,
         outcome,
         bundle_changed_trust_domains,
@@ -699,6 +700,7 @@ pub fn reload_generation(state: &BrokerState) -> Result<ReloadOutcome, ReloadErr
         config,
         overrides,
         oci,
+        federation,
         listeners,
         outcome,
         bundle_changed_trust_domains,
@@ -724,7 +726,7 @@ pub fn reload_generation(state: &BrokerState) -> Result<ReloadOutcome, ReloadErr
         outcome.new_generation,
         unix_now(),
     );
-    let next = Generation::new_with_overrides_oci_and_listeners(
+    let next = Generation::new_with_overrides_oci_listeners_and_federation(
         outcome.new_generation,
         Arc::new(catalog),
         policy,
@@ -732,6 +734,7 @@ pub fn reload_generation(state: &BrokerState) -> Result<ReloadOutcome, ReloadErr
         overrides,
         oci,
         Arc::new(listeners),
+        federation,
     );
     drop(current);
     listener_guard.commit(|| {
@@ -778,6 +781,7 @@ pub async fn reload_generation_live(state: &BrokerState) -> Result<ReloadOutcome
         config,
         overrides,
         oci,
+        federation,
         listeners,
         outcome,
         bundle_changed_trust_domains,
@@ -796,7 +800,7 @@ pub async fn reload_generation_live(state: &BrokerState) -> Result<ReloadOutcome
         outcome.new_generation,
         unix_now(),
     );
-    let next = Generation::new_with_overrides_oci_and_listeners(
+    let next = Generation::new_with_overrides_oci_listeners_and_federation(
         outcome.new_generation,
         Arc::new(catalog),
         policy,
@@ -804,6 +808,7 @@ pub async fn reload_generation_live(state: &BrokerState) -> Result<ReloadOutcome
         overrides,
         oci,
         Arc::new(listeners.clone()),
+        federation,
     );
     runtime
         .transition(&current_listeners, &listeners, || {

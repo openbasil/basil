@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::catalog::{Class, KeyAlgorithm};
+use crate::core::ci_federation::ProviderCatalog;
 use crate::seal::{BackendCred, CredBundle};
 use crate::service::broker::{BrokerIdentityRuntimeConfig, InvocationRuntimeConfig};
 use crate::transport::grpc_server::run_many_with_ready;
@@ -638,6 +639,14 @@ pub(crate) struct AgentConfigFile {
     pub(crate) invocation: InvocationConfigFile,
     pub(crate) jwks: JwksConfigFile,
     pub(crate) oci: OciConfigFile,
+    pub(crate) federation: FederationConfigFile,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub(crate) struct FederationConfigFile {
+    pub(crate) enable: bool,
+    pub(crate) providers: Vec<crate::core::ci_federation::ProviderRule>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -687,6 +696,7 @@ impl Default for AgentConfigFile {
             invocation: InvocationConfigFile::default(),
             jwks: JwksConfigFile::default(),
             oci: OciConfigFile::default(),
+            federation: FederationConfigFile::default(),
         }
     }
 }
@@ -1113,6 +1123,7 @@ struct RunConfig {
     oci_verifier: Option<crate::core::oci_verification::CosignVerifier>,
     oci_cache: Option<Arc<crate::core::oci_evidence_cache::OciEvidenceCache>>,
     oci_denied_subjects: BTreeSet<crate::core::oci_verification::OciDigest>,
+    federation: Option<Arc<ProviderCatalog>>,
     #[cfg(feature = "http")]
     jwks: JwksConfig,
     setup: SetupArgs,
@@ -1134,6 +1145,7 @@ fn load_run_config(overrides: &ConfigOverrides) -> Result<RunConfig> {
     let oci_verifier = resolve_oci_config(&file.oci, None)?;
     let oci_cache = resolve_oci_cache(&file.oci)?;
     let oci_denied_subjects = resolve_oci_denylist(&file.oci)?;
+    let federation = resolve_federation_config(&file.federation)?;
     let listeners = resolve_listener_configs(&file)?;
     Ok(RunConfig {
         listeners,
@@ -1150,10 +1162,34 @@ fn load_run_config(overrides: &ConfigOverrides) -> Result<RunConfig> {
         oci_verifier,
         oci_cache,
         oci_denied_subjects,
+        federation,
         #[cfg(feature = "http")]
         jwks,
         setup,
     })
+}
+
+fn resolve_federation_config(file: &FederationConfigFile) -> Result<Option<Arc<ProviderCatalog>>> {
+    if !file.enable {
+        return Ok(None);
+    }
+    if file.providers.is_empty() {
+        bail!("federation.providers must not be empty when federation.enable is true");
+    }
+    ProviderCatalog::new(file.providers.clone())
+        .map(Arc::new)
+        .map(Some)
+        .map_err(|error| anyhow::anyhow!("validating federation providers: {error}"))
+}
+
+pub(crate) fn parse_reload_federation_config(
+    value: &toml::Value,
+) -> Result<Option<Arc<ProviderCatalog>>> {
+    let file: AgentConfigFile = value
+        .clone()
+        .try_into()
+        .context("parsing reloaded federation configuration")?;
+    resolve_federation_config(&file.federation)
 }
 
 fn resolve_listener_configs(
@@ -2242,6 +2278,7 @@ async fn run_daemon(args: RunArgs, version: &'static str) -> Result<()> {
                 overrides: run_config.setup.startup_overrides.clone(),
             })
             .with_listener_configs(run_config.listeners.clone());
+    state = state.with_federation_catalog(run_config.federation.clone());
     let server_configs = listener_server_configs(&run_config, state.connections());
     state = attach_oci_runtime(
         state,

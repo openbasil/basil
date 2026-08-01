@@ -93,6 +93,7 @@ impl fmt::Debug for DecryptedInvocationBody {
 
 #[derive(Debug)]
 struct PreparedInvocation {
+    generation: std::sync::Arc<crate::state::Generation>,
     actor: AuthenticatedActor,
     recipient_key_id: String,
     response_key_id: String,
@@ -118,11 +119,10 @@ impl BrokerGrpc {
         }
 
         let peer = peer_from_request(request);
-        let generation = self.state.load_generation();
+        let generation = self.state.load_generation().to_owned();
         let generation_id = generation.id();
         let policy = generation.policy().clone();
         let config = generation.config().clone();
-        drop(generation);
 
         let policy_verifier = PolicyVerifier::new(&policy);
         let validation = self.request_validation_params()?;
@@ -232,7 +232,6 @@ impl BrokerGrpc {
             .ok_or_else(|| invalid_request(INVOKE_OP, "missing response encryption key"))?;
         let response_key_id = catalog_key_id(response_key_id, "response encryption key")?;
 
-        let generation = self.state.load_generation();
         let decision = generation
             .pdp()
             .decide(&actor, Op::Decrypt, recipient_key_id);
@@ -247,9 +246,8 @@ impl BrokerGrpc {
         if decision.is_deny() {
             return Err(unauthorized_invocation());
         }
-        drop(generation);
 
-        self.validate_response_encryption_key(response_key_id)
+        self.validate_response_encryption_key(&generation, response_key_id)
             .await?;
         self.check_replay(
             &sealed.signer_key_id,
@@ -279,6 +277,7 @@ impl BrokerGrpc {
             .map(ResponseSubject::as_str)
             .map(str::to_string);
         Ok(PreparedInvocation {
+            generation,
             actor,
             recipient_key_id: recipient_key_id.to_string(),
             response_key_id: response_key_id.to_string(),
@@ -299,7 +298,7 @@ impl BrokerGrpc {
         } else {
             let body = SignInvocationResponse {
                 status: InvocationStatus::invalid_request("UNSUPPORTED_CONTENT_TYPE"),
-                policy_generation: self.state.load_generation().id(),
+                policy_generation: prepared.generation.id(),
                 signature: None,
             };
             self.protect_response(&prepared, CONTENT_TYPE_SIGN_RESPONSE, &body.to_cbor_bytes())
@@ -315,7 +314,7 @@ impl BrokerGrpc {
         {
             Ok(body) => body,
             Err(error) => {
-                let policy_generation = self.state.load_generation().id();
+                let policy_generation = prepared.generation.id();
                 tracing::debug!(%error, "sealed sign invocation body rejected");
                 return self
                     .protect_sign_status_response(
@@ -330,7 +329,7 @@ impl BrokerGrpc {
             request_body.algorithm,
             INVOKE_OP,
         ) {
-            let policy_generation = self.state.load_generation().id();
+            let policy_generation = prepared.generation.id();
             tracing::debug!(%error, "sealed sign invocation algorithm rejected");
             return self
                 .protect_sign_status_response(
@@ -340,7 +339,7 @@ impl BrokerGrpc {
                 )
                 .await;
         }
-        let generation = self.state.load_generation();
+        let generation = &prepared.generation;
         let policy_generation = generation.id();
         let decision = generation
             .pdp()
@@ -354,7 +353,6 @@ impl BrokerGrpc {
                 &decision,
             ));
         if decision.is_deny() {
-            drop(generation);
             return self
                 .protect_sign_status_response(
                     &prepared,
@@ -363,8 +361,6 @@ impl BrokerGrpc {
                 )
                 .await;
         }
-        drop(generation);
-
         let signature = match self
             .state
             .manager()
@@ -424,8 +420,11 @@ impl BrokerGrpc {
         }
     }
 
-    async fn validate_response_encryption_key(&self, key_id: &str) -> Result<(), Status> {
-        let generation = self.state.load_generation();
+    async fn validate_response_encryption_key(
+        &self,
+        generation: &crate::state::Generation,
+        key_id: &str,
+    ) -> Result<(), Status> {
         let Some(key) = generation.catalog().keys.get(key_id) else {
             return Err(invalid_request(
                 INVOKE_OP,
@@ -447,7 +446,6 @@ impl BrokerGrpc {
                 ));
             }
         }
-        drop(generation);
         self.state
             .manager()
             .sealing_public_key(key_id)
