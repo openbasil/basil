@@ -90,7 +90,7 @@ pub const SIDECAR_SUFFIXES: [&str; 2] = ["-wal", "-tshm"];
 
 /// The turso version the [`SIDECAR_SUFFIXES`] set was verified against
 /// (adoption condition C3; see `tests/rekey_boundary.rs`).
-pub const PINNED_TURSO_VERSION: &str = "0.7.0";
+pub const PINNED_TURSO_VERSION: &str = "0.7.1";
 
 /// First line of the intent-marker file: magic plus format version.
 const MARKER_MAGIC: &str = "basil-rekey-intent-v1";
@@ -226,6 +226,20 @@ pub enum KeystoreRekeyError {
     #[error("rekey recovery unrecoverable: {detail}; manual intervention required")]
     RecoveryUnrecoverable {
         /// What was found (names and states only; no content).
+        detail: String,
+    },
+    /// A lock, staged candidate, or transition was supplied for another
+    /// database target.
+    #[error("rekey target identity mismatch: {detail}")]
+    TargetMismatch {
+        /// Which identity component did not match.
+        detail: String,
+    },
+    /// A destructive transition was requested before the preceding protocol
+    /// phase had completed.
+    #[error("invalid rekey protocol phase: {detail}")]
+    InvalidPhase {
+        /// The missing or inconsistent phase evidence.
         detail: String,
     },
     /// The store's shared advisory lock is held (the agent, or another
@@ -502,6 +516,45 @@ pub fn read_new_dek_file(path: &Path) -> Result<SensitiveDek, KeystoreRekeyError
 #[derive(Debug)]
 pub struct RekeyLock {
     _fd: OwnedFd,
+    target: RekeyTarget,
+}
+
+/// Stable identity of the directory/name pair protected by a rekey lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RekeyTarget {
+    directory_device: u64,
+    directory_inode: u64,
+    db_name: String,
+}
+
+fn target_for(db_dir: BorrowedFd<'_>, db_name: &str) -> Result<RekeyTarget, KeystoreRekeyError> {
+    validate_component(db_name)?;
+    let stat =
+        rustix::fs::fstat(db_dir).map_err(|errno| fs_err("fstat database directory", errno))?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+        return Err(KeystoreRekeyError::TargetMismatch {
+            detail: "rekey target descriptor is not a directory".to_owned(),
+        });
+    }
+    Ok(RekeyTarget {
+        directory_device: stat.st_dev,
+        directory_inode: stat.st_ino,
+        db_name: db_name.to_owned(),
+    })
+}
+
+fn validate_lock_target(
+    lock: &RekeyLock,
+    db_dir: BorrowedFd<'_>,
+    db_name: &str,
+) -> Result<(), KeystoreRekeyError> {
+    let actual = target_for(db_dir, db_name)?;
+    if lock.target != actual {
+        return Err(KeystoreRekeyError::TargetMismatch {
+            detail: "the lock belongs to a different database directory or name".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Open (creating if absent) the advisory lock file, with fail-closed
@@ -553,7 +606,10 @@ impl RekeyLock {
                 fs_err("lock rekey lock file (exclusive)", errno)
             }
         })?;
-        Ok(Self { _fd: fd })
+        Ok(Self {
+            _fd: fd,
+            target: target_for(db_dir, db_name)?,
+        })
     }
 }
 
@@ -890,6 +946,7 @@ pub struct StagedCandidate {
     report: RekeyReport,
     candidate_b3: [u8; 32],
     old_db_b3: [u8; 32],
+    target: RekeyTarget,
 }
 
 impl StagedCandidate {
@@ -1000,9 +1057,10 @@ pub fn rekey_to_staging(
     plan: &RekeyPlan<'_>,
     old_dek: SensitiveDek,
     new_dek: &SensitiveDek,
-    _lock: &RekeyLock,
+    lock: &RekeyLock,
 ) -> Result<StagedCandidate, KeystoreRekeyError> {
-    validate_component(plan.db_name)?;
+    validate_lock_target(lock, plan.db_dir, plan.db_name)?;
+    let target = target_for(plan.db_dir, plan.db_name)?;
     let staging = create_staging_dir(plan.db_dir)?;
 
     let staged = stage_and_verify(plan, &old_dek, new_dek, staging.as_fd());
@@ -1032,6 +1090,7 @@ pub fn rekey_to_staging(
         report,
         candidate_b3,
         old_db_b3,
+        target,
     })
 }
 
@@ -1123,9 +1182,9 @@ pub fn write_intent_marker(
     db_dir: BorrowedFd<'_>,
     db_name: &str,
     marker: &IntentMarker,
-    _lock: &RekeyLock,
+    lock: &RekeyLock,
 ) -> Result<(), KeystoreRekeyError> {
-    validate_component(db_name)?;
+    validate_lock_target(lock, db_dir, db_name)?;
     marker.validate()?;
     let name = marker_name(db_name);
     let fd = match rustix::fs::openat(
@@ -1238,9 +1297,21 @@ pub fn swap_candidate(
     db_dir: BorrowedFd<'_>,
     db_name: &str,
     staged: &StagedCandidate,
-    _lock: &RekeyLock,
+    lock: &RekeyLock,
 ) -> Result<(), KeystoreRekeyError> {
-    validate_component(db_name)?;
+    validate_lock_target(lock, db_dir, db_name)?;
+    let target = target_for(db_dir, db_name)?;
+    if staged.target != target {
+        return Err(KeystoreRekeyError::TargetMismatch {
+            detail: "the staged candidate belongs to a different database target".to_owned(),
+        });
+    }
+    let marker = read_intent_marker(db_dir, db_name)?;
+    if marker.candidate_b3 != staged.candidate_b3 || marker.old_db_b3 != staged.old_db_b3 {
+        return Err(KeystoreRekeyError::InvalidPhase {
+            detail: "intent marker does not describe the staged candidate".to_owned(),
+        });
+    }
     let entry = rustix::fs::statat(
         staged.staging_dir.as_fd(),
         CANDIDATE_NAME,
@@ -1252,6 +1323,12 @@ pub fn swap_candidate(
     if entry.st_dev != pinned.st_dev || entry.st_ino != pinned.st_ino {
         return Err(KeystoreRekeyError::UnsafeDestination {
             detail: "staged candidate entry no longer matches the created inode".to_owned(),
+        });
+    }
+    let current_b3 = blake3_of_fd(staged.candidate_fd.as_fd())?;
+    if current_b3 != staged.candidate_b3 {
+        return Err(KeystoreRekeyError::CandidateHashMismatch {
+            detail: "staged candidate changed after verification".to_owned(),
         });
     }
     unlink_old_sidecars(db_dir, db_name)?;
@@ -1271,9 +1348,27 @@ pub fn swap_candidate(
 pub fn finish_rekey(
     db_dir: BorrowedFd<'_>,
     db_name: &str,
-    _lock: &RekeyLock,
+    lock: &RekeyLock,
 ) -> Result<(), KeystoreRekeyError> {
-    validate_component(db_name)?;
+    validate_lock_target(lock, db_dir, db_name)?;
+    let marker = read_intent_marker(db_dir, db_name)?;
+    let live_b3 =
+        blake3_of_entry(db_dir, db_name)?.ok_or_else(|| KeystoreRekeyError::InvalidPhase {
+            detail: "cannot finish rekey without a live database after swap".to_owned(),
+        })?;
+    if live_b3 != marker.candidate_b3 {
+        return Err(KeystoreRekeyError::InvalidPhase {
+            detail: "the live database does not match the staged candidate; swap not complete"
+                .to_owned(),
+        });
+    }
+    if let Some(staging) = open_staging_for_recovery(db_dir)?
+        && blake3_of_entry(staging.as_fd(), marker.candidate_name.as_str())?.is_some()
+    {
+        return Err(KeystoreRekeyError::InvalidPhase {
+            detail: "the staged candidate is still present; swap must complete first".to_owned(),
+        });
+    }
     let name = marker_name(db_name);
     match rustix::fs::unlinkat(db_dir, name.as_str(), AtFlags::empty()) {
         Ok(()) => {}
@@ -1325,9 +1420,10 @@ pub fn roll_back(
     db_dir: BorrowedFd<'_>,
     db_name: &str,
     marker: &IntentMarker,
-    _lock: &RekeyLock,
+    lock: &RekeyLock,
 ) -> Result<(), KeystoreRekeyError> {
-    validate_component(db_name)?;
+    validate_lock_target(lock, db_dir, db_name)?;
+    marker.validate()?;
     let live_b3 = blake3_of_entry(db_dir, db_name)?.ok_or_else(|| {
         KeystoreRekeyError::RecoveryUnrecoverable {
             detail: format!("live database `{db_name}` is missing before the commit point"),
@@ -1382,7 +1478,8 @@ pub fn roll_forward(
     marker: &IntentMarker,
     lock: &RekeyLock,
 ) -> Result<RecoveryOutcome, KeystoreRekeyError> {
-    validate_component(db_name)?;
+    validate_lock_target(lock, db_dir, db_name)?;
+    marker.validate()?;
     validate_component(&marker.candidate_name)?;
     let staging = open_staging_for_recovery(db_dir)?;
     if let Some(staging) = staging {

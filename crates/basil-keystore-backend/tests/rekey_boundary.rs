@@ -474,6 +474,84 @@ fn swap_disposes_of_the_old_wal_and_shm_sidecars() {
     }
 }
 
+/// A lock and candidate are bound to the directory/name pair used to create
+/// them.  Supplying them with another database is rejected before any
+/// destructive operation is attempted.
+#[test]
+fn lock_and_candidate_cannot_be_reused_for_another_database() {
+    let first = TestDir::new("identity-first");
+    let second = TestDir::new("identity-second");
+    provision(&first);
+    provision(&second);
+    let lock = RekeyLock::acquire_exclusive(first.fd.as_fd(), DB_NAME).expect("lock");
+    let staged = stage(&first, &lock);
+    let marker = staged.intent_marker(EPOCHS).expect("marker");
+
+    let err = write_intent_marker(second.fd.as_fd(), DB_NAME, &marker, &lock).unwrap_err();
+    assert!(matches!(err, KeystoreRekeyError::TargetMismatch { .. }));
+    let err = swap_candidate(second.fd.as_fd(), DB_NAME, &staged, &lock).unwrap_err();
+    assert!(matches!(err, KeystoreRekeyError::TargetMismatch { .. }));
+    let err = finish_rekey(second.fd.as_fd(), DB_NAME, &lock).unwrap_err();
+    assert!(matches!(err, KeystoreRekeyError::TargetMismatch { .. }));
+    assert!(second.db_path().exists());
+    assert!(second.path.join(format!("{DB_NAME}-wal")).exists());
+}
+
+/// The candidate is re-hashed after the inode check and before sidecar
+/// disposal, so an in-place mutation cannot pass the fresh-run swap.
+#[test]
+fn swap_rejects_in_place_candidate_mutation_before_sidecar_disposal() {
+    let dir = TestDir::new("candidate-mutation");
+    provision(&dir);
+    let lock = RekeyLock::acquire_exclusive(dir.fd.as_fd(), DB_NAME).expect("lock");
+    let staged = stage(&dir, &lock);
+    let marker = staged.intent_marker(EPOCHS).expect("marker");
+    write_intent_marker(dir.fd.as_fd(), DB_NAME, &marker, &lock).expect("write marker");
+    for suffix in SIDECAR_SUFFIXES {
+        std::fs::write(
+            dir.path.join(format!("{DB_NAME}{suffix}")),
+            b"sidecar under the old key",
+        )
+        .expect("create sidecar");
+    }
+
+    let candidate_path = dir.path.join(STAGING_DIR_NAME).join(CANDIDATE_NAME);
+    let mut candidate = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&candidate_path)
+        .expect("open candidate");
+    std::io::Write::write_all(&mut candidate, b"x").expect("mutate candidate");
+    drop(candidate);
+
+    let err = swap_candidate(dir.fd.as_fd(), DB_NAME, &staged, &lock).unwrap_err();
+    assert!(matches!(
+        err,
+        KeystoreRekeyError::CandidateHashMismatch { .. }
+    ));
+    for suffix in SIDECAR_SUFFIXES {
+        assert!(
+            dir.path.join(format!("{DB_NAME}{suffix}")).exists(),
+            "sidecar must survive failed validation: {suffix}"
+        );
+    }
+    assert!(marker_present(dir.fd.as_fd(), DB_NAME).unwrap());
+}
+
+/// Finish is phase-gated: it cannot remove the fence while the candidate is
+/// still staged and the live database is still the old ciphertext.
+#[test]
+fn finish_rekey_rejects_before_swap() {
+    let dir = TestDir::new("finish-phase");
+    provision(&dir);
+    let lock = RekeyLock::acquire_exclusive(dir.fd.as_fd(), DB_NAME).expect("lock");
+    let staged = stage(&dir, &lock);
+    let marker = staged.intent_marker(EPOCHS).expect("marker");
+    write_intent_marker(dir.fd.as_fd(), DB_NAME, &marker, &lock).expect("write marker");
+    let err = finish_rekey(dir.fd.as_fd(), DB_NAME, &lock).unwrap_err();
+    assert!(matches!(err, KeystoreRekeyError::InvalidPhase { .. }));
+    assert!(marker_present(dir.fd.as_fd(), DB_NAME).unwrap());
+}
+
 /// Marker hardening: a symlinked marker is rejected at read time.
 #[test]
 fn symlinked_marker_is_rejected() {
