@@ -50,5 +50,6 @@ pub use policy::{
 };
 pub use schema::{
     BackendKind, BackendRef, Capability, Catalog, CatalogSchema, Class, Engine, GenerateSpec,
-    KeyAlgorithm, KeyEntry, Labels, MissingPolicy,
+    KeyAlgorithm, KeyEntry, Labels, MissingPolicy, NixCacheIdentity, NixCachePublicKey,
+    NixCacheState,
 };

@@ -3697,6 +3697,7 @@ mod tests {
             public_path: matches!(class, Class::Sealing).then(|| "public/path".to_string()),
             writable: false,
             missing: MissingPolicy::Error,
+            nix_cache: None,
             generate: None,
             sealing_pin: None,
             labels: crate::catalog::Labels(labels.iter().map(ToString::to_string).collect()),

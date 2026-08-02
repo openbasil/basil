@@ -1759,6 +1759,7 @@ mod tests {
             public_path: None,
             writable: true,
             missing: crate::catalog::schema::MissingPolicy::Error,
+            nix_cache: None,
             generate: None,
             sealing_pin: None,
             labels: Labels(labels.iter().map(ToString::to_string).collect()),
