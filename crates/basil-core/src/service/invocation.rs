@@ -42,6 +42,8 @@ const BROKER_KEY_USE_LABEL: &str = "broker_key_use";
 const BROKER_RESPONSE_ENCRYPTION_USE: &str = "response-encryption";
 const INVOKE_OP: &str = "invoke";
 const CHALLENGE_OP: &str = "get_invocation_challenge";
+/// Frozen local courier contract version from SPEC revision 4.2.
+const COURIER_PROTOCOL_VERSION: u32 = 1;
 /// Wire bound on `courier_observed_source`: a rate-limit partition key only.
 const MAX_COURIER_SOURCE_BYTES: usize = 128;
 
@@ -135,6 +137,24 @@ impl InvocationService for BrokerGrpc {
                 Err(challenge_issuance_declined())
             }
         }
+    }
+
+    async fn get_invocation_capabilities(
+        &self,
+        _request: Request<pb::GetInvocationCapabilitiesRequest>,
+    ) -> GrpcResult<pb::GetInvocationCapabilitiesResponse> {
+        let listener_profile = match self.listener_type {
+            crate::transport::grpc_server::ListenerType::Host => pb::ListenerProfile::Host,
+            crate::transport::grpc_server::ListenerType::Container => {
+                pb::ListenerProfile::Container
+            }
+            crate::transport::grpc_server::ListenerType::Courier => pb::ListenerProfile::Courier,
+        };
+        Ok(Response::new(pb::GetInvocationCapabilitiesResponse {
+            listener_profile: listener_profile.into(),
+            require_challenge: self.invocation.require_challenge,
+            courier_protocol_version: COURIER_PROTOCOL_VERSION,
+        }))
     }
 }
 
@@ -2247,19 +2267,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn require_challenge_denies_challenge_less_subject_key_requests() {
-        // With `invocation.require-challenge` set (courier deployments), a
-        // subject-key request without a challenge is the sealed non-retryable
-        // CHALLENGE_UNKNOWN — restoring the courier replay invariant — while
-        // a challenged request still succeeds.
+    async fn courier_denies_challenge_less_subject_key_requests() {
+        // A Courier listener forces require-challenge even when the global
+        // compatibility setting is false. A bare subject-key request receives
+        // sealed CHALLENGE_UNKNOWN, while a challenged request still succeeds.
         let fixture = fixture();
-        let strict = BrokerGrpc::new_with_invocation_config(
+        assert!(!fixture.service.invocation.require_challenge);
+        let strict = BrokerGrpc::new_with_invocation_config_for_listener(
             Arc::clone(&fixture.service.state),
-            InvocationRuntimeConfig {
-                require_challenge: true,
-                ..fixture.service.invocation.clone()
-            },
+            fixture.service.invocation.clone(),
+            crate::transport::grpc_server::ListenerType::Courier,
         );
+        assert!(strict.invocation.require_challenge);
 
         let bare = valid_request(&fixture).await;
         let response = strict

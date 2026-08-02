@@ -919,12 +919,20 @@ fn listener_path_checks(
         .map(|config| {
             let name = format!("listener_path:{}", config.name());
             let path = config.path().display();
+            let effective_profile = if config.listener_type()
+                == crate::transport::grpc_server::ListenerType::Courier
+            {
+                "; courier profile exposes only InvocationService and forces require-challenge=true"
+            } else {
+                ""
+            };
             match QualifiedListener::validate(config) {
                 Ok(_qualified) => CheckResult::ok(
                     name,
                     format!(
-                        "listener `{}` would publish `{path}` cleanly (startup or SIGHUP hot-add)",
-                        config.name()
+                        "listener `{}` ({}) would publish `{path}` cleanly (startup or SIGHUP hot-add){effective_profile}",
+                        config.name(),
+                        config.listener_type(),
                     ),
                 ),
                 Err(ListenerManagerError::PathOccupied { .. }) => {
@@ -1966,6 +1974,47 @@ mod tests {
         assert_eq!(rows[0].name, "listener_path:host");
         assert_eq!(rows[0].status, CheckStatus::Ok);
         assert!(rows[0].detail.contains("SIGHUP hot-add"));
+    }
+
+    #[test]
+    fn doctor_reports_courier_effective_safety_profile() {
+        let dir = unique_dir();
+        let listeners = crate::transport::listener::ListenerConfigSet::resolve(
+            [
+                (
+                    "host".to_string(),
+                    crate::transport::listener::ListenerConfigInput {
+                        listener_type: crate::transport::grpc_server::ListenerType::Host,
+                        path: dir.join("host.sock"),
+                        mode: None,
+                        group: None,
+                    },
+                ),
+                (
+                    "courier".to_string(),
+                    crate::transport::listener::ListenerConfigInput {
+                        listener_type: crate::transport::grpc_server::ListenerType::Courier,
+                        path: dir.join("courier.sock"),
+                        mode: None,
+                        group: None,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            crate::transport::listener::LegacyListenerConfig::default(),
+        )
+        .expect("typed listeners validate");
+
+        let rows = listener_path_checks(&listeners);
+        let courier = rows
+            .iter()
+            .find(|row| row.name == "listener_path:courier")
+            .expect("courier doctor row");
+        assert_eq!(courier.status, CheckStatus::Ok);
+        assert!(courier.detail.contains("(courier)"));
+        assert!(courier.detail.contains("only InvocationService"));
+        assert!(courier.detail.contains("require-challenge=true"));
     }
 
     #[test]

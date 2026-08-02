@@ -1035,6 +1035,31 @@ mod tests {
     }
 
     #[test]
+    fn invocation_capabilities_contract_is_frozen_at_version_one() {
+        use prost::Message as _;
+
+        use crate::broker::v1::{
+            GetInvocationCapabilitiesRequest, GetInvocationCapabilitiesResponse, ListenerProfile,
+        };
+
+        let request = GetInvocationCapabilitiesRequest {};
+        assert!(request.encode_to_vec().is_empty());
+
+        let response = GetInvocationCapabilitiesResponse {
+            listener_profile: ListenerProfile::Courier.into(),
+            require_challenge: true,
+            courier_protocol_version: 1,
+        };
+        let decoded =
+            GetInvocationCapabilitiesResponse::decode(response.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, response);
+        assert_eq!(ListenerProfile::Unspecified as i32, 0);
+        assert_eq!(ListenerProfile::Host as i32, 1);
+        assert_eq!(ListenerProfile::Container as i32, 2);
+        assert_eq!(ListenerProfile::Courier as i32, 3);
+    }
+
+    #[test]
     fn mint_nats_user_request_carries_issuer_account() {
         let with_issuer = MintNatsUserInvocationRequest {
             account_key_id: "nats.account.signing".to_string(),
