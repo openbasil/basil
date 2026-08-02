@@ -122,9 +122,13 @@ fn base_claims() -> Value {
         "jti": "example-token-id",
         "iat": NOW_SECS - 10,
         "exp": NOW_SECS + 300,
+        // The per-run quota partitions on the attested run identity, so
+        // `run_id` and `run_attempt` are required claims.
+        "run_id": "998877",
+        "run_attempt": "1",
         // Real GitHub tokens carry many additional claims; the strict
         // verifier must tolerate (and ignore) them.
-        "run_id": "998877",
+        "run_number": "7",
     })
 }
 

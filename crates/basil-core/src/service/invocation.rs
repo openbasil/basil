@@ -72,8 +72,8 @@ impl InvocationService for BrokerGrpc {
                         response_protection_failed()
                     })
             }
-            PreparedRequest::ChallengeDenied(denied) => self
-                .protect_challenge_denied(&denied)
+            PreparedRequest::Denied(denied) => self
+                .protect_denied_invocation(&denied)
                 .await
                 .map(Response::new)
                 .map_err(|error| {
@@ -161,12 +161,15 @@ impl fmt::Debug for DecryptedInvocationBody {
 }
 
 /// Outcome of the invocation preflight: proceed to the typed operation, or
-/// answer a freshness denial with a sealed non-retryable `CHALLENGE_UNKNOWN`
-/// without touching authorization, quota, or the backend.
+/// answer a sealed denial — a freshness denial (`CHALLENGE_UNKNOWN`, before
+/// authorization, quota, or the backend) or a per-run quota denial
+/// (retryable-never `PER_RUN_QUOTA_EXCEEDED` on exhaustion, retryable
+/// `RUN_QUOTA_UNTRACKED` on bucket-table pressure; both after subject
+/// resolution and before authorization or the backend).
 #[derive(Debug)]
 enum PreparedRequest {
     Proceed(Box<PreparedInvocation>),
-    ChallengeDenied(DeniedInvocation),
+    Denied(DeniedInvocation),
 }
 
 #[derive(Debug)]
@@ -193,12 +196,38 @@ impl PreparedInvocation {
     }
 }
 
-/// A request denied at the freshness-challenge step. Carries exactly what is
-/// needed to protect the sealed denial response; the request body is never
-/// decrypted.
+/// The sealed status a denied preflight answers with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SealedDenial {
+    /// The freshness challenge did not consume; the client fetches a fresh
+    /// challenge and rebuilds. Not retryable with the same message.
+    ChallengeUnknown,
+    /// The rule's per-run operation quota is exhausted for this
+    /// `(rule, run_id, run_attempt)`; never retryable within the run.
+    PerRunQuotaExceeded,
+    /// The rule's bounded run-bucket allowance cannot track this run yet
+    /// (table pressure, not exhaustion); retryable after expired buckets
+    /// are reclaimed.
+    RunQuotaUntracked,
+}
+
+impl SealedDenial {
+    fn status(self) -> InvocationStatus {
+        match self {
+            Self::ChallengeUnknown => InvocationStatus::challenge_unknown(),
+            Self::PerRunQuotaExceeded => InvocationStatus::per_run_quota_exceeded(),
+            Self::RunQuotaUntracked => InvocationStatus::run_quota_untracked(),
+        }
+    }
+}
+
+/// A request denied at the freshness-challenge or per-run quota step.
+/// Carries exactly what is needed to protect the sealed denial response;
+/// the request body is never decrypted.
 #[derive(Debug)]
 struct DeniedInvocation {
     generation: std::sync::Arc<crate::state::Generation>,
+    denial: SealedDenial,
     response_key_id: String,
     response_subject: Option<String>,
     request_message_id: MessageId,
@@ -388,14 +417,27 @@ impl BrokerGrpc {
                 .as_ref()
                 .map(ResponseSubject::as_str)
                 .map(str::to_string);
-            return Ok(PreparedRequest::ChallengeDenied(DeniedInvocation {
+            return Ok(PreparedRequest::Denied(DeniedInvocation {
                 generation,
+                denial: SealedDenial::ChallengeUnknown,
                 response_key_id,
                 response_subject,
                 request_message_id: sealed.claims.message_id.clone(),
                 request_message: message.message.clone(),
             }));
         }
+
+        // Captured before the evidence moves into the actor below; charged
+        // at the quota step (SPEC rev 4, step 6) after subject resolution.
+        let run_quota_charge = provider_evidence.as_ref().map(|provider| RunQuotaCharge {
+            key: crate::ci_federation::RunQuotaKey {
+                rule_id: provider.rule_id.clone(),
+                run_id: provider.claims.run_id(),
+                run_attempt: provider.claims.run_attempt(),
+            },
+            limit: provider.max_operations_per_run,
+            retention_secs: provider.run_bucket_retention_secs,
+        });
 
         let actor = if let Some(provider) = provider_evidence {
             let Some(mut actor) = generation.pdp().resolve_subject_actor(&provider.subject) else {
@@ -442,6 +484,71 @@ impl BrokerGrpc {
                     "actor_claim_mismatch",
                 ));
             return Err(unauthorized_invocation());
+        }
+
+        // Per-run quota (SPEC rev 4, step 6): charge one typed operation
+        // against `(rule, run_id, run_attempt)` after subject resolution and
+        // before authorization or any backend use. Genuine exhaustion (and
+        // the fail-closed missing-limit case) is answered as the sealed
+        // retryable-never `PER_RUN_QUOTA_EXCEEDED`; bucket-table pressure
+        // (`Untracked`) as the sealed retryable `RUN_QUOTA_UNTRACKED` —
+        // both without decrypting the request body. The counter is
+        // in-memory and generation-scoped, so restart or reload resets it
+        // (stated behavior), and a denied charge consumes no quota.
+        if let Some(charge) = run_quota_charge {
+            let outcome = self
+                .invocation_replay_cache
+                .lock()
+                .map_err(|_| challenge_table_unavailable(INVOKE_OP))?
+                .charge_run_quota(
+                    generation_id,
+                    &charge.key,
+                    charge.limit,
+                    charge.retention_secs,
+                    i64::from(self.invocation_now_unix()),
+                );
+            if let Err(denied) = outcome {
+                tracing::debug!(
+                    reason = %denied,
+                    rule = %charge.key.rule_id,
+                    "sealed invocation per-run quota denied",
+                );
+                self.state
+                    .record_decision(&DecisionRecord::from_actor_evidence_denial(
+                        generation_id,
+                        &actor,
+                        Op::Decrypt,
+                        key_id_for_audit(&sealed.recipient_key_id),
+                        EvidenceState::Match,
+                        &format!("per_run_quota_denied: {denied}"),
+                    ));
+                let response_key_id = required_response_key_id(&sealed.claims)?.to_string();
+                self.validate_response_encryption_key(&generation, &response_key_id)
+                    .await?;
+                let response_subject = sealed
+                    .claims
+                    .response_subject
+                    .as_ref()
+                    .map(ResponseSubject::as_str)
+                    .map(str::to_string);
+                let denial = match denied {
+                    crate::ci_federation::RunQuotaDenied::Untracked => {
+                        SealedDenial::RunQuotaUntracked
+                    }
+                    crate::ci_federation::RunQuotaDenied::Exhausted
+                    | crate::ci_federation::RunQuotaDenied::QuotaUnavailable => {
+                        SealedDenial::PerRunQuotaExceeded
+                    }
+                };
+                return Ok(PreparedRequest::Denied(DeniedInvocation {
+                    generation,
+                    denial,
+                    response_key_id,
+                    response_subject,
+                    request_message_id: sealed.claims.message_id.clone(),
+                    request_message: message.message.clone(),
+                }));
+            }
         }
 
         let recipient_key_id = catalog_key_id(&sealed.recipient_key_id, "recipient key id")?;
@@ -545,14 +652,14 @@ impl BrokerGrpc {
         Ok(outcome.map_err(ChallengeDenial::Denied))
     }
 
-    /// Protect the sealed `CHALLENGE_UNKNOWN` denial for a request whose
-    /// freshness challenge did not consume.
-    async fn protect_challenge_denied(
+    /// Protect the sealed non-retryable denial (`CHALLENGE_UNKNOWN` or
+    /// `PER_RUN_QUOTA_EXCEEDED`) for a request rejected in preflight.
+    async fn protect_denied_invocation(
         &self,
         denied: &DeniedInvocation,
     ) -> Result<pb::SealedResponse, ResponseProtectionError> {
         let body = SignInvocationResponse {
-            status: InvocationStatus::challenge_unknown(),
+            status: denied.denial.status(),
             policy_generation: denied.generation.id(),
             signature: None,
         };
@@ -976,6 +1083,10 @@ impl BrokerGrpc {
                     provider: rule.provider.kind(),
                     rule_id: rule.id.clone(),
                     subject: rule.subject.clone(),
+                    max_operations_per_run: rule.max_operations_per_run,
+                    run_bucket_retention_secs: rule
+                        .max_token_age_secs
+                        .saturating_add(rule.clock_skew_secs),
                     claims,
                 });
             }
@@ -1223,15 +1334,92 @@ impl Signer for ManagerSigner<'_> {
     }
 }
 
-/// Transitional name for the single-use freshness-challenge table.
+/// One pending per-run quota charge, captured from verified provider
+/// evidence before it moves into the resolved actor.
+#[derive(Debug)]
+struct RunQuotaCharge {
+    key: crate::ci_federation::RunQuotaKey,
+    /// The selected rule's `max_operations_per_run`; `None` (unreachable for
+    /// a loaded rule) fails closed at the charge.
+    limit: Option<u64>,
+    /// The rule's bucket retention window (`max_token_age_secs +
+    /// clock_skew_secs`), bounding how long an idle bucket stays tracked.
+    retention_secs: u64,
+}
+
+/// Transitional name for the invocation freshness and quota state, behind
+/// the one broker mutex.
 ///
 /// The legacy message-ID replay cache is removed (SPEC rev 4 Freshness): the
 /// COSE message ID is correlation-only, and freshness rests on server-issued
-/// single-use challenges. The name survives because the broker adapter
-/// (`service/broker.rs`) constructs `InvocationReplayCache::new(capacity)`
-/// with its `replay_cache_capacity` knob, now the challenge table's global
-/// capacity; renaming that field and knob is tracked as a follow-up.
-pub(super) type InvocationReplayCache = crate::ci_federation::challenge::ChallengeTable;
+/// single-use challenges; the per-run operation quota (SPEC rev 4, Per-run
+/// quota and kill switch) shares the same in-memory, restart-resetting
+/// lifecycle and therefore the same lock. The name survives because the
+/// broker adapter (`service/broker.rs`) constructs
+/// `InvocationReplayCache::new(capacity)` with its `replay_cache_capacity`
+/// knob, now the challenge table's global capacity; renaming that field and
+/// knob is tracked as a follow-up.
+#[derive(Debug)]
+pub(super) struct InvocationReplayCache {
+    challenges: crate::ci_federation::challenge::ChallengeTable,
+    run_quota: crate::ci_federation::RunQuotaTable,
+}
+
+impl InvocationReplayCache {
+    /// Build the invocation state tables; `global_capacity` bounds the
+    /// challenge table (the legacy construction seam used by the broker
+    /// adapter) and `run_quota_buckets_per_rule` bounds the distinct
+    /// tracked per-run quota buckets for each federation rule
+    /// (`invocation.run-quota-buckets-per-rule`).
+    pub(super) fn new(global_capacity: usize, run_quota_buckets_per_rule: usize) -> Self {
+        Self {
+            challenges: crate::ci_federation::challenge::ChallengeTable::new(global_capacity),
+            run_quota: crate::ci_federation::RunQuotaTable::new(run_quota_buckets_per_rule),
+        }
+    }
+
+    /// Issue a single-use freshness challenge
+    /// ([`ChallengeTable::issue`][crate::ci_federation::challenge::ChallengeTable::issue]).
+    fn issue(
+        &mut self,
+        jkt: [u8; 32],
+        source: Option<&str>,
+        generation: u64,
+        now_unix: i64,
+    ) -> Result<
+        crate::ci_federation::challenge::IssuedChallenge,
+        crate::ci_federation::challenge::IssueDecline,
+    > {
+        self.challenges.issue(jkt, source, generation, now_unix)
+    }
+
+    /// Atomically consume a freshness challenge
+    /// ([`ChallengeTable::consume`][crate::ci_federation::challenge::ChallengeTable::consume]).
+    fn consume(
+        &mut self,
+        challenge: &[u8],
+        jkt: &[u8; 32],
+        generation: u64,
+        now_unix: i64,
+    ) -> Result<(), crate::ci_federation::challenge::ConsumeDenied> {
+        self.challenges
+            .consume(challenge, jkt, generation, now_unix)
+    }
+
+    /// Charge one typed operation against the per-run quota
+    /// ([`RunQuotaTable::charge`][crate::ci_federation::RunQuotaTable::charge]).
+    fn charge_run_quota(
+        &mut self,
+        generation: u64,
+        key: &crate::ci_federation::RunQuotaKey,
+        limit: Option<u64>,
+        retention_secs: u64,
+        now_unix: i64,
+    ) -> Result<(), crate::ci_federation::RunQuotaDenied> {
+        self.run_quota
+            .charge(generation, key, limit, retention_secs, now_unix)
+    }
+}
 
 fn expression_signature_verifies(
     expression: &crate::catalog::EvidenceExpression,
@@ -1537,6 +1725,7 @@ mod tests {
                 max_ttl_secs: DEFAULT_EXPIRES_AFTER_SECS,
                 clock_skew_secs: 5,
                 replay_cache_capacity: 16,
+                run_quota_buckets_per_rule: 16,
                 require_challenge: false,
                 now_unix_override: Some(NOW),
             },
@@ -2082,6 +2271,90 @@ mod tests {
             .consume_freshness_challenge(generation.id(), &claims, Some(&[9; 32]), &verifier)
             .expect("no envelope error");
         assert!(matches!(outcome, Err(ChallengeDenial::Missing)));
+    }
+
+    #[tokio::test]
+    async fn per_run_quota_denial_seals_the_retryable_never_status() {
+        // The quota denial rides the same sealed denial envelope as a
+        // freshness denial: status code 6 `PER_RUN_QUOTA_EXCEEDED`,
+        // `retryable = false`, no signature, correlated to the request.
+        let fixture = fixture();
+        let message = valid_request(&fixture).await;
+        let denied = DeniedInvocation {
+            generation: fixture.service.state.load_generation().to_owned(),
+            denial: SealedDenial::PerRunQuotaExceeded,
+            response_key_id: RESPONSE_SEALING_KEY.to_string(),
+            response_subject: Some("reply.client".to_string()),
+            request_message_id: message_id(b"msg-1"),
+            request_message: message.clone(),
+        };
+        let response = fixture
+            .service
+            .protect_denied_invocation(&denied)
+            .await
+            .expect("denial seals");
+        let (verified, body) = verify_response(&fixture, &response, &message).await;
+        assert_eq!(body.status, InvocationStatus::per_run_quota_exceeded());
+        assert!(!body.status.retryable);
+        assert!(body.signature.is_none());
+        assert_eq!(verified.claims.in_reply_to, Some(message_id(b"msg-1")));
+    }
+
+    #[tokio::test]
+    async fn run_quota_untracked_denial_seals_a_retryable_status() {
+        // Bucket-table pressure is not quota exhaustion: the sealed status
+        // must be retryable so a legitimate run denied by unrelated
+        // pressure retries after expired buckets are reclaimed, and the
+        // reason must be distinguishable from `PER_RUN_QUOTA_EXCEEDED`.
+        let fixture = fixture();
+        let message = valid_request(&fixture).await;
+        let denied = DeniedInvocation {
+            generation: fixture.service.state.load_generation().to_owned(),
+            denial: SealedDenial::RunQuotaUntracked,
+            response_key_id: RESPONSE_SEALING_KEY.to_string(),
+            response_subject: Some("reply.client".to_string()),
+            request_message_id: message_id(b"msg-2"),
+            request_message: message.clone(),
+        };
+        let response = fixture
+            .service
+            .protect_denied_invocation(&denied)
+            .await
+            .expect("denial seals");
+        let (verified, body) = verify_response(&fixture, &response, &message).await;
+        assert_eq!(body.status, InvocationStatus::run_quota_untracked());
+        assert!(body.status.retryable);
+        assert!(body.signature.is_none());
+        assert_eq!(verified.claims.in_reply_to, Some(message_id(b"msg-2")));
+    }
+
+    #[test]
+    fn replay_cache_charges_the_generation_scoped_run_quota() {
+        // The broker-held table delegates to the generation-scoped quota
+        // counters: exhaustion denies, a reload (new generation) resets.
+        const RETENTION: u64 = 630;
+        const QUOTA_NOW: i64 = 1_700_000_000;
+        let mut cache = InvocationReplayCache::new(16, 16);
+        let key = crate::ci_federation::RunQuotaKey {
+            rule_id: "release".to_string(),
+            run_id: 900,
+            run_attempt: 1,
+        };
+        cache
+            .charge_run_quota(7, &key, Some(1), RETENTION, QUOTA_NOW)
+            .expect("admitted");
+        assert_eq!(
+            cache.charge_run_quota(7, &key, Some(1), RETENTION, QUOTA_NOW),
+            Err(crate::ci_federation::RunQuotaDenied::Exhausted)
+        );
+        cache
+            .charge_run_quota(8, &key, Some(1), RETENTION, QUOTA_NOW)
+            .expect("reload resets the counters");
+        // Fail closed when the rule somehow carries no quota value.
+        assert_eq!(
+            cache.charge_run_quota(8, &key, None, RETENTION, QUOTA_NOW),
+            Err(crate::ci_federation::RunQuotaDenied::QuotaUnavailable)
+        );
     }
 
     #[tokio::test]

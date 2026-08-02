@@ -39,6 +39,7 @@ fn provider_catalog() -> Arc<ProviderCatalog> {
         operation_profiles: vec!["artifact-sign".to_string()],
         max_token_age_secs: 900,
         clock_skew_secs: 30,
+        max_operations_per_run: Some(64),
         provider: ProviderConfig::GithubActions(GithubActionsRule {
             issuer: ISSUER.to_string(),
             discovery_url: format!("{ISSUER}/.well-known/openid-configuration"),
@@ -156,6 +157,7 @@ fn forgejo_rules_get_their_own_empty_generation_cache() {
         operation_profiles: vec!["artifact-sign".to_string()],
         max_token_age_secs: 300,
         clock_skew_secs: 30,
+        max_operations_per_run: Some(64),
         provider: ProviderConfig::ForgejoActions(ForgejoActionsRule {
             issuer: forgejo_issuer.to_string(),
             discovery_url: format!("{forgejo_issuer}/.well-known/openid-configuration"),

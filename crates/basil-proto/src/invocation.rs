@@ -86,6 +86,14 @@ pub const REASON_CHALLENGE_ISSUANCE_DECLINED: &str = "CHALLENGE_ISSUANCE_DECLINE
 pub const REASON_CHALLENGE_UNKNOWN: &str = "CHALLENGE_UNKNOWN";
 /// Status reason for [`InvocationStatusCode::PerRunQuotaExceeded`].
 pub const REASON_PER_RUN_QUOTA_EXCEEDED: &str = "PER_RUN_QUOTA_EXCEEDED";
+/// Status reason carried on [`InvocationStatusCode::InternalError`] when the
+/// broker's bounded per-run quota bucket table cannot track a new run yet.
+///
+/// This is table pressure, not quota exhaustion: the run has consumed
+/// nothing, so the denial is **retryable** — expired buckets are reclaimed
+/// on later charges. Code 6 (`PER_RUN_QUOTA_EXCEEDED`) is reserved for
+/// genuine exhaustion of the rule's `max_operations_per_run`.
+pub const REASON_RUN_QUOTA_UNTRACKED: &str = "RUN_QUOTA_UNTRACKED";
 
 /// Status code carried inside encrypted invocation response bodies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +216,24 @@ impl InvocationStatus {
             reason: REASON_PER_RUN_QUOTA_EXCEEDED.to_string(),
             message: None,
             retryable: false,
+        }
+    }
+
+    /// The broker's bounded per-run quota bucket table cannot track this
+    /// run yet ([`REASON_RUN_QUOTA_UNTRACKED`]).
+    ///
+    /// Carried on the existing [`InvocationStatusCode::InternalError`] code
+    /// with `retryable = true`: the run consumed no quota, so the caller
+    /// retries after backoff once expired buckets are reclaimed. Distinct
+    /// from [`Self::per_run_quota_exceeded`], which is genuine exhaustion
+    /// and never retryable within the run attempt.
+    #[must_use]
+    pub fn run_quota_untracked() -> Self {
+        Self {
+            code: InvocationStatusCode::InternalError,
+            reason: REASON_RUN_QUOTA_UNTRACKED.to_string(),
+            message: None,
+            retryable: true,
         }
     }
 
@@ -957,6 +983,19 @@ mod tests {
             Some(InvocationStatusCode::PerRunQuotaExceeded)
         );
         assert_eq!(InvocationStatusCode::from_u64(7), None);
+
+        // Table pressure is not exhaustion: `RUN_QUOTA_UNTRACKED` rides the
+        // retryable internal-error code and round-trips like any status.
+        let untracked = InvocationStatus::run_quota_untracked();
+        assert_eq!(untracked.code, InvocationStatusCode::InternalError);
+        assert!(untracked.retryable, "table pressure must be retryable");
+        let response = SignInvocationResponse {
+            status: untracked.clone(),
+            policy_generation: 7,
+            signature: None,
+        };
+        let decoded = SignInvocationResponse::from_cbor_bytes(&response.to_cbor_bytes()).unwrap();
+        assert_eq!(decoded.status, untracked);
     }
 
     #[test]

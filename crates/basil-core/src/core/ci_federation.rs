@@ -15,7 +15,7 @@
 #[path = "challenge.rs"]
 pub mod challenge;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -277,6 +277,19 @@ pub struct ProviderRule {
     pub max_token_age_secs: u64,
     /// Allowed clock skew in seconds for this rule.
     pub clock_skew_secs: u64,
+    /// Per-run operation quota (SPEC: Per-run quota and kill switch): the
+    /// number of typed operations this rule admits per
+    /// `(rule, run_id, run_attempt)` before the broker denies with the
+    /// retryable-never `PER_RUN_QUOTA_EXCEEDED` status.
+    ///
+    /// The value is required and must be at least 1; there is no unlimited
+    /// default. It deserializes as optional only so catalog validation can
+    /// reject an absent value with a diagnostic naming the rule: every rule
+    /// inside a constructed [`ProviderCatalog`] carries a nonzero value, and
+    /// quota enforcement fails closed (denies) if the value is somehow
+    /// absent.
+    #[serde(default)]
+    pub max_operations_per_run: Option<u64>,
     /// Provider-specific configuration.
     pub provider: ProviderConfig,
 }
@@ -598,6 +611,11 @@ pub struct GithubEvidence {
     pub runner_environment: String,
     /// Protected deployment environment, when configured.
     pub environment: Option<String>,
+    /// Provider-attested run ID: half of the per-run quota partition.
+    pub run_id: u64,
+    /// Provider-attested run attempt; a rerun increments it and opens a
+    /// fresh per-run quota bucket.
+    pub run_attempt: u64,
     /// Keyed digest of the required non-empty GitHub token ID.
     pub jti_digest: [u8; 32],
     /// Keyed token correlation digest (never the raw token).
@@ -662,6 +680,25 @@ impl ProviderClaimEvidence {
             Self::ForgejoActions(evidence) => &evidence.jti_digest,
         }
     }
+
+    /// Provider-attested run ID: half of the per-run quota partition.
+    #[must_use]
+    pub const fn run_id(&self) -> u64 {
+        match self {
+            Self::GithubActions(evidence) => evidence.run_id,
+            Self::ForgejoActions(evidence) => evidence.run_id,
+        }
+    }
+
+    /// Provider-attested run attempt: the other half of the per-run quota
+    /// partition; a rerun increments it and opens a fresh bucket.
+    #[must_use]
+    pub const fn run_attempt(&self) -> u64 {
+        match self {
+            Self::GithubActions(evidence) => evidence.run_attempt,
+            Self::ForgejoActions(evidence) => evidence.run_attempt,
+        }
+    }
 }
 
 /// Verified provider evidence attached to one sealed invocation.
@@ -673,8 +710,243 @@ pub struct VerifiedProviderEvidence {
     pub rule_id: String,
     /// Policy subject granted by the rule.
     pub subject: String,
+    /// The selected rule's per-run operation quota
+    /// ([`ProviderRule::max_operations_per_run`]); catalog validation
+    /// guarantees a loaded rule carries a nonzero value, and quota
+    /// enforcement fails closed (denies) when it is absent.
+    pub max_operations_per_run: Option<u64>,
+    /// Retention window in seconds for this rule's per-run quota buckets:
+    /// the rule's `max_token_age_secs + clock_skew_secs`. A bucket idle
+    /// beyond this window holds no state a currently-valid token could
+    /// still charge against under the same freshness bounds, so the table
+    /// may reclaim it under pressure (see [`RunQuotaTable`]).
+    pub run_bucket_retention_secs: u64,
     /// Provider-specific verified claims.
     pub claims: ProviderClaimEvidence,
+}
+
+/// Default per-rule bound on distinct tracked per-run quota buckets.
+///
+/// The bound is **per rule**, not global: one federated tenant opening many
+/// run buckets can exhaust only its own rule's allowance and never denies
+/// runs under other rules. When a rule's allowance is full, the table first
+/// reclaims buckets whose retention window has lapsed; only if none can be
+/// reclaimed is the new run denied (as the retryable
+/// [`RunQuotaDenied::Untracked`]) rather than evicting live quota state,
+/// because an evicted-then-recreated bucket would restart its counter and
+/// re-admit past an exhausted quota. Operators can tune the bound with the
+/// `invocation.run-quota-buckets-per-rule` configuration knob.
+pub const DEFAULT_MAX_TRACKED_RUN_BUCKETS_PER_RULE: usize = 4096;
+
+/// Identity of one per-run operation-quota bucket (SPEC: Per-run quota and
+/// kill switch): one rule and one provider-attested workflow run attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RunQuotaKey {
+    /// Stable catalog rule identifier.
+    pub rule_id: String,
+    /// Provider-attested run ID.
+    pub run_id: u64,
+    /// Provider-attested run attempt; a rerun increments it and opens a
+    /// fresh bucket.
+    pub run_attempt: u64,
+}
+
+/// Why a per-run quota charge was denied.
+///
+/// [`Exhausted`](Self::Exhausted) and
+/// [`QuotaUnavailable`](Self::QuotaUnavailable) surface as the sealed
+/// retryable-never `PER_RUN_QUOTA_EXCEEDED` status (genuine quota
+/// exhaustion / fail-closed). [`Untracked`](Self::Untracked) is table
+/// pressure, not exhaustion: it surfaces as a **retryable** sealed status
+/// (reason `RUN_QUOTA_UNTRACKED`) so a legitimate run denied by unrelated
+/// pressure retries after the pressure drains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum RunQuotaDenied {
+    /// The bucket reached the rule's per-run operation quota.
+    #[error("per-run operation quota exhausted")]
+    Exhausted,
+    /// The selected rule carries no usable quota value; enforcement fails
+    /// closed. Catalog validation makes this unreachable for a loaded rule.
+    #[error("per-run operation quota unavailable for the selected rule")]
+    QuotaUnavailable,
+    /// The rule's bounded bucket allowance cannot track a new run without
+    /// evicting live quota state, which would re-open exhausted buckets.
+    /// Retryable: expired buckets are reclaimed on later charges.
+    #[error("per-run quota bucket allowance for the rule is full")]
+    Untracked,
+}
+
+/// One tracked per-run quota bucket: the admitted count and the unix time
+/// past which the bucket may be reclaimed under table pressure.
+#[derive(Debug, Clone, Copy)]
+struct RunQuotaBucket {
+    count: u64,
+    expires_at_unix: i64,
+}
+
+/// Bounded in-memory per-run operation counters (SPEC: Per-run quota and
+/// kill switch).
+///
+/// **Bound.** The table bounds distinct `(rule, run_id, run_attempt)`
+/// buckets **per rule** (`max_tracked_buckets_per_rule`), so one federated
+/// tenant opening many attested runs can exhaust only its own rule's
+/// allowance and never denies runs under other rules.
+///
+/// **Retention.** Every bucket carries an expiry refreshed to `now +
+/// retention` on each verified charge attempt for its key, where retention
+/// is the rule's `max_token_age_secs + clock_skew_secs`. A bucket idle past
+/// its expiry has seen no verified token activity for longer than any token
+/// admitted under the rule's freshness bounds stays chargeable, so it is
+/// reclaimed when its rule's allowance is under pressure. A run attempt
+/// that idles past retention and later returns with a freshly minted token
+/// opens a new bucket — the quota bounds each activity window of a run
+/// attempt, the deliberate trade for bounded memory without permanent
+/// denial (recorded on basil-jjgi.3.4).
+///
+/// **Generation scope.** Counters are cleared only when a charge arrives
+/// under a **newer** serving generation than the one tracked (generation
+/// ids are monotonic), so a reload resets the quota — stated behavior,
+/// because the quota bounds a compromised job inside a normal window and
+/// does not survive an agent restart either (the table is process memory).
+/// A slow in-flight request still pinned to the previous generation charges
+/// into the current counters instead of wiping them, so old/new generation
+/// interleavings cannot alternate resets (fail-closed: at worst it
+/// over-counts). Kill-switch semantics ride the existing generation
+/// pinning: a generation installed without the rule stops new requests from
+/// authenticating against it at verification, before any charge.
+///
+/// Every mutating operation takes `&mut self`; the caller serializes access
+/// behind one mutex (no await points held), which is what makes concurrent
+/// charges against one bucket admit at most the configured quota.
+#[derive(Debug)]
+pub struct RunQuotaTable {
+    max_tracked_buckets_per_rule: usize,
+    generation: Option<u64>,
+    counters: HashMap<RunQuotaKey, RunQuotaBucket>,
+    /// Distinct tracked buckets per rule id; kept in lockstep with
+    /// `counters` so the per-rule bound check is O(1).
+    rule_buckets: HashMap<String, usize>,
+}
+
+impl RunQuotaTable {
+    /// Build an empty table bounded to `max_tracked_buckets_per_rule`
+    /// distinct `(run_id, run_attempt)` buckets for each rule.
+    #[must_use]
+    pub fn new(max_tracked_buckets_per_rule: usize) -> Self {
+        Self {
+            max_tracked_buckets_per_rule,
+            generation: None,
+            counters: HashMap::new(),
+            rule_buckets: HashMap::new(),
+        }
+    }
+
+    /// Charge one typed operation against `key` under the pinned serving
+    /// `generation`, admitting at most `limit` operations per bucket.
+    ///
+    /// `limit` is the selected rule's
+    /// [`ProviderRule::max_operations_per_run`]; `None` (which catalog
+    /// validation makes unreachable for a loaded rule) fails closed.
+    /// `retention_secs` is the rule's `max_token_age_secs +
+    /// clock_skew_secs` ([`VerifiedProviderEvidence::run_bucket_retention_secs`])
+    /// and `now_unix` the broker's current time. A denied charge does not
+    /// consume quota, but any charge attempt against an existing bucket
+    /// refreshes its retention expiry: verified token activity proves the
+    /// run attempt is still live, keeping an exhausted bucket exhausted.
+    ///
+    /// # Errors
+    /// [`RunQuotaDenied::Exhausted`] / [`RunQuotaDenied::QuotaUnavailable`]
+    /// surface as the sealed retryable-never `PER_RUN_QUOTA_EXCEEDED`
+    /// status; [`RunQuotaDenied::Untracked`] (the rule's bucket allowance is
+    /// full and nothing has expired) surfaces as a retryable sealed status.
+    pub fn charge(
+        &mut self,
+        generation: u64,
+        key: &RunQuotaKey,
+        limit: Option<u64>,
+        retention_secs: u64,
+        now_unix: i64,
+    ) -> Result<(), RunQuotaDenied> {
+        let Some(limit) = limit else {
+            return Err(RunQuotaDenied::QuotaUnavailable);
+        };
+        if limit == 0 {
+            return Err(RunQuotaDenied::Exhausted);
+        }
+        match self.generation {
+            Some(tracked) if generation > tracked => {
+                // Generation scope: a charge under a newer serving
+                // generation resets the counters (reload resets the quota,
+                // stated behavior). Charges from an older pinned generation
+                // fall through and count against the current counters
+                // instead of wiping them.
+                self.counters.clear();
+                self.rule_buckets.clear();
+                self.generation = Some(generation);
+            }
+            Some(_) => {}
+            None => self.generation = Some(generation),
+        }
+        let expires_at_unix =
+            now_unix.saturating_add(i64::try_from(retention_secs).unwrap_or(i64::MAX));
+        if let Some(bucket) = self.counters.get_mut(key) {
+            // Verified activity: the run attempt is provably still live, so
+            // its bucket (exhausted or not) stays retained.
+            bucket.expires_at_unix = bucket.expires_at_unix.max(expires_at_unix);
+            if bucket.count >= limit {
+                return Err(RunQuotaDenied::Exhausted);
+            }
+            bucket.count = bucket.count.saturating_add(1);
+            return Ok(());
+        }
+        if self
+            .rule_buckets
+            .get(key.rule_id.as_str())
+            .copied()
+            .unwrap_or(0)
+            >= self.max_tracked_buckets_per_rule
+        {
+            self.reclaim_expired(now_unix);
+            if self
+                .rule_buckets
+                .get(key.rule_id.as_str())
+                .copied()
+                .unwrap_or(0)
+                >= self.max_tracked_buckets_per_rule
+            {
+                return Err(RunQuotaDenied::Untracked);
+            }
+        }
+        self.counters.insert(
+            key.clone(),
+            RunQuotaBucket {
+                count: 1,
+                expires_at_unix,
+            },
+        );
+        *self.rule_buckets.entry(key.rule_id.clone()).or_insert(0) += 1;
+        Ok(())
+    }
+
+    /// Drop every bucket whose retention expiry has lapsed. Called only
+    /// under allowance pressure; the common charge path stays O(1).
+    fn reclaim_expired(&mut self, now_unix: i64) {
+        let expired: Vec<RunQuotaKey> = self
+            .counters
+            .iter()
+            .filter(|(_, bucket)| bucket.expires_at_unix <= now_unix)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in expired {
+            self.counters.remove(&key);
+            if let Some(count) = self.rule_buckets.get_mut(key.rule_id.as_str()) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.rule_buckets.remove(key.rule_id.as_str());
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -694,6 +966,11 @@ struct GithubClaims {
     job_workflow_sha: String,
     runner_environment: String,
     environment: Option<String>,
+    /// Required: the per-run quota (SPEC: Per-run quota and kill switch) is
+    /// partitioned by `(rule, run_id, run_attempt)`, so a token that does
+    /// not attest its run identity is rejected.
+    run_id: String,
+    run_attempt: String,
     jti: String,
     iat: u64,
     nbf: Option<u64>,
@@ -1100,6 +1377,16 @@ pub enum FederationError {
     /// The broker-local correlation digest could not be computed.
     #[error("correlation digest unavailable")]
     CorrelationUnavailable,
+    /// A provider rule was configured without its per-run operation quota.
+    #[error(
+        "provider rule `{0}` is missing `maxOperationsPerRun`: every rule must declare a per-run operation quota, and there is no unlimited default"
+    )]
+    MissingRunQuota(String),
+    /// A provider rule declared a per-run operation quota of zero.
+    #[error(
+        "provider rule `{0}` declares `maxOperationsPerRun` 0: the per-run operation quota must be at least 1"
+    )]
+    InvalidRunQuota(String),
 }
 
 fn validate_common_rule(rule: &ProviderRule) -> Result<(), FederationError> {
@@ -1122,6 +1409,13 @@ fn validate_common_rule(rule: &ProviderRule) -> Result<(), FederationError> {
         if profile.is_empty() || profile.len() > MAX_RULE_ID_BYTES || !profiles.insert(profile) {
             return Err(FederationError::ProviderRejected);
         }
+    }
+    // The per-run quota is validated after the identifier bounds above, so
+    // this named diagnostic always carries a sane rule ID.
+    match rule.max_operations_per_run {
+        None => return Err(FederationError::MissingRunQuota(rule.id.clone())),
+        Some(0) => return Err(FederationError::InvalidRunQuota(rule.id.clone())),
+        Some(_) => {}
     }
     Ok(())
 }
@@ -1369,6 +1663,8 @@ pub fn verify_github(
         event_name: claims.event_name,
         runner_environment: claims.runner_environment,
         environment: claims.environment,
+        run_id: decimal(&claims.run_id)?,
+        run_attempt: decimal(&claims.run_attempt)?,
         jti_digest: jti,
         token_digest,
     })
@@ -1646,6 +1942,7 @@ mod tests {
             operation_profiles: vec!["artifact-sign".to_string()],
             max_token_age_secs: 900,
             clock_skew_secs: 30,
+            max_operations_per_run: Some(64),
             provider: ProviderConfig::GithubActions(GithubActionsRule {
                 issuer: GITHUB_ISSUER.to_string(),
                 discovery_url: format!("{GITHUB_ISSUER}/.well-known/openid-configuration"),
@@ -2108,6 +2405,322 @@ mod tests {
         assert!(matches!(overlap, Err(FederationError::OverlappingRules)));
     }
 
+    #[test]
+    fn catalog_requires_a_per_run_quota_and_names_the_rule() {
+        // Absent value: load fails, no unlimited default, diagnostic names
+        // the rule and the missing field.
+        let mut missing = github_rule("release", &["main"], &["push"]);
+        missing.max_operations_per_run = None;
+        let error = ProviderCatalog::new(vec![missing]).expect_err("absent quota must not load");
+        assert_eq!(
+            error,
+            FederationError::MissingRunQuota("release".to_string())
+        );
+        let message = error.to_string();
+        assert!(message.contains("`release`"), "{message}");
+        assert!(message.contains("maxOperationsPerRun"), "{message}");
+
+        // Zero is not a quota either.
+        let mut zero = github_rule("release", &["main"], &["push"]);
+        zero.max_operations_per_run = Some(0);
+        let error = ProviderCatalog::new(vec![zero]).expect_err("zero quota must not load");
+        assert_eq!(
+            error,
+            FederationError::InvalidRunQuota("release".to_string())
+        );
+        assert!(error.to_string().contains("`release`"), "{error}");
+    }
+
+    #[test]
+    fn catalog_json_without_the_quota_field_fails_load_naming_the_rule() {
+        // The configuration load path: strip `maxOperationsPerRun` from an
+        // otherwise valid serialized rule and deserialize the catalog.
+        let valid = serde_json::to_value(vec![github_rule("release", &["main"], &["push"])])
+            .expect("rule serializes");
+        let mut stripped = valid.clone();
+        stripped
+            .as_array_mut()
+            .and_then(|rules| rules.first_mut())
+            .and_then(Value::as_object_mut)
+            .expect("serialized rule object")
+            .remove("maxOperationsPerRun")
+            .expect("field present before stripping");
+        let error = serde_json::from_value::<ProviderCatalog>(stripped)
+            .expect_err("catalog without the quota field must not load");
+        let message = error.to_string();
+        assert!(message.contains("release"), "{message}");
+        assert!(message.contains("maxOperationsPerRun"), "{message}");
+        // The unmodified serialization still loads.
+        serde_json::from_value::<ProviderCatalog>(valid).expect("valid catalog loads");
+    }
+
+    fn quota_key(rule_id: &str, run_id: u64, run_attempt: u64) -> RunQuotaKey {
+        RunQuotaKey {
+            rule_id: rule_id.to_string(),
+            run_id,
+            run_attempt,
+        }
+    }
+
+    /// Retention window used by the quota tests.
+    const RETENTION: u64 = 630;
+    /// Fixed "now" used by the quota tests.
+    const NOW: i64 = 1_700_000_000;
+
+    #[test]
+    fn run_quota_admits_the_limit_then_denies_without_consuming() {
+        let mut table = RunQuotaTable::new(16);
+        let key = quota_key("release", 900, 1);
+        for _ in 0..3 {
+            table
+                .charge(1, &key, Some(3), RETENTION, NOW)
+                .expect("within quota");
+        }
+        for _ in 0..4 {
+            assert_eq!(
+                table.charge(1, &key, Some(3), RETENTION, NOW),
+                Err(RunQuotaDenied::Exhausted),
+                "past the limit every charge is denied"
+            );
+        }
+    }
+
+    #[test]
+    fn run_quota_fails_closed_without_a_usable_limit() {
+        let mut table = RunQuotaTable::new(16);
+        let key = quota_key("release", 900, 1);
+        assert_eq!(
+            table.charge(1, &key, None, RETENTION, NOW),
+            Err(RunQuotaDenied::QuotaUnavailable)
+        );
+        assert_eq!(
+            table.charge(1, &key, Some(0), RETENTION, NOW),
+            Err(RunQuotaDenied::Exhausted)
+        );
+    }
+
+    #[test]
+    fn run_quota_resets_on_a_new_run_attempt_and_isolates_rules() {
+        let mut table = RunQuotaTable::new(16);
+        let first_attempt = quota_key("release", 900, 1);
+        table
+            .charge(1, &first_attempt, Some(1), RETENTION, NOW)
+            .expect("admitted");
+        assert_eq!(
+            table.charge(1, &first_attempt, Some(1), RETENTION, NOW),
+            Err(RunQuotaDenied::Exhausted)
+        );
+
+        // A rerun (new run_attempt) opens a fresh bucket.
+        let second_attempt = quota_key("release", 900, 2);
+        table
+            .charge(1, &second_attempt, Some(1), RETENTION, NOW)
+            .expect("fresh bucket");
+
+        // Another rule's bucket is untouched by the exhausted one.
+        let other_rule = quota_key("nightly", 900, 1);
+        table
+            .charge(1, &other_rule, Some(1), RETENTION, NOW)
+            .expect("isolated rule");
+        // And the exhausted bucket stays exhausted.
+        assert_eq!(
+            table.charge(1, &first_attempt, Some(1), RETENTION, NOW),
+            Err(RunQuotaDenied::Exhausted)
+        );
+    }
+
+    #[test]
+    fn run_quota_resets_on_reload_and_on_restart() {
+        // Reload: a charge under a newer serving generation clears the
+        // counters (stated behavior; the quota bounds a compromised job
+        // inside a normal window).
+        let mut table = RunQuotaTable::new(16);
+        let key = quota_key("release", 900, 1);
+        table
+            .charge(1, &key, Some(1), RETENTION, NOW)
+            .expect("admitted");
+        assert_eq!(
+            table.charge(1, &key, Some(1), RETENTION, NOW),
+            Err(RunQuotaDenied::Exhausted)
+        );
+        table
+            .charge(2, &key, Some(1), RETENTION, NOW)
+            .expect("a new generation starts a fresh counter");
+        assert_eq!(
+            table.charge(2, &key, Some(1), RETENTION, NOW),
+            Err(RunQuotaDenied::Exhausted)
+        );
+
+        // Restart: the table is process memory; a new table is empty.
+        let mut restarted = RunQuotaTable::new(16);
+        restarted
+            .charge(2, &key, Some(1), RETENTION, NOW)
+            .expect("fresh after restart");
+    }
+
+    #[test]
+    fn run_quota_old_generation_charge_does_not_wipe_counters() {
+        // A slow in-flight request pinned to the previous generation whose
+        // charge lands after a reload must not reset the new generation's
+        // counters (and must not re-pin the table backwards): it charges
+        // into the current counters instead.
+        let mut table = RunQuotaTable::new(16);
+        let key = quota_key("release", 900, 1);
+        table
+            .charge(2, &key, Some(2), RETENTION, NOW)
+            .expect("new generation admitted");
+        table
+            .charge(1, &key, Some(2), RETENTION, NOW)
+            .expect("old pinned generation counts against current counters");
+        assert_eq!(
+            table.charge(2, &key, Some(2), RETENTION, NOW),
+            Err(RunQuotaDenied::Exhausted),
+            "the old-generation charge consumed quota instead of wiping it"
+        );
+        assert_eq!(
+            table.charge(1, &key, Some(2), RETENTION, NOW),
+            Err(RunQuotaDenied::Exhausted),
+            "no alternation ever resets the counters"
+        );
+    }
+
+    #[test]
+    fn run_quota_bucket_allowance_is_per_rule() {
+        let mut table = RunQuotaTable::new(2);
+        table
+            .charge(1, &quota_key("release", 1, 1), Some(10), RETENTION, NOW)
+            .expect("tracked");
+        table
+            .charge(1, &quota_key("release", 2, 1), Some(10), RETENTION, NOW)
+            .expect("tracked");
+        // A third distinct run under the SAME rule cannot be tracked: deny
+        // instead of evicting (an evicted bucket would restart its counter
+        // and over-admit).
+        assert_eq!(
+            table.charge(1, &quota_key("release", 3, 1), Some(10), RETENTION, NOW),
+            Err(RunQuotaDenied::Untracked)
+        );
+        // A different rule is unaffected by the saturated one: the bound is
+        // per rule, so one tenant cannot deny another tenant's runs.
+        table
+            .charge(1, &quota_key("nightly", 3, 1), Some(10), RETENTION, NOW)
+            .expect("other rule tracks independently");
+        // Already-tracked buckets keep serving inside their quota.
+        table
+            .charge(1, &quota_key("release", 1, 1), Some(10), RETENTION, NOW)
+            .expect("tracked bucket unaffected");
+    }
+
+    #[test]
+    fn run_quota_reclaims_expired_buckets_under_pressure() {
+        let mut table = RunQuotaTable::new(2);
+        table
+            .charge(1, &quota_key("release", 1, 1), Some(10), RETENTION, NOW)
+            .expect("tracked");
+        table
+            .charge(1, &quota_key("release", 2, 1), Some(10), RETENTION, NOW)
+            .expect("tracked");
+        let retention = i64::try_from(RETENTION).expect("fits");
+        // Inside the retention window nothing is reclaimable: deny.
+        assert_eq!(
+            table.charge(
+                1,
+                &quota_key("release", 3, 1),
+                Some(10),
+                RETENTION,
+                NOW + retention - 1,
+            ),
+            Err(RunQuotaDenied::Untracked)
+        );
+        // Past the retention window the idle buckets are reclaimed and the
+        // new run is admitted: table pressure never becomes permanent
+        // denial.
+        table
+            .charge(
+                1,
+                &quota_key("release", 3, 1),
+                Some(10),
+                RETENTION,
+                NOW + retention,
+            )
+            .expect("expired buckets reclaimed under pressure");
+    }
+
+    #[test]
+    fn run_quota_denied_charges_keep_an_exhausted_bucket_retained() {
+        let mut table = RunQuotaTable::new(1);
+        let exhausted = quota_key("release", 1, 1);
+        table
+            .charge(1, &exhausted, Some(1), RETENTION, NOW)
+            .expect("admitted");
+        let retention = i64::try_from(RETENTION).expect("fits");
+        // A denied charge attempt is verified token activity: it refreshes
+        // the bucket's expiry, so an actively retrying exhausted run stays
+        // exhausted rather than being reclaimed into a fresh quota.
+        let later = NOW + retention;
+        assert_eq!(
+            table.charge(1, &exhausted, Some(1), RETENTION, later),
+            Err(RunQuotaDenied::Exhausted)
+        );
+        // Without the refresh the bucket would have lapsed at NOW +
+        // retention and been reclaimed here; the denied attempt above
+        // extended it to `later + retention`.
+        let probe = later + retention - 1;
+        assert_eq!(
+            table.charge(1, &quota_key("release", 2, 1), Some(1), RETENTION, probe),
+            Err(RunQuotaDenied::Untracked),
+            "the refreshed exhausted bucket is not reclaimable yet"
+        );
+        assert_eq!(
+            table.charge(1, &exhausted, Some(1), RETENTION, probe),
+            Err(RunQuotaDenied::Exhausted),
+            "and it stays exhausted"
+        );
+    }
+
+    #[test]
+    fn concurrent_run_quota_charges_never_over_admit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        const LIMIT: u64 = 100;
+        const THREADS: usize = 8;
+        const CHARGES_PER_THREAD: usize = 50;
+
+        let table = Arc::new(Mutex::new(RunQuotaTable::new(16)));
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let table = Arc::clone(&table);
+                let admitted = Arc::clone(&admitted);
+                std::thread::spawn(move || {
+                    let key = quota_key("release", 900, 1);
+                    for _ in 0..CHARGES_PER_THREAD {
+                        let outcome = table.lock().expect("table lock").charge(
+                            1,
+                            &key,
+                            Some(LIMIT),
+                            RETENTION,
+                            NOW,
+                        );
+                        if outcome.is_ok() {
+                            admitted.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("charge thread joins");
+        }
+        // 400 attempted charges against a limit of 100: exactly the limit
+        // is admitted, never more.
+        assert_eq!(
+            admitted.load(Ordering::SeqCst),
+            usize::try_from(LIMIT).expect("fits")
+        );
+    }
+
     const FORGEJO_ISSUER: &str = "https://forge.example.com/api/actions";
 
     fn forgejo_rule(id: &str, run_attempt: u64) -> ProviderRule {
@@ -2118,6 +2731,7 @@ mod tests {
             operation_profiles: vec!["artifact-sign".to_string()],
             max_token_age_secs: 300,
             clock_skew_secs: 30,
+            max_operations_per_run: Some(64),
             provider: ProviderConfig::ForgejoActions(ForgejoActionsRule {
                 issuer: FORGEJO_ISSUER.to_string(),
                 discovery_url: format!("{FORGEJO_ISSUER}/.well-known/openid-configuration"),

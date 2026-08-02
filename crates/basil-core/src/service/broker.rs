@@ -53,6 +53,11 @@ pub struct InvocationRuntimeConfig {
     pub clock_skew_secs: u32,
     /// Maximum replay-cache entries retained in memory.
     pub replay_cache_capacity: usize,
+    /// Maximum distinct tracked per-run quota buckets **per federation
+    /// rule** (`invocation.run-quota-buckets-per-rule`). The bound is per
+    /// rule so one federated tenant's runs can never exhaust another
+    /// tenant's tracking allowance.
+    pub run_quota_buckets_per_rule: usize,
     /// Require a single-use freshness challenge on every sealed invocation,
     /// including subject-key requests. Proof-bound requests always require
     /// one. Deployments that accept courier-borne traffic (for example the
@@ -74,6 +79,8 @@ impl Default for InvocationRuntimeConfig {
             max_ttl_secs: basil_proto::invocation::DEFAULT_EXPIRES_AFTER_SECS,
             clock_skew_secs: 30,
             replay_cache_capacity: 4096,
+            run_quota_buckets_per_rule:
+                crate::core::ci_federation::DEFAULT_MAX_TRACKED_RUN_BUCKETS_PER_RULE,
             require_challenge: false,
             now_unix_override: None,
         }
@@ -115,11 +122,15 @@ impl BrokerGrpc {
         invocation: InvocationRuntimeConfig,
     ) -> Self {
         let capacity = invocation.replay_cache_capacity;
+        let run_quota_buckets_per_rule = invocation.run_quota_buckets_per_rule;
         Self {
             state,
             invocation,
             invocation_replay_cache: Arc::new(Mutex::new(
-                crate::service::invocation::InvocationReplayCache::new(capacity),
+                crate::service::invocation::InvocationReplayCache::new(
+                    capacity,
+                    run_quota_buckets_per_rule,
+                ),
             )),
         }
     }
