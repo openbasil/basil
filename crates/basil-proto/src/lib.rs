@@ -17,10 +17,17 @@
 pub const FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/basil_descriptor.bin"));
 
+pub mod codec;
+
 pub mod broker {
     pub mod v1 {
         #![allow(clippy::all, clippy::nursery, clippy::pedantic)]
         tonic::include_proto!("basil.broker.v1");
+        include!(concat!(env!("OUT_DIR"), "/nix_cache/basil.broker.v1.rs"));
+        include!(concat!(
+            env!("OUT_DIR"),
+            "/basil.broker.v1.NixCacheService.rs"
+        ));
     }
 }
 

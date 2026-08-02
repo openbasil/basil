@@ -1,0 +1,76 @@
+// SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package basil.broker.v1;
+
+// Purpose-specific Nix binary-cache key custody operations.
+service NixCacheService {
+  // Return the enrolled Nix verifier identity for a catalog key.
+  rpc DescribeNixCacheKey(DescribeNixCacheKeyRequest) returns (DescribeNixCacheKeyResponse);
+  // Ensure and enroll a pending Nix binary-cache key.
+  rpc EnrollNixCacheKey(EnrollNixCacheKeyRequest) returns (EnrollNixCacheKeyResponse);
+  // Sign one canonical PATH_INFO_V1 fingerprint.
+  rpc SignNixCacheFingerprint(SignNixCacheFingerprintRequest) returns (SignNixCacheFingerprintResponse);
+}
+
+// Request the enrolled identity for one Nix binary-cache key.
+message DescribeNixCacheKeyRequest {
+  string key_id = 1;
+  bytes batch_id = 2;
+  bytes request_id = 3;
+}
+
+// Enrolled Nix verifier identity.
+message DescribeNixCacheKeyResponse {
+  string key_name = 1;
+  bytes public_key = 2;
+  uint32 backend_version = 3;
+  bytes batch_id = 4;
+  bytes request_id = 5;
+}
+
+// Request creation or compare-only validation of a pending Nix cache key.
+message EnrollNixCacheKeyRequest {
+  string key_id = 1;
+  bytes batch_id = 2;
+  bytes request_id = 3;
+}
+
+// Result of a Nix cache key enrollment request.
+enum NixCacheEnrollmentDisposition {
+  NIX_CACHE_ENROLLMENT_DISPOSITION_UNSPECIFIED = 0;
+  NIX_CACHE_ENROLLMENT_DISPOSITION_CREATED = 1;
+  NIX_CACHE_ENROLLMENT_DISPOSITION_EXISTING = 2;
+}
+
+// Public-only enrollment result.
+message EnrollNixCacheKeyResponse {
+  string key_name = 1;
+  bytes public_key = 2;
+  uint32 backend_version = 3;
+  NixCacheEnrollmentDisposition disposition = 4;
+  bytes batch_id = 5;
+  bytes request_id = 6;
+}
+
+// Request a signature over one canonical Nix path-info fingerprint.
+message SignNixCacheFingerprintRequest {
+  string key_id = 1;
+  string profile = 2;
+  bytes fingerprint = 3;
+  bytes batch_id = 4;
+  bytes request_id = 5;
+}
+
+// Signature and enrolled verifier identity for one Nix path-info fingerprint.
+message SignNixCacheFingerprintResponse {
+  string key_name = 1;
+  bytes public_key = 2;
+  uint32 backend_version = 3;
+  bytes signature = 4;
+  bytes batch_id = 5;
+  bytes request_id = 6;
+}

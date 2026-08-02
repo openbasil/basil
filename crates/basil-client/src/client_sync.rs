@@ -12,7 +12,8 @@ use crate::client::{
     AgentConnection, AgentConnectionDrop, AgentConnectionSelector, AgentExplanation, AgentHealth,
     AgentReadiness, AgentReload, AgentRevocation, AgentStatus, AllowedNatsSigner, ImportEntry,
     InvocationChallenge, IssuedCertificate, KeyHandle, MintedJwt, NatsJwtValidation,
-    NatsUserPermissions, SecretValue, SignNatsJwtOptions,
+    NatsUserPermissions, NixCacheEnrollment, NixCacheKey, NixCacheSignature, SecretValue,
+    SignNatsJwtOptions,
 };
 use crate::constants::DEFAULT_CONN_TIMEOUT;
 use crate::error::Result;
@@ -64,6 +65,48 @@ impl BlockingClient {
     /// server nonce or JWT signing input (see [`Client::sign`]).
     pub fn sign(&mut self, key_id: &str, message: &[u8]) -> Result<Vec<u8>> {
         self.runtime.block_on(self.inner.sign(key_id, message))
+    }
+
+    /// Describe one enrolled Nix binary-cache key.
+    pub fn describe_nix_cache_key(
+        &mut self,
+        key_id: &str,
+        batch_id: [u8; 16],
+        request_id: [u8; 16],
+    ) -> Result<NixCacheKey> {
+        self.runtime.block_on(
+            self.inner
+                .describe_nix_cache_key(key_id, batch_id, request_id),
+        )
+    }
+
+    /// Ensure and enroll one pending Nix binary-cache key.
+    pub fn enroll_nix_cache_key(
+        &mut self,
+        key_id: &str,
+        batch_id: [u8; 16],
+        request_id: [u8; 16],
+    ) -> Result<NixCacheEnrollment> {
+        self.runtime.block_on(
+            self.inner
+                .enroll_nix_cache_key(key_id, batch_id, request_id),
+        )
+    }
+
+    /// Sign one canonical `PATH_INFO_V1` fingerprint.
+    pub fn sign_nix_cache_fingerprint(
+        &mut self,
+        key_id: &str,
+        fingerprint: &[u8],
+        batch_id: [u8; 16],
+        request_id: [u8; 16],
+    ) -> Result<NixCacheSignature> {
+        self.runtime.block_on(self.inner.sign_nix_cache_fingerprint(
+            key_id,
+            fingerprint,
+            batch_id,
+            request_id,
+        ))
     }
 
     /// Verify `signature` over `message` with `key_id`.
