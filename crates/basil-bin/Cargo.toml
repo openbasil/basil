@@ -64,6 +64,7 @@ base64 = { workspace = true, features = ["std"] }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 hex = { workspace = true }
+getrandom = { workspace = true }
 mimalloc = { workspace = true }
 # `basil-attestor` entrypoint: effective-UID default for the runtime-directory
 # owner check.
@@ -74,6 +75,11 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 zeroize = { workspace = true }
+
+[dev-dependencies]
+basil-proto = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
 
 [lints]
 workspace = true

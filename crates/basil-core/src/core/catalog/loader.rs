@@ -30,7 +30,9 @@ use super::policy::{
     ALL_OPS, ActionTerm, ActionTermError, Config, Grant, Op, ResolvedPolicy, ResolvedRule, Rule,
     SignatureKeyAlgorithm, SubjectDefinition, SubjectName,
 };
-use super::schema::{Catalog, Class, Engine, GenerateSpec, KeyAlgorithm, KeyEntry, MissingPolicy};
+use super::schema::{
+    BackendKind, Catalog, Class, Engine, GenerateSpec, KeyAlgorithm, KeyEntry, MissingPolicy,
+};
 
 /// A warning recorded during loading that is not fatal (§3.7). The broker should
 /// log these; they do not abort the load.
@@ -404,6 +406,29 @@ pub enum LoadError {
     EmptyPinnedPartyIdentity {
         /// The offending key name.
         key: String,
+    },
+
+    /// A `nixCache` identity is incompatible with the key's routing/custody
+    /// shape or violates the pending/enrolled identity contract.
+    #[error("key `{key}` has invalid `nixCache` identity: {reason}")]
+    InvalidNixCacheIdentity {
+        /// The offending catalog key ID.
+        key: String,
+        /// Stable, secret-free validation reason.
+        reason: &'static str,
+    },
+
+    /// Two catalog entries declare the same Nix verifier identity.
+    #[error(
+        "`nixCache` `keyName` `{key_name}` is declared by both `{first_key}` and `{second_key}`"
+    )]
+    DuplicateNixCacheKeyName {
+        /// The duplicated Nix verifier identity.
+        key_name: String,
+        /// First catalog key ID using the identity.
+        first_key: String,
+        /// Second catalog key ID using the identity.
+        second_key: String,
     },
 
     /// A reserved label appears more than once on one key.
@@ -835,8 +860,18 @@ fn validate_catalog(catalog: &Catalog) -> Result<Vec<LoadWarning>, LoadError> {
     // Duplicate key names cannot occur (BTreeMap dedups on deserialize), so the
     // §5 "duplicate key" guard is structurally satisfied by the map type.
     let mut warnings = Vec::new();
+    let mut nix_key_names = BTreeMap::<&str, &str>::new();
     for (name, key) in &catalog.keys {
         validate_key(catalog, name, key, &mut warnings)?;
+        if let Some(identity) = key.nix_cache.as_ref()
+            && let Some(first_key) = nix_key_names.insert(&identity.key_name, name)
+        {
+            return Err(LoadError::DuplicateNixCacheKeyName {
+                key_name: identity.key_name.clone(),
+                first_key: first_key.to_string(),
+                second_key: name.clone(),
+            });
+        }
     }
     Ok(warnings)
 }
@@ -856,9 +891,77 @@ fn validate_key(
     validate_jwt_svid_issuer_alg(name, key)?;
     validate_public_path(name, key)?;
     validate_sealing_pin(name, key)?;
+    validate_nix_cache_identity(catalog, name, key)?;
     validate_reserved_labels(name, key)?;
     warn_missing_nats_type(name, key, warnings);
     Ok(())
+}
+
+fn validate_nix_cache_identity(
+    catalog: &Catalog,
+    name: &str,
+    key: &KeyEntry,
+) -> Result<(), LoadError> {
+    let Some(identity) = key.nix_cache.as_ref() else {
+        return Ok(());
+    };
+    let invalid = |reason| LoadError::InvalidNixCacheIdentity {
+        key: name.to_string(),
+        reason,
+    };
+
+    if key.class != Class::Asymmetric {
+        return Err(invalid("class must be asymmetric"));
+    }
+    if key.key_type != Some(KeyAlgorithm::Ed25519) {
+        return Err(invalid("keyType must be ed25519"));
+    }
+    if key.effective_engine() != Engine::Transit {
+        return Err(invalid("engine must be transit"));
+    }
+    if key.path.trim().is_empty() {
+        return Err(invalid("backend path must not be blank"));
+    }
+    if key.missing == MissingPolicy::Generate {
+        return Err(invalid(
+            "missing=generate is forbidden; use explicit Nix cache enrollment",
+        ));
+    }
+    let backend = catalog
+        .backends
+        .get(&key.backend)
+        .ok_or_else(|| invalid("backend must exist"))?;
+    if backend.kind != BackendKind::Vault {
+        return Err(invalid("backend must be OpenBao or Vault transit"));
+    }
+    if identity.backend_version != 1 {
+        return Err(invalid("backendVersion must be 1"));
+    }
+    if !valid_nix_cache_key_name(&identity.key_name) {
+        return Err(invalid(
+            "keyName must match [A-Za-z0-9][A-Za-z0-9._-]{0,127}",
+        ));
+    }
+    match (identity.state, identity.public_key) {
+        (crate::catalog::schema::NixCacheState::Pending, None)
+        | (crate::catalog::schema::NixCacheState::Enrolled, Some(_)) => Ok(()),
+        (crate::catalog::schema::NixCacheState::Pending, Some(_)) => {
+            Err(invalid("pending state forbids publicKey"))
+        }
+        (crate::catalog::schema::NixCacheState::Enrolled, None) => {
+            Err(invalid("enrolled state requires publicKey"))
+        }
+    }
+}
+
+fn valid_nix_cache_key_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    (1..=128).contains(&bytes.len())
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .skip(1)
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'_' | b'-'))
 }
 
 /// Enforce the documented dotted-lowercase key-name shape (§2.4): one or more
@@ -2419,6 +2522,151 @@ mod tests {
         assert!(matches!(
             load(&cat, &pol),
             Err(LoadError::UnknownBackend { .. })
+        ));
+    }
+
+    fn nix_cache_key(state: &str, public_key: Option<&str>) -> String {
+        let public_key =
+            public_key.map_or_else(String::new, |value| format!(r#", "publicKey": "{value}""#));
+        format!(
+            r#""cache.signer": {{
+              "class": "asymmetric", "keyType": "ed25519", "backend": "bao",
+              "engine": "transit", "path": "cache-signer", "writable": false,
+              "nixCache": {{ "keyName": "cache.example.org-1", "state": "{state}",
+                "backendVersion": 1{public_key} }},
+              "description": "Nix cache signer"
+            }}"#
+        )
+    }
+
+    #[test]
+    fn nix_cache_pending_and_enrolled_identities_load() {
+        let pol = policy_json("", "");
+        let pending = catalog_json(&nix_cache_key("pending", None));
+        let (catalog, _, _, _) = load(&pending, &pol).expect("pending identity loads");
+        let identity = catalog.keys["cache.signer"]
+            .nix_cache
+            .as_ref()
+            .expect("typed identity retained");
+        assert_eq!(identity.state, crate::catalog::NixCacheState::Pending);
+        assert!(identity.public_key.is_none());
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode([0x42; 32]);
+        let enrolled = catalog_json(&nix_cache_key("enrolled", Some(&encoded)));
+        let (catalog, _, _, _) = load(&enrolled, &pol).expect("enrolled identity loads");
+        let public_key = catalog.keys["cache.signer"]
+            .nix_cache
+            .as_ref()
+            .and_then(|identity| identity.public_key)
+            .expect("public key retained");
+        assert_eq!(public_key.as_bytes(), &[0x42; 32]);
+    }
+
+    #[test]
+    fn nix_cache_state_and_public_key_presence_are_exact() {
+        let pol = policy_json("", "");
+        let encoded = base64::engine::general_purpose::STANDARD.encode([7; 32]);
+        let pending_with_public = catalog_json(&nix_cache_key("pending", Some(&encoded)));
+        assert!(matches!(
+            load(&pending_with_public, &pol),
+            Err(LoadError::InvalidNixCacheIdentity { .. })
+        ));
+
+        let enrolled_without_public = catalog_json(&nix_cache_key("enrolled", None));
+        assert!(matches!(
+            load(&enrolled_without_public, &pol),
+            Err(LoadError::InvalidNixCacheIdentity { .. })
+        ));
+    }
+
+    #[test]
+    fn nix_cache_identity_forbids_startup_generate_in_every_state() {
+        let pol = policy_json("", "");
+        let public_key = base64::engine::general_purpose::STANDARD.encode([7; 32]);
+        for (state, public_key) in [("pending", None), ("enrolled", Some(public_key.as_str()))] {
+            let generated = nix_cache_key(state, public_key).replacen(
+                r#""writable": false,"#,
+                r#""writable": false, "missing": "generate","#,
+                1,
+            );
+            let catalog = catalog_json(&generated);
+            assert!(matches!(
+                load(&catalog, &pol),
+                Err(LoadError::InvalidNixCacheIdentity {
+                    reason: "missing=generate is forbidden; use explicit Nix cache enrollment",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn nix_cache_public_key_requires_canonical_padded_standard_base64() {
+        let pol = policy_json("", "");
+        let canonical = base64::engine::general_purpose::STANDARD.encode([0xff; 32]);
+        let invalid = [
+            canonical.trim_end_matches('=').to_string(),
+            base64::engine::general_purpose::URL_SAFE.encode([0xff; 32]),
+            base64::engine::general_purpose::STANDARD.encode([0xff; 31]),
+            "not-base64".to_string(),
+        ];
+        for public_key in invalid {
+            let catalog = catalog_json(&nix_cache_key("enrolled", Some(&public_key)));
+            assert!(
+                matches!(
+                    load(&catalog, &pol),
+                    Err(LoadError::Json {
+                        what: "catalog",
+                        ..
+                    })
+                ),
+                "noncanonical public key must fail: {public_key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nix_cache_identity_requires_vault_ed25519_transit_version_one() {
+        let pol = policy_json("", "");
+        let valid = catalog_json(&nix_cache_key("pending", None));
+        for invalid in [
+            valid.replacen("\"class\": \"asymmetric\"", "\"class\": \"symmetric\"", 1),
+            valid.replacen("\"keyType\": \"ed25519\"", "\"keyType\": \"rsa-2048\"", 1),
+            valid.replacen("\"engine\": \"transit\"", "\"engine\": \"kv2\"", 1),
+            valid.replacen("\"kind\": \"vault\"", "\"kind\": \"keystore\"", 1),
+            valid.replacen("\"backendVersion\": 1", "\"backendVersion\": 2", 1),
+        ] {
+            assert!(
+                matches!(
+                    load(&invalid, &pol),
+                    Err(LoadError::InvalidNixCacheIdentity { .. }
+                        | LoadError::MissingPublicPath { .. })
+                ),
+                "incompatible Nix identity must fail"
+            );
+        }
+    }
+
+    #[test]
+    fn nix_cache_key_name_shape_and_catalog_wide_uniqueness_are_enforced() {
+        let pol = policy_json("", "");
+        let valid = catalog_json(&nix_cache_key("pending", None));
+        for invalid_name in ["", "-cache", "cache/name", "cache name", &"a".repeat(129)] {
+            let invalid = valid.replacen("cache.example.org-1", invalid_name, 1);
+            assert!(matches!(
+                load(&invalid, &pol),
+                Err(LoadError::InvalidNixCacheIdentity { .. })
+            ));
+        }
+
+        let first = nix_cache_key("pending", None);
+        let second = first
+            .replacen("\"cache.signer\"", "\"cache.other\"", 1)
+            .replacen("\"path\": \"cache-signer\"", "\"path\": \"cache-other\"", 1);
+        let duplicate = catalog_json(&format!("{first}, {second}"));
+        assert!(matches!(
+            load(&duplicate, &pol),
+            Err(LoadError::DuplicateNixCacheKeyName { .. })
         ));
     }
 

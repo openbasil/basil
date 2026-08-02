@@ -19,7 +19,11 @@
 //! The reloadable surface is the **content** the [`Pdp`](crate::catalog::Pdp) and
 //! the audit trail consume: the entire policy (rules / roles / name + membership
 //! tables) and the per-key *authorization* attributes: `writable`, `labels`,
-//! `description`, `missing`. The **routing shape** is restart-only:
+//! `description`, `missing`. A declared `nixCache` identity has one additional,
+//! purpose-specific transition: `pending` may become `enrolled` exactly once.
+//! Its name, route, version, and enrolled public key are process-lifetime
+//! immutable, including through a monotonic enrolled-name tombstone. The
+//! **routing shape** is otherwise restart-only:
 //! the [`BackendManager`](crate::manager::BackendManager) and the live backend
 //! instances were built from the sealed bundle at startup, so adding/removing a
 //! backend, or changing any key's `class`/`backend`/`path`/`engine`/`key_type`/
@@ -147,6 +151,11 @@ pub enum ReloadError {
     #[error("reload touches a restart-only routing dimension: {0}")]
     RoutingShapeChanged(String),
 
+    /// A candidate violated the one-way, process-lifetime Nix cache identity
+    /// enrollment contract.
+    #[error("reload violates immutable nixCache identity: {0}")]
+    NixCacheIdentityChanged(String),
+
     /// The broker was constructed without [`ReloadInputs`] (no configured
     /// catalog/policy paths), so it has nothing to re-read. A reload is a no-op
     /// fail-closed rather than reading from an unknown source.
@@ -173,6 +182,7 @@ impl ReloadError {
             | Self::ListenerTransition(_) => "validation_failed",
             Self::ListenerTransitionBlocked(_) => "listener_transition_blocked",
             Self::RoutingShapeChanged(_) => "routing_shape_changed",
+            Self::NixCacheIdentityChanged(_) => "nix_cache_identity_changed",
             Self::NoInputs => "no_reload_inputs",
             Self::LiveRuntimeRequired => "listener_runtime_required",
         }
@@ -196,6 +206,8 @@ struct BackendShape {
 /// backend instance, a backend-native locator, and the materialize footprint.
 /// `writable` is not here (it is reloadable), but `class` selects the op surface,
 /// engine inference, and the materialize arm, so it is restart-only shape.
+/// `nixCache` is validated separately because its sole pending-to-enrolled
+/// transition is reloadable while all of its identity fields are immutable.
 #[derive(Debug, PartialEq, Eq)]
 struct KeyShape {
     class: Class,
@@ -269,6 +281,92 @@ fn ensure_reloadable(current: &Catalog, candidate: &Catalog) -> Result<(), Reloa
             "a key was added/removed or a key's class/backend/path/engine/key_type/public_path changed"
                 .to_string(),
         ));
+    }
+    Ok(())
+}
+
+fn ensure_nix_cache_reloadable(
+    current: &Catalog,
+    candidate: &Catalog,
+    enrolled_tombstones: &BTreeSet<String>,
+) -> Result<(), ReloadError> {
+    for (key_id, current_key) in &current.keys {
+        let candidate_key = candidate.keys.get(key_id).ok_or_else(|| {
+            ReloadError::NixCacheIdentityChanged(format!("catalog key `{key_id}` was removed"))
+        })?;
+        match (
+            current_key.nix_cache.as_ref(),
+            candidate_key.nix_cache.as_ref(),
+        ) {
+            (None, None) => {}
+            (None, Some(_)) => {
+                return Err(ReloadError::NixCacheIdentityChanged(format!(
+                    "catalog key `{key_id}` added nixCache metadata; declare the identity at startup"
+                )));
+            }
+            (Some(_), None) => {
+                return Err(ReloadError::NixCacheIdentityChanged(format!(
+                    "catalog key `{key_id}` removed nixCache metadata"
+                )));
+            }
+            (Some(previous), Some(next)) => {
+                if previous.key_name != next.key_name {
+                    return Err(ReloadError::NixCacheIdentityChanged(format!(
+                        "catalog key `{key_id}` changed keyName"
+                    )));
+                }
+                if previous.backend_version != next.backend_version {
+                    return Err(ReloadError::NixCacheIdentityChanged(format!(
+                        "catalog key `{key_id}` changed backendVersion"
+                    )));
+                }
+                match (previous.state, next.state) {
+                    (
+                        crate::catalog::NixCacheState::Pending,
+                        crate::catalog::NixCacheState::Pending
+                        | crate::catalog::NixCacheState::Enrolled,
+                    ) => {}
+                    (
+                        crate::catalog::NixCacheState::Enrolled,
+                        crate::catalog::NixCacheState::Pending,
+                    ) => {
+                        return Err(ReloadError::NixCacheIdentityChanged(format!(
+                            "catalog key `{key_id}` moved from enrolled back to pending"
+                        )));
+                    }
+                    (
+                        crate::catalog::NixCacheState::Enrolled,
+                        crate::catalog::NixCacheState::Enrolled,
+                    ) => {
+                        if previous.public_key != next.public_key {
+                            return Err(ReloadError::NixCacheIdentityChanged(format!(
+                                "catalog key `{key_id}` replaced its enrolled publicKey"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for (key_id, candidate_key) in &candidate.keys {
+        let Some(identity) = candidate_key.nix_cache.as_ref() else {
+            continue;
+        };
+        if !enrolled_tombstones.contains(&identity.key_name) {
+            continue;
+        }
+        let preserves_current_enrollment = current.keys.get(key_id).is_some_and(|current_key| {
+            current_key.nix_cache.as_ref().is_some_and(|previous| {
+                previous.state == crate::catalog::NixCacheState::Enrolled && previous == identity
+            })
+        });
+        if !preserves_current_enrollment {
+            return Err(ReloadError::NixCacheIdentityChanged(format!(
+                "keyName `{}` was already enrolled during this process lifetime",
+                identity.key_name
+            )));
+        }
     }
     Ok(())
 }
@@ -608,6 +706,11 @@ fn validate_candidate_with_trace_collector_and_observer(
     // and (b) read the previous id to bump from: one coherent snapshot.
     let current = state.load_generation();
     ensure_reloadable(current.catalog(), &catalog)?;
+    ensure_nix_cache_reloadable(
+        current.catalog(),
+        &catalog,
+        &state.nix_cache_enrolled_tombstones(),
+    )?;
     let listener_impacts = crate::transport::listener_manager::assess_transition(
         current.listeners(),
         &listeners,
@@ -726,9 +829,10 @@ pub fn reload_generation(state: &BrokerState) -> Result<ReloadOutcome, ReloadErr
         outcome.new_generation,
         unix_now(),
     );
+    let catalog = Arc::new(catalog);
     let next = Generation::new_with_overrides_oci_listeners_and_federation(
         outcome.new_generation,
-        Arc::new(catalog),
+        Arc::clone(&catalog),
         policy,
         config,
         overrides,
@@ -739,6 +843,7 @@ pub fn reload_generation(state: &BrokerState) -> Result<ReloadOutcome, ReloadErr
     drop(current);
     listener_guard.commit(|| {
         state.swap_generation(Arc::new(next));
+        state.record_nix_cache_enrollments(&catalog);
         state.connections().rewire().apply(rewire_updates);
         for trust_domain in bundle_changed_trust_domains {
             state.events().bundle_changed(trust_domain);
@@ -800,9 +905,10 @@ pub async fn reload_generation_live(state: &BrokerState) -> Result<ReloadOutcome
         outcome.new_generation,
         unix_now(),
     );
+    let catalog = Arc::new(catalog);
     let next = Generation::new_with_overrides_oci_listeners_and_federation(
         outcome.new_generation,
-        Arc::new(catalog),
+        Arc::clone(&catalog),
         policy,
         config,
         overrides,
@@ -813,6 +919,7 @@ pub async fn reload_generation_live(state: &BrokerState) -> Result<ReloadOutcome
     runtime
         .transition(&current_listeners, &listeners, || {
             state.swap_generation(Arc::new(next));
+            state.record_nix_cache_enrollments(&catalog);
             state.connections().rewire().apply(rewire_updates);
             for trust_domain in bundle_changed_trust_domains {
                 state.events().bundle_changed(trust_domain);
@@ -825,12 +932,13 @@ pub async fn reload_generation_live(state: &BrokerState) -> Result<ReloadOutcome
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::os::unix::fs::PermissionsExt as _;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use async_trait::async_trait;
+    use base64::Engine as _;
     use basil_proto::KeyType;
     use tracing::field::{Field, Visit};
     use tracing::{Event, Level, Subscriber};
@@ -1000,6 +1108,26 @@ mod tests {
           }
         }"#
         .to_string()
+    }
+
+    fn nix_catalog_json(state: &str, key_name: &str, public_key: Option<&str>) -> String {
+        let public_key =
+            public_key.map_or_else(String::new, |value| format!(r#", "publicKey": "{value}""#));
+        format!(
+            r#"{{
+              "schema": "catalog",
+              "backends": {{ "bao": {{ "kind": "vault", "addr": "http://127.0.0.1:8200" }} }},
+              "keys": {{
+                "cache.signer": {{
+                  "class": "asymmetric", "keyType": "ed25519", "backend": "bao",
+                  "engine": "transit", "path": "cache-signer", "writable": false,
+                  "nixCache": {{ "keyName": "{key_name}", "state": "{state}",
+                    "backendVersion": 1{public_key} }},
+                  "description": "Nix cache signer"
+                }}
+              }}
+            }}"#
+        )
     }
 
     fn policy_json(grant_sign: bool) -> String {
@@ -1198,6 +1326,119 @@ mod tests {
         // a fresh load sees the NEW one.
         assert_eq!(pinned.id(), INITIAL_GENERATION_ID);
         assert_eq!(state.active_generation_id(), INITIAL_GENERATION_ID + 1);
+    }
+
+    #[test]
+    fn nix_cache_pending_enrolls_once_and_check_is_non_mutating() {
+        let pending = nix_catalog_json("pending", "cache.example.org-1", None);
+        let (state, inputs) = state_with_files(&pending, &policy_json(false));
+        assert!(state.nix_cache_enrolled_tombstones().is_empty());
+
+        let public_key = base64::engine::general_purpose::STANDARD.encode([0x42; 32]);
+        let enrolled = nix_catalog_json("enrolled", "cache.example.org-1", Some(&public_key));
+        write_files(&inputs, &enrolled, &policy_json(false));
+        check_reload(&state).expect("pending to enrolled dry-run validates");
+        assert!(
+            state.nix_cache_enrolled_tombstones().is_empty(),
+            "a dry-run must not mutate enrollment history"
+        );
+
+        reload_generation(&state).expect("pending to enrolled reload applies");
+        let current = state.load_generation();
+        assert_eq!(
+            current.catalog().keys["cache.signer"]
+                .nix_cache
+                .as_ref()
+                .expect("identity")
+                .state,
+            crate::catalog::NixCacheState::Enrolled
+        );
+        assert_eq!(
+            state.nix_cache_enrolled_tombstones(),
+            BTreeSet::from(["cache.example.org-1".to_string()])
+        );
+    }
+
+    #[test]
+    fn nix_cache_enrollment_reverse_replacement_and_removal_fail_closed() {
+        let public_key = base64::engine::general_purpose::STANDARD.encode([0x42; 32]);
+        let enrolled = nix_catalog_json("enrolled", "cache.example.org-1", Some(&public_key));
+        let (state, inputs) = state_with_files(&enrolled, &policy_json(false));
+        let initial_generation = state.active_generation_id();
+        let replacement = base64::engine::general_purpose::STANDARD.encode([0x43; 32]);
+        let mut without_identity: serde_json::Value =
+            serde_json::from_str(&enrolled).expect("enrolled JSON parses");
+        without_identity["keys"]["cache.signer"]
+            .as_object_mut()
+            .expect("key is an object")
+            .remove("nixCache");
+        let without_identity =
+            serde_json::to_string(&without_identity).expect("candidate serializes");
+        let candidates = [
+            nix_catalog_json("pending", "cache.example.org-1", None),
+            nix_catalog_json("enrolled", "cache.example.org-1", Some(&replacement)),
+            nix_catalog_json("enrolled", "cache.example.org-2", Some(&public_key)),
+            without_identity,
+        ];
+        for candidate in candidates {
+            write_files(&inputs, &candidate, &policy_json(false));
+            assert!(
+                matches!(
+                    reload_generation(&state),
+                    Err(ReloadError::NixCacheIdentityChanged(_))
+                ),
+                "immutable identity edit must fail closed"
+            );
+            assert_eq!(state.active_generation_id(), initial_generation);
+        }
+    }
+
+    #[test]
+    fn nix_cache_metadata_cannot_be_added_by_reload() {
+        let generic = catalog_json(false);
+        let (state, inputs) = state_with_files(&generic, &policy_json(false));
+        let pending = generic.replacen(
+            r#", "writable": false, "description": "a signer""#,
+            r#", "writable": false, "nixCache": { "keyName": "cache.example.org-1", "state": "pending", "backendVersion": 1 }, "description": "a signer""#,
+            1,
+        );
+        write_files(&inputs, &pending, &policy_json(false));
+        assert!(matches!(
+            reload_generation(&state),
+            Err(ReloadError::NixCacheIdentityChanged(_))
+        ));
+    }
+
+    #[test]
+    fn nix_cache_tombstone_rejects_redeclaration_after_absence() {
+        let current_json = catalog_json(false);
+        let candidate_json = current_json.replacen(
+            r#", "writable": false, "description": "a signer""#,
+            r#", "writable": false, "nixCache": { "keyName": "cache.example.org-1", "state": "pending", "backendVersion": 1 }, "description": "a signer""#,
+            1,
+        );
+        let (current, _, _, _) = load(&current_json, &policy_json(false)).expect("current loads");
+        let (candidate, _, _, _) =
+            load(&candidate_json, &policy_json(false)).expect("candidate loads");
+        assert!(matches!(
+            super::ensure_nix_cache_reloadable(
+                &current,
+                &candidate,
+                &BTreeSet::from(["cache.example.org-1".to_string()]),
+            ),
+            Err(ReloadError::NixCacheIdentityChanged(_))
+        ));
+    }
+
+    #[test]
+    fn failed_nix_cache_reload_does_not_add_tombstone() {
+        let pending = nix_catalog_json("pending", "cache.example.org-1", None);
+        let (state, inputs) = state_with_files(&pending, &policy_json(false));
+        let public_key = base64::engine::general_purpose::STANDARD.encode([0x42; 32]);
+        let enrolled = nix_catalog_json("enrolled", "cache.example.org-1", Some(&public_key));
+        write_files(&inputs, &enrolled, "not-json");
+        assert!(reload_generation(&state).is_err());
+        assert!(state.nix_cache_enrolled_tombstones().is_empty());
     }
 
     #[test]

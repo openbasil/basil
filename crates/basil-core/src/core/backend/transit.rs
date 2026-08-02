@@ -25,7 +25,7 @@ use zeroize::{Zeroize, Zeroizing};
 use basil_proto::{AeadAlgorithm, CiphertextEnvelope, KeyMaterial, KeyType};
 
 use super::kms_common::{ecdsa_der_to_raw, ecdsa_raw_to_der};
-use super::{BackendError, KeyMetadata, NewKey, PublicKey, SignOptions};
+use super::{BackendError, KeyMetadata, NewKey, NixCacheKeyPosture, PublicKey, SignOptions};
 
 /// Wire version assumed for transit signatures (v1 keys are never rotated).
 const SIG_VERSION: u32 = 1;
@@ -342,6 +342,26 @@ impl TransitClient {
         })
     }
 
+    /// Idempotently create a purpose-bound Nix binary-cache signing key.
+    ///
+    /// Vault and `OpenBao` ignore a named create when the key already exists. The
+    /// manager serializes the initial read/create/read sequence and compares the
+    /// exact posture after this call, so an existing key is never mutated here.
+    pub(crate) async fn create_nix_cache_key(
+        &self,
+        token: &str,
+        key_id: &str,
+    ) -> Result<(), BackendError> {
+        self.post_at_segments(
+            Mount::Transit,
+            token,
+            &["keys", key_id],
+            nix_cache_create_body(),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Create a transit **symmetric AEAD** key at a named path. AEAD suites
     /// (`aes256-gcm96`, `chacha20-poly1305`) are not wire [`KeyType`]s, so the
     /// reconcile `generate` path passes the transit type string directly. Unlike a
@@ -428,6 +448,18 @@ impl TransitClient {
             key_type: transit_type_to_wire(data).ok(),
             latest_version: latest_version(data),
         })
+    }
+
+    /// Read the exact public-only posture used by Nix key enrollment.
+    pub(crate) async fn read_nix_cache_key_posture(
+        &self,
+        token: &str,
+        key_id: &str,
+    ) -> Result<NixCacheKeyPosture, BackendError> {
+        let info = self
+            .get_at_segments(Mount::Transit, token, &["keys", key_id])
+            .await?;
+        nix_cache_key_posture(key_data(&info)?)
     }
 
     /// `IMPORT` (BYOK) provisions transit key `key_id` from caller material.
@@ -1071,6 +1103,85 @@ fn transit_type_to_wire(data: &Value) -> Result<KeyType, BackendError> {
     }
 }
 
+fn nix_cache_create_body() -> Value {
+    json!({
+        "type": "ed25519",
+        "derived": false,
+        "exportable": false,
+        "allow_plaintext_backup": false,
+        "auto_rotate_period": "0",
+    })
+}
+
+/// Parse the fail-closed posture contract for a Nix binary-cache key.
+fn nix_cache_key_posture(data: &Value) -> Result<NixCacheKeyPosture, BackendError> {
+    let public_key = data
+        .get("keys")
+        .and_then(|keys| keys.get("1"))
+        .and_then(|version| version.get("public_key"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError::Protocol("no version-one public_key in key info".into()))?;
+    let decoded = B64.decode(public_key).map_err(|_| {
+        BackendError::Protocol("version-one public_key is not padded standard base64".into())
+    })?;
+    let public_key: [u8; 32] = decoded.try_into().map_err(|_| {
+        BackendError::Protocol("version-one public_key is not exactly 32 bytes".into())
+    })?;
+    if B64.encode(public_key) != public_key_field(data)? {
+        return Err(BackendError::Protocol(
+            "version-one public_key is not canonical padded standard base64".into(),
+        ));
+    }
+
+    Ok(NixCacheKeyPosture {
+        public_key,
+        key_type: transit_type_to_wire(data)?,
+        latest_version: required_u32(data, "latest_version")?,
+        min_decryption_version: required_u32(data, "min_decryption_version")?,
+        derived: required_bool(data, "derived")?,
+        exportable: required_bool(data, "exportable")?,
+        allow_plaintext_backup: required_bool(data, "allow_plaintext_backup")?,
+        deletion_allowed: required_bool(data, "deletion_allowed")?,
+        auto_rotation_disabled: auto_rotation_disabled(data)?,
+    })
+}
+
+fn public_key_field(data: &Value) -> Result<&str, BackendError> {
+    data.get("keys")
+        .and_then(|keys| keys.get("1"))
+        .and_then(|version| version.get("public_key"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError::Protocol("no version-one public_key in key info".into()))
+}
+
+fn required_u32(data: &Value, field: &'static str) -> Result<u32, BackendError> {
+    let value = data
+        .get(field)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| BackendError::Protocol(format!("missing or invalid {field} in key info")))?;
+    u32::try_from(value)
+        .map_err(|_| BackendError::Protocol(format!("{field} exceeds u32 in key info")))
+}
+
+fn required_bool(data: &Value, field: &'static str) -> Result<bool, BackendError> {
+    data.get(field)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| BackendError::Protocol(format!("missing or invalid {field} in key info")))
+}
+
+fn auto_rotation_disabled(data: &Value) -> Result<bool, BackendError> {
+    match data.get("auto_rotate_period") {
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .map(|seconds| seconds == 0)
+            .ok_or_else(|| BackendError::Protocol("invalid auto_rotate_period in key info".into())),
+        Some(Value::String(value)) => Ok(matches!(value.as_str(), "0" | "0s")),
+        Some(_) | None => Err(BackendError::Protocol(
+            "missing or invalid auto_rotate_period in key info".into(),
+        )),
+    }
+}
+
 /// Build the transit BYOK import `ciphertext`: AES-KWP-wrap `target` under a
 /// fresh AES-256 key, RSA-OAEP(SHA-256)-wrap that key under `wrapping_pem`, and
 /// concatenate `rsa_wrapped_aes || kwp_wrapped_target` (the transit import
@@ -1158,6 +1269,76 @@ mod tests {
         crate::ensure_crypto_provider();
         let http = reqwest::Client::new();
         TransitClient::new(http, "http://127.0.0.1:8200/", "transit")
+    }
+
+    fn nix_cache_data() -> Value {
+        json!({
+            "type": "ed25519",
+            "latest_version": 1,
+            "min_decryption_version": 1,
+            "derived": false,
+            "exportable": false,
+            "allow_plaintext_backup": false,
+            "deletion_allowed": false,
+            "auto_rotate_period": 0,
+            "keys": {
+                "1": { "public_key": B64.encode([7_u8; 32]) }
+            }
+        })
+    }
+
+    #[test]
+    fn nix_cache_create_requests_locked_down_ed25519_posture() {
+        assert_eq!(
+            nix_cache_create_body(),
+            json!({
+                "type": "ed25519",
+                "derived": false,
+                "exportable": false,
+                "allow_plaintext_backup": false,
+                "auto_rotate_period": "0",
+            })
+        );
+    }
+
+    #[test]
+    fn nix_cache_posture_requires_exact_public_version_and_safety_fields() {
+        let posture = nix_cache_key_posture(&nix_cache_data()).expect("exact posture");
+        assert_eq!(
+            posture,
+            NixCacheKeyPosture {
+                public_key: [7; 32],
+                key_type: KeyType::Ed25519,
+                latest_version: 1,
+                min_decryption_version: 1,
+                derived: false,
+                exportable: false,
+                allow_plaintext_backup: false,
+                deletion_allowed: false,
+                auto_rotation_disabled: true,
+            }
+        );
+    }
+
+    #[test]
+    fn nix_cache_posture_rejects_noncanonical_or_incomplete_metadata() {
+        let mut unpadded = nix_cache_data();
+        unpadded["keys"]["1"]["public_key"] =
+            Value::String(B64.encode([7_u8; 32]).trim_end_matches('=').to_string());
+        assert!(matches!(
+            nix_cache_key_posture(&unpadded),
+            Err(BackendError::Protocol(_))
+        ));
+
+        let mut missing = nix_cache_data();
+        missing
+            .as_object_mut()
+            .expect("object fixture")
+            .remove("deletion_allowed");
+        assert!(matches!(
+            nix_cache_key_posture(&missing),
+            Err(BackendError::Protocol(_))
+        ));
     }
 
     #[test]

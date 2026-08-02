@@ -1336,6 +1336,8 @@ fn x509_issue_status(err: &crate::manager::ManagerError) -> Status {
         | crate::manager::ManagerError::AlgorithmMismatch { .. }
         | crate::manager::ManagerError::KemAlgorithmMismatch { .. }
         | crate::manager::ManagerError::ValueRotateNeedsSet(_)
+        | crate::manager::ManagerError::NixCacheEnrollment { .. }
+        | crate::manager::ManagerError::NixCacheRotationForbidden(_)
         // Neither a sealing nor a materialize-to-sign error (nor a missing
         // public_path, nor a provider-dispatch ML-DSA error) can arise on the
         // X.509 issuance path (a PKI issuer is asymmetric+pki, not sealing, kv2,

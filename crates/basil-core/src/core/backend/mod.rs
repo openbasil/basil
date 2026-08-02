@@ -114,6 +114,35 @@ pub struct KeyMetadata {
     pub latest_version: u32,
 }
 
+/// Exact public-only Vault transit posture for a Nix binary-cache signing key.
+///
+/// This purpose-specific view deliberately excludes private material and every
+/// backend field that is not part of the immutable enrollment contract. Callers
+/// must compare every field before treating a key as enrolled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+// These are independent backend posture fields, not interchangeable state bits.
+#[allow(clippy::struct_excessive_bools)]
+pub struct NixCacheKeyPosture {
+    /// Canonical decoded Ed25519 public bytes for transit version one.
+    pub public_key: [u8; 32],
+    /// Backend-reported algorithm.
+    pub key_type: KeyType,
+    /// Latest transit key version.
+    pub latest_version: u32,
+    /// Backend-reported `min_decryption_version` posture.
+    pub min_decryption_version: u32,
+    /// Whether the transit key derives per-context subkeys.
+    pub derived: bool,
+    /// Whether private key material may be exported.
+    pub exportable: bool,
+    /// Whether plaintext backup of private material is permitted.
+    pub allow_plaintext_backup: bool,
+    /// Whether deletion of the transit key is permitted.
+    pub deletion_allowed: bool,
+    /// Whether automatic backend rotation is disabled.
+    pub auto_rotation_disabled: bool,
+}
+
 /// Backend signing mode for operations whose wire format fixes an algorithm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SignOptions {
@@ -234,6 +263,29 @@ pub trait Backend: Send + Sync {
     ) -> Result<NewKey, BackendError> {
         let _ = (key_id, key_type);
         Err(BackendError::Unsupported("create_named_key"))
+    }
+
+    /// Create the named Vault transit key used by a Nix binary cache.
+    ///
+    /// Implementations must use an idempotent named-create operation and request
+    /// Ed25519 version-one posture with derivation, export, plaintext backup,
+    /// and automatic rotation disabled. The caller always reads and compares
+    /// [`Self::nix_cache_key_posture`] after this operation.
+    async fn create_nix_cache_key(&self, key_id: &str) -> Result<(), BackendError> {
+        let _ = key_id;
+        Err(BackendError::Unsupported("create_nix_cache_key"))
+    }
+
+    /// Read the exact public-only posture of a named Nix binary-cache key.
+    ///
+    /// The default fails closed. Vault-compatible backends return only public
+    /// bytes and immutable posture metadata; private material is never requested.
+    async fn nix_cache_key_posture(
+        &self,
+        key_id: &str,
+    ) -> Result<NixCacheKeyPosture, BackendError> {
+        let _ = key_id;
+        Err(BackendError::Unsupported("nix_cache_key_posture"))
     }
 
     /// Create a **symmetric AEAD** crypto key at a **named path**. AEAD suites are

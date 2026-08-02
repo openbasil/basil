@@ -29,6 +29,7 @@ Online docs: **[CLI overview](https://docs.openbasil.org/cli/overview/)** and **
 | `basil agent`     | Run the broker daemon.                                                                                                                                                                                                                                                 |
 | `basil compose …` | Project a selected frontend's effective Compose model into bounded, secret-discarding JSON.                                                                                                                                                                            |
 | `basil bundle …`  | Create and manage the sealed credential bundle (seal, verify, `set-backend`, …).                                                                                                                                                                                       |
+| `basil nix key …` | Enroll or inspect a Nix binary-cache signing key held in backend custody. The commands return public material only.                                                                                                                                                     |
 | `basil explain`   | Explain a policy decision offline from the catalog + policy files; `--live` asks the running broker instead.                                                                                                                                                           |
 | `basil doctor`    | Preflight environment and deployment checks.                                                                                                                                                                                                                           |
 | `basil cache …`   | Inspect the private OCI evidence cache or preview and confirm exact-ID/reference pruning.                                                                                                                                                                              |
@@ -41,6 +42,12 @@ when the cache must be inspected without repair.
 Client commands take the socket from `--socket` or `BASIL_SOCKET`. `basil --help` is the
 authoritative command reference; man pages are rendered from this crate's library surface
 ([`cli()`]) by the workspace `xtask`, so the shipped documentation should always be in sync with the parser.
+
+Nix cache keys are declared in the catalog before enrollment. Generate the backend-custodied key
+with `basil nix key generate-cache-key --key-id ID`; use `--json` for stable automation output.
+After recording the returned public identity in the catalog and reloading Basil, read it with
+`basil nix key public --key-id ID`. `convert-secret-to-public` is an alias for `public` and also
+accepts a catalog key ID. Neither command accepts secret bytes or a private-key file.
 
 ## basil-measure-helper
 

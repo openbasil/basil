@@ -30,7 +30,8 @@ use basil_proto::{AeadAlgorithm, CiphertextEnvelope, KeyMaterial, KeyType};
 use super::svid::SvidMinter;
 use super::transit::{TransitClient, transit_aead_type};
 use super::{
-    Backend, BackendError, KeyMetadata, KvSecret, KvValue, NewKey, PublicKey, SignOptions,
+    Backend, BackendError, KeyMetadata, KvSecret, KvValue, NewKey, NixCacheKeyPosture, PublicKey,
+    SignOptions,
 };
 
 /// Re-login this long before the cached token actually expires.
@@ -238,6 +239,21 @@ impl Backend for SpiffeVaultBackend {
         let token = self.token().await?;
         self.transit
             .create_named_key(&token, key_id, key_type)
+            .await
+    }
+
+    async fn create_nix_cache_key(&self, key_id: &str) -> Result<(), BackendError> {
+        let token = self.token().await?;
+        self.transit.create_nix_cache_key(&token, key_id).await
+    }
+
+    async fn nix_cache_key_posture(
+        &self,
+        key_id: &str,
+    ) -> Result<NixCacheKeyPosture, BackendError> {
+        let token = self.token().await?;
+        self.transit
+            .read_nix_cache_key_posture(&token, key_id)
             .await
     }
 

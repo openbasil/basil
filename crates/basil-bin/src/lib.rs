@@ -12,6 +12,7 @@
 #![cfg_attr(test, allow(clippy::indexing_slicing))]
 
 pub mod client_cli;
+pub mod nix_cli;
 
 #[cfg(feature = "keystore-backend")]
 use basil_core::demo;
@@ -81,6 +82,9 @@ pub enum Command {
     /// Create and manage a sealed credential bundle.
     #[command(subcommand)]
     Bundle(Box<bundle_cli::BundleCommand>),
+    /// Manage Nix binary-cache signing keys held in backend custody.
+    #[command(subcommand)]
+    Nix(nix_cli::NixCommand),
     /// Reserved built-in keystore maintenance surface; currently fails closed.
     #[cfg(feature = "db-keystore")]
     #[command(subcommand)]

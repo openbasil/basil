@@ -316,6 +316,7 @@ fn build_catalog(args: &InitArgs, layout: &Layout) -> Catalog {
             writable: true,
             // Created in place by startup reconcile on first run.
             missing: MissingPolicy::Generate,
+            nix_cache: None,
             generate: None,
             sealing_pin: None,
             labels: Labels::default(),
@@ -705,6 +706,7 @@ fn add_sops_entries(
                     public_path: None,
                     writable: true,
                     missing: MissingPolicy::Warn,
+                    nix_cache: None,
                     generate: None,
                     sealing_pin: None,
                     labels: Labels::default(),

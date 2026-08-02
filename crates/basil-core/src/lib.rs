@@ -78,7 +78,7 @@ pub use audit::{AuditLog, ReloadActor};
 pub use backend::keystore::KeystoreBackend;
 pub use backend::spiffe::{SpiffeConfig, SpiffeVaultBackend};
 pub use backend::vault::VaultBackend;
-pub use backend::{Backend, BackendError, NewKey};
+pub use backend::{Backend, BackendError, NewKey, NixCacheKeyPosture};
 pub use capability::{
     CapabilityError, CapabilityGap, CapabilityPolicy, CapabilitySummary, enforce_capabilities,
 };
@@ -98,7 +98,9 @@ pub use event::{BrokerEvent, BrokerEventKind, EventSource};
 pub use grpc_server::{
     DEFAULT_SOCKET_MODE, ServerConfig, run as run_grpc, run_many as run_grpc_many,
 };
-pub use manager::{BackendManager, ManagerError};
+pub use manager::{
+    BackendManager, ManagerError, NixCacheEnrollment, NixCacheEnrollmentDisposition,
+};
 pub use peer::PeerInfo;
 pub use reconcile::{CheckReport, KeyCheck, KeyStatus, ReconcileError, ReconcileSummary};
 pub use reload::{
