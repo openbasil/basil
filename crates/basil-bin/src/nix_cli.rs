@@ -14,6 +14,8 @@ use basil::{Client, NixCacheEnrollment, NixCacheEnrollmentDisposition, NixCacheK
 use clap::Subcommand;
 use serde::Serialize;
 
+use crate::nix_provider::{ProviderServeArgs, serve as serve_provider};
+
 const CORRELATION_ID_LEN: usize = 16;
 const RANDOM_ID_ATTEMPTS: usize = 8;
 const PENDING_REASON: &str = "NIX_CACHE_KEY_PENDING";
@@ -28,6 +30,16 @@ pub enum NixCommand {
     /// Manage backend-custodied Nix binary-cache keys.
     #[command(subcommand)]
     Key(NixKeyCommand),
+    /// Serve the purpose-specific local external-signer protocol.
+    #[command(subcommand, visible_alias = "provider")]
+    Signer(NixSignerCommand),
+}
+
+/// Nix external-signer provider commands.
+#[derive(Debug, Subcommand)]
+pub enum NixSignerCommand {
+    /// Serve one enrolled catalog key on one owner-only Unix socket.
+    Serve(ProviderServeArgs),
 }
 
 /// Nix binary-cache key commands.
@@ -163,6 +175,9 @@ fn random_correlation_id(
 pub async fn run(socket: Option<String>, command: NixCommand) -> Result<()> {
     reject_legacy_input(&command)?;
     let socket = socket.unwrap_or_else(|| basil::constants::DEFAULT_SOCKET_PATH.to_string());
+    if let NixCommand::Signer(NixSignerCommand::Serve(args)) = command {
+        return serve_provider(&socket, args).await;
+    }
     let mut client = Client::connect(&socket)
         .await
         .with_context(|| format!("connecting to agent at {socket}"))?;
@@ -177,7 +192,9 @@ pub async fn run(socket: Option<String>, command: NixCommand) -> Result<()> {
 }
 
 fn reject_legacy_input(command: &NixCommand) -> Result<()> {
-    let NixCommand::Key(command) = command;
+    let NixCommand::Key(command) = command else {
+        return Ok(());
+    };
     match command {
         NixKeyCommand::GenerateSecret { arguments } => {
             let _ = arguments;
@@ -211,7 +228,9 @@ where
     W: std::io::Write,
 {
     reject_legacy_input(&command)?;
-    let NixCommand::Key(command) = command;
+    let NixCommand::Key(command) = command else {
+        bail!("provider commands use the provider runtime dispatcher");
+    };
     match command {
         NixKeyCommand::GenerateCacheKey {
             key_id: Some(key_id),
@@ -588,6 +607,29 @@ mod tests {
         ])
         .unwrap();
         assert!(matches!(alias.command, Command::Nix(_)));
+    }
+
+    #[test]
+    fn parses_canonical_nix_signer_serve_and_provider_alias() {
+        for spelling in ["signer", "provider"] {
+            let parsed = Cli::try_parse_from([
+                "basil",
+                "nix",
+                spelling,
+                "serve",
+                "--key-id",
+                KEY_ID,
+                "--listen",
+                "/run/nix-cache/signer.sock",
+            ])
+            .unwrap();
+            let Command::Nix(NixCommand::Signer(NixSignerCommand::Serve(args))) = parsed.command
+            else {
+                panic!("Nix signer serve command expected");
+            };
+            assert_eq!(args.key_id, KEY_ID);
+            assert_eq!(args.listen, PathBuf::from("/run/nix-cache/signer.sock"));
+        }
     }
 
     #[test]

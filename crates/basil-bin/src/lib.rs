@@ -13,6 +13,7 @@
 
 pub mod client_cli;
 pub mod nix_cli;
+pub mod nix_provider;
 
 #[cfg(feature = "keystore-backend")]
 use basil_core::demo;

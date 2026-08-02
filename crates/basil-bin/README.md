@@ -30,6 +30,7 @@ Online docs: **[CLI overview](https://docs.openbasil.org/cli/overview/)** and **
 | `basil compose …` | Project a selected frontend's effective Compose model into bounded, secret-discarding JSON.                                                                                                                                                                            |
 | `basil bundle …`  | Create and manage the sealed credential bundle (seal, verify, `set-backend`, …).                                                                                                                                                                                       |
 | `basil nix key …` | Enroll or inspect a Nix binary-cache signing key held in backend custody. The commands return public material only.                                                                                                                                                     |
+| `basil nix signer serve` | Serve one backend-custodied Nix cache key through the purpose-specific local external-signer protocol.                                                                                                                                                        |
 | `basil explain`   | Explain a policy decision offline from the catalog + policy files; `--live` asks the running broker instead.                                                                                                                                                           |
 | `basil doctor`    | Preflight environment and deployment checks.                                                                                                                                                                                                                           |
 | `basil cache …`   | Inspect the private OCI evidence cache or preview and confirm exact-ID/reference pruning.                                                                                                                                                                              |
@@ -48,6 +49,12 @@ with `basil nix key generate-cache-key --key-id ID`; use `--json` for stable aut
 After recording the returned public identity in the catalog and reloading Basil, read it with
 `basil nix key public --key-id ID`. `convert-secret-to-public` is an alias for `public` and also
 accepts a catalog key ID. Neither command accepts secret bytes or a private-key file.
+
+Run `basil nix signer serve --key-id ID --listen ABSOLUTE_SOCKET` as the dedicated cache-publisher
+user to expose one enrolled key to a local Nix client. The socket parent must be a real directory
+owned by that user with mode `0700`; Basil publishes the socket at mode `0600` and admits only peers
+with the same effective UID. Requests contain canonical public fingerprints only. Private key bytes
+stay in backend custody.
 
 ## basil-measure-helper
 

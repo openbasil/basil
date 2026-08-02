@@ -63,6 +63,7 @@ anyhow = { workspace = true }
 base64 = { workspace = true, features = ["std"] }
 clap = { workspace = true }
 clap_complete = { workspace = true }
+ed25519-dalek = { workspace = true }
 hex = { workspace = true }
 getrandom = { workspace = true }
 mimalloc = { workspace = true }
@@ -72,14 +73,15 @@ rustix = { workspace = true }
 serde = { workspace = true, features = ["std"] }
 serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true }
+tonic = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
 basil-proto = { workspace = true }
 tokio-stream = { workspace = true }
-tonic = { workspace = true }
 
 [lints]
 workspace = true
