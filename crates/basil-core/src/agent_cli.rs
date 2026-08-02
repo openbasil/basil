@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::catalog::{Class, KeyAlgorithm};
-use crate::core::ci_federation::ProviderCatalog;
+use crate::core::ci_federation::{ProviderCatalog, ProviderKind};
 use crate::seal::{BackendCred, CredBundle};
 use crate::service::broker::{BrokerIdentityRuntimeConfig, InvocationRuntimeConfig};
 use crate::transport::grpc_server::run_many_with_ready;
@@ -647,6 +647,12 @@ pub(crate) struct AgentConfigFile {
 pub(crate) struct FederationConfigFile {
     pub(crate) enable: bool,
     pub(crate) providers: Vec<crate::core::ci_federation::ProviderRule>,
+    /// Provider kinds the operator explicitly accepts from the experimental
+    /// support tier. A rule for an experimental-tier provider (currently only
+    /// `forgejoActions`) fails catalog load unless its kind is named here, so
+    /// an operator cannot reach an experimental authorization anchor by
+    /// copying an example. Naming a supported-tier kind changes nothing.
+    pub(crate) experimental_providers: Vec<ProviderKind>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1176,10 +1182,13 @@ fn resolve_federation_config(file: &FederationConfigFile) -> Result<Option<Arc<P
     if file.providers.is_empty() {
         bail!("federation.providers must not be empty when federation.enable is true");
     }
-    ProviderCatalog::new(file.providers.clone())
-        .map(Arc::new)
-        .map(Some)
-        .map_err(|error| anyhow::anyhow!("validating federation providers: {error}"))
+    ProviderCatalog::with_experimental_providers(
+        file.providers.clone(),
+        &file.experimental_providers,
+    )
+    .map(Arc::new)
+    .map(Some)
+    .map_err(|error| anyhow::anyhow!("validating federation providers: {error}"))
 }
 
 pub(crate) fn parse_reload_federation_config(
@@ -4868,5 +4877,95 @@ vault-addr = "http://cfg-vault:8200"
             std::fs::remove_file(&policy_path).ok();
             std::fs::remove_file(&config_path).ok();
         }
+    }
+
+    /// Build an agent-config fragment carrying a single `forgejoActions`
+    /// (experimental-tier) federation rule. When `opt_in` is set the fragment
+    /// also names the experimental tier in `experimental-providers`.
+    fn forgejo_federation_toml(opt_in: bool) -> String {
+        let opt_in_line = if opt_in {
+            "experimental-providers = [\"forgejoActions\"]\n"
+        } else {
+            ""
+        };
+        format!(
+            "[federation]\n\
+             enable = true\n\
+             {opt_in_line}\
+             \n\
+             [[federation.providers]]\n\
+             id = \"nightly\"\n\
+             subject = \"ci/forgejo-release\"\n\
+             audience = \"urn:basil:ci\"\n\
+             operationProfiles = [\"artifact-sign\"]\n\
+             maxTokenAgeSecs = 300\n\
+             clockSkewSecs = 30\n\
+             \n\
+             [federation.providers.provider]\n\
+             kind = \"forgejoActions\"\n\
+             issuer = \"https://forge.example.com/api/actions\"\n\
+             discoveryUrl = \"https://forge.example.com/api/actions/.well-known/openid-configuration\"\n\
+             jwksUrl = \"https://forge.example.com/api/actions/.well-known/jwks\"\n\
+             audiencePrefix = \"urn:basil:ci:jkt:\"\n\
+             repositoryId = 11\n\
+             repositoryOwnerId = 3\n\
+             workflowRef = \"forge/basil/.forgejo/workflows/release.yml@refs/heads/main\"\n\
+             ref = \"refs/heads/main\"\n\
+             refType = \"branch\"\n\
+             sha = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"\n\
+             runId = 900\n\
+             runAttempt = 1\n\
+             notBeforeUnix = 1700000000\n\
+             expiresAtUnix = 1700000900\n\
+             maxTokenAgeSecs = 300\n\
+             clockSkewSecs = 30\n"
+        )
+    }
+
+    #[test]
+    fn startup_forgejo_rule_needs_the_experimental_opt_in() {
+        // Without the opt-in the experimental rule must fail closed, and the
+        // error must name the experimental tier so the operator sees why.
+        let denied: AgentConfigFile = toml::from_str(&forgejo_federation_toml(false))
+            .expect("federation config without opt-in parses");
+        assert!(
+            denied.federation.experimental_providers.is_empty(),
+            "an absent opt-in must deserialize to an empty list"
+        );
+        let error = resolve_federation_config(&denied.federation)
+            .expect_err("experimental rule must fail closed without the opt-in");
+        let message = error.to_string();
+        assert!(message.contains("experimental"), "{message}");
+        assert!(message.contains("forgejoActions"), "{message}");
+
+        // With the opt-in the same rule loads into a one-rule catalog.
+        let allowed: AgentConfigFile = toml::from_str(&forgejo_federation_toml(true))
+            .expect("federation config with opt-in parses");
+        assert_eq!(
+            allowed.federation.experimental_providers,
+            vec![ProviderKind::ForgejoActions],
+        );
+        let catalog = resolve_federation_config(&allowed.federation)
+            .expect("opted-in experimental rule resolves")
+            .expect("federation is enabled");
+        assert_eq!(catalog.rules().len(), 1);
+    }
+
+    #[test]
+    fn reload_forgejo_rule_gates_on_the_experimental_opt_in() {
+        // Reload parity: the reload parse path threads the same opt-in, so an
+        // experimental rule is gated identically to the startup path.
+        let denied: toml::Value = toml::from_str(&forgejo_federation_toml(false))
+            .expect("reload config without opt-in parses");
+        let error = parse_reload_federation_config(&denied)
+            .expect_err("reload must fail closed without the opt-in");
+        assert!(error.to_string().contains("experimental"), "{error}");
+
+        let allowed: toml::Value = toml::from_str(&forgejo_federation_toml(true))
+            .expect("reload config with opt-in parses");
+        let catalog = parse_reload_federation_config(&allowed)
+            .expect("opted-in reload resolves")
+            .expect("federation is enabled");
+        assert_eq!(catalog.rules().len(), 1);
     }
 }
