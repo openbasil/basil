@@ -40,8 +40,8 @@ provisioned, so a booted broker in this lane cannot open a request body.
 - **Proof-bound sealed invocations**: `ci_federation_proof_matrix` drives an adversarial
   corpus (malformed proof `COSE_Key`s, `crit` enforcement for `-70007`, algorithm
   confusion, proof-key and response-key substitution, COSE mutation) over the real
-  `Invoke` RPC, parametrized over provider arm. The GitHub arm runs; the Forgejo arm
-  ships `#[ignore]` and is activated by `basil-jjgi.3.5`.
+  `Invoke` RPC, parametrized over provider arm. Both the GitHub and opt-in experimental
+  Forgejo arms run in the focused acceptance test.
 - **Freshness challenges and per-run quota**: `ci_challenge_lifecycle_matrix` drives the
   broker's challenge state machine over the real `GetInvocationChallenge` + `Invoke` RPCs
   (issuance shape, single-use and concurrent-duplicate consumption, expiry boundary,

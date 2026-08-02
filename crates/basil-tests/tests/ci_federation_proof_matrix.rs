@@ -21,9 +21,8 @@
 //!    baseline only in the mutation under test;
 //! 2. the LIVE broker's gRPC status over the real socket.
 //!
-//! Provider matrix: the body runs parametrized over [`ProviderArm`]. The GitHub
-//! arm runs now. The Forgejo arm ships gated (`#[ignore]`) and is activated by
-//! `basil-jjgi.3.5` — do NOT unignore it here.
+//! Provider matrix: the body runs parametrized over [`ProviderArm`]. Both the
+//! GitHub arm and the opt-in experimental Forgejo arm run here.
 //!
 //! Deliberately out of scope (and why): no case presents a provider token that
 //! a real issuer signed, so no case is ever ACCEPTED end to end. Token
@@ -98,15 +97,10 @@ fn github_arm_denies_the_adversarial_proof_corpus() {
     run_arm(ProviderArm::GithubActions, "jjgi-matrix-gh");
 }
 
-/// The Forgejo arm of the same matrix. It ships GATED: `basil-jjgi.3.5`
-/// activates it (this ticket must not block on `basil-jjgi.7` or on
-/// `basil-jjgi.3.5`). Everything it needs is already here — the arm only has to
-/// be unignored there, after the experimental-tier runner lane exists. It is
-/// kept honest meanwhile: it passes today under
-/// `cargo test -p basil-tests --features live-e2e --test ci_federation_proof_matrix -- --ignored`,
-/// which also proves the experimental-tier operator opt-in loads.
+/// The Forgejo arm of the same matrix. Forgejo is an experimental provider, so
+/// this test also proves that the explicit experimental-provider opt-in loads.
+/// The arm runs under the standard focused test command alongside GitHub.
 #[test]
-#[ignore = "Forgejo arm is activated by basil-jjgi.3.5"]
 fn forgejo_arm_denies_the_adversarial_proof_corpus() {
     run_arm(ProviderArm::ForgejoActions, "jjgi-matrix-fj");
 }
