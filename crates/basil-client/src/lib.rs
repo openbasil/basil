@@ -24,7 +24,7 @@ pub use basil_proto::broker::v1::{
     CatalogKind as GrpcCatalogKind, CiphertextEnvelope as GrpcCiphertextEnvelope,
     EnvelopeAlgorithm, Event, EventKind, KemAlgorithm, KemEnvelope, KeyMaterial as GrpcKeyMaterial,
     NatsJtiMode, NatsJwtType, NatsJwtValidationReason as GrpcNatsJwtValidationReason,
-    SigningAlgorithm,
+    NixCacheEnrollmentDisposition, SigningAlgorithm,
 };
 pub use client::{
     AgentComposeIdentity, AgentConnection, AgentConnectionDomain, AgentConnectionDrop,
@@ -32,8 +32,9 @@ pub use client::{
     AgentListenerChange, AgentListenerImpact, AgentReadiness, AgentReload, AgentRevocation,
     AgentRewireDiagnostic, AgentStatus, AgentSystemdIdentity, AllowedNatsSigner, Client,
     ImportEntry, InvocationChallenge, IssuedCertificate, KeyHandle, MatchedRule, MintedJwt,
-    NatsJwtValidation, NatsJwtValidationReason, NatsUserPermissions, ReadinessReason,
-    ReloadRejection, SecretValue, SignNatsJwtOptions,
+    NatsJwtValidation, NatsJwtValidationReason, NatsUserPermissions, NixCacheEnrollment,
+    NixCacheKey, NixCacheSignature, ReadinessReason, ReloadRejection, SecretValue,
+    SignNatsJwtOptions,
 };
 pub use client_sync::BlockingClient;
 pub use error::{Error, Result};

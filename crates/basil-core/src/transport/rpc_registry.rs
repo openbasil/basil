@@ -264,6 +264,7 @@ const AEAD: &str = "basil.broker.v1.AeadService";
 const SECRET: &str = "basil.broker.v1.SecretService";
 const MINTING: &str = "basil.broker.v1.MintingService";
 const NATS: &str = "basil.broker.v1.NatsService";
+const NIX_CACHE: &str = "basil.broker.v1.NixCacheService";
 const ADMIN: &str = "basil.broker.v1.AdminService";
 const SPIFFE_WORKLOAD: &str = "SpiffeWorkloadAPI";
 const SDS: &str = "envoy.service.secret.v3.SecretDiscoveryService";
@@ -320,6 +321,10 @@ const CLASSIFICATION_TABLE: &[ClassificationEntry] = &[
     unary(NATS, "DecryptNatsCurve"),
     unary(NATS, "SignNatsJwt"),
     unary_read(NATS, "ValidateNatsJwt"),
+    // Purpose-specific Nix binary-cache custody operations.
+    unary_read(NIX_CACHE, "DescribeNixCacheKey"),
+    unary(NIX_CACHE, "EnrollNixCacheKey"),
+    unary(NIX_CACHE, "SignNixCacheFingerprint"),
     // Admin: the operator/recovery lane plus diagnostics.
     operator(ADMIN, "Status", ReplayClass::OutcomeSafe),
     operator(ADMIN, "Health", ReplayClass::OutcomeSafe),

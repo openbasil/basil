@@ -491,6 +491,8 @@ fn x509_issue_status(err: crate::manager::ManagerError) -> Status {
         | crate::manager::ManagerError::AlgorithmMismatch { .. }
         | crate::manager::ManagerError::KemAlgorithmMismatch { .. }
         | crate::manager::ManagerError::ValueRotateNeedsSet(_)
+        | crate::manager::ManagerError::NixCacheEnrollment { .. }
+        | crate::manager::ManagerError::NixCacheRotationForbidden(_)
         | crate::manager::ManagerError::Sealing(_)
         | crate::manager::ManagerError::Signing(_)
         // A provider-dispatch (ML-DSA software custody) error cannot arise on the
