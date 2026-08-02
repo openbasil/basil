@@ -15,6 +15,16 @@ This crate is not published (`publish = false`) and has no public API.
 boot a dev `bao` (OpenBao), write catalog / policy / sealed-bundle fixtures, and build the
 binaries; then it runs `target/debug/basil run` on a temporary Unix socket.
 
+`boot_basil_invocation` layers the sealed-invocation surface on top of those
+fixtures without editing the prefill script: it provisions the broker
+response-signing transit key and the out-of-band public halves in the running
+dev engine, extends `catalog.json` with the three broker keys (each labelled
+with the `broker_key_use` its role requires), extends `policy.json` with a
+subject bound to a caller-supplied invocation signature key, and writes an agent
+config carrying `[broker-identity]`, `[invocation]`, and the `[federation]` rule
+for the requested `ProviderArm`. The X25519 private halves are deliberately never
+provisioned, so a booted broker in this lane cannot open a request body.
+
 ## What is covered
 
 - **COSE interop**: Rust round trips (`cose_interop`, `cose_es256_interop`) and cross-language
@@ -27,6 +37,11 @@ binaries; then it runs `target/debug/basil run` on a temporary Unix socket.
   `pqc_e2e`, `envoy_sds_e2e`, `openbao_vault_jwt_auth_interop`.
 - **Operations**: `init_flow_e2e`, `reload_e2e`, `doctor_e2e`, `health_ready_e2e`,
   `bip39_unlock_e2e`.
+- **Proof-bound sealed invocations**: `ci_federation_proof_matrix` drives an adversarial
+  corpus (malformed proof `COSE_Key`s, `crit` enforcement for `-70007`, algorithm
+  confusion, proof-key and response-key substitution, COSE mutation) over the real
+  `Invoke` RPC, parametrized over provider arm. The GitHub arm runs; the Forgejo arm
+  ships `#[ignore]` and is activated by `basil-jjgi.3.5`.
 
 ## Features
 

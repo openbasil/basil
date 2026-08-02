@@ -33,6 +33,9 @@ http = []
 unlock-bip39 = ["basil-core/unlock-bip39"]
 
 [dependencies]
+# Used by the shared harness (`src/lib.rs`) to base64 the out-of-band public
+# halves an invocation boot provisions into the dev engine.
+base64 = { workspace = true, features = ["std"] }
 basil-core = { workspace = true, features = ["http", "unlock-age-yubikey", "unlock-bip39"] }
 basil-proto = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
@@ -57,7 +60,6 @@ basil-nats-bridge = { workspace = true }
 basil-proto = { workspace = true }
 
 async-nats = { workspace = true }
-base64 = { workspace = true, features = ["std"] }
 bytes = { workspace = true }
 cose_minicbor = { version = "0.1.1", default-features = false, features = ["suit-sha256-ed25519"] }
 ed25519-dalek = { workspace = true }
@@ -72,6 +74,11 @@ tokio-stream = { workspace = true }
 tonic = { workspace = true }
 tower = { workspace = true }
 x509-parser = { workspace = true }
+
+[[test]]
+name = "ci_federation_proof_matrix"
+path = "tests/ci_federation_proof_matrix.rs"
+required-features = ["live-e2e"]
 
 [[test]]
 name = "jwks_oidc_e2e"
