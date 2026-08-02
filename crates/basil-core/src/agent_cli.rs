@@ -3127,6 +3127,7 @@ const fn deny_reason_json(reason: crate::catalog::DenyReason) -> &'static str {
     use crate::catalog::DenyReason;
     match reason {
         DenyReason::UnknownKey => "unknown_key",
+        DenyReason::NixCachePurposeBound => "nix_cache_purpose_bound",
         DenyReason::NotWritable => "not_writable",
         DenyReason::IssuerRawSign => "issuer_raw_sign",
         DenyReason::NotPermitted => "not_permitted",
@@ -3138,6 +3139,9 @@ const fn deny_explanation(reason: crate::catalog::DenyReason) -> &'static str {
     use crate::catalog::DenyReason;
     match reason {
         DenyReason::UnknownKey => "key is not in the catalog",
+        DenyReason::NixCachePurposeBound => {
+            "the Nix cache key is purpose-bound; use its dedicated enrollment/signing operations"
+        }
         DenyReason::NotWritable => {
             "the key is not writable (write hard-cap), denied regardless of policy"
         }

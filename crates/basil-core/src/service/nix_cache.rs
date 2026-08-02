@@ -35,11 +35,19 @@ impl NixCacheService for BrokerGrpc {
         let batch_id = correlation_id(&input.batch_id, "describe_nix_cache_key", "batch_id")?;
         let request_id = correlation_id(&input.request_id, "describe_nix_cache_key", "request_id")?;
         let identity = nix_identity(&generation, &input.key_id);
+        let policy_op = identity
+            .as_ref()
+            .map_or(Op::SignNixCacheFingerprint, |identity| {
+                match identity.state {
+                    NixCacheState::Pending => Op::EnrollNixCacheKey,
+                    NixCacheState::Enrolled => Op::SignNixCacheFingerprint,
+                }
+            });
         let actor = authorize_nix(
             self,
             &generation,
             &request,
-            Op::SignNixCacheFingerprint,
+            policy_op,
             NixCacheAuditOp::Describe,
             &input.key_id,
             identity.as_ref(),
@@ -526,10 +534,11 @@ mod tests {
     use async_trait::async_trait;
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
-    use basil_proto::KeyType;
     use basil_proto::broker::v1::nix_cache_service_server::NixCacheService as _;
+    use basil_proto::broker::v1::signing_service_server::SigningService as _;
     use basil_proto::broker::v1::{BrokerErrorInfo, SignNixCacheFingerprintRequest};
     use basil_proto::google::rpc::Status as RpcStatus;
+    use basil_proto::{KeyMaterial, KeyType};
     use prost::Message as _;
     use tonic::{Code, Request};
     use zeroize::Zeroizing;
@@ -537,7 +546,7 @@ mod tests {
     use super::*;
     use crate::audit::AuditLog;
     use crate::backend::{
-        Backend, BackendError, NewKey, NixCacheBackendSignature, NixCacheKeyPosture,
+        Backend, BackendError, NewKey, NixCacheBackendSignature, NixCacheKeyPosture, PublicKey,
     };
     use crate::catalog::load;
     use crate::manager::BackendManager;
@@ -560,6 +569,7 @@ mod tests {
         missing: AtomicBool,
         create_calls: AtomicUsize,
         sign_calls: AtomicUsize,
+        generic_calls: AtomicUsize,
     }
 
     impl SigningBackend {
@@ -573,6 +583,7 @@ mod tests {
                 missing: AtomicBool::new(false),
                 create_calls: AtomicUsize::new(0),
                 sign_calls: AtomicUsize::new(0),
+                generic_calls: AtomicUsize::new(0),
             })
         }
 
@@ -645,7 +656,23 @@ mod tests {
             Err(BackendError::Unsupported("public_key"))
         }
 
+        async fn public_key_with_meta(&self, _key_id: &str) -> Result<PublicKey, BackendError> {
+            self.0.generic_calls.fetch_add(1, Ordering::SeqCst);
+            Err(BackendError::Unsupported("get_public_key"))
+        }
+
+        async fn import(
+            &self,
+            _key_id: &str,
+            _key_type: KeyType,
+            _material: &KeyMaterial,
+        ) -> Result<NewKey, BackendError> {
+            self.0.generic_calls.fetch_add(1, Ordering::SeqCst);
+            Err(BackendError::Unsupported("import"))
+        }
+
         async fn sign(&self, _key_id: &str, _message: &[u8]) -> Result<Vec<u8>, BackendError> {
+            self.0.generic_calls.fetch_add(1, Ordering::SeqCst);
             Err(BackendError::Unsupported("sign"))
         }
 
@@ -659,7 +686,11 @@ mod tests {
         }
     }
 
-    fn documents(state: NixCacheState, allow: bool, backend: &SigningBackend) -> (String, String) {
+    fn documents(
+        state: NixCacheState,
+        actions: &[&str],
+        backend: &SigningBackend,
+    ) -> (String, String) {
         let mut identity = serde_json::json!({
             "keyName": "cache.example-1",
             "state": if state == NixCacheState::Enrolled { "enrolled" } else { "pending" },
@@ -681,11 +712,6 @@ mod tests {
             }
         })
         .to_string();
-        let actions = if allow {
-            serde_json::json!(["op:enroll_nix_cache_key", "op:sign_nix_cache_fingerprint"])
-        } else {
-            serde_json::json!(["*"])
-        };
         let policy = serde_json::json!({
             "schema": "policy",
             "subjects": {
@@ -710,7 +736,11 @@ mod tests {
         audit: Option<Arc<AuditLog>>,
     ) -> (BrokerGrpc, Arc<BrokerState>, Arc<SigningBackend>) {
         let backend = SigningBackend::new();
-        let (catalog_json, policy_json) = documents(state, true, &backend);
+        let (catalog_json, policy_json) = documents(
+            state,
+            &["op:enroll_nix_cache_key", "op:sign_nix_cache_fingerprint"],
+            &backend,
+        );
         let (catalog, policy, config, warnings) =
             load(&catalog_json, &policy_json).expect("fixture loads");
         assert!(warnings.is_empty());
@@ -728,9 +758,9 @@ mod tests {
         (BrokerGrpc::new(Arc::clone(&state)), state, backend)
     }
 
-    fn denied_fixture(state: NixCacheState) -> (BrokerGrpc, Arc<SigningBackend>) {
+    fn policy_fixture(state: NixCacheState, actions: &[&str]) -> (BrokerGrpc, Arc<SigningBackend>) {
         let backend = SigningBackend::new();
-        let (catalog_json, policy_json) = documents(state, false, &backend);
+        let (catalog_json, policy_json) = documents(state, actions, &backend);
         let (catalog, policy, config, warnings) =
             load(&catalog_json, &policy_json).expect("fixture loads");
         assert!(warnings.is_empty());
@@ -742,6 +772,10 @@ mod tests {
         let manager = BackendManager::new(catalog.clone(), backends).expect("manager");
         let state = Arc::new(BrokerState::new(catalog, policy, config, manager, "test"));
         (BrokerGrpc::new(state), backend)
+    }
+
+    fn denied_fixture(state: NixCacheState) -> (BrokerGrpc, Arc<SigningBackend>) {
+        policy_fixture(state, &["*"])
     }
 
     fn sign_request() -> Request<SignNixCacheFingerprintRequest> {
@@ -771,6 +805,35 @@ mod tests {
             key_id: "cache.signer".into(),
             batch_id: vec![0xabu8; 16],
             request_id: vec![0xcdu8; 16],
+        });
+        insert_peer(&mut request);
+        request
+    }
+
+    fn generic_sign_request() -> Request<pb::SignRequest> {
+        let mut request = Request::new(pb::SignRequest {
+            key_id: "cache.signer".into(),
+            message: b"generic-sign-bypass".to_vec(),
+            algorithm: i32::from(pb::SigningAlgorithm::Ed25519),
+        });
+        insert_peer(&mut request);
+        request
+    }
+
+    fn generic_get_public_key_request() -> Request<pb::GetPublicKeyRequest> {
+        let mut request = Request::new(pb::GetPublicKeyRequest {
+            key_id: "cache.signer".into(),
+            version: None,
+        });
+        insert_peer(&mut request);
+        request
+    }
+
+    fn generic_import_request() -> Request<pb::ImportRequest> {
+        let mut request = Request::new(pb::ImportRequest {
+            key_id: "cache.signer".into(),
+            key_type: 0,
+            material: None,
         });
         insert_peer(&mut request);
         request
@@ -811,6 +874,8 @@ mod tests {
             )
             .expect("well-formed signature")
         );
+        assert_eq!(backend.sign_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.generic_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -879,6 +944,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_identity_rejects_explicit_and_wildcard_generic_operations() {
+        for actions in [
+            &["op:get_public_key", "op:sign", "op:import"][..],
+            &["*"][..],
+        ] {
+            let (service, backend) = policy_fixture(NixCacheState::Pending, actions);
+            let get_status = service
+                .get_public_key(generic_get_public_key_request())
+                .await
+                .expect_err("pending Nix identity must reject generic public-key reads");
+            assert_eq!(get_status.code(), Code::PermissionDenied);
+            let sign_status = service
+                .sign(generic_sign_request())
+                .await
+                .expect_err("pending Nix identity must reject generic signing");
+            assert_eq!(sign_status.code(), Code::PermissionDenied);
+            let import_status = service
+                .import(generic_import_request())
+                .await
+                .expect_err("pending Nix identity must reject generic import");
+            assert_eq!(import_status.code(), Code::PermissionDenied);
+            assert_eq!(backend.generic_calls.load(Ordering::SeqCst), 0);
+            assert!(backend.paths.lock().expect("path lock").is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn enrolled_identity_rejects_explicit_and_wildcard_generic_signing() {
+        for actions in [&["op:sign"][..], &["*"][..]] {
+            let (service, backend) = policy_fixture(NixCacheState::Enrolled, actions);
+            let status = service
+                .sign(generic_sign_request())
+                .await
+                .expect_err("enrolled Nix identity must reject generic signing");
+            assert_eq!(status.code(), Code::PermissionDenied);
+            assert_eq!(backend.generic_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(backend.sign_calls.load(Ordering::SeqCst), 0);
+            assert!(backend.paths.lock().expect("path lock").is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn malformed_profile_and_fingerprint_never_reach_backend() {
         let (service, _, backend) = fixture(NixCacheState::Enrolled, None);
         let mut bad_profile = sign_request();
@@ -907,8 +1014,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn describe_pending_returns_stable_pending_reason() {
-        let (service, _, _) = fixture(NixCacheState::Pending, None);
+    async fn describe_pending_returns_stable_pending_reason_without_backend_access() {
+        let (service, backend) =
+            policy_fixture(NixCacheState::Pending, &["op:enroll_nix_cache_key"]);
         let sign = sign_request().into_inner();
         let mut request = Request::new(pb::DescribeNixCacheKeyRequest {
             key_id: sign.key_id,
@@ -925,6 +1033,24 @@ mod tests {
         let detail = rpc.details.first().expect("error info detail");
         let info = BrokerErrorInfo::decode(detail.value.as_slice()).expect("error info");
         assert_eq!(info.reason, "NIX_CACHE_KEY_PENDING");
+        assert!(backend.paths.lock().expect("path lock").is_empty());
+        assert_eq!(backend.create_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.sign_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.generic_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn describe_pending_rejects_wildcard_without_backend_access() {
+        let (service, backend) = denied_fixture(NixCacheState::Pending);
+        let status = service
+            .describe_nix_cache_key(describe_request())
+            .await
+            .expect_err("wildcard must not grant pending Nix identity disclosure");
+        assert_eq!(status.code(), Code::PermissionDenied);
+        assert!(backend.paths.lock().expect("path lock").is_empty());
+        assert_eq!(backend.create_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.sign_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.generic_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -935,7 +1061,7 @@ mod tests {
             tokio::spawn(async move { service.sign_nix_cache_fingerprint(sign_request()).await });
         backend.entered.notified().await;
 
-        let (catalog_json, policy_json) = documents(NixCacheState::Enrolled, false, &backend);
+        let (catalog_json, policy_json) = documents(NixCacheState::Enrolled, &["*"], &backend);
         let (catalog, policy, config, warnings) =
             load(&catalog_json, &policy_json).expect("deny generation loads");
         assert!(warnings.is_empty());

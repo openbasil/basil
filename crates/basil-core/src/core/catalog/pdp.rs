@@ -22,20 +22,23 @@
 //!
 //! 1. If `key` is not in the catalog → [`DenyReason::UnknownKey`] (don't leak
 //!    which other check would have failed).
-//! 2. **`writable` hard cap (§2.4.2):** if `op.is_write()` and the key's
+//! 2. **Nix cache identity hard cap:** a `nixCache` key exposes only its
+//!    purpose-specific operations. Pending permits only `enroll_nix_cache_key`;
+//!    enrolled permits compare-only enrollment and `sign_nix_cache_fingerprint`.
+//! 3. **`writable` hard cap (§2.4.2):** if `op.is_write()` and the key's
 //!    `writable == false` → [`DenyReason::NotWritable`], regardless of policy.
-//! 3. **Credential-issuer hard cap:** if `op` is `sign` and the key is a
+//! 4. **Credential-issuer hard cap:** if `op` is `sign` and the key is a
 //!    credential issuer (`nats_type=O`/`A`, or `svid_kind=jwt`/`x509`) →
 //!    [`DenyReason::IssuerRawSign`], regardless of policy. Raw `sign` on an
 //!    issuer key is unrestricted minting: the caller assembles the signing
 //!    input off-broker and none of the `sign_nats_jwt`/`mint` validation runs.
-//! 4. Allow if a `(op, glob)` grant for the actor's [`SubjectName`] matches
+//! 5. Allow if a `(op, glob)` grant for the actor's [`SubjectName`] matches
 //!    `key`.
-//! 5. Allow if `op` is [`Op::Get`] or [`Op::GetPublicKey`], the key's
+//! 6. Allow if `op` is [`Op::Get`] or [`Op::GetPublicKey`], the key's
 //!    `class == Public`, and the actor has a resolved subject. This preserves the
 //!    public-read rule without making missing local identity authorization
 //!    implicit.
-//! 6. Else [`DenyReason::NotPermitted`].
+//! 7. Else [`DenyReason::NotPermitted`].
 //!
 //! The decision carries enough for the audit log (`vault-vq5`): which subject
 //! matched on allow, or which check failed on deny. This module does **not** write
@@ -143,6 +146,10 @@ pub enum DenyReason {
     /// The key is not in the catalog (step 1). Reported first so we don't leak
     /// which finer-grained check would otherwise have failed.
     UnknownKey,
+    /// A generic operation targeted a purpose-bound Nix cache identity, or an
+    /// enrolled-only operation targeted a pending identity. Policy grants cannot
+    /// bypass the typed enrollment/signing service boundary.
+    NixCachePurposeBound,
     /// A write op against a key whose `writable == false` (the §2.4.2 hard cap),
     /// denied regardless of policy.
     NotWritable,
@@ -400,6 +407,18 @@ impl<'a> Pdp<'a> {
             return Explanation::deny(DenyReason::UnknownKey);
         };
 
+        // A Nix cache key is a typed trust root, not a generic asymmetric key.
+        // Enforce the complete state-aware op surface before writable, grants,
+        // or public-read rules so neither explicit nor wildcard policy can route
+        // around validation, posture checks, local verification, and Nix audit.
+        if entry
+            .nix_cache
+            .as_ref()
+            .is_some_and(|identity| !nix_cache_op_allowed(identity.state, op))
+        {
+            return Explanation::deny(DenyReason::NixCachePurposeBound);
+        }
+
         // Step 2: the `writable` hard cap (§2.4.2): a write to a non-writable key
         // is denied regardless of any policy grant.
         if op.is_write() && !entry.writable {
@@ -461,6 +480,13 @@ impl<'a> Pdp<'a> {
         let Some(entry) = self.catalog.keys.get(key) else {
             return Explanation::deny(DenyReason::UnknownKey);
         };
+        if entry
+            .nix_cache
+            .as_ref()
+            .is_some_and(|identity| !nix_cache_op_allowed(identity.state, op))
+        {
+            return Explanation::deny(DenyReason::NixCachePurposeBound);
+        }
         if op.is_write() && !entry.writable {
             return Explanation::deny(DenyReason::NotWritable);
         }
@@ -590,6 +616,15 @@ const fn is_public_read(op: Op) -> bool {
     matches!(op, Op::Get | Op::GetPublicKey)
 }
 
+const fn nix_cache_op_allowed(state: super::NixCacheState, op: Op) -> bool {
+    match state {
+        super::NixCacheState::Pending => matches!(op, Op::EnrollNixCacheKey),
+        super::NixCacheState::Enrolled => {
+            matches!(op, Op::EnrollNixCacheKey | Op::SignNixCacheFingerprint)
+        }
+    }
+}
+
 fn matching_rule_subject<'a>(
     rule_subjects: &'a [SubjectName],
     actor_subject: &str,
@@ -641,6 +676,23 @@ mod tests {
           "path": "secret/data/enroll/x25519",
           "publicPath": "secret/data/enroll/x25519-public", "writable": true,
           "missing": "error", "description": "x25519 enrollment sealing key"
+        },
+        "nix.pending": {
+          "class": "asymmetric", "keyType": "ed25519", "backend": "bao",
+          "engine": "transit", "path": "nix-pending", "writable": true,
+          "nixCache": {
+            "keyName": "cache.pending-1", "state": "pending", "backendVersion": 1
+          },
+          "description": "pending Nix cache signing key"
+        },
+        "nix.enrolled": {
+          "class": "asymmetric", "keyType": "ed25519", "backend": "bao",
+          "engine": "transit", "path": "nix-enrolled", "writable": true,
+          "nixCache": {
+            "keyName": "cache.enrolled-1", "state": "enrolled", "backendVersion": 1,
+            "publicKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+          },
+          "description": "enrolled Nix cache signing key"
         }
       }
     }"#;
@@ -1153,7 +1205,7 @@ mod tests {
                 .into_iter()
                 .map(|op| Grant {
                     op,
-                    target: crate::catalog::glob::KeyGlob::parse("nats.account")
+                    target: crate::catalog::glob::KeyGlob::parse("nix.enrolled")
                         .expect("exact target"),
                     rule_id: "explicit-nix".into(),
                     action: format!("op:{}", op.token()),
@@ -1165,8 +1217,88 @@ mod tests {
             .resolve_unix_actor(0)
             .expect("root breakglass subject resolves");
         for op in [Op::EnrollNixCacheKey, Op::SignNixCacheFingerprint] {
-            assert!(pdp.decide(&actor, op, "nats.account").is_allow());
+            assert!(pdp.decide(&actor, op, "nix.enrolled").is_allow());
         }
+    }
+
+    #[test]
+    fn nix_cache_hard_cap_is_state_aware_and_overrides_all_generic_grants() {
+        let (c, mut r, cfg) = fixture();
+        let exact = |target| crate::catalog::glob::KeyGlob::parse(target).expect("exact target");
+        r.rules.push(crate::catalog::policy::ResolvedRule {
+            subjects: vec!["svc.nats".into()],
+            grants: ["nix.pending", "nix.enrolled"]
+                .into_iter()
+                .flat_map(|target| {
+                    [
+                        Op::GetPublicKey,
+                        Op::Sign,
+                        Op::Import,
+                        Op::NewKey,
+                        Op::EnrollNixCacheKey,
+                        Op::SignNixCacheFingerprint,
+                    ]
+                    .into_iter()
+                    .map(move |op| Grant {
+                        op,
+                        target: exact(target),
+                        rule_id: "explicit-nix-matrix".into(),
+                        action: format!("op:{}", op.token()),
+                    })
+                })
+                .collect(),
+        });
+        let pdp = Pdp::new(&c, &r, &cfg);
+        let explicit_actor = pdp.resolve_unix_actor(9003).expect("explicit subject");
+        let wildcard_actor = pdp.resolve_unix_actor(0).expect("wildcard subject");
+
+        for actor in [&explicit_actor, &wildcard_actor] {
+            for key in ["nix.pending", "nix.enrolled"] {
+                for op in [
+                    Op::GetPublicKey,
+                    Op::Sign,
+                    Op::Import,
+                    Op::NewKey,
+                    Op::Rotate,
+                ] {
+                    assert_eq!(
+                        pdp.decide(actor, op, key),
+                        Decision::Deny {
+                            reason: DenyReason::NixCachePurposeBound
+                        },
+                        "generic {op:?} must be hard-denied on {key}"
+                    );
+                }
+            }
+        }
+
+        assert!(
+            pdp.decide(&explicit_actor, Op::EnrollNixCacheKey, "nix.pending")
+                .is_allow()
+        );
+        assert!(
+            pdp.decide(&explicit_actor, Op::EnrollNixCacheKey, "nix.enrolled")
+                .is_allow()
+        );
+        assert_eq!(
+            pdp.decide(&explicit_actor, Op::SignNixCacheFingerprint, "nix.pending"),
+            Decision::Deny {
+                reason: DenyReason::NixCachePurposeBound
+            }
+        );
+        assert!(
+            pdp.decide(&explicit_actor, Op::SignNixCacheFingerprint, "nix.enrolled")
+                .is_allow()
+        );
+
+        assert_eq!(
+            pdp.explain_subject("unknown.subject", Op::Sign, "nix.enrolled")
+                .decision,
+            Decision::Deny {
+                reason: DenyReason::NixCachePurposeBound
+            },
+            "offline evaluation must preserve the same hard cap"
+        );
     }
 
     #[test]
