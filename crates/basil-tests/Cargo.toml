@@ -63,6 +63,7 @@ async-nats = { workspace = true }
 bytes = { workspace = true }
 cose_minicbor = { version = "0.1.1", default-features = false, features = ["suit-sha256-ed25519"] }
 ed25519-dalek = { workspace = true }
+hex = { workspace = true }
 hyper-util = { workspace = true }
 jsonwebtoken = { workspace = true }
 minicbor = { workspace = true, features = ["alloc", "std"] }
@@ -73,6 +74,7 @@ pkcs8 = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
 rsa = { workspace = true }
+sha2 = { workspace = true }
 spiffe-rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-stream = { workspace = true }
