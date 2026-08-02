@@ -67,12 +67,18 @@ hyper-util = { workspace = true }
 jsonwebtoken = { workspace = true }
 minicbor = { workspace = true, features = ["alloc", "std"] }
 pkcs8 = { workspace = true }
+# `rand`/`rsa`/`url`: deterministic runtime-generated RSA trust material and the
+# provider document-fetcher seam for `ci_trust_reload_matrix` (no key blobs in
+# source; `url` must be the workspace version so the fetcher trait types unify).
+rand = { workspace = true }
 reqwest = { workspace = true }
+rsa = { workspace = true }
 spiffe-rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
 tower = { workspace = true }
+url = { workspace = true }
 x509-parser = { workspace = true }
 
 [[test]]
@@ -83,6 +89,11 @@ required-features = ["live-e2e"]
 [[test]]
 name = "ci_challenge_lifecycle_matrix"
 path = "tests/ci_challenge_lifecycle_matrix.rs"
+required-features = ["live-e2e"]
+
+[[test]]
+name = "ci_reload_policy_matrix"
+path = "tests/ci_reload_policy_matrix.rs"
 required-features = ["live-e2e"]
 
 [[test]]

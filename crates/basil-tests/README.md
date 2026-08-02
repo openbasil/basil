@@ -52,6 +52,17 @@ provisioned, so a booted broker in this lane cannot open a request body.
   `run_attempt`/restart, generation-scoped reload reset, allowance pressure) against the
   public `RunQuotaTable` API — quota-over-RPC needs a hermetic provider seam
   (`basil-abdh`).
+- **Reload isolation and policy separation**: `ci_reload_policy_matrix` drives three live
+  SIGHUP reloads of one booted broker: default-deny separation among gateway UID, remote
+  subject, operation, and key (each probe flips exactly one dimension, attributed by wire
+  status plus the broker's own audit line); pinned-generation reload races (every racing
+  response is a whole-generation outcome, sealed denials name the new generation); and the
+  federation kill switch (removing `[federation]` flips the proof-bound shape to the
+  entry-gate audience rejection while reserved in-flight challenges complete coherently and
+  the subject lane keeps serving). `ci_trust_reload_matrix` is the hermetic JWKS half of the
+  reload boundary: a provider trust rotation with identical issuer and `kid` must never
+  cross a generation reload (generation B refetches; A stays pinned) — the live rendition
+  needs the provider-origin seam (`basil-abdh`).
 
 ## Features
 
