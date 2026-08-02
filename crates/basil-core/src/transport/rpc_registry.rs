@@ -286,6 +286,8 @@ const CLASSIFICATION_TABLE: &[ClassificationEntry] = &[
     // an UNIMPLEMENTED stub until basil-jjgi.3.2). Conservatively
     // `NoAutomaticReplay`: issuance mints bounded broker state.
     unary(INVOCATION, "GetInvocationChallenge"),
+    // Listener capability discovery is read-only and safe to replay.
+    unary_read(INVOCATION, "GetInvocationCapabilities"),
     // Signing.
     unary(SIGNING, "NewKey"),
     unary(SIGNING, "Import"),

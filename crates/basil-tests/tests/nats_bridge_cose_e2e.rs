@@ -53,6 +53,7 @@ use basil_proto::broker::v1::invocation_service_server::{
     InvocationService, InvocationServiceServer,
 };
 use basil_proto::broker::v1::{
+    GetInvocationCapabilitiesRequest, GetInvocationCapabilitiesResponse,
     GetInvocationChallengeRequest, GetInvocationChallengeResponse, SealedRequest, SealedResponse,
     SigningAlgorithm,
 };
@@ -106,6 +107,15 @@ impl InvocationService for FakeInvocationService {
     ) -> Result<Response<GetInvocationChallengeResponse>, Status> {
         Err(Status::unimplemented(
             "GetInvocationChallenge is not part of the courier round-trip",
+        ))
+    }
+
+    async fn get_invocation_capabilities(
+        &self,
+        _request: Request<GetInvocationCapabilitiesRequest>,
+    ) -> Result<Response<GetInvocationCapabilitiesResponse>, Status> {
+        Err(Status::unimplemented(
+            "GetInvocationCapabilities is not part of the courier round-trip",
         ))
     }
 }
@@ -211,6 +221,15 @@ impl InvocationService for VerifyingInvocationService {
     ) -> Result<Response<GetInvocationChallengeResponse>, Status> {
         Err(Status::unimplemented(
             "GetInvocationChallenge is not part of the courier round-trip",
+        ))
+    }
+
+    async fn get_invocation_capabilities(
+        &self,
+        _request: Request<GetInvocationCapabilitiesRequest>,
+    ) -> Result<Response<GetInvocationCapabilitiesResponse>, Status> {
+        Err(Status::unimplemented(
+            "GetInvocationCapabilities is not part of the courier round-trip",
         ))
     }
 }
