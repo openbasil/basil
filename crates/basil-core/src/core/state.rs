@@ -544,6 +544,12 @@ pub struct BrokerState {
     /// two triggers. Reloads are rare, so contention is irrelevant.
     reload_lock: Mutex<()>,
     live_reload_lock: tokio::sync::Mutex<()>,
+    /// Every Nix verifier identity enrolled during this process lifetime.
+    ///
+    /// The set is monotonic and deliberately outlives catalog generations. A
+    /// removed name therefore cannot be re-declared at another route or with
+    /// different material until the process restarts.
+    nix_cache_enrolled_tombstones: Mutex<BTreeSet<String>>,
 }
 
 impl BrokerState {
@@ -584,6 +590,16 @@ impl BrokerState {
         backend_label: impl Into<String>,
         limits: BrokerLimits,
     ) -> Self {
+        let catalog = catalog.into();
+        let nix_cache_enrolled_tombstones = catalog
+            .keys
+            .values()
+            .filter_map(|key| {
+                let identity = key.nix_cache.as_ref()?;
+                (identity.state == crate::catalog::NixCacheState::Enrolled)
+                    .then(|| identity.key_name.clone())
+            })
+            .collect();
         let generation = Generation::new(INITIAL_GENERATION_ID, catalog, policy, config);
         Self {
             generation: ArcSwap::from_pointee(generation),
@@ -606,6 +622,7 @@ impl BrokerState {
             jwks_cache: Mutex::new(None),
             reload_lock: Mutex::new(()),
             live_reload_lock: tokio::sync::Mutex::new(()),
+            nix_cache_enrolled_tombstones: Mutex::new(nix_cache_enrolled_tombstones),
         }
     }
 
@@ -802,6 +819,29 @@ impl BrokerState {
     #[must_use]
     pub const fn reload_lock(&self) -> &Mutex<()> {
         &self.reload_lock
+    }
+
+    /// Snapshot the process-lifetime enrolled Nix identity tombstones.
+    #[must_use]
+    pub(crate) fn nix_cache_enrolled_tombstones(&self) -> BTreeSet<String> {
+        self.nix_cache_enrolled_tombstones
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Extend the process-lifetime Nix identity tombstones after a successful
+    /// generation swap. Existing entries are never removed.
+    pub(crate) fn record_nix_cache_enrollments(&self, catalog: &Catalog) {
+        let mut tombstones = self
+            .nix_cache_enrolled_tombstones
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tombstones.extend(catalog.keys.values().filter_map(|key| {
+            let identity = key.nix_cache.as_ref()?;
+            (identity.state == crate::catalog::NixCacheState::Enrolled)
+                .then(|| identity.key_name.clone())
+        }));
     }
 
     /// The id of the **currently serving** generation (observable for the status
