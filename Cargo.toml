@@ -8,6 +8,7 @@ members = [
   "crates/basil-bin",
   "crates/basil-client",
   "crates/basil-compose",
+  "crates/basil-courier",
   "crates/basil-core",
   "crates/basil-cose",
   "crates/basil-keystore-backend",
@@ -31,6 +32,7 @@ repository = "https://github.com/openbasil/basil"
 basil = { version = "0.8.0-pre.1", path = "crates/basil-client" }
 basil-bin = { version = "0.8.0-pre.1", path = "crates/basil-bin" }
 basil-compose = { version = "0.8.0-pre.1", path = "crates/basil-compose" }
+basil-courier = { version = "0.8.0-pre.1", path = "crates/basil-courier" }
 basil-core = { version = "0.8.0-pre.1", path = "crates/basil-core", default-features = false }
 basil-cose = { version = "0.8.0-pre.1", path = "crates/basil-cose" }
 basil-keystore-backend = { version = "0.8.0-pre.1", path = "crates/basil-keystore-backend" }
