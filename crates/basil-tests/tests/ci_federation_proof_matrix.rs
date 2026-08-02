@@ -127,7 +127,9 @@ fn run_arm(arm: ProviderArm, tag: &str) {
             Ed25519Signer::from_secret_bytes(text_key("subject"), &Zeroizing::new(SUBJECT_SEED))
                 .public_key_bytes(),
         ),
+        second_subject_signature_key: None,
         response_public: RESPONSE_PUBLIC,
+        challenge: None,
     };
     let harness = boot_basil_invocation(tag, Engine::OpenBao, &addr, &spec);
 

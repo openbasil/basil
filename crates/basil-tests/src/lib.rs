@@ -569,6 +569,51 @@ impl Harness {
             .expect("dev backend pid available to kill");
         reap_dev_server(pid);
     }
+
+    /// Stop the running `basil-agent` and boot a fresh one from the SAME
+    /// on-disk config (`--config` [`Harness::config_path`]), leaving the dev
+    /// backend up. This is a real process restart: all in-memory broker state
+    /// (challenge table with its instance ID, per-run quota counters, serving
+    /// generation) is rebuilt from scratch, which is what the restart rows of
+    /// the challenge acceptance matrix (`basil-jjgi.3.3.2`) assert. Existing
+    /// gRPC channels to the old process are dead after this returns; callers
+    /// reconnect. Panics if the harness holds no agent child.
+    #[cfg(unix)]
+    pub fn restart_agent(&mut self) {
+        let mut child = self.agent.take().expect("agent is running for restart");
+        signal(child.id().cast_signed(), "-INT");
+        for _ in 0..100 {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if !matches!(child.try_wait(), Ok(Some(_))) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        // Remove the dead process's socket file: `wait_for_socket` keys on
+        // existence, so a stale file would report readiness early.
+        let socket = self.socket();
+        let _ = std::fs::remove_file(&socket);
+
+        let broker_log = self.workdir.join("broker.log");
+        let log = std::fs::File::options()
+            .append(true)
+            .create(true)
+            .open(&broker_log)
+            .expect("reopen broker log for the restarted agent");
+        let child = Command::new(repo_root().join("target/debug/basil"))
+            .arg("agent")
+            .arg("--config")
+            .arg(self.config_path())
+            .stdout(log.try_clone().expect("clone log handle"))
+            .stderr(log)
+            .spawn()
+            .expect("respawn basil agent");
+        self.agent = Some(child);
+        wait_for_socket(self, &socket, &broker_log);
+    }
 }
 
 #[cfg(unix)]
@@ -1341,6 +1386,11 @@ pub const INVOCATION_AUDIENCE: &str = "basil://ci.test/invocation";
 pub const INVOCATION_BROKER_ID: &str = "basil://ci.test/broker";
 /// Policy subject name bound to the caller-supplied invocation signature key.
 pub const INVOCATION_SUBJECT: &str = "ci.invoker";
+/// Second policy subject, admitted only when
+/// [`InvocationBootSpec::second_subject_signature_key`] is set. The challenge
+/// lifecycle matrix (`basil-jjgi.3.3.2`) uses it to prove a wrong-`jkt`
+/// consumption attempt does not burn the rightful holder's challenge.
+pub const INVOCATION_SUBJECT_2: &str = "ci.invoker2";
 
 /// Which CI provider arm of the proof-bound acceptance matrix a boot configures.
 ///
@@ -1458,9 +1508,43 @@ pub struct InvocationBootSpec {
     /// Base64url (unpadded) Ed25519 public key admitted as the
     /// [`INVOCATION_SUBJECT`] subject-key invocation signer.
     pub subject_signature_key: String,
+    /// Optional base64url (unpadded) Ed25519 public key admitted as a second
+    /// subject-key signer, [`INVOCATION_SUBJECT_2`], with its own decrypt
+    /// grant. `None` leaves the boot single-subject (the `basil-jjgi.3.3.1`
+    /// shape).
+    pub second_subject_signature_key: Option<String>,
     /// X25519 public key provisioned out of band at the response key's
     /// `publicPath`, so the broker can seal a response the caller can open.
     pub response_public: [u8; 32],
+    /// Optional `[invocation.challenge]` table shape. `None` keeps the SPEC
+    /// defaults (global capacity 16384, per-`jkt` rate `8/4`).
+    pub challenge: Option<ChallengeTableBoot>,
+}
+
+/// The `[invocation.challenge]` knobs an invocation boot may pin down.
+///
+/// Only the operator-configurable dimensions are here; the per-`jkt`
+/// outstanding cap (8) and the 60-second TTL are SPEC-fixed and deliberately
+/// not exposed (see `docs/ci-oidc-federation/SPEC.md`, Freshness). The
+/// challenge lifecycle matrix shrinks `capacity` to make global exhaustion
+/// reachable, raises the per-`jkt` rate burst above the outstanding cap so
+/// a per-`jkt` decline is attributable to the cap, and pins the per-source
+/// bucket burst-only (refill 0) so a per-source decline lands on a
+/// deterministic issuance count instead of racing wall-clock refills.
+#[derive(Clone, Copy, Debug)]
+pub struct ChallengeTableBoot {
+    /// Global maximum of outstanding challenges (`capacity`).
+    pub capacity: usize,
+    /// Per proof-key-thumbprint issuance token-bucket burst.
+    pub per_jkt_rate_burst: u32,
+    /// Per proof-key-thumbprint issuance token-bucket refill per second.
+    pub per_jkt_rate_refill_per_sec: u32,
+    /// Per courier-observed-source issuance token-bucket burst.
+    pub per_source_rate_burst: u32,
+    /// Per courier-observed-source issuance token-bucket refill per second.
+    /// Zero makes the bucket burst-only (the broker allows it; only a zero
+    /// burst is rejected).
+    pub per_source_rate_refill_per_sec: u32,
 }
 
 /// Boot a broker that accepts sealed invocations from proof-bound CI workloads.
@@ -1498,7 +1582,11 @@ pub fn boot_basil_invocation(
 
     provision_invocation_material(engine, &addr, spec);
     extend_invocation_catalog(&harness.catalog_path());
-    extend_invocation_policy(&harness.policy_path(), &spec.subject_signature_key);
+    extend_invocation_policy(
+        &harness.policy_path(),
+        &spec.subject_signature_key,
+        spec.second_subject_signature_key.as_deref(),
+    );
 
     let fixtures = harness.fixtures();
     let bundle = fixtures.join("bundle.sealed");
@@ -1550,6 +1638,10 @@ bundle = "{bundle}"
 
 [unlock]
 unlock-passphrase-file = "{pass}"
+# Keep the passphrase file: the challenge-matrix restart row respawns the
+# agent from this same config ([`Harness::restart_agent`]), and the default
+# wipe-after-unlock would leave the restarted agent unable to unseal.
+unlock-passphrase-no-wipe = true
 
 [broker-identity]
 id = "{broker_id}"
@@ -1560,7 +1652,7 @@ enable = true
 audience = ["{audience}"]
 request-encryption-key-id = "{request}"
 require-challenge = {require_challenge}
-{federation}"#,
+{challenge}{federation}"#,
         audit = harness.audit_log_path().display(),
         socket = harness.socket().display(),
         catalog = harness.catalog_path().display(),
@@ -1572,8 +1664,27 @@ require-challenge = {require_challenge}
         audience = INVOCATION_AUDIENCE,
         request = INVOCATION_REQUEST_KEY_ID,
         require_challenge = spec.require_challenge,
+        challenge = challenge_table_toml(spec.challenge.as_ref()),
         federation = spec.provider.federation_toml(),
     )
+}
+
+/// Render the `[invocation.challenge]` section, empty when the boot keeps the
+/// SPEC defaults. Emitted before `[federation]` so it stays inside the
+/// `[invocation]` table tree.
+fn challenge_table_toml(challenge: Option<&ChallengeTableBoot>) -> String {
+    challenge.map_or_else(String::new, |shape| {
+        format!(
+            "\n[invocation.challenge]\ncapacity = {capacity}\n\
+             per-jkt-rate = {{ burst = {jkt_burst}, refill-per-sec = {jkt_refill} }}\n\
+             per-source-rate = {{ burst = {source_burst}, refill-per-sec = {source_refill} }}\n",
+            capacity = shape.capacity,
+            jkt_burst = shape.per_jkt_rate_burst,
+            jkt_refill = shape.per_jkt_rate_refill_per_sec,
+            source_burst = shape.per_source_rate_burst,
+            source_refill = shape.per_source_rate_refill_per_sec,
+        )
+    })
 }
 
 /// Provision the key material an invocation boot needs in the running dev
@@ -1695,38 +1806,52 @@ fn sealing_key_entry(path: &str, key_use: &str) -> serde_json::Value {
     })
 }
 
-/// Add the subject-key invocation subject (and its decrypt grant) to the
-/// prefill policy in place.
-fn extend_invocation_policy(policy_path: &Path, subject_signature_key: &str) {
+/// Add the subject-key invocation subject(s) (and their decrypt grants) to
+/// the prefill policy in place.
+fn extend_invocation_policy(
+    policy_path: &Path,
+    subject_signature_key: &str,
+    second_subject_signature_key: Option<&str>,
+) {
     let mut policy: serde_json::Value =
         serde_json::from_slice(&std::fs::read(policy_path).expect("read prefill policy"))
             .expect("parse prefill policy");
-    policy
-        .get_mut("subjects")
-        .and_then(serde_json::Value::as_object_mut)
-        .expect("policy carries a subjects object")
-        .insert(
-            INVOCATION_SUBJECT.to_string(),
-            serde_json::json!({
-                "domain": "host-process",
-                "match": {
-                    "invocation.signature-key": {
-                        "algorithm": "ed25519",
-                        "public": subject_signature_key
+    let mut admitted = vec![(
+        INVOCATION_SUBJECT,
+        "ci-invoker-decrypt",
+        subject_signature_key,
+    )];
+    if let Some(second) = second_subject_signature_key {
+        admitted.push((INVOCATION_SUBJECT_2, "ci-invoker2-decrypt", second));
+    }
+    for (subject, rule_id, public) in admitted {
+        policy
+            .get_mut("subjects")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("policy carries a subjects object")
+            .insert(
+                subject.to_string(),
+                serde_json::json!({
+                    "domain": "host-process",
+                    "match": {
+                        "invocation.signature-key": {
+                            "algorithm": "ed25519",
+                            "public": public
+                        }
                     }
-                }
-            }),
-        );
-    policy
-        .get_mut("rules")
-        .and_then(serde_json::Value::as_array_mut)
-        .expect("policy carries a rules array")
-        .push(serde_json::json!({
-            "id": "ci-invoker-decrypt",
-            "subjects": [INVOCATION_SUBJECT],
-            "action": ["op:decrypt"],
-            "target": [INVOCATION_REQUEST_KEY_ID]
-        }));
+                }),
+            );
+        policy
+            .get_mut("rules")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("policy carries a rules array")
+            .push(serde_json::json!({
+                "id": rule_id,
+                "subjects": [subject],
+                "action": ["op:decrypt"],
+                "target": [INVOCATION_REQUEST_KEY_ID]
+            }));
+    }
     std::fs::write(
         policy_path,
         serde_json::to_vec_pretty(&policy).expect("serialize extended policy"),

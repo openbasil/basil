@@ -42,6 +42,16 @@ provisioned, so a booted broker in this lane cannot open a request body.
   confusion, proof-key and response-key substitution, COSE mutation) over the real
   `Invoke` RPC, parametrized over provider arm. The GitHub arm runs; the Forgejo arm
   ships `#[ignore]` and is activated by `basil-jjgi.3.5`.
+- **Freshness challenges and per-run quota**: `ci_challenge_lifecycle_matrix` drives the
+  broker's challenge state machine over the real `GetInvocationChallenge` + `Invoke` RPCs
+  (issuance shape, single-use and concurrent-duplicate consumption, expiry boundary,
+  wrong-`jkt` without burning the rightful holder's record, wrong-generation across a live
+  SIGHUP reload, restart invalidation, instance-prefix routing, per-`jkt`/per-source/global
+  issuance limits with an outstanding challenge still consuming under pressure).
+  `ci_run_quota_matrix` covers the per-run quota state machine (exhaustion, reset on
+  `run_attempt`/restart, generation-scoped reload reset, allowance pressure) against the
+  public `RunQuotaTable` API — quota-over-RPC needs a hermetic provider seam
+  (`basil-abdh`).
 
 ## Features
 

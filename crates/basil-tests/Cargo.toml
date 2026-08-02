@@ -81,6 +81,11 @@ path = "tests/ci_federation_proof_matrix.rs"
 required-features = ["live-e2e"]
 
 [[test]]
+name = "ci_challenge_lifecycle_matrix"
+path = "tests/ci_challenge_lifecycle_matrix.rs"
+required-features = ["live-e2e"]
+
+[[test]]
 name = "jwks_oidc_e2e"
 path = "tests/jwks_oidc_e2e.rs"
 required-features = ["live-e2e", "http"]
