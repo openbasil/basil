@@ -271,6 +271,31 @@ message GetInvocationChallengeResponse {
   int64 expires_at_unix = 3;
 }
 
+// Closed service-surface profile of the Unix listener serving this RPC.
+enum ListenerProfile {
+  // Unset; never reported by a conforming broker.
+  UNSPECIFIED = 0;
+  // Host and operator listener.
+  HOST = 1;
+  // Container workload listener.
+  CONTAINER = 2;
+  // Courier-only invocation listener.
+  COURIER = 3;
+}
+
+// Empty request for the effective local invocation-listener contract.
+message GetInvocationCapabilitiesRequest {}
+
+// Effective invocation behavior of the Unix listener serving this RPC.
+message GetInvocationCapabilitiesResponse {
+  // Closed service-surface profile of this listener.
+  ListenerProfile listener_profile = 1;
+  // Whether every invocation on this listener requires a freshness challenge.
+  bool require_challenge = 2;
+  // Frozen courier protocol contract version supported by this broker.
+  uint32 courier_protocol_version = 3;
+}
+
 // Disabled-by-default transport-neutral invocation service. Local clients keep
 // using the typed gRPC services over Unix sockets.
 service InvocationService {
@@ -283,6 +308,9 @@ service InvocationService {
   // request after backoff. Until broker challenge issuance lands this method
   // returns `UNIMPLEMENTED`.
   rpc GetInvocationChallenge(GetInvocationChallengeRequest) returns (GetInvocationChallengeResponse);
+  // Report the effective local listener profile and courier safety contract.
+  // Couriers require COURIER, require_challenge=true, and protocol version 1.
+  rpc GetInvocationCapabilities(GetInvocationCapabilitiesRequest) returns (GetInvocationCapabilitiesResponse);
 }
 
 // Create, import, and use asymmetric signing keys. Private key material is

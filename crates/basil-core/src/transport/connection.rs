@@ -32,12 +32,13 @@ pub const DEFAULT_MAX_CONNECTIONS_PER_LISTENER: usize = 1024;
 /// Default accepted-transport ceiling across every host-type listener.
 pub const DEFAULT_MAX_CONNECTIONS_HOST: usize = 1024;
 
-/// Default accepted-transport ceiling across every container-type listener.
+/// Default accepted-transport ceiling across all non-host listeners.
 ///
 /// Compiled strictly below [`DEFAULT_MAX_CONNECTIONS`] so container workloads
-/// can never occupy the whole global ceiling: the host/operator surface always
+/// and couriers together can never occupy the whole global ceiling: the
+/// host/operator surface always
 /// retains `DEFAULT_MAX_CONNECTIONS - DEFAULT_MAX_CONNECTIONS_CONTAINER`
-/// admittable connections, whatever the container side does (`basil-22pt`).
+/// admittable connections, whatever the non-host side does (`basil-22pt`).
 pub const DEFAULT_MAX_CONNECTIONS_CONTAINER: usize = 3072;
 
 /// Compiled accepted-transport ceilings enforced by [`ConnectionRegistry`].
@@ -53,7 +54,7 @@ pub struct ConnectionCeilings {
     pub maximum_per_listener: usize,
     /// Bound across every host-type listener.
     pub maximum_host: usize,
-    /// Bound across every container-type listener.
+    /// Aggregate bound across every container- and courier-type listener.
     pub maximum_container: usize,
 }
 
@@ -74,7 +75,9 @@ impl ConnectionCeilings {
     pub const fn maximum_for_type(&self, listener_type: ListenerType) -> usize {
         match listener_type {
             ListenerType::Host => self.maximum_host,
-            ListenerType::Container => self.maximum_container,
+            // The invocation-only courier surface shares the existing
+            // non-operator type ceiling without sharing its live count.
+            ListenerType::Container | ListenerType::Courier => self.maximum_container,
         }
     }
 
@@ -94,6 +97,7 @@ impl ConnectionCeilings {
 struct TypeCounts {
     host: usize,
     container: usize,
+    courier: usize,
 }
 
 impl TypeCounts {
@@ -101,6 +105,7 @@ impl TypeCounts {
         match listener_type {
             ListenerType::Host => self.host,
             ListenerType::Container => self.container,
+            ListenerType::Courier => self.courier,
         }
     }
 
@@ -108,6 +113,21 @@ impl TypeCounts {
         match listener_type {
             ListenerType::Host => &mut self.host,
             ListenerType::Container => &mut self.container,
+            ListenerType::Courier => &mut self.courier,
+        }
+    }
+
+    /// Admission count for the listener's resource class.
+    ///
+    /// `Container` and `Courier` retain distinct observable counters but share one
+    /// aggregate non-host ceiling so neither can consume `Host` reserve through
+    /// the other's otherwise-idle allowance.
+    const fn admission_count(self, listener_type: ListenerType) -> usize {
+        match listener_type {
+            ListenerType::Host => self.host,
+            ListenerType::Container | ListenerType::Courier => {
+                self.container.saturating_add(self.courier)
+            }
         }
     }
 }
@@ -430,7 +450,7 @@ impl ConnectionRegistry {
         if state.entries.len() >= self.inner.ceilings.maximum {
             return Err(ConnectionRegistryError::GlobalLimit);
         }
-        if state.type_counts.get(listener_type)
+        if state.type_counts.admission_count(listener_type)
             >= self.inner.ceilings.maximum_for_type(listener_type)
         {
             return Err(ConnectionRegistryError::ListenerTypeLimit(listener_type));
@@ -976,6 +996,10 @@ mod tests {
             compiled.maximum_for_type(ListenerType::Container),
             compiled.maximum_container
         );
+        assert_eq!(
+            compiled.maximum_for_type(ListenerType::Courier),
+            compiled.maximum_container
+        );
         let registry = ConnectionRegistry::with_defaults();
         assert_eq!(registry.ceilings(), compiled);
     }
@@ -1036,6 +1060,83 @@ mod tests {
         drop(third);
         drop(first);
         drop(host);
+        assert_eq!(registry.active_for_type(ListenerType::Container), 0);
+        assert_eq!(registry.active_for_type(ListenerType::Host), 0);
+    }
+
+    /// Container and courier listeners share one aggregate non-host budget,
+    /// including across distinct listener names. Filling that budget cannot
+    /// consume the host reserve, and releasing either type restores shared
+    /// capacity without merging their observable counts.
+    #[tokio::test]
+    async fn mixed_non_host_listeners_cannot_starve_host_reserve() {
+        let registry = ConnectionRegistry::with_ceilings(ConnectionCeilings {
+            maximum: 5,
+            maximum_per_listener: 3,
+            maximum_host: 2,
+            maximum_container: 3,
+        })
+        .expect("registry");
+
+        let (stream, _peer) = pair();
+        let courier_one = registry
+            .register(stream, "courier-1", ListenerType::Courier)
+            .expect("first courier connection");
+        let (stream, _peer) = pair();
+        let courier_two = registry
+            .register(stream, "courier-2", ListenerType::Courier)
+            .expect("second courier listener shares non-host budget");
+        let (stream, _peer) = pair();
+        let container = registry
+            .register(stream, "container", ListenerType::Container)
+            .expect("container consumes final non-host slot");
+        assert_eq!(registry.active_for_type(ListenerType::Courier), 2);
+        assert_eq!(registry.active_for_type(ListenerType::Container), 1);
+
+        let (stream, _peer) = pair();
+        assert!(matches!(
+            registry.register(stream, "courier-3", ListenerType::Courier),
+            Err(ConnectionRegistryError::ListenerTypeLimit(
+                ListenerType::Courier
+            ))
+        ));
+        let (stream, _peer) = pair();
+        assert!(matches!(
+            registry.register(stream, "container-2", ListenerType::Container),
+            Err(ConnectionRegistryError::ListenerTypeLimit(
+                ListenerType::Container
+            ))
+        ));
+
+        // The complete two-connection host reserve remains admissible after a
+        // mix of courier and container listeners fills the non-host budget.
+        let (stream, _peer) = pair();
+        let host_one = registry
+            .register(stream, "host-1", ListenerType::Host)
+            .expect("first reserved host connection");
+        let (stream, _peer) = pair();
+        let host_two = registry
+            .register(stream, "host-2", ListenerType::Host)
+            .expect("second reserved host connection");
+        assert_eq!(registry.active_for_type(ListenerType::Host), 2);
+
+        // Releasing one courier slot makes it reusable by a different
+        // non-host type while the separate observability counters stay exact.
+        drop(courier_two);
+        assert_eq!(registry.active_for_type(ListenerType::Courier), 1);
+        let (stream, _peer) = pair();
+        let replacement = registry
+            .register(stream, "container-2", ListenerType::Container)
+            .expect("released courier capacity is reusable by container");
+        assert_eq!(registry.active_for_type(ListenerType::Courier), 1);
+        assert_eq!(registry.active_for_type(ListenerType::Container), 2);
+
+        drop(replacement);
+        drop(container);
+        drop(courier_one);
+        drop(host_two);
+        drop(host_one);
+        assert_eq!(registry.active_for_type(ListenerType::Courier), 0);
         assert_eq!(registry.active_for_type(ListenerType::Container), 0);
         assert_eq!(registry.active_for_type(ListenerType::Host), 0);
     }

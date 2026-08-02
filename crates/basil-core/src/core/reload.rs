@@ -1230,6 +1230,74 @@ mod tests {
         assert!(pinned.listeners().get("control").is_none());
     }
 
+    #[test]
+    fn reload_treats_courier_type_change_as_listener_routing_reconfiguration() {
+        use crate::transport::listener_manager::ListenerChangeKind;
+
+        let (state, inputs) = state_with_files(&catalog_json(false), &policy_json(false));
+        let parent = inputs.config_path.parent().expect("config parent");
+        let host_socket = parent.join("host.sock");
+        let edge_socket = parent.join("edge.sock");
+        let initial = ListenerConfigSet::resolve(
+            BTreeMap::from([
+                (
+                    "host".to_string(),
+                    ListenerConfigInput {
+                        listener_type: ListenerType::Host,
+                        path: host_socket.clone(),
+                        mode: None,
+                        group: None,
+                    },
+                ),
+                (
+                    "edge".to_string(),
+                    ListenerConfigInput {
+                        listener_type: ListenerType::Container,
+                        path: edge_socket.clone(),
+                        mode: None,
+                        group: None,
+                    },
+                ),
+            ]),
+            LegacyListenerConfig::default(),
+        )
+        .expect("initial listeners validate");
+        let state = Arc::new(
+            Arc::try_unwrap(state)
+                .unwrap_or_else(|_| panic!("fixture state has one owner"))
+                .with_listener_configs(initial),
+        );
+        std::fs::write(
+            &inputs.config_path,
+            format!(
+                "schema = \"agent\"\nschemaVersion = 3\n[import]\ncatalog = \"catalog.json\"\npolicy = \"policy.json\"\nbundle = \"bundle.age\"\n[listeners.host]\ntype = \"host\"\npath = {host_socket:?}\n[listeners.edge]\ntype = \"courier\"\npath = {edge_socket:?}\n"
+            ),
+        )
+        .expect("write courier listener candidate");
+
+        let dry = check_reload(&state).expect("courier type candidate validates");
+        assert_eq!(dry.listener_impacts.len(), 1, "{:?}", dry.listener_impacts);
+        let impact = dry
+            .listener_impacts
+            .first()
+            .expect("one type reconfiguration");
+        assert_eq!(impact.name(), "edge");
+        assert_eq!(impact.kind(), ListenerChangeKind::Reconfigure);
+        assert_eq!(impact.previous_path(), Some(edge_socket.as_path()));
+        assert_eq!(impact.new_path(), Some(edge_socket.as_path()));
+
+        reload_generation(&state).expect("courier type candidate applies");
+        assert_eq!(
+            state
+                .load_generation()
+                .listeners()
+                .get("edge")
+                .expect("edge listener retained")
+                .listener_type(),
+            ListenerType::Courier
+        );
+    }
+
     #[tokio::test]
     async fn live_reload_publishes_added_listener_with_generation() {
         let (state, inputs) = state_with_files(&catalog_json(false), &policy_json(false));

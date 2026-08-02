@@ -53,6 +53,8 @@ pub enum ListenerType {
     Host,
     /// Container workload surface, excluding the Admin service.
     Container,
+    /// Courier surface exposing only sealed invocation RPCs.
+    Courier,
 }
 
 impl FromStr for ListenerType {
@@ -62,7 +64,8 @@ impl FromStr for ListenerType {
         match value {
             "host" => Ok(Self::Host),
             "container" => Ok(Self::Container),
-            _ => Err("listener type must be `host` or `container`"),
+            "courier" => Ok(Self::Courier),
+            _ => Err("listener type must be `host`, `container`, or `courier`"),
         }
     }
 }
@@ -72,6 +75,7 @@ impl std::fmt::Display for ListenerType {
         formatter.write_str(match self {
             Self::Host => "host",
             Self::Container => "container",
+            Self::Courier => "courier",
         })
     }
 }
@@ -135,6 +139,18 @@ impl ListenerType {
                 | GrpcService::SpiffeWorkload
                 | GrpcService::Sds,
             ) => true,
+            (Self::Courier, GrpcService::Invocation) => true,
+            (
+                Self::Courier,
+                GrpcService::Signing
+                | GrpcService::Aead
+                | GrpcService::Secret
+                | GrpcService::Minting
+                | GrpcService::Nats
+                | GrpcService::Admin
+                | GrpcService::SpiffeWorkload
+                | GrpcService::Sds,
+            ) => false,
         }
     }
 }
@@ -743,7 +759,11 @@ async fn serve_bound(
             Err(error) => Some(Err(error)),
         }
     });
-    let broker = BrokerGrpc::new_with_invocation_config(state.clone(), config.invocation);
+    let broker = BrokerGrpc::new_with_invocation_config_for_listener(
+        state.clone(),
+        config.invocation,
+        listener_type,
+    );
 
     let server = Server::builder()
         .add_optional_service(
@@ -880,10 +900,18 @@ mod tests {
     use async_trait::async_trait;
     use basil::Client;
     use basil_proto::KeyType;
-    use basil_proto::broker::v1::SealedRequest;
     use basil_proto::broker::v1::StatusRequest;
     use basil_proto::broker::v1::admin_service_client::AdminServiceClient;
+    use basil_proto::broker::v1::aead_service_client::AeadServiceClient;
     use basil_proto::broker::v1::invocation_service_client::InvocationServiceClient;
+    use basil_proto::broker::v1::minting_service_client::MintingServiceClient;
+    use basil_proto::broker::v1::nats_service_client::NatsServiceClient;
+    use basil_proto::broker::v1::secret_service_client::SecretServiceClient;
+    use basil_proto::broker::v1::signing_service_client::SigningServiceClient;
+    use basil_proto::broker::v1::{
+        EncryptRequest, GetInvocationCapabilitiesRequest, GetPublicKeyRequest, GetSecretRequest,
+        ListenerProfile, MintJwtRequest, MintNatsUserRequest, SealedRequest,
+    };
     use basil_proto::envoy::service::discovery::v3::DiscoveryRequest;
     use basil_proto::envoy::service::secret::v3::secret_discovery_service_client::SecretDiscoveryServiceClient;
     use basil_proto::spiffe::X509BundlesRequest;
@@ -911,6 +939,10 @@ mod tests {
                 ListenerType::Container.exposes(service),
                 service != GrpcService::Admin
             );
+            assert_eq!(
+                ListenerType::Courier.exposes(service),
+                service == GrpcService::Invocation
+            );
         }
     }
 
@@ -918,6 +950,7 @@ mod tests {
     fn listener_type_parser_rejects_unknown_and_ambiguous_values() {
         assert_eq!("host".parse(), Ok(ListenerType::Host));
         assert_eq!("container".parse(), Ok(ListenerType::Container));
+        assert_eq!("courier".parse(), Ok(ListenerType::Courier));
         assert!("Host".parse::<ListenerType>().is_err());
         assert!("workload".parse::<ListenerType>().is_err());
         assert!("".parse::<ListenerType>().is_err());
@@ -1238,6 +1271,16 @@ mod tests {
             .expect("connect")
     }
 
+    fn assert_invocation_capabilities(
+        capabilities: &basil_proto::broker::v1::GetInvocationCapabilitiesResponse,
+        profile: ListenerProfile,
+        require_challenge: bool,
+    ) {
+        assert_eq!(capabilities.listener_profile, profile as i32);
+        assert_eq!(capabilities.require_challenge, require_challenge);
+        assert_eq!(capabilities.courier_protocol_version, 1);
+    }
+
     #[tokio::test]
     async fn broker_grpc_serves_status_on_unix_socket() {
         let socket = socket_path("broker-only");
@@ -1311,6 +1354,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_listener_reports_its_effective_invocation_capabilities() {
+        for (listener_type, expected_profile, expected_challenge) in [
+            (ListenerType::Host, ListenerProfile::Host, false),
+            (ListenerType::Container, ListenerProfile::Container, false),
+            (ListenerType::Courier, ListenerProfile::Courier, true),
+        ] {
+            let socket = socket_path(listener_type.to_string().as_str());
+            let shutdown = spawn_server_with_type(socket.clone(), listener_type).await;
+            let mut client = InvocationServiceClient::new(uds_channel(&socket).await);
+            let capabilities = client
+                .get_invocation_capabilities(GetInvocationCapabilitiesRequest {})
+                .await
+                .expect("capability RPC is available even when invocation is disabled")
+                .into_inner();
+            assert_invocation_capabilities(&capabilities, expected_profile, expected_challenge);
+            let _ = shutdown.send(());
+        }
+    }
+
+    #[tokio::test]
+    async fn courier_listener_exposes_only_invocation_service() {
+        let socket = socket_path("courier-surface");
+        let shutdown = spawn_server_with_type(socket.clone(), ListenerType::Courier).await;
+        let channel = uds_channel(&socket).await;
+
+        let mut invocation = InvocationServiceClient::new(channel.clone());
+        invocation
+            .get_invocation_capabilities(GetInvocationCapabilitiesRequest {})
+            .await
+            .expect("courier exposes InvocationService");
+
+        let mut signing = SigningServiceClient::new(channel.clone());
+        assert_eq!(
+            signing
+                .get_public_key(GetPublicKeyRequest::default())
+                .await
+                .expect_err("courier omits SigningService")
+                .code(),
+            Code::Unimplemented
+        );
+
+        let mut aead = AeadServiceClient::new(channel.clone());
+        assert_eq!(
+            aead.encrypt(EncryptRequest::default())
+                .await
+                .expect_err("courier omits AeadService")
+                .code(),
+            Code::Unimplemented
+        );
+
+        let mut secret = SecretServiceClient::new(channel.clone());
+        assert_eq!(
+            secret
+                .get_secret(GetSecretRequest::default())
+                .await
+                .expect_err("courier omits SecretService")
+                .code(),
+            Code::Unimplemented
+        );
+
+        let mut minting = MintingServiceClient::new(channel.clone());
+        assert_eq!(
+            minting
+                .mint_jwt(MintJwtRequest::default())
+                .await
+                .expect_err("courier omits MintingService")
+                .code(),
+            Code::Unimplemented
+        );
+
+        let mut nats = NatsServiceClient::new(channel.clone());
+        assert_eq!(
+            nats.mint_nats_user(MintNatsUserRequest::default())
+                .await
+                .expect_err("courier omits NatsService")
+                .code(),
+            Code::Unimplemented
+        );
+
+        let mut admin = AdminServiceClient::new(channel.clone());
+        assert_eq!(
+            admin
+                .status(StatusRequest {
+                    include_realms: false,
+                })
+                .await
+                .expect_err("courier omits AdminService")
+                .code(),
+            Code::Unimplemented
+        );
+
+        let mut spiffe = SpiffeWorkloadApiClient::new(channel.clone());
+        assert_eq!(
+            spiffe
+                .fetch_x509_bundles(X509BundlesRequest {})
+                .await
+                .expect_err("courier omits SPIFFE Workload API")
+                .code(),
+            Code::Unimplemented
+        );
+
+        let mut sds = SecretDiscoveryServiceClient::new(channel);
+        assert_eq!(
+            sds.fetch_secrets(DiscoveryRequest::default())
+                .await
+                .expect_err("courier omits Envoy Secret Discovery Service")
+                .code(),
+            Code::Unimplemented
+        );
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
     async fn configured_host_and_container_listeners_serve_together() {
         let host_socket = socket_path("multi-host");
         let container_socket = socket_path("multi-container");
@@ -1365,6 +1522,114 @@ mod tests {
             .expect("multi-listener server exits cleanly");
         assert!(!host_socket.exists());
         assert!(!container_socket.exists());
+    }
+
+    #[tokio::test]
+    async fn live_same_path_host_and_container_rebind_to_courier() {
+        for (previous_type, previous_profile) in [
+            (ListenerType::Host, ListenerProfile::Host),
+            (ListenerType::Container, ListenerProfile::Container),
+        ] {
+            let suffix = previous_type.to_string();
+            let control_socket = socket_path(format!("rebind-control-{suffix}").as_str());
+            let edge_socket = socket_path(format!("rebind-edge-{suffix}").as_str());
+            let connections = ConnectionRegistry::with_defaults();
+            let runtime = ListenerRuntime::start(
+                vec![
+                    test_server_config(
+                        "control",
+                        &control_socket,
+                        ListenerType::Host,
+                        connections.clone(),
+                    ),
+                    test_server_config("edge", &edge_socket, previous_type, connections.clone()),
+                ],
+                state(),
+            )
+            .await
+            .expect("runtime starts");
+            wait_for_socket(&control_socket).await;
+            wait_for_socket(&edge_socket).await;
+            let initial = listener_set([
+                ("control", ListenerType::Host, control_socket.clone()),
+                ("edge", previous_type, edge_socket.clone()),
+            ]);
+            let courier = listener_set([
+                ("control", ListenerType::Host, control_socket.clone()),
+                ("edge", ListenerType::Courier, edge_socket.clone()),
+            ]);
+
+            let mut old_client = InvocationServiceClient::new(uds_channel(&edge_socket).await);
+            let old_capabilities = old_client
+                .get_invocation_capabilities(GetInvocationCapabilitiesRequest {})
+                .await
+                .expect("container capability RPC")
+                .into_inner();
+            assert_invocation_capabilities(&old_capabilities, previous_profile, false);
+            let old_connection_id = connections
+                .snapshot()
+                .into_iter()
+                .find(|record| record.context().listener_name() == "edge")
+                .expect("old edge connection is tracked")
+                .context()
+                .connection_id();
+
+            runtime
+                .transition(&initial, &courier, || {})
+                .await
+                .expect_err("an active old channel blocks same-path replacement");
+            let still_old = old_client
+                .get_invocation_capabilities(GetInvocationCapabilitiesRequest {})
+                .await
+                .expect("rejected transition leaves old listener serving")
+                .into_inner();
+            assert_invocation_capabilities(&still_old, previous_profile, false);
+
+            drop(old_client);
+            for _ in 0..100 {
+                if connections.active_for_listener("edge") == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(connections.active_for_listener("edge"), 0);
+            assert!(
+                connections
+                    .snapshot()
+                    .iter()
+                    .all(|record| record.context().connection_id() != old_connection_id),
+                "the old channel must be gone before replacement"
+            );
+
+            runtime
+                .transition(&initial, &courier, || {})
+                .await
+                .expect("drained same-path replacement succeeds");
+            wait_for_socket(&edge_socket).await;
+
+            let mut new_client = InvocationServiceClient::new(uds_channel(&edge_socket).await);
+            let new_capabilities = new_client
+                .get_invocation_capabilities(GetInvocationCapabilitiesRequest {})
+                .await
+                .expect("replacement capability RPC")
+                .into_inner();
+            assert_invocation_capabilities(&new_capabilities, ListenerProfile::Courier, true);
+            let replacement = connections
+                .snapshot()
+                .into_iter()
+                .find(|record| record.context().listener_name() == "edge")
+                .expect("replacement edge connection is tracked");
+            assert_eq!(replacement.context().listener_type(), ListenerType::Courier);
+            assert_ne!(replacement.context().connection_id(), old_connection_id);
+
+            drop(new_client);
+            runtime
+                .run_until_shutdown(std::future::ready(()))
+                .await
+                .expect("runtime shuts down");
+            assert!(!control_socket.exists());
+            assert!(!edge_socket.exists());
+        }
     }
 
     #[tokio::test]

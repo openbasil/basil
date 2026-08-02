@@ -42,6 +42,8 @@ const BROKER_KEY_USE_LABEL: &str = "broker_key_use";
 const BROKER_RESPONSE_ENCRYPTION_USE: &str = "response-encryption";
 const INVOKE_OP: &str = "invoke";
 const CHALLENGE_OP: &str = "get_invocation_challenge";
+/// Frozen local courier contract version from SPEC revision 4.2.
+const COURIER_PROTOCOL_VERSION: u32 = 1;
 /// Wire bound on `courier_observed_source`: a rate-limit partition key only.
 const MAX_COURIER_SOURCE_BYTES: usize = 128;
 
@@ -61,6 +63,7 @@ impl InvocationService for BrokerGrpc {
                 tracing::debug!(
                     sender_subject = %prepared.actor.subject,
                     recipient_key_id = %prepared.recipient_key_id,
+                    response_key_id = %prepared.response_recipient.key_id(),
                     plaintext_len = prepared.body.len(),
                     "sealed invocation preflight accepted",
                 );
@@ -136,6 +139,24 @@ impl InvocationService for BrokerGrpc {
             }
         }
     }
+
+    async fn get_invocation_capabilities(
+        &self,
+        _request: Request<pb::GetInvocationCapabilitiesRequest>,
+    ) -> GrpcResult<pb::GetInvocationCapabilitiesResponse> {
+        let listener_profile = match self.listener_type {
+            crate::transport::grpc_server::ListenerType::Host => pb::ListenerProfile::Host,
+            crate::transport::grpc_server::ListenerType::Container => {
+                pb::ListenerProfile::Container
+            }
+            crate::transport::grpc_server::ListenerType::Courier => pb::ListenerProfile::Courier,
+        };
+        Ok(Response::new(pb::GetInvocationCapabilitiesResponse {
+            listener_profile: listener_profile.into(),
+            require_challenge: self.invocation.require_challenge,
+            courier_protocol_version: COURIER_PROTOCOL_VERSION,
+        }))
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -177,7 +198,7 @@ struct PreparedInvocation {
     generation: std::sync::Arc<crate::state::Generation>,
     actor: AuthenticatedActor,
     recipient_key_id: String,
-    response_key_id: String,
+    response_recipient: ResponseRecipient,
     response_subject: Option<String>,
     content_type: String,
     claims: Claims,
@@ -188,7 +209,7 @@ struct PreparedInvocation {
 impl PreparedInvocation {
     fn envelope(&self) -> ResponseEnvelope<'_> {
         ResponseEnvelope {
-            response_key_id: &self.response_key_id,
+            response_recipient: &self.response_recipient,
             response_subject: self.response_subject.as_deref(),
             request_message: &self.request_message,
             request_message_id: &self.claims.message_id,
@@ -228,7 +249,7 @@ impl SealedDenial {
 struct DeniedInvocation {
     generation: std::sync::Arc<crate::state::Generation>,
     denial: SealedDenial,
-    response_key_id: String,
+    response_recipient: ResponseRecipient,
     response_subject: Option<String>,
     request_message_id: MessageId,
     request_message: Vec<u8>,
@@ -237,7 +258,7 @@ struct DeniedInvocation {
 impl DeniedInvocation {
     fn envelope(&self) -> ResponseEnvelope<'_> {
         ResponseEnvelope {
-            response_key_id: &self.response_key_id,
+            response_recipient: &self.response_recipient,
             response_subject: self.response_subject.as_deref(),
             request_message: &self.request_message,
             request_message_id: &self.request_message_id,
@@ -248,10 +269,34 @@ impl DeniedInvocation {
 /// The request-derived inputs of response protection, shared by success,
 /// operation-status, and challenge-denial responses.
 struct ResponseEnvelope<'a> {
-    response_key_id: &'a str,
+    response_recipient: &'a ResponseRecipient,
     response_subject: Option<&'a str>,
     request_message: &'a [u8],
     request_message_id: &'a MessageId,
+}
+
+/// The response-encryption recipient resolved once during preflight.
+///
+/// Catalog recipients retain the existing local subject-key behavior.
+/// Ephemeral recipients are supplied by a successfully verified provider
+/// proof and carry the already validated public half directly; response
+/// protection never consults a catalog entry with the same key ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResponseRecipient {
+    Catalog { key_id: String },
+    Ephemeral { key_id: String, public: [u8; 32] },
+}
+
+impl ResponseRecipient {
+    fn key_id(&self) -> &str {
+        match self {
+            Self::Catalog { key_id } | Self::Ephemeral { key_id, .. } => key_id,
+        }
+    }
+
+    const fn is_catalog(&self) -> bool {
+        matches!(self, Self::Catalog { .. })
+    }
 }
 
 /// Why the freshness-challenge step denied the request. Every variant maps
@@ -370,6 +415,18 @@ impl BrokerGrpc {
             None
         };
 
+        // SPEC revision 4.2 step 3: resolve the one response recipient after
+        // provider verification and before peer admission, challenge
+        // consumption, policy, or backend use. The provider-proof and local
+        // subject-key shapes are disjoint and never fall back into one
+        // another, even when an ephemeral thumbprint collides with a catalog
+        // key name.
+        let response_recipient = Self::resolve_response_recipient(
+            &generation,
+            &sealed.claims,
+            provider_evidence.is_some(),
+        )?;
+
         let Some(uid) = peer.uid else {
             self.state
                 .record_decision(&DecisionRecord::from_resolution_error(
@@ -408,9 +465,6 @@ impl BrokerGrpc {
                     EvidenceState::NoMatch,
                     &format!("freshness_challenge_denied: {denial}"),
                 ));
-            let response_key_id = required_response_key_id(&sealed.claims)?.to_string();
-            self.validate_response_encryption_key(&generation, &response_key_id)
-                .await?;
             let response_subject = sealed
                 .claims
                 .response_subject
@@ -420,7 +474,7 @@ impl BrokerGrpc {
             return Ok(PreparedRequest::Denied(DeniedInvocation {
                 generation,
                 denial: SealedDenial::ChallengeUnknown,
-                response_key_id,
+                response_recipient,
                 response_subject,
                 request_message_id: sealed.claims.message_id.clone(),
                 request_message: message.message.clone(),
@@ -522,9 +576,6 @@ impl BrokerGrpc {
                         EvidenceState::Match,
                         &format!("per_run_quota_denied: {denied}"),
                     ));
-                let response_key_id = required_response_key_id(&sealed.claims)?.to_string();
-                self.validate_response_encryption_key(&generation, &response_key_id)
-                    .await?;
                 let response_subject = sealed
                     .claims
                     .response_subject
@@ -543,7 +594,7 @@ impl BrokerGrpc {
                 return Ok(PreparedRequest::Denied(DeniedInvocation {
                     generation,
                     denial,
-                    response_key_id,
+                    response_recipient,
                     response_subject,
                     request_message_id: sealed.claims.message_id.clone(),
                     request_message: message.message.clone(),
@@ -553,8 +604,6 @@ impl BrokerGrpc {
 
         let recipient_key_id = catalog_key_id(&sealed.recipient_key_id, "recipient key id")?;
         self.validate_request_recipient_key(recipient_key_id)?;
-        let response_key_id = required_response_key_id(&sealed.claims)?;
-
         let decision = generation
             .pdp()
             .decide(&actor, Op::Decrypt, recipient_key_id);
@@ -570,8 +619,10 @@ impl BrokerGrpc {
             return Err(unauthorized_invocation());
         }
 
-        self.validate_response_encryption_key(&generation, response_key_id)
-            .await?;
+        if response_recipient.is_catalog() {
+            self.validate_catalog_response_encryption_key_material(response_recipient.key_id())
+                .await?;
+        }
 
         let opened = sealed
             .open(
@@ -598,7 +649,7 @@ impl BrokerGrpc {
             generation,
             actor,
             recipient_key_id: recipient_key_id.to_string(),
-            response_key_id: response_key_id.to_string(),
+            response_recipient,
             response_subject,
             content_type: sealed.content_type.as_str().to_string(),
             claims: sealed.claims,
@@ -814,8 +865,47 @@ impl BrokerGrpc {
         }
     }
 
-    async fn validate_response_encryption_key(
-        &self,
+    fn resolve_response_recipient(
+        generation: &crate::state::Generation,
+        claims: &Claims,
+        provider_verified: bool,
+    ) -> Result<ResponseRecipient, Status> {
+        let key_id = required_response_key_id(claims)?;
+        match (provider_verified, claims.response_public_key_cose) {
+            (true, Some(public)) => {
+                // The COSE profile already enforces this relation while
+                // decoding. Recheck at the trust-boundary selection seam so
+                // this function remains correct for typed callers and future
+                // construction paths too.
+                if key_id.as_bytes() != public.thumbprint().as_bytes() {
+                    return Err(invalid_request(
+                        INVOKE_OP,
+                        "response key id does not match ephemeral response public key",
+                    ));
+                }
+                Ok(ResponseRecipient::Ephemeral {
+                    key_id: key_id.to_string(),
+                    public: *public.as_public_bytes(),
+                })
+            }
+            (true, None) => Err(invalid_request(
+                INVOKE_OP,
+                "provider-proof request is missing an ephemeral response public key",
+            )),
+            (false, Some(_)) => Err(invalid_request(
+                INVOKE_OP,
+                "ephemeral response public key requires verified provider proof",
+            )),
+            (false, None) => {
+                Self::validate_catalog_response_encryption_key(generation, key_id)?;
+                Ok(ResponseRecipient::Catalog {
+                    key_id: key_id.to_string(),
+                })
+            }
+        }
+    }
+
+    fn validate_catalog_response_encryption_key(
         generation: &crate::state::Generation,
         key_id: &str,
     ) -> Result<(), Status> {
@@ -840,6 +930,13 @@ impl BrokerGrpc {
                 ));
             }
         }
+        Ok(())
+    }
+
+    async fn validate_catalog_response_encryption_key_material(
+        &self,
+        key_id: &str,
+    ) -> Result<(), Status> {
         self.state
             .manager()
             .sealing_public_key(key_id)
@@ -859,12 +956,15 @@ impl BrokerGrpc {
             .broker_identity
             .as_ref()
             .ok_or(ResponseProtectionError::MissingBrokerIdentity)?;
-        let recipient_public = self
-            .state
-            .manager()
-            .sealing_public_key(envelope.response_key_id)
-            .await
-            .map_err(ResponseProtectionError::Manager)?;
+        let recipient_public = match envelope.response_recipient {
+            ResponseRecipient::Catalog { key_id } => self
+                .state
+                .manager()
+                .sealing_public_key(key_id)
+                .await
+                .map_err(ResponseProtectionError::Manager)?,
+            ResponseRecipient::Ephemeral { public, .. } => *public,
+        };
         let now = self.invocation_now_unix();
         let response_message_id = MessageId::from_bytes(uuid::Uuid::new_v4().as_bytes().to_vec())?;
         let signer_key_id = KeyId::from_text(&identity.response_signing_key_id)?;
@@ -882,6 +982,7 @@ impl BrokerGrpc {
             in_reply_to: Some(envelope.request_message_id.clone()),
             request_hash: Some(request_hash(envelope.request_message)),
             freshness_challenge: None,
+            response_public_key_cose: None,
         };
         let message = build_sealed(
             &SealParams {
@@ -890,7 +991,7 @@ impl BrokerGrpc {
                 claims,
                 role: MessageRole::Response,
                 recipient: X25519RecipientPublic {
-                    key_id: KeyId::from_text(envelope.response_key_id)?,
+                    key_id: KeyId::from_text(envelope.response_recipient.key_id())?,
                     public: recipient_public,
                 },
                 content_algorithm: ContentAlgorithm::A256Gcm,
@@ -1566,7 +1667,8 @@ mod tests {
     use crate::service::broker::{BrokerIdentityRuntimeConfig, InvocationRuntimeConfig};
     use crate::state::BrokerState;
     use basil_cose::{
-        Ed25519Signer, Ed25519Verifier, SignParams, VerifiedSealed, X25519Recipient, build_signed,
+        Ed25519Signer, Ed25519Verifier, SignParams, VerifiedSealed, X25519Recipient,
+        X25519ResponsePublicKey, build_signed,
     };
     use basil_proto::KeyType;
     use ed25519_dalek::{Signer as _, SigningKey};
@@ -1863,7 +1965,20 @@ mod tests {
             in_reply_to: None,
             request_hash: None,
             freshness_challenge: None,
+            response_public_key_cose: None,
         }
+    }
+
+    fn ephemeral_response_recipient(seed: u8) -> (X25519Recipient, X25519ResponsePublicKey) {
+        let private = Zeroizing::new([seed; 32]);
+        let provisional = X25519Recipient::new(key_id("provisional"), private);
+        let public = X25519ResponsePublicKey::from_public_bytes(provisional.public().public)
+            .expect("contributory response public key");
+        let recipient = X25519Recipient::new(
+            KeyId::from_text(&public.thumbprint()).expect("thumbprint key id"),
+            Zeroizing::new([seed; 32]),
+        );
+        (recipient, public)
     }
 
     fn sign_body() -> Vec<u8> {
@@ -1989,6 +2104,21 @@ mod tests {
         response: &pb::SealedResponse,
         original_request: &[u8],
     ) -> (VerifiedSealed, SignInvocationResponse) {
+        verify_response_with_recipient(
+            fixture,
+            response,
+            original_request,
+            &fixture.response_recipient,
+        )
+        .await
+    }
+
+    async fn verify_response_with_recipient(
+        fixture: &Fixture,
+        response: &pb::SealedResponse,
+        original_request: &[u8],
+        recipient: &X25519Recipient,
+    ) -> (VerifiedSealed, SignInvocationResponse) {
         let validation = response_validation();
         let verified = verify_sealed(
             &response.message,
@@ -2006,7 +2136,7 @@ mod tests {
         );
         let opened = verified
             .open(
-                &fixture.response_recipient,
+                recipient,
                 &ExternalAad::empty(),
                 Some(&KdfParties::anonymous()),
             )
@@ -2136,6 +2266,182 @@ mod tests {
         assert_eq!(body.signature.as_ref().unwrap().len(), 64);
     }
 
+    #[test]
+    fn response_recipient_admission_matrix_is_strict_and_disjoint() {
+        let fixture = fixture();
+        let generation = fixture.service.state.load_generation();
+
+        let missing = request_claims(b"provider-missing-response-key");
+        let status = BrokerGrpc::resolve_response_recipient(&generation, &missing, true)
+            .expect_err("verified provider proof requires an ephemeral response key");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(status.message().contains("missing an ephemeral response"));
+
+        let (_, public) = ephemeral_response_recipient(0x31);
+        let mut injected = request_claims(b"subject-key-injection");
+        injected.response_key_id = Some(key_id(&public.thumbprint()));
+        injected.response_public_key_cose = Some(public);
+        let status = BrokerGrpc::resolve_response_recipient(&generation, &injected, false)
+            .expect_err("subject-key mode forbids an ephemeral response key");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(
+            status
+                .message()
+                .contains("requires verified provider proof")
+        );
+
+        let mut substituted = injected.clone();
+        substituted.response_key_id = Some(key_id(RESPONSE_SEALING_KEY));
+        let status = BrokerGrpc::resolve_response_recipient(&generation, &substituted, true)
+            .expect_err("provider response key substitution must fail closed");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(status.message().contains("does not match"));
+
+        let ephemeral = BrokerGrpc::resolve_response_recipient(&generation, &injected, true)
+            .expect("verified provider selects the request key");
+        assert_eq!(
+            ephemeral,
+            ResponseRecipient::Ephemeral {
+                key_id: public.thumbprint(),
+                public: *public.as_public_bytes(),
+            }
+        );
+
+        let catalog = BrokerGrpc::resolve_response_recipient(
+            &generation,
+            &request_claims(b"legacy-catalog"),
+            false,
+        )
+        .expect("subject-key mode retains the catalog response key");
+        assert_eq!(
+            catalog,
+            ResponseRecipient::Catalog {
+                key_id: RESPONSE_SEALING_KEY.to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn subject_key_request_cannot_inject_an_ephemeral_response_recipient() {
+        let fixture = fixture();
+        let (_, public) = ephemeral_response_recipient(0x37);
+        let mut claims = request_claims(b"subject-key-ephemeral-injection");
+        claims.response_key_id = Some(key_id(&public.thumbprint()));
+        claims.response_public_key_cose = Some(public);
+        let message =
+            sealed_request_with(&fixture, claims, CONTENT_TYPE_SIGN_REQUEST, &sign_body()).await;
+        let status = prepare_err(&fixture, message).await;
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(
+            status
+                .message()
+                .contains("requires verified provider proof")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_response_recipient_admission_does_not_consume_challenge() {
+        let fixture = fixture();
+        let generation = fixture.service.state.load_generation().to_owned();
+        let proof_public = fixture.client_signer.public_key_bytes();
+        let challenge = issue_challenge(&fixture, client_jkt(&fixture)).await;
+        let mut claims = request_claims(b"admission-before-challenge");
+        claims.freshness_challenge = Some(basil_cose::FreshnessChallenge::new(challenge));
+
+        BrokerGrpc::resolve_response_recipient(&generation, &claims, true)
+            .expect_err("missing provider response key is rejected");
+
+        let policy = generation.policy().clone();
+        let verifier = PolicyVerifier::new(&policy);
+        fixture
+            .service
+            .consume_freshness_challenge(generation.id(), &claims, Some(&proof_public), &verifier)
+            .expect("no envelope error")
+            .expect("recipient admission failure must leave challenge unconsumed");
+    }
+
+    #[tokio::test]
+    async fn ephemeral_recipient_protects_success_and_denial_without_catalog_lookup() {
+        let fixture = fixture();
+        let (ephemeral_private, ephemeral_public) = ephemeral_response_recipient(0x41);
+        let recipient = ResponseRecipient::Ephemeral {
+            key_id: ephemeral_public.thumbprint(),
+            public: *ephemeral_public.as_public_bytes(),
+        };
+        let request_message = valid_request(&fixture).await;
+        let request_message_id = message_id(b"ephemeral-response");
+        let envelope = ResponseEnvelope {
+            response_recipient: &recipient,
+            response_subject: Some("reply.ephemeral"),
+            request_message: &request_message,
+            request_message_id: &request_message_id,
+        };
+        let success_body = SignInvocationResponse {
+            status: InvocationStatus::ok(),
+            policy_generation: fixture.service.state.load_generation().id(),
+            signature: Some(vec![0x5a; 64]),
+        };
+        let response = fixture
+            .service
+            .protect_response(
+                &envelope,
+                CONTENT_TYPE_SIGN_RESPONSE,
+                &success_body.to_cbor_bytes(),
+            )
+            .await
+            .expect("ephemeral response protection does not need a catalog entry");
+        let (_, opened) = verify_response_with_recipient(
+            &fixture,
+            &response,
+            &request_message,
+            &ephemeral_private,
+        )
+        .await;
+        assert_eq!(opened, success_body);
+
+        let validation = response_validation();
+        let verified = verify_sealed(
+            &response.message,
+            &fixture.broker_verifier,
+            &VerifySealedParams {
+                signature_aad: ExternalAad::empty(),
+                validation: &validation,
+            },
+        )
+        .await
+        .expect("broker signature remains independently pinned");
+        assert!(
+            verified
+                .open(
+                    &fixture.response_recipient,
+                    &ExternalAad::empty(),
+                    Some(&KdfParties::anonymous()),
+                )
+                .await
+                .is_err(),
+            "catalog private key must not open an ephemeral response",
+        );
+
+        let denied = DeniedInvocation {
+            generation: fixture.service.state.load_generation().to_owned(),
+            denial: SealedDenial::ChallengeUnknown,
+            response_recipient: recipient,
+            response_subject: Some("reply.ephemeral".to_string()),
+            request_message_id,
+            request_message: request_message.clone(),
+        };
+        let denial = fixture
+            .service
+            .protect_denied_invocation(&denied)
+            .await
+            .expect("freshness denial uses the same ephemeral recipient");
+        let (_, opened) =
+            verify_response_with_recipient(&fixture, &denial, &request_message, &ephemeral_private)
+                .await;
+        assert_eq!(opened.status, InvocationStatus::challenge_unknown());
+        assert!(opened.signature.is_none());
+    }
+
     fn client_jkt(fixture: &Fixture) -> [u8; 32] {
         crate::ci_federation::proof_key_thumbprint(&fixture.client_signer.public_key_bytes())
     }
@@ -2247,19 +2553,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn require_challenge_denies_challenge_less_subject_key_requests() {
-        // With `invocation.require-challenge` set (courier deployments), a
-        // subject-key request without a challenge is the sealed non-retryable
-        // CHALLENGE_UNKNOWN — restoring the courier replay invariant — while
-        // a challenged request still succeeds.
+    async fn courier_denies_challenge_less_subject_key_requests() {
+        // A Courier listener forces require-challenge even when the global
+        // compatibility setting is false. A bare subject-key request receives
+        // sealed CHALLENGE_UNKNOWN, while a challenged request still succeeds.
         let fixture = fixture();
-        let strict = BrokerGrpc::new_with_invocation_config(
+        assert!(!fixture.service.invocation.require_challenge);
+        let strict = BrokerGrpc::new_with_invocation_config_for_listener(
             Arc::clone(&fixture.service.state),
-            InvocationRuntimeConfig {
-                require_challenge: true,
-                ..fixture.service.invocation.clone()
-            },
+            fixture.service.invocation.clone(),
+            crate::transport::grpc_server::ListenerType::Courier,
         );
+        assert!(strict.invocation.require_challenge);
 
         let bare = valid_request(&fixture).await;
         let response = strict
@@ -2319,7 +2624,9 @@ mod tests {
         let denied = DeniedInvocation {
             generation: fixture.service.state.load_generation().to_owned(),
             denial: SealedDenial::PerRunQuotaExceeded,
-            response_key_id: RESPONSE_SEALING_KEY.to_string(),
+            response_recipient: ResponseRecipient::Catalog {
+                key_id: RESPONSE_SEALING_KEY.to_string(),
+            },
             response_subject: Some("reply.client".to_string()),
             request_message_id: message_id(b"msg-1"),
             request_message: message.clone(),
@@ -2347,7 +2654,9 @@ mod tests {
         let denied = DeniedInvocation {
             generation: fixture.service.state.load_generation().to_owned(),
             denial: SealedDenial::RunQuotaUntracked,
-            response_key_id: RESPONSE_SEALING_KEY.to_string(),
+            response_recipient: ResponseRecipient::Catalog {
+                key_id: RESPONSE_SEALING_KEY.to_string(),
+            },
             response_subject: Some("reply.client".to_string()),
             request_message_id: message_id(b"msg-2"),
             request_message: message.clone(),
@@ -2757,7 +3066,7 @@ mod tests {
         unauthorized_unknown_response_key.issuer = Some(subject("mallory"));
         unauthorized_unknown_response_key.sender_key_id = Some(key_id(MALLORY_SIGNING_KEY));
         unauthorized_unknown_response_key.response_key_id = Some(key_id("unknown.response"));
-        assert_prepare_code(
+        let status = assert_prepare_code(
             &fixture,
             sealed_request_with_signer(
                 &fixture,
@@ -2767,9 +3076,10 @@ mod tests {
                 &fixture.mallory_signer,
             )
             .await,
-            Code::PermissionDenied,
+            Code::InvalidArgument,
         )
         .await;
+        assert!(status.message().contains("unknown response encryption key"));
 
         let mut forged_subject = request_claims(b"forged-subject");
         forged_subject.issuer = Some(subject("mallory"));
