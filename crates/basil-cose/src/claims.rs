@@ -16,7 +16,10 @@ use core::time::Duration;
 use crate::error::ClaimsError;
 use crate::hash::RequestHash;
 use crate::label;
-use crate::types::{FreshnessChallenge, KeyId, MessageId, ResponseSubject, Subject, UnixTime};
+use crate::types::{
+    FreshnessChallenge, KeyId, MessageId, ResponseSubject, Subject, UnixTime,
+    X25519ResponsePublicKey,
+};
 
 /// The claim set carried in a protected header (CWT map, header 15, plus the
 /// basil private labels).
@@ -50,6 +53,10 @@ pub struct Claims {
     /// only, optional). The remote CI sealed-invocation profile requires it;
     /// enforcement of its presence is the broker's, not the claim shape's.
     pub freshness_challenge: Option<FreshnessChallenge>,
+    /// `-70009`: a validated deterministic X25519 response public
+    /// `COSE_Key` (requests only, optional). Provider-proof requests require
+    /// it; admission of that biconditional shape is the broker's concern.
+    pub response_public_key_cose: Option<X25519ResponsePublicKey>,
 }
 
 /// Additional protected header values carried outside the CWT claim map.
@@ -179,6 +186,11 @@ impl Claims {
                 Ok(())
             }
         };
+        if let (Some(key_id), Some(public)) = (&self.response_key_id, self.response_public_key_cose)
+            && key_id.as_bytes() != public.thumbprint().as_bytes()
+        {
+            return Err(ClaimsError::ResponseKeyIdMismatch);
+        }
         match role {
             MessageRole::Request => {
                 require(self.sender_key_id.is_some(), label::SENDER_KEY_ID)?;
@@ -194,6 +206,10 @@ impl Claims {
                 forbid(
                     self.freshness_challenge.is_some(),
                     label::FRESHNESS_CHALLENGE,
+                )?;
+                forbid(
+                    self.response_public_key_cose.is_some(),
+                    label::RESPONSE_PUBLIC_KEY_COSE,
                 )
             }
             MessageRole::Peer => {
@@ -205,6 +221,10 @@ impl Claims {
                 forbid(
                     self.freshness_challenge.is_some(),
                     label::FRESHNESS_CHALLENGE,
+                )?;
+                forbid(
+                    self.response_public_key_cose.is_some(),
+                    label::RESPONSE_PUBLIC_KEY_COSE,
                 )
             }
         }
@@ -230,6 +250,7 @@ mod tests {
             in_reply_to: None,
             request_hash: None,
             freshness_challenge: None,
+            response_public_key_cose: None,
         }
     }
 
@@ -242,6 +263,52 @@ mod tests {
             allowed_audiences: BTreeSet::new(),
             role: MessageRole::Peer,
         }
+    }
+
+    fn response_public_key() -> X25519ResponsePublicKey {
+        let mut public = [0; 32];
+        public[0] = 9;
+        X25519ResponsePublicKey::from_public_bytes(public).unwrap()
+    }
+
+    #[test]
+    fn response_public_key_requires_matching_thumbprint() {
+        let public = response_public_key();
+        let mut claims = base_claims();
+        claims.response_key_id = Some(KeyId::from_text(&public.thumbprint()).unwrap());
+        claims.response_public_key_cose = Some(public);
+        assert_eq!(claims.validate_role(MessageRole::Request), Ok(()));
+
+        claims.response_key_id = Some(KeyId::from_text("catalog-alias").unwrap());
+        assert_eq!(
+            claims.validate_role(MessageRole::Request),
+            Err(ClaimsError::ResponseKeyIdMismatch)
+        );
+    }
+
+    #[test]
+    fn response_and_peer_forbid_response_public_key() {
+        let public = response_public_key();
+        let mut response = base_claims();
+        response.sender_key_id = None;
+        response.in_reply_to = Some(MessageId::from_bytes(vec![9]).unwrap());
+        response.request_hash = Some(RequestHash([7; 32]));
+        response.response_public_key_cose = Some(public);
+        assert_eq!(
+            response.validate_role(MessageRole::Response),
+            Err(ClaimsError::ForbiddenClaim {
+                label: label::RESPONSE_PUBLIC_KEY_COSE
+            })
+        );
+
+        let mut peer = base_claims();
+        peer.response_public_key_cose = Some(public);
+        assert_eq!(
+            peer.validate_role(MessageRole::Peer),
+            Err(ClaimsError::ForbiddenClaim {
+                label: label::RESPONSE_PUBLIC_KEY_COSE
+            })
+        );
     }
 
     #[test]

@@ -64,6 +64,7 @@ fn peer_claims(sender: &KeyId) -> Claims {
         in_reply_to: None,
         request_hash: None,
         freshness_challenge: None,
+        response_public_key_cose: None,
     }
 }
 
@@ -1001,6 +1002,240 @@ fn sealed_request_freshness_challenge_round_trips() {
     ))
     .unwrap();
     assert_eq!(verified_bare.claims.freshness_challenge, None);
+}
+
+fn response_public_key() -> X25519ResponsePublicKey {
+    let mut public = [0; 32];
+    public[0] = 9;
+    X25519ResponsePublicKey::from_public_bytes(public).unwrap()
+}
+
+#[test]
+fn sealed_request_response_public_key_is_exact_and_critical() {
+    let s = signer();
+    let v = verifier_for(&s);
+    let r = recipient();
+    let response_public = response_public_key();
+    let mut p = seal_params(b"req", ContentAlgorithm::A256Gcm, r.public());
+    p.role = MessageRole::Request;
+    p.claims.response_key_id = Some(kid(&response_public.thumbprint()));
+    p.claims.freshness_challenge = Some(FreshnessChallenge::new([0x41; 32]));
+    p.claims.response_public_key_cose = Some(response_public);
+    let req = block_on(build_sealed(&p, &s)).unwrap();
+
+    let outer = codec::decode_sign1_strict(req.as_bytes(), codec::Sign1Layer::SealedOuter).unwrap();
+    let embedded =
+        codec::decode_encrypt_strict(&outer.payload, codec::ClaimsExpectation::Required).unwrap();
+    let encoded_key = response_public.to_cose_key_bytes();
+    assert!(
+        embedded
+            .protected
+            .windows(encoded_key.len())
+            .any(|window| window == encoded_key)
+    );
+    assert_eq!(
+        embedded
+            .claims
+            .as_ref()
+            .and_then(|claims| claims.response_public_key_cose),
+        Some(response_public)
+    );
+
+    let verified = block_on(verify_sealed(
+        req.as_bytes(),
+        &v,
+        &VerifySealedParams {
+            signature_aad: ExternalAad::empty(),
+            validation: &validation(MessageRole::Request),
+        },
+    ))
+    .unwrap();
+    assert_eq!(
+        verified.claims.response_public_key_cose,
+        Some(response_public)
+    );
+
+    // Mutate the first -70009 occurrence (the crit entry) to -70008 while
+    // leaving the actual map member intact. Strict decode must diagnose the
+    // missing critical declaration before any authenticated opening.
+    let mut response_label = Vec::new();
+    minicbor::Encoder::new(&mut response_label)
+        .i64(label::RESPONSE_PUBLIC_KEY_COSE)
+        .unwrap();
+    let mut freshness_label = Vec::new();
+    minicbor::Encoder::new(&mut freshness_label)
+        .i64(label::FRESHNESS_CHALLENGE)
+        .unwrap();
+    let mut mutated_protected = embedded.protected.clone();
+    let offset = mutated_protected
+        .windows(response_label.len())
+        .position(|window| window == response_label)
+        .unwrap();
+    mutated_protected[offset..offset + response_label.len()].copy_from_slice(&freshness_label);
+    let mutated = codec::assemble_encrypt(&codec::EncryptAssembly {
+        protected: &mutated_protected,
+        iv: &embedded.iv,
+        ciphertext: &embedded.ciphertext,
+        recipient_protected: &embedded.recipient_protected,
+        recipient_kid: &embedded.recipient_kid,
+        ephemeral_x: &embedded.ephemeral_x,
+    })
+    .unwrap();
+    assert_eq!(
+        codec::decode_encrypt_strict(&mutated, codec::ClaimsExpectation::Required).unwrap_err(),
+        DecodeError::CritIncomplete {
+            label: label::RESPONSE_PUBLIC_KEY_COSE
+        }
+    );
+}
+
+#[test]
+fn strict_decoder_rejects_response_key_id_and_public_key_substitution() {
+    let s = signer();
+    let r = recipient();
+    let response_public = response_public_key();
+    let mut p = seal_params(b"req", ContentAlgorithm::A256Gcm, r.public());
+    p.role = MessageRole::Request;
+    p.claims.response_key_id = Some(kid(&response_public.thumbprint()));
+    p.claims.response_public_key_cose = Some(response_public);
+    let req = block_on(build_sealed(&p, &s)).unwrap();
+    let outer = codec::decode_sign1_strict(req.as_bytes(), codec::Sign1Layer::SealedOuter).unwrap();
+    let embedded =
+        codec::decode_encrypt_strict(&outer.payload, codec::ClaimsExpectation::Required).unwrap();
+
+    // Keep the protected map structurally canonical but substitute one ASCII
+    // byte in the response key id. Strict decoding must reject the binding at
+    // the codec boundary, before signature verification or opening.
+    let thumbprint = response_public.thumbprint();
+    let mut mismatched_protected = embedded.protected.clone();
+    let id_offset = mismatched_protected
+        .windows(thumbprint.len())
+        .position(|window| window == thumbprint.as_bytes())
+        .unwrap();
+    mismatched_protected[id_offset] ^= 1;
+    let mismatched = codec::assemble_encrypt(&codec::EncryptAssembly {
+        protected: &mismatched_protected,
+        iv: &embedded.iv,
+        ciphertext: &embedded.ciphertext,
+        recipient_protected: &embedded.recipient_protected,
+        recipient_kid: &embedded.recipient_kid,
+        ephemeral_x: &embedded.ephemeral_x,
+    })
+    .unwrap();
+    assert_eq!(
+        codec::decode_encrypt_strict(&mismatched, codec::ClaimsExpectation::Required).unwrap_err(),
+        DecodeError::ResponseKeyIdMismatch
+    );
+
+    // Substituting a different valid X25519 key under the unchanged key id
+    // is the symmetric attack and must fail at the same boundary.
+    let encoded_key = response_public.to_cose_key_bytes();
+    let substituted_public =
+        X25519ResponsePublicKey::from_public_bytes(recipient().public().public).unwrap();
+    assert_ne!(substituted_public, response_public);
+    let mut substituted_protected = embedded.protected.clone();
+    let key_offset = substituted_protected
+        .windows(encoded_key.len())
+        .position(|window| window == encoded_key)
+        .unwrap();
+    substituted_protected[key_offset..key_offset + encoded_key.len()]
+        .copy_from_slice(&substituted_public.to_cose_key_bytes());
+    let substituted = codec::assemble_encrypt(&codec::EncryptAssembly {
+        protected: &substituted_protected,
+        iv: &embedded.iv,
+        ciphertext: &embedded.ciphertext,
+        recipient_protected: &embedded.recipient_protected,
+        recipient_kid: &embedded.recipient_kid,
+        ephemeral_x: &embedded.ephemeral_x,
+    })
+    .unwrap();
+    assert_eq!(
+        codec::decode_encrypt_strict(&substituted, codec::ClaimsExpectation::Required).unwrap_err(),
+        DecodeError::ResponseKeyIdMismatch
+    );
+}
+
+#[test]
+fn protected_encoder_rejects_response_key_id_substitution() {
+    let response_public = response_public_key();
+    let mut claims = peer_claims(&kid("alice"));
+    claims.response_key_id = Some(kid("substituted-catalog-key"));
+    claims.response_public_key_cose = Some(response_public);
+    assert_eq!(
+        codec::encode_encrypt_protected(ContentAlgorithm::A256Gcm, &ct(), Some(&claims),),
+        Err(codec::CodecError)
+    );
+}
+
+#[test]
+fn legacy_request_protected_bytes_are_unchanged_without_response_public_key() {
+    let mut claims = peer_claims(&kid("alice"));
+    claims.response_key_id = Some(kid("alice-response"));
+    let protected =
+        codec::encode_encrypt_protected(ContentAlgorithm::A256Gcm, &ct(), Some(&claims)).unwrap();
+    // Frozen revision-4.1 bytes. Adding an absent optional field must not
+    // perturb existing catalog-mode request signatures or ciphertext AAD.
+    assert_eq!(
+        protected,
+        vec![
+            166, 1, 3, 2, 132, 3, 15, 58, 0, 1, 17, 114, 58, 0, 1, 17, 115, 3, 118, 97, 112, 112,
+            108, 105, 99, 97, 116, 105, 111, 110, 47, 98, 97, 115, 105, 108, 46, 116, 101, 115,
+            116, 15, 162, 6, 25, 3, 232, 7, 66, 171, 205, 58, 0, 1, 17, 114, 69, 97, 108, 105, 99,
+            101, 58, 0, 1, 17, 115, 110, 97, 108, 105, 99, 101, 45, 114, 101, 115, 112, 111, 110,
+            115, 101,
+        ]
+    );
+}
+
+#[test]
+fn response_public_key_is_rejected_on_bare_signed_layer() {
+    let s = signer();
+    let response_public = response_public_key();
+    let mut claims = peer_claims(s.key_id());
+    claims.response_key_id = Some(kid(&response_public.thumbprint()));
+    claims.response_public_key_cose = Some(response_public);
+    assert_eq!(
+        block_on(build_signed(
+            &SignParams {
+                content_type: ct(),
+                payload: b"not encrypted",
+                claims: Some(claims),
+                external_aad: ExternalAad::empty(),
+            },
+            &s,
+        ))
+        .unwrap_err(),
+        BuildError::ResponsePublicKeyRequiresEncryption
+    );
+}
+
+#[test]
+fn strict_decoder_rejects_canonical_bare_sign1_with_response_public_key() {
+    let s = signer();
+    let response_public = response_public_key();
+    let mut claims = peer_claims(s.key_id());
+    claims.response_key_id = Some(kid(&response_public.thumbprint()));
+    claims.response_public_key_cose = Some(response_public);
+
+    // Bypass the public signed-message builder and manually assemble a
+    // structurally canonical bare COSE_Sign1. The protected encoder is used
+    // only to obtain deterministic map bytes; the signature is deliberately
+    // opaque because strict shape rejection precedes signature verification.
+    let protected = codec::encode_sign1_protected_bare_with_headers(
+        SignatureAlgorithm::EdDsa,
+        s.key_id(),
+        &ct(),
+        Some(&claims),
+        None,
+    )
+    .unwrap();
+    let message = codec::assemble_sign1(&protected, b"payload", &[0x5a; 64]).unwrap();
+    assert_eq!(
+        codec::decode_sign1_strict(&message, codec::Sign1Layer::Bare).unwrap_err(),
+        DecodeError::UnknownLabel {
+            label: label::RESPONSE_PUBLIC_KEY_COSE
+        }
+    );
 }
 
 #[test]

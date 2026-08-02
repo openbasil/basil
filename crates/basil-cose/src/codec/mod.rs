@@ -29,6 +29,7 @@ use crate::kdf::{KdfParties, PartyIdentity};
 use crate::label::{self, canonical_sort_key};
 use crate::types::{
     ContentType, FreshnessChallenge, KeyId, MessageId, ResponseSubject, Subject, UnixTime,
+    X25519ResponsePublicKey,
 };
 
 /// Internal encode failure. Statically unreachable for profile-valid input
@@ -48,7 +49,7 @@ pub const X25519_LEN: usize = 32;
 
 /// Labels that constitute claims; finding one in an unprotected header is
 /// [`DecodeError::ClaimsInUnprotected`].
-const CLAIM_LABELS: [i64; 7] = [
+const CLAIM_LABELS: [i64; 8] = [
     label::HDR_CWT_CLAIMS,
     label::IN_REPLY_TO,
     label::REQUEST_HASH,
@@ -56,9 +57,17 @@ const CLAIM_LABELS: [i64; 7] = [
     label::RESPONSE_KEY_ID,
     label::RESPONSE_SUBJECT,
     label::FRESHNESS_CHALLENGE,
+    label::RESPONSE_PUBLIC_KEY_COSE,
 ];
 
 type EncResult = Result<(), minicbor::encode::Error<core::convert::Infallible>>;
+
+fn response_key_binding_matches(claims: &Claims) -> bool {
+    match (&claims.response_key_id, claims.response_public_key_cose) {
+        (Some(key_id), Some(public)) => key_id.as_bytes() == public.thumbprint().as_bytes(),
+        _ => true,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Encoding (canonical by construction)
@@ -93,6 +102,9 @@ fn basil_labels(claims: &Claims) -> Vec<i64> {
     }
     if claims.freshness_challenge.is_some() {
         labels.push(label::FRESHNESS_CHALLENGE);
+    }
+    if claims.response_public_key_cose.is_some() {
+        labels.push(label::RESPONSE_PUBLIC_KEY_COSE);
     }
     labels
 }
@@ -206,6 +218,11 @@ fn write_claims_capable_tail(
     if let Some(v) = claims.and_then(|c| c.freshness_challenge.as_ref()) {
         e.i64(label::FRESHNESS_CHALLENGE)?.bytes(v.as_bytes())?;
     }
+    // `-70009` sorts immediately after `-70008`.
+    if let Some(v) = claims.and_then(|c| c.response_public_key_cose) {
+        e.i64(label::RESPONSE_PUBLIC_KEY_COSE)?
+            .bytes(&v.to_cose_key_bytes())?;
+    }
     Ok(())
 }
 
@@ -234,6 +251,9 @@ pub fn encode_sign1_protected_bare_with_headers(
     claims: Option<&Claims>,
     protected_headers: Option<&ProtectedHeaders>,
 ) -> Result<Vec<u8>, CodecError> {
+    if claims.is_some_and(|claims| !response_key_binding_matches(claims)) {
+        return Err(CodecError);
+    }
     encode_with(|e| {
         e.map(2 + claims_capable_tail_len(claims, protected_headers))?;
         e.i64(label::HDR_ALG)?.i64(algorithm.codepoint())?;
@@ -299,6 +319,9 @@ pub fn encode_encrypt_protected(
     content_type: &ContentType,
     claims: Option<&Claims>,
 ) -> Result<Vec<u8>, CodecError> {
+    if claims.is_some_and(|claims| !response_key_binding_matches(claims)) {
+        return Err(CodecError);
+    }
     encode_with(|e| {
         e.map(1 + claims_capable_tail_len(claims, None))?;
         e.i64(label::HDR_ALG)?.i64(content_algorithm.codepoint())?;
@@ -649,6 +672,7 @@ struct ClaimsParts {
     response_key_id: Option<KeyId>,
     response_subject: Option<ResponseSubject>,
     freshness_challenge: Option<FreshnessChallenge>,
+    response_public_key_cose: Option<X25519ResponsePublicKey>,
     cwt_present: bool,
     basil_present: bool,
 }
@@ -670,7 +694,7 @@ impl ClaimsParts {
         let message_id = self.message_id.ok_or(DecodeError::MissingClaim {
             claim: label::CWT_CTI,
         })?;
-        Ok(Some(Claims {
+        let claims = Claims {
             issuer: self.issuer,
             audience: self.audience,
             expires_at: self.expires_at,
@@ -682,7 +706,12 @@ impl ClaimsParts {
             in_reply_to: self.in_reply_to,
             request_hash: self.request_hash,
             freshness_challenge: self.freshness_challenge,
-        }))
+            response_public_key_cose: self.response_public_key_cose,
+        };
+        if !response_key_binding_matches(&claims) {
+            return Err(DecodeError::ResponseKeyIdMismatch);
+        }
+        Ok(Some(claims))
     }
 }
 
@@ -758,6 +787,11 @@ fn parse_basil_label(
                     actual: raw.len(),
                 })?;
             parts.freshness_challenge = Some(challenge);
+        }
+        label::RESPONSE_PUBLIC_KEY_COSE => {
+            parts.response_public_key_cose = Some(X25519ResponsePublicKey::from_cose_key_bytes(
+                &read_bytes(d, l)?,
+            )?);
         }
         _ => return Ok(false),
     }
@@ -869,6 +903,15 @@ fn parse_claims_capable_header(
         label: label::HDR_ALG,
     })?;
     let claims = parts.into_claims()?;
+    if allow_kid
+        && claims
+            .as_ref()
+            .is_some_and(|claims| claims.response_public_key_cose.is_some())
+    {
+        return Err(DecodeError::UnknownLabel {
+            label: label::RESPONSE_PUBLIC_KEY_COSE,
+        });
+    }
     Ok(ClaimsCapableHeader {
         alg,
         crit,

@@ -22,10 +22,10 @@ use zeroize::Zeroizing;
 
 use crate::alg::SignatureAlgorithm;
 use crate::codec;
-use crate::error::{OpenError, SignError, VerifyError};
+use crate::error::{BuildError, OpenError, SignError, VerifyError};
 use crate::kdf;
 use crate::traits::{OpenRequest, Recipient, Signer, Verifier};
-use crate::types::{KeyId, Signature};
+use crate::types::{KeyId, Signature, X25519ResponsePublicKey};
 
 /// A local Ed25519 signer: a `SigningKey` (`ZeroizeOnDrop`) plus its key id.
 pub struct Ed25519Signer {
@@ -282,6 +282,27 @@ pub struct X25519Recipient {
 }
 
 impl X25519Recipient {
+    /// Generate a fresh ephemeral response recipient from the system CSPRNG.
+    ///
+    /// The returned recipient owns the private half in zeroizing memory. Its
+    /// key id is the exact RFC 7638 thumbprint of the returned typed public
+    /// key, so callers cannot accidentally bind different public and private
+    /// response keys.
+    ///
+    /// # Errors
+    /// [`BuildError::Rng`] if system randomness is unavailable. Internal
+    /// key construction failures are reported as [`BuildError::SealFailed`]
+    /// or [`BuildError::Codec`].
+    pub fn generate_ephemeral_response() -> Result<(Self, X25519ResponsePublicKey), BuildError> {
+        let private = crate::encrypt::random_array::<32>()?;
+        let secret = StaticSecret::from(*private);
+        let public =
+            X25519ResponsePublicKey::from_public_bytes(PublicKey::from(&secret).to_bytes())
+                .map_err(|_| BuildError::SealFailed)?;
+        let key_id = KeyId::from_text(&public.thumbprint()).map_err(|_| BuildError::Codec)?;
+        Ok((Self::new(key_id, private), public))
+    }
+
     /// Build a recipient from the 32 private key bytes.
     #[must_use]
     pub const fn new(key_id: KeyId, private: Zeroizing<[u8; 32]>) -> Self {

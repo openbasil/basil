@@ -41,11 +41,12 @@ pub use proto::{
     AeadAlgorithm, CatalogEntry, CatalogKind, CiphertextEnvelope, KeyMaterial, KeyType,
 };
 pub use sealed_invocation::{
-    BrokerRecipient, BrokerSigner, CarrierSigner, CarrierSignerConfig, LocalCarrierSigner,
-    LocalSealedInvocationRecipient, LocalSealedInvocationSigner, PreparedSealedInvocation,
+    BrokerRecipient, BrokerSigner, CarrierSigner, CarrierSignerConfig,
+    EphemeralSealedInvocationOptions, LocalCarrierSigner, LocalSealedInvocationRecipient,
+    LocalSealedInvocationSigner, PreparedEphemeralSealedInvocation, PreparedSealedInvocation,
     SealedInvocationCarrier, SealedInvocationError, SealedInvocationOptions,
-    SealedInvocationResponseError, prepare_sealed_invocation, verify_and_decrypt_sign_response,
-    verify_and_open_sign_response,
+    SealedInvocationResponseError, prepare_ephemeral_sealed_invocation, prepare_sealed_invocation,
+    verify_and_decrypt_sign_response, verify_and_open_sign_response,
 };
 pub use stream::{
     AeadSuite, BrokerCekRecovery, CekRecovery, CekSource, DEFAULT_CHUNK_SIZE, LocalSeedCekRecovery,

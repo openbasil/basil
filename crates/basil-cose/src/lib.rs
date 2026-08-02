@@ -36,7 +36,7 @@
 //! ## Claims
 //!
 //! Claims ride in the protected header as a CWT map (header 15) plus basil
-//! private labels (`-70001..=-70005` and `-70008`, see [`label`]).
+//! private labels (`-70001..=-70005` and `-70008..=-70009`, see [`label`]).
 //! [`ValidationParams`] parameterizes skew/TTL/audience bounds; `now` is
 //! injected, never sampled.
 //!
@@ -103,7 +103,7 @@ pub use sign::{
 pub use traits::{OpenRequest, Recipient, Signer, Verifier};
 pub use types::{
     ContentType, CoseBytes, ExternalAad, FreshnessChallenge, KeyId, MessageId, ResponseSubject,
-    SealedAad, Signature, Subject, UnixTime,
+    SealedAad, Signature, Subject, UnixTime, X25519ResponsePublicKey,
 };
 
 // Re-exported so trait implementors and callers name the same zeroizing

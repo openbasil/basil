@@ -25,6 +25,9 @@ pub const SIGNER_PUBLIC_KEY_COSE: i64 = -70007;
 /// Server-issued single-use freshness challenge (bstr, 32 bytes). Requests
 /// only, optional; required by the remote CI sealed-invocation profile.
 pub const FRESHNESS_CHALLENGE: i64 = -70008;
+/// Deterministic public X25519 response `COSE_Key` (bstr, 40 bytes). Requests
+/// only, optional; required by the remote CI sealed-invocation profile.
+pub const RESPONSE_PUBLIC_KEY_COSE: i64 = -70009;
 
 /// COSE header parameter: algorithm.
 pub(crate) const HDR_ALG: i64 = 1;
