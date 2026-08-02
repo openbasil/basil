@@ -200,11 +200,7 @@ impl Generation {
                     .filter_map(|rule| {
                         crate::core::ci_federation::GenerationJwksCache::new(
                             id,
-                            match &rule.provider {
-                                crate::core::ci_federation::ProviderConfig::GithubActions(rule) => {
-                                    rule
-                                }
-                            },
+                            &rule.provider,
                             crate::core::ci_federation::JwksCachePolicy::default(),
                         )
                         .ok()

@@ -24,6 +24,12 @@ use zeroize::Zeroizing;
 
 const MAX_TOKEN_BYTES: usize = 32 * 1024;
 const GITHUB_ISSUER: &str = "https://token.actions.githubusercontent.com";
+/// Forgejo issues Actions tokens from the instance's Actions API root.
+const FORGEJO_ISSUER_PATH: &str = "/api/actions";
+/// The only event a `forgejoActions` rule can authorize.
+const FORGEJO_EVENT: &str = "push";
+/// Upper bound on a Forgejo run-specific grant window (15 minutes).
+const MAX_FORGEJO_GRANT_SECS: u64 = 15 * 60;
 const MAX_RULE_ID_BYTES: usize = 128;
 const MAX_SUBJECT_BYTES: usize = 256;
 const MAX_AUDIENCE_BYTES: usize = 256;
@@ -166,12 +172,86 @@ pub struct GithubActionsRule {
     pub clock_skew_secs: u64,
 }
 
+/// Trusted configuration for one Forgejo Actions identity rule.
+///
+/// The tier is experimental: the token cannot attest runner identity,
+/// executor isolation, or repository protection, so what remains as
+/// authorization evidence is this operator-installed run-specific grant. The
+/// rule explicitly trusts the configured Forgejo server and its scheduler.
+/// The supported event is closed to `push`; environment, reusable-workflow,
+/// and `ref_protected` selectors do not exist in this schema, and tokens
+/// presenting environment or reusable-callee authority are denied.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ForgejoActionsRule {
+    /// Exact issuer URL (`https://<instance>/api/actions`).
+    pub issuer: String,
+    /// Exact discovery URL on the issuer's origin.
+    pub discovery_url: String,
+    /// Exact JWKS URL on the issuer's origin.
+    pub jwks_url: String,
+    /// The proof-bound Basil audience prefix.
+    pub audience_prefix: String,
+    /// Exact numeric repository ID.
+    pub repository_id: u64,
+    /// Exact numeric repository owner ID.
+    pub repository_owner_id: u64,
+    /// Exact same-repository workflow identity (`workflow_ref`).
+    pub workflow_ref: String,
+    /// Exact triggering ref (`refs/heads/...` or `refs/tags/...`).
+    #[serde(rename = "ref")]
+    pub ref_name: String,
+    /// Exact ref type (`branch` or `tag`), consistent with `ref`.
+    pub ref_type: String,
+    /// Exact triggering commit (40 or 64 lowercase hex).
+    pub sha: String,
+    /// Exact run ID the grant authorizes.
+    pub run_id: u64,
+    /// Exact run attempt; a rerun increments it and needs another grant.
+    pub run_attempt: u64,
+    /// Grant start (Unix seconds); the operator installs the grant after the
+    /// run and attempt IDs are known.
+    pub not_before_unix: u64,
+    /// Grant expiry (Unix seconds), at most 15 minutes after the start.
+    pub expires_at_unix: u64,
+    /// Maximum accepted token age in seconds.
+    pub max_token_age_secs: u64,
+    /// Maximum clock skew allowed for `iat`, `nbf`, and `exp`.
+    pub clock_skew_secs: u64,
+}
+
 /// The provider families understood by this closed federation interface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ProviderKind {
     /// GitHub Actions OIDC.
     GithubActions,
+    /// Forgejo Actions OIDC (experimental tier).
+    ForgejoActions,
+}
+
+impl ProviderKind {
+    /// The configuration spelling of this provider kind.
+    #[must_use]
+    pub const fn config_name(self) -> &'static str {
+        match self {
+            Self::GithubActions => "githubActions",
+            Self::ForgejoActions => "forgejoActions",
+        }
+    }
+
+    /// Whether this provider sits in the experimental support tier.
+    ///
+    /// An experimental provider is outside the security guarantees and must
+    /// be unreachable by accident: a catalog holding one loads only when the
+    /// operator names it in the explicit experimental opt-in.
+    #[must_use]
+    pub const fn is_experimental(self) -> bool {
+        match self {
+            Self::GithubActions => false,
+            Self::ForgejoActions => true,
+        }
+    }
 }
 
 /// A typed provider rule in the trusted federation catalog.
@@ -200,6 +280,8 @@ pub struct ProviderRule {
 pub enum ProviderConfig {
     /// GitHub Actions configuration.
     GithubActions(GithubActionsRule),
+    /// Forgejo Actions configuration (experimental tier).
+    ForgejoActions(ForgejoActionsRule),
 }
 
 impl ProviderConfig {
@@ -208,12 +290,50 @@ impl ProviderConfig {
     pub const fn kind(&self) -> ProviderKind {
         match self {
             Self::GithubActions(_) => ProviderKind::GithubActions,
+            Self::ForgejoActions(_) => ProviderKind::ForgejoActions,
         }
     }
 
-    const fn github(&self) -> &GithubActionsRule {
+    /// Exact configured issuer URL.
+    #[must_use]
+    pub fn issuer(&self) -> &str {
         match self {
-            Self::GithubActions(rule) => rule,
+            Self::GithubActions(rule) => &rule.issuer,
+            Self::ForgejoActions(rule) => &rule.issuer,
+        }
+    }
+
+    /// Exact configured discovery URL.
+    #[must_use]
+    pub fn discovery_url(&self) -> &str {
+        match self {
+            Self::GithubActions(rule) => &rule.discovery_url,
+            Self::ForgejoActions(rule) => &rule.discovery_url,
+        }
+    }
+
+    /// Exact configured JWKS URL.
+    #[must_use]
+    pub fn jwks_url(&self) -> &str {
+        match self {
+            Self::GithubActions(rule) => &rule.jwks_url,
+            Self::ForgejoActions(rule) => &rule.jwks_url,
+        }
+    }
+
+    /// Validate the provider-specific rule and its endpoint URLs.
+    pub fn validate(&self) -> Result<(), FederationError> {
+        match self {
+            Self::GithubActions(rule) => validate_github_rule(rule)?,
+            Self::ForgejoActions(rule) => validate_forgejo_rule(rule)?,
+        }
+        validate_urls(self.issuer(), self.discovery_url(), self.jwks_url())
+    }
+
+    const fn rule_time_bounds(&self) -> (u64, u64) {
+        match self {
+            Self::GithubActions(rule) => (rule.max_token_age_secs, rule.clock_skew_secs),
+            Self::ForgejoActions(rule) => (rule.max_token_age_secs, rule.clock_skew_secs),
         }
     }
 }
@@ -256,6 +376,27 @@ pub struct GithubSelection<'a> {
     pub environment: Option<&'a str>,
 }
 
+/// Typed evidence used to select one Forgejo provider rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgejoSelection<'a> {
+    /// Stable numeric repository ID from the verified token.
+    pub repository_id: u64,
+    /// Stable numeric owner ID from the verified token.
+    pub repository_owner_id: u64,
+    /// Exact same-repository workflow identity from the verified token.
+    pub workflow_ref: &'a str,
+    /// Exact triggering ref from the verified token.
+    pub ref_name: &'a str,
+    /// Exact ref type from the verified token.
+    pub ref_type: &'a str,
+    /// Exact triggering commit from the verified token.
+    pub sha: &'a str,
+    /// Exact run ID from the verified token.
+    pub run_id: u64,
+    /// Exact run attempt from the verified token.
+    pub run_attempt: u64,
+}
+
 /// One unambiguous selected provider rule.
 #[derive(Debug, Clone, Copy)]
 pub struct SelectedProvider<'a> {
@@ -264,19 +405,41 @@ pub struct SelectedProvider<'a> {
 }
 
 impl ProviderCatalog {
-    /// Validate and construct a catalog before it can be used for selection.
+    /// Validate and construct a catalog with no experimental tier opt-in.
+    ///
+    /// Any experimental-tier rule fails catalog construction with an error
+    /// naming the tier; [`Self::with_experimental_providers`] is the only way
+    /// to load one, so an operator cannot arrive at an experimental
+    /// authorization anchor by copying an example.
     pub fn new(rules: Vec<ProviderRule>) -> Result<Self, FederationError> {
+        Self::with_experimental_providers(rules, &[])
+    }
+
+    /// Validate and construct a catalog with an explicit experimental opt-in.
+    ///
+    /// `experimental` holds the provider kinds the operator explicitly named
+    /// in the `experimentalProviders` configuration; a supported-tier kind in
+    /// the list is ignored.
+    pub fn with_experimental_providers(
+        rules: Vec<ProviderRule>,
+        experimental: &[ProviderKind],
+    ) -> Result<Self, FederationError> {
         let mut ids = std::collections::BTreeSet::new();
         for rule in &rules {
             validate_common_rule(rule)?;
             if !ids.insert(rule.id.as_str()) {
                 return Err(FederationError::DuplicateRuleId);
             }
-            let github = rule.provider.github();
-            validate_github_rule(github)?;
-            validate_urls(&github.issuer, &github.discovery_url, &github.jwks_url)?;
-            if rule.max_token_age_secs != github.max_token_age_secs
-                || rule.clock_skew_secs != github.clock_skew_secs
+            let kind = rule.provider.kind();
+            if kind.is_experimental() && !experimental.contains(&kind) {
+                return Err(FederationError::ExperimentalProviderDisabled(
+                    kind.config_name(),
+                ));
+            }
+            rule.provider.validate()?;
+            let (max_token_age_secs, clock_skew_secs) = rule.provider.rule_time_bounds();
+            if rule.max_token_age_secs != max_token_age_secs
+                || rule.clock_skew_secs != clock_skew_secs
             {
                 return Err(FederationError::ProviderRejected);
             }
@@ -302,8 +465,10 @@ impl ProviderCatalog {
         &self,
         selection: &GithubSelection<'_>,
     ) -> Result<SelectedProvider<'_>, FederationError> {
-        let mut matches = self.rules.iter().filter(|rule| {
-            let github = rule.provider.github();
+        let matches = self.rules.iter().filter(|rule| {
+            let ProviderConfig::GithubActions(github) = &rule.provider else {
+                return false;
+            };
             let repository_matches = github.repository_id == selection.repository_id
                 && github.repository_owner_id == selection.repository_owner_id;
             let workflow_matches = github.job_workflow_ref == selection.workflow_ref
@@ -324,14 +489,41 @@ impl ProviderCatalog {
                     .any(|value| value == selection.runner_environment)
                 && github.environment.as_deref() == selection.environment
         });
-        let Some(rule) = matches.next() else {
-            return Err(FederationError::NoMatchingRule);
-        };
-        if matches.next().is_some() {
-            return Err(FederationError::AmbiguousRule);
-        }
-        Ok(SelectedProvider { rule })
+        exactly_one(matches)
     }
+
+    /// Select exactly one Forgejo rule from already typed and verified evidence.
+    pub fn select_forgejo(
+        &self,
+        selection: &ForgejoSelection<'_>,
+    ) -> Result<SelectedProvider<'_>, FederationError> {
+        let matches = self.rules.iter().filter(|rule| {
+            let ProviderConfig::ForgejoActions(forgejo) = &rule.provider else {
+                return false;
+            };
+            forgejo.repository_id == selection.repository_id
+                && forgejo.repository_owner_id == selection.repository_owner_id
+                && forgejo.workflow_ref == selection.workflow_ref
+                && forgejo.ref_name == selection.ref_name
+                && forgejo.ref_type == selection.ref_type
+                && forgejo.sha == selection.sha
+                && forgejo.run_id == selection.run_id
+                && forgejo.run_attempt == selection.run_attempt
+        });
+        exactly_one(matches)
+    }
+}
+
+fn exactly_one<'a>(
+    mut matches: impl Iterator<Item = &'a ProviderRule>,
+) -> Result<SelectedProvider<'a>, FederationError> {
+    let Some(rule) = matches.next() else {
+        return Err(FederationError::NoMatchingRule);
+    };
+    if matches.next().is_some() {
+        return Err(FederationError::AmbiguousRule);
+    }
+    Ok(SelectedProvider { rule })
 }
 
 /// Broker-local secret keying the token and `jti` correlation digests.
@@ -405,6 +597,66 @@ pub struct GithubEvidence {
     pub token_digest: [u8; 32],
 }
 
+/// A validated, typed Forgejo Actions certificate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgejoEvidence {
+    /// Stable numeric repository ID.
+    pub repository_id: u64,
+    /// Stable numeric owner ID.
+    pub repository_owner_id: u64,
+    /// Source repository name, for audit context only.
+    pub repository: String,
+    /// Actor ID, for audit correlation only.
+    pub actor_id: Option<u64>,
+    /// Exact same-repository workflow identity.
+    pub workflow_ref: String,
+    /// Exact triggering ref.
+    pub ref_name: String,
+    /// Exact ref type.
+    pub ref_type: String,
+    /// Exact triggering commit.
+    pub sha: String,
+    /// Exact run ID.
+    pub run_id: u64,
+    /// Exact run attempt.
+    pub run_attempt: u64,
+    /// The (closed) provider event, always `push`.
+    pub event_name: String,
+    /// Keyed digest of the required non-empty token ID.
+    pub jti_digest: [u8; 32],
+    /// Keyed token correlation digest (never the raw token).
+    pub token_digest: [u8; 32],
+}
+
+/// Closed provider-specific verified claims.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderClaimEvidence {
+    /// Verified GitHub Actions claims.
+    GithubActions(GithubEvidence),
+    /// Verified Forgejo Actions claims (experimental tier).
+    ForgejoActions(ForgejoEvidence),
+}
+
+impl ProviderClaimEvidence {
+    /// Keyed token correlation digest (never the raw token).
+    #[must_use]
+    pub const fn token_digest(&self) -> &[u8; 32] {
+        match self {
+            Self::GithubActions(evidence) => &evidence.token_digest,
+            Self::ForgejoActions(evidence) => &evidence.token_digest,
+        }
+    }
+
+    /// Keyed digest of the provider token ID.
+    #[must_use]
+    pub const fn jti_digest(&self) -> &[u8; 32] {
+        match self {
+            Self::GithubActions(evidence) => &evidence.jti_digest,
+            Self::ForgejoActions(evidence) => &evidence.jti_digest,
+        }
+    }
+}
+
 /// Verified provider evidence attached to one sealed invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedProviderEvidence {
@@ -415,7 +667,7 @@ pub struct VerifiedProviderEvidence {
     /// Policy subject granted by the rule.
     pub subject: String,
     /// Provider-specific verified claims.
-    pub github: GithubEvidence,
+    pub claims: ProviderClaimEvidence,
 }
 
 #[derive(Debug, Deserialize)]
@@ -435,6 +687,36 @@ struct GithubClaims {
     job_workflow_sha: String,
     runner_environment: String,
     environment: Option<String>,
+    jti: String,
+    iat: u64,
+    nbf: Option<u64>,
+    exp: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct ForgejoClaims {
+    iss: String,
+    aud: String,
+    sub: String,
+    repository: String,
+    repository_id: String,
+    repository_owner_id: String,
+    actor_id: Option<String>,
+    event_name: String,
+    #[serde(rename = "ref")]
+    ref_field: String,
+    ref_type: String,
+    sha: String,
+    workflow_ref: String,
+    run_id: String,
+    run_attempt: String,
+    /// Forgejo publishes no environment identity; presence denies.
+    environment: Option<Value>,
+    /// Forgejo publishes no reusable-callee identity; presence denies.
+    job_workflow_ref: Option<Value>,
+    /// Forgejo publishes no reusable-callee identity; presence denies.
+    job_workflow_sha: Option<Value>,
     jti: String,
     iat: u64,
     nbf: Option<u64>,
@@ -564,19 +846,18 @@ impl GenerationJwksCache {
     /// Create an empty cache after validating the configured provider URLs.
     pub fn new(
         generation: u64,
-        rule: &GithubActionsRule,
+        provider: &ProviderConfig,
         policy: JwksCachePolicy,
     ) -> Result<Self, FederationError> {
-        validate_github_rule(rule)?;
-        validate_urls(&rule.issuer, &rule.discovery_url, &rule.jwks_url)?;
+        provider.validate()?;
         if policy.max_body_bytes == 0 || policy.max_body_bytes > MAX_JWKS_BODY_BYTES {
             return Err(FederationError::InvalidCachePolicy);
         }
         Ok(Self {
             generation,
-            discovery_url: Url::parse(&rule.discovery_url)
+            discovery_url: Url::parse(provider.discovery_url())
                 .map_err(|_| FederationError::InvalidUrl)?,
-            jwks_url: Url::parse(&rule.jwks_url).map_err(|_| FederationError::InvalidUrl)?,
+            jwks_url: Url::parse(provider.jwks_url()).map_err(|_| FederationError::InvalidUrl)?,
             policy,
             keys: None,
             fetched_at: None,
@@ -791,6 +1072,12 @@ pub enum FederationError {
     /// A provider document returned a non-success status.
     #[error("provider fetch rejected")]
     FetchRejected,
+    /// An experimental-tier provider rule was configured without the
+    /// explicit tier opt-in.
+    #[error(
+        "provider {0} is in the experimental tier: outside the security guarantees, and loadable only when named in the `experimentalProviders` opt-in"
+    )]
+    ExperimentalProviderDisabled(&'static str),
     /// Two catalog rules used the same trusted identifier.
     #[error("duplicate provider rule ID")]
     DuplicateRuleId,
@@ -833,11 +1120,32 @@ fn validate_common_rule(rule: &ProviderRule) -> Result<(), FederationError> {
 }
 
 fn rules_overlap(left: &ProviderRule, right: &ProviderRule) -> bool {
-    if left.provider.kind() != right.provider.kind() {
-        return false;
+    match (&left.provider, &right.provider) {
+        (ProviderConfig::GithubActions(left), ProviderConfig::GithubActions(right)) => {
+            github_rules_overlap(left, right)
+        }
+        (ProviderConfig::ForgejoActions(left), ProviderConfig::ForgejoActions(right)) => {
+            forgejo_rules_overlap(left, right)
+        }
+        _ => false,
     }
-    let left = left.provider.github();
-    let right = right.provider.github();
+}
+
+/// Two Forgejo grants overlap when the same verified token could satisfy
+/// both exact selector sets; differing grant windows do not disambiguate,
+/// so identical selectors are rejected outright.
+fn forgejo_rules_overlap(left: &ForgejoActionsRule, right: &ForgejoActionsRule) -> bool {
+    left.repository_id == right.repository_id
+        && left.repository_owner_id == right.repository_owner_id
+        && left.workflow_ref == right.workflow_ref
+        && left.ref_name == right.ref_name
+        && left.ref_type == right.ref_type
+        && left.sha == right.sha
+        && left.run_id == right.run_id
+        && left.run_attempt == right.run_attempt
+}
+
+fn github_rules_overlap(left: &GithubActionsRule, right: &GithubActionsRule) -> bool {
     left.repository_id == right.repository_id
         && left.repository_owner_id == right.repository_owner_id
         && left.job_workflow_ref == right.job_workflow_ref
@@ -1052,6 +1360,127 @@ pub fn verify_github(
     })
 }
 
+/// Verify a Forgejo Actions token against one trusted run-specific grant and
+/// one generation's isolated JWKS cache.
+///
+/// The supported event is closed to `push` and the workflow must belong to
+/// the token's own repository. Tokens presenting environment or
+/// reusable-callee authority are denied; `ref_protected` carries no
+/// protection meaning on Forgejo and is ignored entirely. The rule's
+/// `clock_skew_secs` bounds only the token's own temporal claims; the
+/// operator-installed grant window is compared exactly against broker time.
+pub fn verify_forgejo(
+    rule: &ForgejoActionsRule,
+    jwks: &GenerationJwks,
+    token: &str,
+    proof_public_key: &[u8; 32],
+    correlation: &TokenCorrelationKey,
+    now: SystemTime,
+) -> Result<ForgejoEvidence, FederationError> {
+    if token.len() > MAX_TOKEN_BYTES {
+        return Err(FederationError::Oversized("token"));
+    }
+    validate_forgejo_rule(rule)?;
+    validate_urls(&rule.issuer, &rule.discovery_url, &rule.jwks_url)?;
+    let header = decode_header(token).map_err(|_| FederationError::TokenRejected)?;
+    if header.alg != Algorithm::RS256 {
+        return Err(FederationError::TokenRejected);
+    }
+    let kid = header.kid.ok_or(FederationError::TokenRejected)?;
+    let key = jwks.key(&kid).ok_or(FederationError::TokenRejected)?;
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.set_audience(&[proof_audience(proof_public_key)]);
+    validation.set_issuer(&[rule.issuer.as_str()]);
+    // The rule's `clock_skew_secs` is the single time-boundary authority: the
+    // library's own leeway (default 60 s) and temporal checks are disabled and
+    // the explicit `iat`/`nbf`/`exp` checks below apply exactly the rule skew.
+    validation.leeway = 0;
+    validation.validate_exp = false;
+    validation.validate_nbf = false;
+    validation.set_required_spec_claims(&["exp", "iss", "aud"]);
+    let data = decode::<Value>(
+        token,
+        &DecodingKey::from_rsa_components(&key.n, &key.e)
+            .map_err(|_| FederationError::TokenRejected)?,
+        &validation,
+    )
+    .map_err(|_| FederationError::TokenRejected)?;
+    let claims: ForgejoClaims =
+        serde_json::from_value(data.claims).map_err(|_| FederationError::TokenRejected)?;
+    let now_secs = now
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| FederationError::TokenRejected)?
+        .as_secs();
+    check_forgejo_claims(rule, &claims, proof_public_key, now_secs)?;
+    let jti = correlation.digest("basil-ci-jti", claims.jti.as_bytes())?;
+    let token_digest = correlation.digest("basil-ci-token", token.as_bytes())?;
+    Ok(ForgejoEvidence {
+        repository_id: decimal(&claims.repository_id)?,
+        repository_owner_id: decimal(&claims.repository_owner_id)?,
+        repository: claims.repository,
+        actor_id: claims.actor_id.as_deref().map(decimal).transpose()?,
+        workflow_ref: claims.workflow_ref,
+        ref_name: claims.ref_field,
+        ref_type: claims.ref_type,
+        sha: claims.sha,
+        run_id: decimal(&claims.run_id)?,
+        run_attempt: decimal(&claims.run_attempt)?,
+        event_name: claims.event_name,
+        jti_digest: jti,
+        token_digest,
+    })
+}
+
+/// Apply the exact Forgejo selector, denial, temporal, and grant-window rules.
+fn check_forgejo_claims(
+    rule: &ForgejoActionsRule,
+    claims: &ForgejoClaims,
+    proof_public_key: &[u8; 32],
+    now_secs: u64,
+) -> Result<(), FederationError> {
+    if claims.iss != rule.issuer
+        || claims.aud != proof_audience(proof_public_key)
+        || claims.sub.is_empty()
+        || claims.repository.is_empty()
+        || decimal(&claims.repository_id)? != rule.repository_id
+        || decimal(&claims.repository_owner_id)? != rule.repository_owner_id
+        || claims.event_name != FORGEJO_EVENT
+        || claims.ref_field != rule.ref_name
+        || claims.ref_type != rule.ref_type
+        || claims.sha != rule.sha
+        || claims.workflow_ref != rule.workflow_ref
+        // Same-repository workflow only: the workflow identity must belong to
+        // the repository the token was issued for.
+        || !claims
+            .workflow_ref
+            .strip_prefix(claims.repository.as_str())
+            .is_some_and(|rest| rest.starts_with('/'))
+        || decimal(&claims.run_id)? != rule.run_id
+        || decimal(&claims.run_attempt)? != rule.run_attempt
+        // Forgejo publishes no environment or reusable-callee identity, so a
+        // token presenting either is not a Forgejo Actions token this rule
+        // can authorize.
+        || claims.environment.is_some()
+        || claims.job_workflow_ref.is_some()
+        || claims.job_workflow_sha.is_some()
+        || claims.exp < claims.iat
+        || claims.iat > now_secs.saturating_add(rule.clock_skew_secs)
+        || claims
+            .nbf
+            .is_some_and(|nbf| nbf > now_secs.saturating_add(rule.clock_skew_secs))
+        || claims.exp.saturating_add(rule.clock_skew_secs) < now_secs
+        || now_secs.saturating_sub(claims.iat) > rule.max_token_age_secs
+        // The operator-installed grant window, compared exactly: authority
+        // exists only between `not_before_unix` and `expires_at_unix`.
+        || now_secs < rule.not_before_unix
+        || now_secs > rule.expires_at_unix
+        || claims.jti.is_empty()
+    {
+        return Err(FederationError::ProviderRejected);
+    }
+    Ok(())
+}
+
 /// Fetch and strictly parse one configured provider JWKS for a serving generation.
 ///
 /// Redirects are disabled at the HTTP boundary and the response URL is checked
@@ -1059,12 +1488,12 @@ pub fn verify_github(
 pub async fn fetch_generation_jwks(
     client: &reqwest::Client,
     generation: u64,
-    rule: &GithubActionsRule,
+    provider: &ProviderConfig,
 ) -> Result<GenerationJwks, FederationError> {
-    validate_github_rule(rule)?;
-    validate_urls(&rule.issuer, &rule.discovery_url, &rule.jwks_url)?;
-    let discovery_url = Url::parse(&rule.discovery_url).map_err(|_| FederationError::InvalidUrl)?;
-    let jwks_url = Url::parse(&rule.jwks_url).map_err(|_| FederationError::InvalidUrl)?;
+    provider.validate()?;
+    let discovery_url =
+        Url::parse(provider.discovery_url()).map_err(|_| FederationError::InvalidUrl)?;
+    let jwks_url = Url::parse(provider.jwks_url()).map_err(|_| FederationError::InvalidUrl)?;
     let discovery = client
         .get(discovery_url.clone())
         .send()
@@ -1138,6 +1567,39 @@ fn validate_github_rule(rule: &GithubActionsRule) -> Result<(), FederationError>
     Ok(())
 }
 
+fn validate_forgejo_rule(rule: &ForgejoActionsRule) -> Result<(), FederationError> {
+    let issuer_path_ok =
+        Url::parse(&rule.issuer).is_ok_and(|url| url.path().ends_with(FORGEJO_ISSUER_PATH));
+    let ref_consistent = match rule.ref_type.as_str() {
+        "branch" => rule.ref_name.starts_with("refs/heads/"),
+        "tag" => rule.ref_name.starts_with("refs/tags/"),
+        _ => false,
+    };
+    let sha_ok = matches!(rule.sha.len(), 40 | 64)
+        && rule
+            .sha
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if !issuer_path_ok
+        || rule.audience_prefix != "urn:basil:ci:jkt:"
+        || rule.repository_id == 0
+        || rule.repository_owner_id == 0
+        || rule.workflow_ref.is_empty()
+        || !ref_consistent
+        || !sha_ok
+        || rule.run_id == 0
+        || rule.run_attempt == 0
+        || rule.not_before_unix >= rule.expires_at_unix
+        || rule.expires_at_unix - rule.not_before_unix > MAX_FORGEJO_GRANT_SECS
+        || rule.max_token_age_secs == 0
+        || rule.max_token_age_secs > 15 * 60
+        || rule.clock_skew_secs > 5 * 60
+    {
+        return Err(FederationError::ProviderRejected);
+    }
+    Ok(())
+}
+
 fn validate_urls(issuer: &str, discovery: &str, jwks: &str) -> Result<(), FederationError> {
     let issuer_url = Url::parse(issuer).map_err(|_| FederationError::InvalidUrl)?;
     let discovery_url = Url::parse(discovery).map_err(|_| FederationError::InvalidUrl)?;
@@ -1159,6 +1621,7 @@ fn validate_urls(issuer: &str, discovery: &str, jwks: &str) -> Result<(), Federa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::collections::VecDeque;
 
     fn github_rule(id: &str, refs: &[&str], events: &[&str]) -> ProviderRule {
@@ -1207,18 +1670,16 @@ mod tests {
         }
     }
 
-    fn cache_rule() -> GithubActionsRule {
-        match github_rule("cache", &["main"], &["push"]).provider {
-            ProviderConfig::GithubActions(rule) => rule,
-        }
+    fn cache_rule() -> ProviderConfig {
+        github_rule("cache", &["main"], &["push"]).provider
     }
 
-    fn discovery(rule: &GithubActionsRule) -> FetchedDocument {
+    fn discovery(provider: &ProviderConfig) -> FetchedDocument {
         FetchedDocument::new(
-            &rule.discovery_url,
+            provider.discovery_url(),
             200,
             false,
-            format!(r#"{{"jwks_uri":"{}"}}"#, rule.jwks_url).into_bytes(),
+            format!(r#"{{"jwks_uri":"{}"}}"#, provider.jwks_url()).into_bytes(),
         )
         .expect("valid discovery response")
     }
@@ -1477,8 +1938,8 @@ mod tests {
             responses: VecDeque::from([
                 discovery(&rule),
                 jwks("old"),
-                FetchedDocument::new(&rule.discovery_url, 503, false, Vec::new()).unwrap(),
-                FetchedDocument::new(&rule.discovery_url, 503, false, Vec::new()).unwrap(),
+                FetchedDocument::new(rule.discovery_url(), 503, false, Vec::new()).unwrap(),
+                FetchedDocument::new(rule.discovery_url(), 503, false, Vec::new()).unwrap(),
             ]),
             calls: 0,
         };
@@ -1631,6 +2092,226 @@ mod tests {
             github_rule("two", &["tag"], &["push", "workflow_dispatch"]),
         ]);
         assert!(matches!(overlap, Err(FederationError::OverlappingRules)));
+    }
+
+    const FORGEJO_ISSUER: &str = "https://forge.example.com/api/actions";
+
+    fn forgejo_rule(id: &str, run_attempt: u64) -> ProviderRule {
+        ProviderRule {
+            id: id.to_string(),
+            subject: "ci/forgejo-release".to_string(),
+            audience: "urn:basil:ci".to_string(),
+            operation_profiles: vec!["artifact-sign".to_string()],
+            max_token_age_secs: 300,
+            clock_skew_secs: 30,
+            provider: ProviderConfig::ForgejoActions(ForgejoActionsRule {
+                issuer: FORGEJO_ISSUER.to_string(),
+                discovery_url: format!("{FORGEJO_ISSUER}/.well-known/openid-configuration"),
+                jwks_url: format!("{FORGEJO_ISSUER}/.well-known/jwks"),
+                audience_prefix: "urn:basil:ci:jkt:".to_string(),
+                repository_id: 11,
+                repository_owner_id: 3,
+                workflow_ref: "forge/basil/.forgejo/workflows/release.yml@refs/heads/main"
+                    .to_string(),
+                ref_name: "refs/heads/main".to_string(),
+                ref_type: "branch".to_string(),
+                sha: "b".repeat(40),
+                run_id: 900,
+                run_attempt,
+                not_before_unix: 1_700_000_000,
+                expires_at_unix: 1_700_000_000 + 900,
+                max_token_age_secs: 300,
+                clock_skew_secs: 30,
+            }),
+        }
+    }
+
+    #[test]
+    fn forgejo_rules_require_the_explicit_experimental_opt_in() {
+        // Without the opt-in, catalog load fails and the error names the tier.
+        let denied = ProviderCatalog::new(vec![forgejo_rule("nightly", 1)]);
+        let Err(error) = denied else {
+            panic!("forgejo rule must not load without the opt-in");
+        };
+        assert_eq!(
+            error,
+            FederationError::ExperimentalProviderDisabled("forgejoActions")
+        );
+        let message = error.to_string();
+        assert!(message.contains("experimental"), "{message}");
+        assert!(message.contains("experimentalProviders"), "{message}");
+        assert!(message.contains("forgejoActions"), "{message}");
+
+        // With the opt-in the same rule loads; naming a supported kind in the
+        // opt-in list changes nothing.
+        let catalog = ProviderCatalog::with_experimental_providers(
+            vec![forgejo_rule("nightly", 1)],
+            &[ProviderKind::ForgejoActions],
+        )
+        .expect("opted-in forgejo rule loads");
+        assert_eq!(catalog.rules().len(), 1);
+        assert!(
+            ProviderCatalog::with_experimental_providers(
+                vec![forgejo_rule("nightly", 1)],
+                &[ProviderKind::GithubActions],
+            )
+            .is_err(),
+            "a supported-tier opt-in entry must not enable the experimental tier"
+        );
+    }
+
+    #[test]
+    fn deserialized_catalogs_never_enable_the_experimental_tier() {
+        // The serde path routes through `new`, so configuration that has no
+        // explicit opt-in wiring fails closed on an experimental rule.
+        let serialized =
+            serde_json::to_value(vec![forgejo_rule("nightly", 1)]).expect("rules serialize");
+        let parsed: Result<ProviderCatalog, _> = serde_json::from_value(serialized);
+        let message = parsed
+            .expect_err("experimental rule fails closed")
+            .to_string();
+        assert!(message.contains("experimental"), "{message}");
+
+        let github_only = serde_json::to_value(vec![github_rule("release", &["main"], &["push"])])
+            .expect("rules serialize");
+        assert!(serde_json::from_value::<ProviderCatalog>(github_only).is_ok());
+    }
+
+    #[test]
+    fn forgejo_grants_overlap_only_on_identical_selectors() {
+        let opt_in = [ProviderKind::ForgejoActions];
+        // Identical selectors under two ids: rejected even though grant
+        // windows could differ.
+        let mut shifted = forgejo_rule("second", 1);
+        if let ProviderConfig::ForgejoActions(rule) = &mut shifted.provider {
+            rule.not_before_unix += 100;
+            rule.expires_at_unix += 100;
+        }
+        assert!(matches!(
+            ProviderCatalog::with_experimental_providers(
+                vec![forgejo_rule("first", 1), shifted],
+                &opt_in
+            ),
+            Err(FederationError::OverlappingRules)
+        ));
+
+        // A rerun grant (next attempt) is disjoint by construction.
+        let catalog = ProviderCatalog::with_experimental_providers(
+            vec![forgejo_rule("first", 1), forgejo_rule("rerun", 2)],
+            &opt_in,
+        )
+        .expect("attempt-disjoint grants load");
+        assert_eq!(catalog.rules().len(), 2);
+
+        // Provider kinds never overlap with each other.
+        let mixed = ProviderCatalog::with_experimental_providers(
+            vec![
+                github_rule("release", &["main"], &["push"]),
+                forgejo_rule("nightly", 1),
+            ],
+            &opt_in,
+        )
+        .expect("mixed-kind catalog loads");
+        assert_eq!(mixed.rules().len(), 2);
+    }
+
+    #[test]
+    fn forgejo_selection_is_exact_and_kind_isolated() {
+        let catalog = ProviderCatalog::with_experimental_providers(
+            vec![
+                github_rule("release", &["main"], &["push"]),
+                forgejo_rule("nightly", 1),
+            ],
+            &[ProviderKind::ForgejoActions],
+        )
+        .expect("mixed catalog loads");
+        let selection = ForgejoSelection {
+            repository_id: 11,
+            repository_owner_id: 3,
+            workflow_ref: "forge/basil/.forgejo/workflows/release.yml@refs/heads/main",
+            ref_name: "refs/heads/main",
+            ref_type: "branch",
+            sha: &"b".repeat(40),
+            run_id: 900,
+            run_attempt: 1,
+        };
+        let selected = catalog
+            .select_forgejo(&selection)
+            .expect("exact forgejo rule selected");
+        assert_eq!(selected.rule.id, "nightly");
+
+        // A near miss (wrong attempt) selects nothing, and GitHub rules are
+        // invisible to Forgejo selection.
+        let near_miss = ForgejoSelection {
+            run_attempt: 2,
+            ..selection
+        };
+        assert!(matches!(
+            catalog.select_forgejo(&near_miss),
+            Err(FederationError::NoMatchingRule)
+        ));
+    }
+
+    #[test]
+    fn forgejo_rule_configuration_is_validated_strictly() {
+        let case = |mutate: fn(&mut ForgejoActionsRule)| {
+            let mut rule = forgejo_rule("check", 1);
+            if let ProviderConfig::ForgejoActions(forgejo) = &mut rule.provider {
+                mutate(forgejo);
+            }
+            ProviderCatalog::with_experimental_providers(
+                vec![rule],
+                &[ProviderKind::ForgejoActions],
+            )
+        };
+        assert!(case(|_| {}).is_ok());
+        // The issuer must be the instance's Actions API root.
+        assert!(case(|r| r.issuer = "https://forge.example.com".to_string()).is_err());
+        // The grant window is bounded and ordered.
+        assert!(case(|r| r.expires_at_unix = r.not_before_unix).is_err());
+        assert!(case(|r| r.expires_at_unix = r.not_before_unix + 901).is_err());
+        // Ref type and ref must be consistent.
+        assert!(case(|r| r.ref_type = "tag".to_string()).is_err());
+        assert!(
+            case(|r| {
+                r.ref_type = "tag".to_string();
+                r.ref_name = "refs/tags/v1.0.0".to_string();
+            })
+            .is_ok()
+        );
+        // Numeric identities are nonzero.
+        assert!(case(|r| r.repository_id = 0).is_err());
+        assert!(case(|r| r.repository_owner_id = 0).is_err());
+        assert!(case(|r| r.run_id = 0).is_err());
+        assert!(case(|r| r.run_attempt = 0).is_err());
+    }
+
+    #[test]
+    fn forgejo_config_rejects_unknown_and_selector_like_fields() {
+        // `deny_unknown_fields` closes the schema: environment-like,
+        // reusable-workflow, and `ref_protected` selectors do not exist.
+        for field in ["environment", "jobWorkflowRef", "refProtected", "events"] {
+            let mut value =
+                serde_json::to_value(forgejo_rule("strict", 1)).expect("rule serializes");
+            value
+                .get_mut("provider")
+                .and_then(Value::as_object_mut)
+                .expect("provider object")
+                .insert(field.to_string(), json!("x"));
+            assert!(
+                serde_json::from_value::<ProviderRule>(value).is_err(),
+                "unknown field {field} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn generation_caches_serve_forgejo_providers_identically() {
+        let provider = forgejo_rule("cache", 1).provider;
+        let cache = GenerationJwksCache::new(5, &provider, JwksCachePolicy::default())
+            .expect("forgejo cache");
+        assert_eq!(cache.generation(), 5);
+        assert!(cache.cached_key("any").is_none());
     }
 
     #[test]

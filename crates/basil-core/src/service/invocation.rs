@@ -237,7 +237,7 @@ impl BrokerGrpc {
             actor.authenticated_by.push(ProofSummary {
                 kind: ProofKind::ProviderJwt,
                 subject: provider.subject,
-                fingerprint: Some(encode_id(&provider.github.token_digest)),
+                fingerprint: Some(encode_id(provider.claims.token_digest())),
             });
             actor.presenter = PresenterInfo::from(&peer);
             actor.transport = TransportInfo::default();
@@ -633,7 +633,7 @@ impl BrokerGrpc {
         &self,
         generation: &std::sync::Arc<crate::state::Generation>,
         rule_id: &str,
-        github: &crate::core::ci_federation::GithubActionsRule,
+        provider: &crate::core::ci_federation::ProviderConfig,
         client: &reqwest::Client,
         token_kid: &str,
         now: std::time::SystemTime,
@@ -655,7 +655,7 @@ impl BrokerGrpc {
                 stale,
             } => {
                 let fetched = if refresh_allowed {
-                    crate::ci_federation::fetch_generation_jwks(client, generation.id(), github)
+                    crate::ci_federation::fetch_generation_jwks(client, generation.id(), provider)
                         .await
                         .ok()
                 } else {
@@ -674,7 +674,7 @@ impl BrokerGrpc {
                     return Ok(None);
                 }
                 let Ok(keys) =
-                    crate::ci_federation::fetch_generation_jwks(client, generation.id(), github)
+                    crate::ci_federation::fetch_generation_jwks(client, generation.id(), provider)
                         .await
                 else {
                     return Ok(None);
@@ -724,26 +724,49 @@ impl BrokerGrpc {
             .ok_or_else(unauthorized_invocation)?;
         let correlation = token_correlation_key()?;
         for rule in catalog.rules() {
-            let crate::core::ci_federation::ProviderConfig::GithubActions(github) = &rule.provider;
             let Some(keys) = self
-                .resolve_rule_jwks(generation, &rule.id, github, &client, &token_kid, now)
+                .resolve_rule_jwks(
+                    generation,
+                    &rule.id,
+                    &rule.provider,
+                    &client,
+                    &token_kid,
+                    now,
+                )
                 .await?
             else {
                 continue;
             };
-            if let Ok(evidence) = crate::core::ci_federation::verify_github(
-                github,
-                &keys,
-                token,
-                &public,
-                correlation,
-                now,
-            ) {
+            let verified = match &rule.provider {
+                crate::core::ci_federation::ProviderConfig::GithubActions(github) => {
+                    crate::core::ci_federation::verify_github(
+                        github,
+                        &keys,
+                        token,
+                        &public,
+                        correlation,
+                        now,
+                    )
+                    .map(crate::core::ci_federation::ProviderClaimEvidence::GithubActions)
+                }
+                crate::core::ci_federation::ProviderConfig::ForgejoActions(forgejo) => {
+                    crate::core::ci_federation::verify_forgejo(
+                        forgejo,
+                        &keys,
+                        token,
+                        &public,
+                        correlation,
+                        now,
+                    )
+                    .map(crate::core::ci_federation::ProviderClaimEvidence::ForgejoActions)
+                }
+            };
+            if let Ok(claims) = verified {
                 return Ok(crate::core::ci_federation::VerifiedProviderEvidence {
                     provider: rule.provider.kind(),
                     rule_id: rule.id.clone(),
                     subject: rule.subject.clone(),
-                    github: evidence,
+                    claims,
                 });
             }
         }

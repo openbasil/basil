@@ -23,7 +23,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use basil_core::catalog::loader::load;
 use basil_core::ci_federation::{
-    GenerationJwks, GithubActionsRule, ProviderCatalog, ProviderConfig, ProviderRule,
+    ForgejoActionsRule, GenerationJwks, GithubActionsRule, ProviderCatalog, ProviderConfig,
+    ProviderKind, ProviderRule,
 };
 use basil_core::state::Generation;
 
@@ -143,4 +144,44 @@ fn a_generation_without_federation_config_exposes_no_providers_or_caches() {
     let plain = generation(3, None);
     assert!(plain.federation().is_none());
     assert!(plain.jwks_caches().lock().expect("cache lock").is_empty());
+}
+
+#[test]
+fn forgejo_rules_get_their_own_empty_generation_cache() {
+    let forgejo_issuer = "https://forge.example.com/api/actions";
+    let rule = ProviderRule {
+        id: "forgejo-nightly".to_string(),
+        subject: "ci/forgejo-release".to_string(),
+        audience: "urn:basil:ci".to_string(),
+        operation_profiles: vec!["artifact-sign".to_string()],
+        max_token_age_secs: 300,
+        clock_skew_secs: 30,
+        provider: ProviderConfig::ForgejoActions(ForgejoActionsRule {
+            issuer: forgejo_issuer.to_string(),
+            discovery_url: format!("{forgejo_issuer}/.well-known/openid-configuration"),
+            jwks_url: format!("{forgejo_issuer}/.well-known/jwks"),
+            audience_prefix: "urn:basil:ci:jkt:".to_string(),
+            repository_id: 11,
+            repository_owner_id: 3,
+            workflow_ref: "forge/basil/.forgejo/workflows/release.yml@refs/heads/main".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            ref_type: "branch".to_string(),
+            sha: "b".repeat(40),
+            run_id: 900,
+            run_attempt: 1,
+            not_before_unix: 1_700_000_000,
+            expires_at_unix: 1_700_000_000 + 900,
+            max_token_age_secs: 300,
+            clock_skew_secs: 30,
+        }),
+    };
+    let catalog = Arc::new(
+        ProviderCatalog::with_experimental_providers(vec![rule], &[ProviderKind::ForgejoActions])
+            .expect("opted-in forgejo catalog"),
+    );
+    let generation = generation(4, Some(catalog));
+    let caches = generation.jwks_caches().lock().expect("cache lock");
+    let cache = caches.get("forgejo-nightly").expect("forgejo rule cache");
+    assert_eq!(cache.generation(), 4);
+    assert!(cache.cached_key("any").is_none(), "new cache starts empty");
 }
