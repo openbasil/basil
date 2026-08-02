@@ -23,6 +23,8 @@ pub mod manager;
 pub mod minter;
 pub mod ml_dsa_sign;
 pub mod ml_kem_envelope;
+pub mod nix_cache_audit;
+pub mod nix_cache_fingerprint;
 pub mod oci_evidence_cache;
 pub mod oci_verification;
 pub mod peer;

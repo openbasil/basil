@@ -143,6 +143,15 @@ pub struct NixCacheKeyPosture {
     pub auto_rotation_disabled: bool,
 }
 
+/// A purpose-specific backend Nix signature with its actual transit version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NixCacheBackendSignature {
+    /// Version reported by the backend's signed-result framing.
+    pub backend_version: u32,
+    /// Exact Ed25519 signature bytes.
+    pub signature: [u8; 64],
+}
+
 /// Backend signing mode for operations whose wire format fixes an algorithm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SignOptions {
@@ -286,6 +295,20 @@ pub trait Backend: Send + Sync {
     ) -> Result<NixCacheKeyPosture, BackendError> {
         let _ = key_id;
         Err(BackendError::Unsupported("nix_cache_key_posture"))
+    }
+
+    /// Sign an exact canonical Nix cache fingerprint with transit version one.
+    ///
+    /// This purpose-specific operation is separate from generic [`Self::sign`]
+    /// so backends cannot accidentally inherit Nix publication authority. The
+    /// default fails closed.
+    async fn sign_nix_cache_fingerprint(
+        &self,
+        key_id: &str,
+        fingerprint: &[u8],
+    ) -> Result<NixCacheBackendSignature, BackendError> {
+        let _ = (key_id, fingerprint);
+        Err(BackendError::Unsupported("sign_nix_cache_fingerprint"))
     }
 
     /// Create a **symmetric AEAD** crypto key at a **named path**. AEAD suites are

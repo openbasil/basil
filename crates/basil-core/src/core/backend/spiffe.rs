@@ -257,6 +257,17 @@ impl Backend for SpiffeVaultBackend {
             .await
     }
 
+    async fn sign_nix_cache_fingerprint(
+        &self,
+        key_id: &str,
+        fingerprint: &[u8],
+    ) -> Result<super::NixCacheBackendSignature, BackendError> {
+        let token = self.token().await?;
+        self.transit
+            .sign_nix_cache_fingerprint(&token, key_id, fingerprint)
+            .await
+    }
+
     async fn create_named_aead(
         &self,
         key_id: &str,

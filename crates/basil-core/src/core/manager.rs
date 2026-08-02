@@ -486,6 +486,26 @@ pub struct NixCacheEnrollment {
     pub disposition: NixCacheEnrollmentDisposition,
 }
 
+/// Public-only description of an enrolled Nix binary-cache signing key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NixCacheDescription {
+    /// Stable Nix verifier key name.
+    pub key_name: String,
+    /// Catalog-pinned Ed25519 public key.
+    pub public_key: NixCachePublicKey,
+    /// Exact backend key version observed during the operation.
+    pub backend_version: u32,
+}
+
+/// Locally verified result of a purpose-specific Nix fingerprint signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NixCacheSignature {
+    /// Enrolled verifier identity used to validate the signature.
+    pub identity: NixCacheDescription,
+    /// Exact 64-byte Ed25519 signature.
+    pub signature: [u8; 64],
+}
+
 // `Box<dyn Backend>` is not `Debug`; report the routing table by name only.
 impl std::fmt::Debug for BackendManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -655,9 +675,118 @@ impl BackendManager {
         Ok(NixCacheEnrollment {
             key_name: active_identity.key_name,
             public_key,
-            backend_version: active_identity.backend_version,
+            backend_version: posture.latest_version,
             disposition,
         })
+    }
+
+    /// Describe an enrolled Nix cache key after rechecking backend posture.
+    pub async fn describe_nix_cache_key(
+        &self,
+        key_id: &str,
+        active_identity: NixCacheIdentity,
+    ) -> Result<NixCacheDescription, ManagerError> {
+        let routed = self.resolve_enrolled_nix_cache_key(key_id, &active_identity)?;
+        let posture = routed.backend.nix_cache_key_posture(routed.path()).await?;
+        validate_nix_cache_posture(key_id, &posture)?;
+        validate_nix_cache_pin(key_id, &active_identity, &posture)?;
+        Ok(NixCacheDescription {
+            key_name: active_identity.key_name,
+            public_key: NixCachePublicKey::from_bytes(posture.public_key),
+            backend_version: posture.latest_version,
+        })
+    }
+
+    /// Sign an exact canonical Nix fingerprint and verify the result locally.
+    ///
+    /// The backend posture and immutable public pin are checked both before and
+    /// after signing. This closes the replacement/rotation window around the
+    /// backend await. The returned signature is then verified against the same
+    /// active-generation public pin before it may cross the service boundary.
+    pub async fn sign_nix_cache_fingerprint(
+        &self,
+        key_id: &str,
+        active_identity: NixCacheIdentity,
+        fingerprint: &[u8],
+    ) -> Result<NixCacheSignature, ManagerError> {
+        let routed = self.resolve_enrolled_nix_cache_key(key_id, &active_identity)?;
+        let before = routed.backend.nix_cache_key_posture(routed.path()).await?;
+        validate_nix_cache_posture(key_id, &before)?;
+        validate_nix_cache_pin(key_id, &active_identity, &before)?;
+
+        let backend_signature = routed
+            .backend
+            .sign_nix_cache_fingerprint(routed.path(), fingerprint)
+            .await?;
+        if backend_signature.backend_version != active_identity.backend_version {
+            return Err(nix_cache_enrollment_error(
+                key_id,
+                "signature backend version does not match the enrolled catalog pin",
+            ));
+        }
+
+        let after = routed.backend.nix_cache_key_posture(routed.path()).await?;
+        validate_nix_cache_posture(key_id, &after)?;
+        validate_nix_cache_pin(key_id, &active_identity, &after)?;
+        if before != after {
+            return Err(nix_cache_enrollment_error(
+                key_id,
+                "backend posture changed while signing",
+            ));
+        }
+
+        let public_key = active_identity.public_key.ok_or_else(|| {
+            nix_cache_enrollment_error(key_id, "enrolled identity has no public-key pin")
+        })?;
+        let verified = ed25519_sign::verify(
+            public_key.as_bytes(),
+            fingerprint,
+            &backend_signature.signature,
+        )
+        .map_err(|_| nix_cache_enrollment_error(key_id, "returned signature is malformed"))?;
+        if !verified {
+            return Err(nix_cache_enrollment_error(
+                key_id,
+                "returned signature does not verify against the enrolled public key",
+            ));
+        }
+
+        Ok(NixCacheSignature {
+            identity: NixCacheDescription {
+                key_name: active_identity.key_name,
+                public_key,
+                backend_version: after.latest_version,
+            },
+            signature: backend_signature.signature,
+        })
+    }
+
+    fn resolve_enrolled_nix_cache_key<'a>(
+        &'a self,
+        key_id: &str,
+        active_identity: &NixCacheIdentity,
+    ) -> Result<Routed<'a>, ManagerError> {
+        if active_identity.state != NixCacheState::Enrolled || active_identity.public_key.is_none()
+        {
+            return Err(nix_cache_enrollment_error(
+                key_id,
+                "operation requires an enrolled identity with a public-key pin",
+            ));
+        }
+        let routed = self.resolve(key_id)?;
+        let routed_identity = routed.entry.nix_cache.as_ref().ok_or_else(|| {
+            nix_cache_enrollment_error(key_id, "catalog key has no nixCache identity")
+        })?;
+        if active_identity.key_name != routed_identity.key_name
+            || active_identity.backend_version != routed_identity.backend_version
+        {
+            return Err(nix_cache_enrollment_error(
+                key_id,
+                "active-generation identity does not match the immutable routed identity",
+            ));
+        }
+        validate_nix_cache_route(key_id, &routed, active_identity.backend_version)?;
+        Ok(routed)
     }
 
     /// Iterate the catalog's `(dotted name, entry)` pairs, in name order.
@@ -2475,6 +2604,27 @@ fn validate_nix_cache_posture(
     reason.map_or(Ok(()), |reason| {
         Err(nix_cache_enrollment_error(key_id, reason))
     })
+}
+
+fn validate_nix_cache_pin(
+    key_id: &str,
+    active_identity: &NixCacheIdentity,
+    posture: &NixCacheKeyPosture,
+) -> Result<(), ManagerError> {
+    if posture.latest_version != active_identity.backend_version {
+        return Err(nix_cache_enrollment_error(
+            key_id,
+            "backend version does not match the enrolled catalog pin",
+        ));
+    }
+    let public_key = NixCachePublicKey::from_bytes(posture.public_key);
+    if active_identity.public_key.as_ref() != Some(&public_key) {
+        return Err(nix_cache_enrollment_error(
+            key_id,
+            "backend public key does not match the enrolled catalog pin",
+        ));
+    }
+    Ok(())
 }
 
 /// Check that `op` is valid for `class`, returning [`ManagerError::OpNotValidForClass`]
@@ -5446,7 +5596,7 @@ mod pqc_dispatch_tests {
 #[cfg(test)]
 mod nix_cache_enrollment_tests {
     use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
@@ -5456,15 +5606,19 @@ mod nix_cache_enrollment_tests {
         BackendManager, ManagerError, NixCacheEnrollmentDisposition, NixCacheKeyPosture,
         validate_nix_cache_posture,
     };
-    use crate::backend::{Backend, BackendError, NewKey};
+    use crate::backend::{Backend, BackendError, NewKey, NixCacheBackendSignature};
     use crate::catalog::{BackendKind, Catalog, NixCacheIdentity, NixCacheState};
     use crate::state::BrokerLimits;
     use basil_proto::KeyType;
+    use zeroize::Zeroizing;
 
     struct EnrollmentBackend {
         posture: Mutex<Option<NixCacheKeyPosture>>,
         create_calls: AtomicUsize,
         paths: Mutex<Vec<String>>,
+        signature_version: AtomicUsize,
+        invalid_signature: AtomicBool,
+        replace_after_sign: AtomicBool,
     }
 
     impl EnrollmentBackend {
@@ -5473,6 +5627,9 @@ mod nix_cache_enrollment_tests {
                 posture: Mutex::new(posture),
                 create_calls: AtomicUsize::new(0),
                 paths: Mutex::new(Vec::new()),
+                signature_version: AtomicUsize::new(1),
+                invalid_signature: AtomicBool::new(false),
+                replace_after_sign: AtomicBool::new(false),
             })
         }
     }
@@ -5522,6 +5679,30 @@ mod nix_cache_enrollment_tests {
                 .ok_or_else(|| BackendError::KeyNotFound(key_id.to_string()))
         }
 
+        async fn sign_nix_cache_fingerprint(
+            &self,
+            _key_id: &str,
+            fingerprint: &[u8],
+        ) -> Result<NixCacheBackendSignature, BackendError> {
+            let seed = Zeroizing::new([7u8; 32]);
+            let mut signature = crate::ed25519_sign::sign(&seed, fingerprint);
+            if self.0.invalid_signature.load(Ordering::SeqCst)
+                && let Some(first) = signature.first_mut()
+            {
+                *first ^= 1;
+            }
+            if self.0.replace_after_sign.load(Ordering::SeqCst) {
+                let mut replacement = compatible_posture();
+                replacement.public_key = [8; 32];
+                *self.0.posture.lock().expect("posture lock") = Some(replacement);
+            }
+            Ok(NixCacheBackendSignature {
+                backend_version: u32::try_from(self.0.signature_version.load(Ordering::SeqCst))
+                    .unwrap_or(u32::MAX),
+                signature,
+            })
+        }
+
         async fn public_key(&self, _key_id: &str) -> Result<Vec<u8>, BackendError> {
             Err(BackendError::Unsupported("public_key"))
         }
@@ -5541,8 +5722,9 @@ mod nix_cache_enrollment_tests {
     }
 
     fn compatible_posture() -> NixCacheKeyPosture {
+        let seed = Zeroizing::new([7u8; 32]);
         NixCacheKeyPosture {
-            public_key: [7; 32],
+            public_key: crate::ed25519_sign::public_from_seed(&seed),
             key_type: KeyType::Ed25519,
             latest_version: 1,
             min_decryption_version: 1,
@@ -5564,7 +5746,9 @@ mod nix_cache_enrollment_tests {
             "backendVersion": 1,
         });
         if state == NixCacheState::Enrolled {
-            identity["publicKey"] = json!(crate::catalog::NixCachePublicKey::from_bytes([7; 32]));
+            identity["publicKey"] = json!(crate::catalog::NixCachePublicKey::from_bytes(
+                compatible_posture().public_key
+            ));
         }
         serde_json::from_value(json!({
             "schema": "catalog",
@@ -5635,7 +5819,10 @@ mod nix_cache_enrollment_tests {
         let mut existing = 0;
         for task in tasks {
             let enrollment = task.await.expect("task joins").expect("enrollment");
-            assert_eq!(enrollment.public_key.as_bytes(), &[7; 32]);
+            assert_eq!(
+                enrollment.public_key.as_bytes(),
+                &compatible_posture().public_key
+            );
             match enrollment.disposition {
                 NixCacheEnrollmentDisposition::Created => created += 1,
                 NixCacheEnrollmentDisposition::Existing => existing += 1,
@@ -5665,6 +5852,24 @@ mod nix_cache_enrollment_tests {
             .enroll_nix_cache_key("cache.signer", active_identity(NixCacheState::Pending))
             .await
             .expect("compatible existing key");
+        assert_eq!(
+            enrollment.disposition,
+            NixCacheEnrollmentDisposition::Existing
+        );
+        assert_eq!(backend.create_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn compatible_existing_enrolled_key_is_compare_only_existing() {
+        let (manager, backend) = manager(
+            NixCacheState::Enrolled,
+            BackendKind::Vault,
+            Some(compatible_posture()),
+        );
+        let enrollment = manager
+            .enroll_nix_cache_key("cache.signer", active_identity(NixCacheState::Enrolled))
+            .await
+            .expect("compatible enrolled key");
         assert_eq!(
             enrollment.disposition,
             NixCacheEnrollmentDisposition::Existing
@@ -5734,6 +5939,93 @@ mod nix_cache_enrollment_tests {
             Err(ManagerError::NixCacheEnrollment { .. })
         ));
         assert_eq!(backend.create_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn nix_signature_is_locally_verified_and_preserves_backend_version() {
+        let (manager, _) = manager(
+            NixCacheState::Enrolled,
+            BackendKind::Vault,
+            Some(compatible_posture()),
+        );
+        let fingerprint = b"canonical-fingerprint";
+        let signed = manager
+            .sign_nix_cache_fingerprint(
+                "cache.signer",
+                active_identity(NixCacheState::Enrolled),
+                fingerprint,
+            )
+            .await
+            .expect("locally verified signature");
+        assert_eq!(signed.identity.backend_version, 1);
+        assert!(
+            crate::ed25519_sign::verify(
+                signed.identity.public_key.as_bytes(),
+                fingerprint,
+                &signed.signature,
+            )
+            .expect("well-formed signature")
+        );
+    }
+
+    #[tokio::test]
+    async fn signature_version_mismatch_fails_closed() {
+        let (manager, backend) = manager(
+            NixCacheState::Enrolled,
+            BackendKind::Vault,
+            Some(compatible_posture()),
+        );
+        backend.signature_version.store(2, Ordering::SeqCst);
+        assert!(matches!(
+            manager
+                .sign_nix_cache_fingerprint(
+                    "cache.signer",
+                    active_identity(NixCacheState::Enrolled),
+                    b"fingerprint",
+                )
+                .await,
+            Err(ManagerError::NixCacheEnrollment { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_returned_signature_fails_local_verification() {
+        let (manager, backend) = manager(
+            NixCacheState::Enrolled,
+            BackendKind::Vault,
+            Some(compatible_posture()),
+        );
+        backend.invalid_signature.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            manager
+                .sign_nix_cache_fingerprint(
+                    "cache.signer",
+                    active_identity(NixCacheState::Enrolled),
+                    b"fingerprint",
+                )
+                .await,
+            Err(ManagerError::NixCacheEnrollment { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn backend_replacement_during_sign_is_detected_by_posture_recheck() {
+        let (manager, backend) = manager(
+            NixCacheState::Enrolled,
+            BackendKind::Vault,
+            Some(compatible_posture()),
+        );
+        backend.replace_after_sign.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            manager
+                .sign_nix_cache_fingerprint(
+                    "cache.signer",
+                    active_identity(NixCacheState::Enrolled),
+                    b"fingerprint",
+                )
+                .await,
+            Err(ManagerError::NixCacheEnrollment { .. })
+        ));
     }
 
     #[test]

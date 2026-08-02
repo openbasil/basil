@@ -577,6 +577,8 @@ const fn admin_target(op: Op) -> Option<&'static str> {
         | Op::Rotate
         | Op::Import
         | Op::NewKey
+        | Op::EnrollNixCacheKey
+        | Op::SignNixCacheFingerprint
         // A key-scoped op (decided via `decide`, not `decide_admin`); it has no
         // reserved admin target.
         | Op::UseSoftwareCustody => None,
@@ -1143,6 +1145,31 @@ mod tests {
     }
 
     #[test]
+    fn explicit_nix_cache_grants_are_honored() {
+        let (c, mut r, cfg) = fixture();
+        r.rules.push(crate::catalog::policy::ResolvedRule {
+            subjects: vec!["breakglass.root".into()],
+            grants: [Op::EnrollNixCacheKey, Op::SignNixCacheFingerprint]
+                .into_iter()
+                .map(|op| Grant {
+                    op,
+                    target: crate::catalog::glob::KeyGlob::parse("nats.account")
+                        .expect("exact target"),
+                    rule_id: "explicit-nix".into(),
+                    action: format!("op:{}", op.token()),
+                })
+                .collect(),
+        });
+        let pdp = Pdp::new(&c, &r, &cfg);
+        let actor = pdp
+            .resolve_unix_actor(0)
+            .expect("root breakglass subject resolves");
+        for op in [Op::EnrollNixCacheKey, Op::SignNixCacheFingerprint] {
+            assert!(pdp.decide(&actor, op, "nats.account").is_allow());
+        }
+    }
+
+    #[test]
     fn sealing_key_default_denies_without_a_grant() {
         // INVARIANT 2 (default-deny): an arbitrary uid with no rule gets nothing on
         // a sealing key: not even get_public_key (it is NOT class:public).
@@ -1300,6 +1327,15 @@ mod tests {
                     reason: DenyReason::NotPermitted
                 },
                 "breakglass wildcard must not imply admin {op:?}"
+            );
+        }
+        for op in [Op::EnrollNixCacheKey, Op::SignNixCacheFingerprint] {
+            assert_eq!(
+                pdp.decide(&actor, op, "nats.account"),
+                Decision::Deny {
+                    reason: DenyReason::NotPermitted
+                },
+                "breakglass wildcard must not imply purpose-specific {op:?}"
             );
         }
     }

@@ -81,6 +81,10 @@ let
     "rotate"
     "import"
     "new_key"
+    # Purpose-specific Nix cache trust-root enrollment; `*` never implies it.
+    "enroll_nix_cache_key"
+    # Purpose-specific canonical PATH_INFO_V1 signing; `*` never implies it.
+    "sign_nix_cache_fingerprint"
     # Explicit opt-in for a key's software-custody (materialize-to-use) arm; never
     # implied by another grant.
     "use_software_custody"
@@ -561,7 +565,10 @@ let
           Operations are the policy operation enum: get, list, get_public_key,
           verify, sign, encrypt, decrypt, mint, sign_nats_jwt, validate_nats_jwt,
           encrypt_nats_curve, decrypt_nats_curve, validate, set, rotate, import,
-          new_key, and use_software_custody. Broker-wide admin ops (reload,
+          new_key, enroll_nix_cache_key, sign_nix_cache_fingerprint, and
+          use_software_custody. The Nix cache operations and
+          use_software_custody are explicit-only: wildcard actions never imply
+          them. Broker-wide admin ops (reload,
           explain, revoke, watch, realm_status, connection_status,
           connection_drop) are granted over their reserved broker.* targets.
         '';

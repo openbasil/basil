@@ -25,7 +25,10 @@ use zeroize::{Zeroize, Zeroizing};
 use basil_proto::{AeadAlgorithm, CiphertextEnvelope, KeyMaterial, KeyType};
 
 use super::kms_common::{ecdsa_der_to_raw, ecdsa_raw_to_der};
-use super::{BackendError, KeyMetadata, NewKey, NixCacheKeyPosture, PublicKey, SignOptions};
+use super::{
+    BackendError, KeyMetadata, NewKey, NixCacheBackendSignature, NixCacheKeyPosture, PublicKey,
+    SignOptions,
+};
 
 /// Wire version assumed for transit signatures (v1 keys are never rotated).
 const SIG_VERSION: u32 = 1;
@@ -460,6 +463,33 @@ impl TransitClient {
             .get_at_segments(Mount::Transit, token, &["keys", key_id])
             .await?;
         nix_cache_key_posture(key_data(&info)?)
+    }
+
+    /// Sign one canonical Nix fingerprint with the enrolled version-one key.
+    pub(crate) async fn sign_nix_cache_fingerprint(
+        &self,
+        token: &str,
+        key_id: &str,
+        fingerprint: &[u8],
+    ) -> Result<NixCacheBackendSignature, BackendError> {
+        let response = self
+            .post_at_segments(
+                Mount::Transit,
+                token,
+                &["sign", key_id],
+                json!({
+                    "input": B64.encode(fingerprint),
+                    "key_version": 1,
+                }),
+            )
+            .await?
+            .ok_or_else(|| BackendError::Protocol("empty Nix sign response".into()))?;
+        let wrapped = response
+            .get("data")
+            .and_then(|data| data.get("signature"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| BackendError::Protocol("Nix sign response has no signature".into()))?;
+        parse_nix_cache_signature(wrapped)
     }
 
     /// `IMPORT` (BYOK) provisions transit key `key_id` from caller material.
@@ -1014,6 +1044,58 @@ fn split_vault_wrapped(wrapped: &str) -> Result<(u32, Vec<u8>), BackendError> {
     Ok((version, bytes))
 }
 
+/// Parse canonical transit framing while preserving the reported key version.
+/// The manager enforces equality with the enrolled version-one pin.
+fn parse_nix_cache_signature(wrapped: &str) -> Result<NixCacheBackendSignature, BackendError> {
+    let mut parts = wrapped.split(':');
+    let (Some("vault"), Some(version), Some(encoded), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(BackendError::Protocol(
+            "Nix signature has malformed transit framing".into(),
+        ));
+    };
+    let Some(version_digits) = version.strip_prefix('v') else {
+        return Err(BackendError::Protocol(
+            "Nix signature has malformed transit version".into(),
+        ));
+    };
+    if version_digits.is_empty()
+        || (version_digits.starts_with('0') && version_digits.len() > 1)
+        || !version_digits.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(BackendError::Protocol(
+            "Nix signature has noncanonical transit version".into(),
+        ));
+    }
+    let backend_version = version_digits.parse::<u32>().map_err(|_| {
+        BackendError::Protocol("Nix signature transit version is out of range".into())
+    })?;
+    if backend_version == 0 {
+        return Err(BackendError::Protocol(
+            "Nix signature transit version must be positive".into(),
+        ));
+    }
+    let decoded = B64
+        .decode(encoded)
+        .map_err(|error| BackendError::Protocol(format!("Nix signature is not base64: {error}")))?;
+    if B64.encode(&decoded) != encoded {
+        return Err(BackendError::Protocol(
+            "Nix signature base64 is not canonical".into(),
+        ));
+    }
+    let signature = decoded.try_into().map_err(|bytes: Vec<u8>| {
+        BackendError::Protocol(format!(
+            "Nix Ed25519 signature is {} bytes, expected 64",
+            bytes.len()
+        ))
+    })?;
+    Ok(NixCacheBackendSignature {
+        backend_version,
+        signature,
+    })
+}
+
 /// The `data` object of a transit key-info response, or a protocol error.
 fn key_data(info: &Value) -> Result<&Value, BackendError> {
     info.get("data")
@@ -1262,6 +1344,38 @@ pub async fn read_body(resp: reqwest::Response) -> Result<Option<Value>, Backend
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nix_signature_parser_preserves_canonical_backend_version() {
+        let signature = [0x5au8; 64];
+        let encoded = B64.encode(signature);
+        let parsed = parse_nix_cache_signature(&format!("vault:v2:{encoded}"))
+            .expect("canonical versioned signature");
+        assert_eq!(parsed.backend_version, 2);
+        assert_eq!(parsed.signature, signature);
+    }
+
+    #[test]
+    fn nix_signature_parser_rejects_malformed_framing_and_versions() {
+        let encoded = B64.encode([0x5au8; 64]);
+        for wrapped in [
+            format!("openbao:v1:{encoded}"),
+            format!("vault:1:{encoded}"),
+            format!("vault:v:{encoded}"),
+            format!("vault:v0:{encoded}"),
+            format!("vault:v01:{encoded}"),
+            format!("vault:v-1:{encoded}"),
+            format!("vault:v4294967296:{encoded}"),
+            format!("vault:v1:{encoded}:extra"),
+            "vault:v1:not-base64".to_string(),
+            format!("vault:v1:{}", B64.encode([0u8; 63])),
+        ] {
+            assert!(
+                parse_nix_cache_signature(&wrapped).is_err(),
+                "accepted malformed signature {wrapped:?}"
+            );
+        }
+    }
 
     fn client() -> TransitClient {
         // The reqwest client is never driven in these URL-shape tests, but

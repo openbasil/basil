@@ -41,6 +41,7 @@ use crate::catalog::policy::{Config, ResolvedPolicy};
 use crate::catalog::{Catalog, Pdp};
 use crate::configuration::OverrideProvenance;
 use crate::core::crypto_provider::{ProviderAuditEvent, ProviderAuditOutcome};
+use crate::core::nix_cache_audit::{NixCacheAuditEvent, NixCacheAuditOutcome};
 use crate::decision::DecisionRecord;
 use crate::event::EventSource;
 use crate::manager::{BackendManager, ManagerError};
@@ -988,6 +989,34 @@ impl BrokerState {
                 outcome = ?event.outcome,
                 reason = event.reason,
                 "software-custody provider operation",
+            ),
+        }
+        if let Some(audit) = &self.audit {
+            audit.append_value(&event.to_json_value());
+        }
+    }
+
+    /// Record one purpose-specific Nix cache operation without payload,
+    /// signature, private material, or installation claims.
+    pub fn record_nix_cache_event(&self, event: &NixCacheAuditEvent<'_>) {
+        match event.outcome {
+            NixCacheAuditOutcome::Deny | NixCacheAuditOutcome::Failure => tracing::warn!(
+                event = "basil.audit.nix_cache_operation",
+                op = event.op.token(),
+                key = event.key_id,
+                generation = event.generation,
+                outcome = event.outcome.token(),
+                reason = event.reason,
+                "Nix cache operation",
+            ),
+            NixCacheAuditOutcome::Success => tracing::info!(
+                event = "basil.audit.nix_cache_operation",
+                op = event.op.token(),
+                key = event.key_id,
+                generation = event.generation,
+                outcome = event.outcome.token(),
+                reason = event.reason,
+                "Nix cache operation",
             ),
         }
         if let Some(audit) = &self.audit {

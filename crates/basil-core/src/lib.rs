@@ -63,8 +63,8 @@ pub use core::ml_dsa_sign;
 pub use core::{
     actor, attestor_realm, attestor_realm_unix, audit, authority_install, backend, capability,
     catalog, ci_federation, configuration, decision, ed25519_sign, event, manager, minter,
-    ml_kem_envelope, peer, reconcile, release_admission, reload, revocation, seal, state,
-    x25519_seal,
+    ml_kem_envelope, nix_cache_audit, nix_cache_fingerprint, peer, reconcile, release_admission,
+    reload, revocation, seal, state, x25519_seal,
 };
 pub use service::broker as grpc;
 #[cfg(feature = "http")]
@@ -78,7 +78,7 @@ pub use audit::{AuditLog, ReloadActor};
 pub use backend::keystore::KeystoreBackend;
 pub use backend::spiffe::{SpiffeConfig, SpiffeVaultBackend};
 pub use backend::vault::VaultBackend;
-pub use backend::{Backend, BackendError, NewKey, NixCacheKeyPosture};
+pub use backend::{Backend, BackendError, NewKey, NixCacheBackendSignature, NixCacheKeyPosture};
 pub use capability::{
     CapabilityError, CapabilityGap, CapabilityPolicy, CapabilitySummary, enforce_capabilities,
 };
@@ -99,7 +99,8 @@ pub use grpc_server::{
     DEFAULT_SOCKET_MODE, ServerConfig, run as run_grpc, run_many as run_grpc_many,
 };
 pub use manager::{
-    BackendManager, ManagerError, NixCacheEnrollment, NixCacheEnrollmentDisposition,
+    BackendManager, ManagerError, NixCacheDescription, NixCacheEnrollment,
+    NixCacheEnrollmentDisposition, NixCacheSignature,
 };
 pub use peer::PeerInfo;
 pub use reconcile::{CheckReport, KeyCheck, KeyStatus, ReconcileError, ReconcileSummary};

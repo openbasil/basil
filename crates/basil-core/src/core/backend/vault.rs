@@ -80,6 +80,16 @@ impl Backend for VaultBackend {
             .await
     }
 
+    async fn sign_nix_cache_fingerprint(
+        &self,
+        key_id: &str,
+        fingerprint: &[u8],
+    ) -> Result<super::NixCacheBackendSignature, BackendError> {
+        self.transit
+            .sign_nix_cache_fingerprint(&self.token, key_id, fingerprint)
+            .await
+    }
+
     async fn create_named_aead(
         &self,
         key_id: &str,

@@ -84,6 +84,91 @@ pub fn authorize_in_generation<T>(
     authorize_extensions_in_generation(state, generation, request.extensions(), op, key)
 }
 
+/// An authorization failure retaining the resolved actor for denial auditing.
+#[derive(Debug)]
+pub struct AuthorizationFailure {
+    actor: Option<AuthenticatedActor>,
+    status: Status,
+}
+
+impl AuthorizationFailure {
+    /// Resolved authenticated actor, absent only when subject resolution failed.
+    #[must_use]
+    pub const fn actor(&self) -> Option<&AuthenticatedActor> {
+        self.actor.as_ref()
+    }
+
+    /// Consume the detailed failure and return its wire status.
+    #[must_use]
+    pub fn into_status(self) -> Status {
+        self.status
+    }
+}
+
+/// Authorize against one pinned generation while retaining a denied actor.
+///
+/// This is used by services whose dedicated audit event must attribute policy
+/// denial to the authenticated transport subject. Resolution failures have no
+/// authenticated subject and therefore return `actor = None`.
+pub fn authorize_in_generation_detailed<T>(
+    state: &BrokerState,
+    generation: &Generation,
+    request: &Request<T>,
+    op: Op,
+    key: &str,
+) -> Result<AuthenticatedActor, AuthorizationFailure> {
+    authorize_extensions_in_generation_detailed(state, generation, request.extensions(), op, key)
+}
+
+fn authorize_extensions_in_generation_detailed(
+    state: &BrokerState,
+    generation: &Generation,
+    extensions: &Extensions,
+    op: Op,
+    key: &str,
+) -> Result<AuthenticatedActor, AuthorizationFailure> {
+    let peer = peer_from_extensions(extensions);
+    let actor = generation
+        .pdp()
+        .resolve_local_actor(&peer)
+        .map_err(|error| {
+            record_resolution_error(state, generation.id(), &peer, op, key, &error);
+            AuthorizationFailure {
+                actor: None,
+                status: resolution_status(op, &error),
+            }
+        })?;
+    if let Err(status) =
+        enforce_listener_domain_extensions(state, generation.id(), extensions, &actor, op, key)
+    {
+        return Err(AuthorizationFailure {
+            actor: Some(actor),
+            status,
+        });
+    }
+
+    let decision = generation.pdp().decide(&actor, op, key);
+    state.record_decision(&DecisionRecord::from_actor_decision(
+        generation.id(),
+        &actor,
+        op,
+        key,
+        &decision,
+    ));
+    if decision.is_deny() {
+        return Err(AuthorizationFailure {
+            actor: Some(actor),
+            status: broker_status(
+                Code::PermissionDenied,
+                "UNAUTHORIZED",
+                op_token(op),
+                "not authorized",
+            ),
+        });
+    }
+    Ok(actor)
+}
+
 fn peer_from_extensions(extensions: &Extensions) -> PeerInfo {
     if let Some(peer) = extensions.get::<PeerInfo>() {
         return peer.clone();
@@ -106,31 +191,8 @@ fn authorize_extensions_in_generation(
     op: Op,
     key: &str,
 ) -> Result<AuthenticatedActor, Status> {
-    let peer = peer_from_extensions(extensions);
-    let actor = generation.pdp().resolve_local_actor(&peer).map_err(|err| {
-        record_resolution_error(state, generation.id(), &peer, op, key, &err);
-        resolution_status(op, &err)
-    })?;
-    enforce_listener_domain_extensions(state, generation.id(), extensions, &actor, op, key)?;
-
-    let decision = generation.pdp().decide(&actor, op, key);
-    state.record_decision(&DecisionRecord::from_actor_decision(
-        generation.id(),
-        &actor,
-        op,
-        key,
-        &decision,
-    ));
-    if decision.is_deny() {
-        return Err(broker_status(
-            Code::PermissionDenied,
-            "UNAUTHORIZED",
-            op_token(op),
-            "not authorized",
-        ));
-    }
-
-    Ok(actor)
+    authorize_extensions_in_generation_detailed(state, generation, extensions, op, key)
+        .map_err(AuthorizationFailure::into_status)
 }
 
 /// Enforce typed-listener domain admission for a previously resolved actor.
