@@ -697,6 +697,7 @@ impl BrokerGrpc {
         if tokens.len() != 1 {
             return Err(invalid_request(INVOKE_OP, "multiple signer certificates"));
         }
+        crate::ensure_crypto_provider();
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(5))
