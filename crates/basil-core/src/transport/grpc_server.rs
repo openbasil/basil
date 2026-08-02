@@ -16,6 +16,7 @@ use basil_proto::broker::v1::aead_service_server::AeadServiceServer;
 use basil_proto::broker::v1::invocation_service_server::InvocationServiceServer;
 use basil_proto::broker::v1::minting_service_server::MintingServiceServer;
 use basil_proto::broker::v1::nats_service_server::NatsServiceServer;
+use basil_proto::broker::v1::nix_cache_service_server::NixCacheServiceServer;
 use basil_proto::broker::v1::secret_service_server::SecretServiceServer;
 use basil_proto::broker::v1::signing_service_server::SigningServiceServer;
 use basil_proto::envoy::service::secret::v3::secret_discovery_service_server::SecretDiscoveryServiceServer;
@@ -99,6 +100,8 @@ pub enum GrpcService {
     Minting,
     /// NATS identity operations.
     Nats,
+    /// Purpose-specific Nix binary-cache operations.
+    NixCache,
     /// Operator and control-plane operations.
     Admin,
     /// SPIFFE Workload API.
@@ -108,13 +111,14 @@ pub enum GrpcService {
 }
 
 /// Exhaustive list used by service-surface validation and diagnostics.
-pub const ALL_GRPC_SERVICES: [GrpcService; 9] = [
+pub const ALL_GRPC_SERVICES: [GrpcService; 10] = [
     GrpcService::Invocation,
     GrpcService::Signing,
     GrpcService::Aead,
     GrpcService::Secret,
     GrpcService::Minting,
     GrpcService::Nats,
+    GrpcService::NixCache,
     GrpcService::Admin,
     GrpcService::SpiffeWorkload,
     GrpcService::Sds,
@@ -136,6 +140,7 @@ impl ListenerType {
                 | GrpcService::Secret
                 | GrpcService::Minting
                 | GrpcService::Nats
+                | GrpcService::NixCache
                 | GrpcService::SpiffeWorkload
                 | GrpcService::Sds,
             ) => true,
@@ -147,6 +152,7 @@ impl ListenerType {
                 | GrpcService::Secret
                 | GrpcService::Minting
                 | GrpcService::Nats
+                | GrpcService::NixCache
                 | GrpcService::Admin
                 | GrpcService::SpiffeWorkload
                 | GrpcService::Sds,
@@ -795,6 +801,11 @@ async fn serve_bound(
             listener_type
                 .exposes(GrpcService::Nats)
                 .then(|| NatsServiceServer::new(broker.clone())),
+        )
+        .add_optional_service(
+            listener_type
+                .exposes(GrpcService::NixCache)
+                .then(|| NixCacheServiceServer::new(broker.clone())),
         )
         .add_optional_service(
             listener_type

@@ -58,6 +58,18 @@ pub enum Op {
     Import,
     /// Create a new key (operator-only).
     NewKey,
+    /// Enroll a backend-custodied Nix binary-cache signing key.
+    ///
+    /// This purpose-specific, key-scoped operation is deliberately absent from
+    /// [`ALL_OPS`]. Generic key-creation or wildcard grants must not imply
+    /// authority to establish a Nix cache trust root.
+    EnrollNixCacheKey,
+    /// Sign a canonical Nix `PATH_INFO_V1` fingerprint.
+    ///
+    /// This purpose-specific, key-scoped operation is deliberately absent from
+    /// [`ALL_OPS`]. Generic signing or wildcard grants must not imply authority
+    /// to publish paths into a trusted Nix binary cache.
+    SignNixCacheFingerprint,
     /// Hot-reload the catalog/policy generation from disk (broker-admin only).
     ///
     /// A privileged, **broker-wide** admin op: not key-scoped like the others.
@@ -155,7 +167,10 @@ impl Op {
     /// Writes live in the `operator` role and are never implied (§2.4.2).
     #[must_use]
     pub const fn is_write(self) -> bool {
-        matches!(self, Self::Set | Self::Rotate | Self::Import | Self::NewKey)
+        matches!(
+            self,
+            Self::Set | Self::Rotate | Self::Import | Self::NewKey | Self::EnrollNixCacheKey
+        )
     }
 
     /// The bare wire token for this op (the part after `op:`), e.g.
@@ -180,6 +195,8 @@ impl Op {
             Self::Rotate => "rotate",
             Self::Import => "import",
             Self::NewKey => "new_key",
+            Self::EnrollNixCacheKey => "enroll_nix_cache_key",
+            Self::SignNixCacheFingerprint => "sign_nix_cache_fingerprint",
             Self::Reload => "reload",
             Self::Explain => "explain",
             Self::Revoke => "revoke",
@@ -211,6 +228,8 @@ impl Op {
             "rotate" => Self::Rotate,
             "import" => Self::Import,
             "new_key" => Self::NewKey,
+            "enroll_nix_cache_key" => Self::EnrollNixCacheKey,
+            "sign_nix_cache_fingerprint" => Self::SignNixCacheFingerprint,
             "reload" => Self::Reload,
             "explain" => Self::Explain,
             "revoke" => Self::Revoke,
@@ -420,7 +439,13 @@ mod tests {
 
     #[test]
     fn op_is_write_only_for_write_ops() {
-        for op in [Op::Set, Op::Rotate, Op::Import, Op::NewKey] {
+        for op in [
+            Op::Set,
+            Op::Rotate,
+            Op::Import,
+            Op::NewKey,
+            Op::EnrollNixCacheKey,
+        ] {
             assert!(op.is_write(), "{op:?} should be a write");
         }
         for op in [
@@ -437,6 +462,7 @@ mod tests {
             Op::EncryptNatsCurve,
             Op::DecryptNatsCurve,
             Op::Validate,
+            Op::SignNixCacheFingerprint,
         ] {
             assert!(!op.is_write(), "{op:?} should not be a write");
         }
@@ -458,6 +484,14 @@ mod tests {
             Op::DecryptNatsCurve
         );
         assert_eq!(Op::parse("validate").unwrap(), Op::Validate);
+        assert_eq!(
+            Op::parse("enroll_nix_cache_key").unwrap(),
+            Op::EnrollNixCacheKey
+        );
+        assert_eq!(
+            Op::parse("sign_nix_cache_fingerprint").unwrap(),
+            Op::SignNixCacheFingerprint
+        );
         assert_eq!(Op::parse("reload").unwrap(), Op::Reload);
         assert_eq!(Op::parse("explain").unwrap(), Op::Explain);
         assert_eq!(Op::parse("revoke").unwrap(), Op::Revoke);
@@ -494,6 +528,18 @@ mod tests {
                 "{op:?} must stay out of the `*`/effective-sweep op set"
             );
         }
+    }
+
+    #[test]
+    fn purpose_specific_nix_ops_are_excluded_from_wildcards() {
+        for op in [Op::EnrollNixCacheKey, Op::SignNixCacheFingerprint] {
+            assert!(
+                !ALL_OPS.contains(&op),
+                "{op:?} must require an explicit policy grant"
+            );
+        }
+        assert!(Op::EnrollNixCacheKey.is_write());
+        assert!(!Op::SignNixCacheFingerprint.is_write());
     }
 
     #[test]

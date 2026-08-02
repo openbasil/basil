@@ -25,7 +25,10 @@ use zeroize::{Zeroize, Zeroizing};
 use basil_proto::{AeadAlgorithm, CiphertextEnvelope, KeyMaterial, KeyType};
 
 use super::kms_common::{ecdsa_der_to_raw, ecdsa_raw_to_der};
-use super::{BackendError, KeyMetadata, NewKey, PublicKey, SignOptions};
+use super::{
+    BackendError, KeyMetadata, NewKey, NixCacheBackendSignature, NixCacheKeyPosture, PublicKey,
+    SignOptions,
+};
 
 /// Wire version assumed for transit signatures (v1 keys are never rotated).
 const SIG_VERSION: u32 = 1;
@@ -342,6 +345,26 @@ impl TransitClient {
         })
     }
 
+    /// Idempotently create a purpose-bound Nix binary-cache signing key.
+    ///
+    /// Vault and `OpenBao` ignore a named create when the key already exists. The
+    /// manager serializes the initial read/create/read sequence and compares the
+    /// exact posture after this call, so an existing key is never mutated here.
+    pub(crate) async fn create_nix_cache_key(
+        &self,
+        token: &str,
+        key_id: &str,
+    ) -> Result<(), BackendError> {
+        self.post_at_segments(
+            Mount::Transit,
+            token,
+            &["keys", key_id],
+            nix_cache_create_body(),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Create a transit **symmetric AEAD** key at a named path. AEAD suites
     /// (`aes256-gcm96`, `chacha20-poly1305`) are not wire [`KeyType`]s, so the
     /// reconcile `generate` path passes the transit type string directly. Unlike a
@@ -428,6 +451,45 @@ impl TransitClient {
             key_type: transit_type_to_wire(data).ok(),
             latest_version: latest_version(data),
         })
+    }
+
+    /// Read the exact public-only posture used by Nix key enrollment.
+    pub(crate) async fn read_nix_cache_key_posture(
+        &self,
+        token: &str,
+        key_id: &str,
+    ) -> Result<NixCacheKeyPosture, BackendError> {
+        let info = self
+            .get_at_segments(Mount::Transit, token, &["keys", key_id])
+            .await?;
+        nix_cache_key_posture(key_data(&info)?)
+    }
+
+    /// Sign one canonical Nix fingerprint with the enrolled version-one key.
+    pub(crate) async fn sign_nix_cache_fingerprint(
+        &self,
+        token: &str,
+        key_id: &str,
+        fingerprint: &[u8],
+    ) -> Result<NixCacheBackendSignature, BackendError> {
+        let response = self
+            .post_at_segments(
+                Mount::Transit,
+                token,
+                &["sign", key_id],
+                json!({
+                    "input": B64.encode(fingerprint),
+                    "key_version": 1,
+                }),
+            )
+            .await?
+            .ok_or_else(|| BackendError::Protocol("empty Nix sign response".into()))?;
+        let wrapped = response
+            .get("data")
+            .and_then(|data| data.get("signature"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| BackendError::Protocol("Nix sign response has no signature".into()))?;
+        parse_nix_cache_signature(wrapped)
     }
 
     /// `IMPORT` (BYOK) provisions transit key `key_id` from caller material.
@@ -982,6 +1044,58 @@ fn split_vault_wrapped(wrapped: &str) -> Result<(u32, Vec<u8>), BackendError> {
     Ok((version, bytes))
 }
 
+/// Parse canonical transit framing while preserving the reported key version.
+/// The manager enforces equality with the enrolled version-one pin.
+fn parse_nix_cache_signature(wrapped: &str) -> Result<NixCacheBackendSignature, BackendError> {
+    let mut parts = wrapped.split(':');
+    let (Some("vault"), Some(version), Some(encoded), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(BackendError::Protocol(
+            "Nix signature has malformed transit framing".into(),
+        ));
+    };
+    let Some(version_digits) = version.strip_prefix('v') else {
+        return Err(BackendError::Protocol(
+            "Nix signature has malformed transit version".into(),
+        ));
+    };
+    if version_digits.is_empty()
+        || (version_digits.starts_with('0') && version_digits.len() > 1)
+        || !version_digits.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(BackendError::Protocol(
+            "Nix signature has noncanonical transit version".into(),
+        ));
+    }
+    let backend_version = version_digits.parse::<u32>().map_err(|_| {
+        BackendError::Protocol("Nix signature transit version is out of range".into())
+    })?;
+    if backend_version == 0 {
+        return Err(BackendError::Protocol(
+            "Nix signature transit version must be positive".into(),
+        ));
+    }
+    let decoded = B64
+        .decode(encoded)
+        .map_err(|error| BackendError::Protocol(format!("Nix signature is not base64: {error}")))?;
+    if B64.encode(&decoded) != encoded {
+        return Err(BackendError::Protocol(
+            "Nix signature base64 is not canonical".into(),
+        ));
+    }
+    let signature = decoded.try_into().map_err(|bytes: Vec<u8>| {
+        BackendError::Protocol(format!(
+            "Nix Ed25519 signature is {} bytes, expected 64",
+            bytes.len()
+        ))
+    })?;
+    Ok(NixCacheBackendSignature {
+        backend_version,
+        signature,
+    })
+}
+
 /// The `data` object of a transit key-info response, or a protocol error.
 fn key_data(info: &Value) -> Result<&Value, BackendError> {
     info.get("data")
@@ -1071,6 +1185,85 @@ fn transit_type_to_wire(data: &Value) -> Result<KeyType, BackendError> {
     }
 }
 
+fn nix_cache_create_body() -> Value {
+    json!({
+        "type": "ed25519",
+        "derived": false,
+        "exportable": false,
+        "allow_plaintext_backup": false,
+        "auto_rotate_period": "0",
+    })
+}
+
+/// Parse the fail-closed posture contract for a Nix binary-cache key.
+fn nix_cache_key_posture(data: &Value) -> Result<NixCacheKeyPosture, BackendError> {
+    let public_key = data
+        .get("keys")
+        .and_then(|keys| keys.get("1"))
+        .and_then(|version| version.get("public_key"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError::Protocol("no version-one public_key in key info".into()))?;
+    let decoded = B64.decode(public_key).map_err(|_| {
+        BackendError::Protocol("version-one public_key is not padded standard base64".into())
+    })?;
+    let public_key: [u8; 32] = decoded.try_into().map_err(|_| {
+        BackendError::Protocol("version-one public_key is not exactly 32 bytes".into())
+    })?;
+    if B64.encode(public_key) != public_key_field(data)? {
+        return Err(BackendError::Protocol(
+            "version-one public_key is not canonical padded standard base64".into(),
+        ));
+    }
+
+    Ok(NixCacheKeyPosture {
+        public_key,
+        key_type: transit_type_to_wire(data)?,
+        latest_version: required_u32(data, "latest_version")?,
+        min_decryption_version: required_u32(data, "min_decryption_version")?,
+        derived: required_bool(data, "derived")?,
+        exportable: required_bool(data, "exportable")?,
+        allow_plaintext_backup: required_bool(data, "allow_plaintext_backup")?,
+        deletion_allowed: required_bool(data, "deletion_allowed")?,
+        auto_rotation_disabled: auto_rotation_disabled(data)?,
+    })
+}
+
+fn public_key_field(data: &Value) -> Result<&str, BackendError> {
+    data.get("keys")
+        .and_then(|keys| keys.get("1"))
+        .and_then(|version| version.get("public_key"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError::Protocol("no version-one public_key in key info".into()))
+}
+
+fn required_u32(data: &Value, field: &'static str) -> Result<u32, BackendError> {
+    let value = data
+        .get(field)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| BackendError::Protocol(format!("missing or invalid {field} in key info")))?;
+    u32::try_from(value)
+        .map_err(|_| BackendError::Protocol(format!("{field} exceeds u32 in key info")))
+}
+
+fn required_bool(data: &Value, field: &'static str) -> Result<bool, BackendError> {
+    data.get(field)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| BackendError::Protocol(format!("missing or invalid {field} in key info")))
+}
+
+fn auto_rotation_disabled(data: &Value) -> Result<bool, BackendError> {
+    match data.get("auto_rotate_period") {
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .map(|seconds| seconds == 0)
+            .ok_or_else(|| BackendError::Protocol("invalid auto_rotate_period in key info".into())),
+        Some(Value::String(value)) => Ok(matches!(value.as_str(), "0" | "0s")),
+        Some(_) | None => Err(BackendError::Protocol(
+            "missing or invalid auto_rotate_period in key info".into(),
+        )),
+    }
+}
+
 /// Build the transit BYOK import `ciphertext`: AES-KWP-wrap `target` under a
 /// fresh AES-256 key, RSA-OAEP(SHA-256)-wrap that key under `wrapping_pem`, and
 /// concatenate `rsa_wrapped_aes || kwp_wrapped_target` (the transit import
@@ -1152,12 +1345,114 @@ pub async fn read_body(resp: reqwest::Response) -> Result<Option<Value>, Backend
 mod tests {
     use super::*;
 
+    #[test]
+    fn nix_signature_parser_preserves_canonical_backend_version() {
+        let signature = [0x5au8; 64];
+        let encoded = B64.encode(signature);
+        let parsed = parse_nix_cache_signature(&format!("vault:v2:{encoded}"))
+            .expect("canonical versioned signature");
+        assert_eq!(parsed.backend_version, 2);
+        assert_eq!(parsed.signature, signature);
+    }
+
+    #[test]
+    fn nix_signature_parser_rejects_malformed_framing_and_versions() {
+        let encoded = B64.encode([0x5au8; 64]);
+        for wrapped in [
+            format!("openbao:v1:{encoded}"),
+            format!("vault:1:{encoded}"),
+            format!("vault:v:{encoded}"),
+            format!("vault:v0:{encoded}"),
+            format!("vault:v01:{encoded}"),
+            format!("vault:v-1:{encoded}"),
+            format!("vault:v4294967296:{encoded}"),
+            format!("vault:v1:{encoded}:extra"),
+            "vault:v1:not-base64".to_string(),
+            format!("vault:v1:{}", B64.encode([0u8; 63])),
+        ] {
+            assert!(
+                parse_nix_cache_signature(&wrapped).is_err(),
+                "accepted malformed signature {wrapped:?}"
+            );
+        }
+    }
+
     fn client() -> TransitClient {
         // The reqwest client is never driven in these URL-shape tests, but
         // building it still requires the default crypto provider.
         crate::ensure_crypto_provider();
         let http = reqwest::Client::new();
         TransitClient::new(http, "http://127.0.0.1:8200/", "transit")
+    }
+
+    fn nix_cache_data() -> Value {
+        json!({
+            "type": "ed25519",
+            "latest_version": 1,
+            "min_decryption_version": 1,
+            "derived": false,
+            "exportable": false,
+            "allow_plaintext_backup": false,
+            "deletion_allowed": false,
+            "auto_rotate_period": 0,
+            "keys": {
+                "1": { "public_key": B64.encode([7_u8; 32]) }
+            }
+        })
+    }
+
+    #[test]
+    fn nix_cache_create_requests_locked_down_ed25519_posture() {
+        assert_eq!(
+            nix_cache_create_body(),
+            json!({
+                "type": "ed25519",
+                "derived": false,
+                "exportable": false,
+                "allow_plaintext_backup": false,
+                "auto_rotate_period": "0",
+            })
+        );
+    }
+
+    #[test]
+    fn nix_cache_posture_requires_exact_public_version_and_safety_fields() {
+        let posture = nix_cache_key_posture(&nix_cache_data()).expect("exact posture");
+        assert_eq!(
+            posture,
+            NixCacheKeyPosture {
+                public_key: [7; 32],
+                key_type: KeyType::Ed25519,
+                latest_version: 1,
+                min_decryption_version: 1,
+                derived: false,
+                exportable: false,
+                allow_plaintext_backup: false,
+                deletion_allowed: false,
+                auto_rotation_disabled: true,
+            }
+        );
+    }
+
+    #[test]
+    fn nix_cache_posture_rejects_noncanonical_or_incomplete_metadata() {
+        let mut unpadded = nix_cache_data();
+        unpadded["keys"]["1"]["public_key"] =
+            Value::String(B64.encode([7_u8; 32]).trim_end_matches('=').to_string());
+        assert!(matches!(
+            nix_cache_key_posture(&unpadded),
+            Err(BackendError::Protocol(_))
+        ));
+
+        let mut missing = nix_cache_data();
+        missing
+            .as_object_mut()
+            .expect("object fixture")
+            .remove("deletion_allowed");
+        assert!(matches!(
+            nix_cache_key_posture(&missing),
+            Err(BackendError::Protocol(_))
+        ));
     }
 
     #[test]

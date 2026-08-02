@@ -12,6 +12,7 @@ use basil_proto::broker::v1::aead_service_client::AeadServiceClient;
 use basil_proto::broker::v1::invocation_service_client::InvocationServiceClient;
 use basil_proto::broker::v1::minting_service_client::MintingServiceClient;
 use basil_proto::broker::v1::nats_service_client::NatsServiceClient;
+use basil_proto::broker::v1::nix_cache_service_client::NixCacheServiceClient;
 use basil_proto::broker::v1::secret_service_client::SecretServiceClient;
 use basil_proto::broker::v1::signing_service_client::SigningServiceClient;
 use hyper_util::rt::TokioIo;
@@ -36,6 +37,35 @@ pub struct KeyHandle {
     pub key_id: String,
     /// The key's public half (raw bytes; empty for value/symmetric keys).
     pub public_key: Vec<u8>,
+}
+
+/// Enrolled public identity of a Nix binary-cache signing key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NixCacheKey {
+    /// Nix verifier key name.
+    pub key_name: String,
+    /// Raw 32-byte Ed25519 public key.
+    pub public_key: [u8; 32],
+    /// Immutable backend version. V1 requires this to be `1`.
+    pub backend_version: u32,
+}
+
+/// Public-only result of a Nix binary-cache key enrollment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NixCacheEnrollment {
+    /// Enrolled verifier identity.
+    pub key: NixCacheKey,
+    /// Whether this request created or found identical backend material.
+    pub disposition: pb::NixCacheEnrollmentDisposition,
+}
+
+/// Purpose-specific signature over a canonical Nix path-info fingerprint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NixCacheSignature {
+    /// Enrolled verifier identity used for the signature.
+    pub key: NixCacheKey,
+    /// Raw 64-byte Ed25519 signature.
+    pub signature: [u8; 64],
 }
 
 /// One key to import in an [`Client::import_set`] batch.
@@ -870,6 +900,7 @@ pub struct Client {
     secrets: SecretServiceClient<Channel>,
     minting: MintingServiceClient<Channel>,
     nats: NatsServiceClient<Channel>,
+    nix_cache: NixCacheServiceClient<Channel>,
     invocation: InvocationServiceClient<Channel>,
     admin: AdminServiceClient<Channel>,
     default_timeout: u64,
@@ -891,6 +922,7 @@ impl Client {
             secrets: SecretServiceClient::new(channel.clone()),
             minting: MintingServiceClient::new(channel.clone()),
             nats: NatsServiceClient::new(channel.clone()),
+            nix_cache: NixCacheServiceClient::new(channel.clone()),
             invocation: InvocationServiceClient::new(channel.clone()),
             admin: AdminServiceClient::new(channel),
             default_timeout,
@@ -995,6 +1027,121 @@ impl Client {
     pub async fn sign(&mut self, key_id: &str, message: &[u8]) -> Result<Vec<u8>> {
         self.sign_with_algorithm(key_id, message, pb::SigningAlgorithm::Unspecified)
             .await
+    }
+
+    /// Describe one enrolled Nix binary-cache key.
+    pub async fn describe_nix_cache_key(
+        &mut self,
+        key_id: &str,
+        batch_id: [u8; 16],
+        request_id: [u8; 16],
+    ) -> Result<NixCacheKey> {
+        validate_nix_cache_key_id(key_id)?;
+        validate_correlation_ids(&batch_id, &request_id)?;
+        let response = Self::bounded(
+            self.default_timeout,
+            self.nix_cache
+                .describe_nix_cache_key(pb::DescribeNixCacheKeyRequest {
+                    key_id: key_id.to_string(),
+                    batch_id: batch_id.to_vec(),
+                    request_id: request_id.to_vec(),
+                }),
+        )
+        .await?
+        .into_inner();
+        validate_echoes(
+            &response.batch_id,
+            &response.request_id,
+            &batch_id,
+            &request_id,
+        )?;
+        nix_cache_key(
+            response.key_name,
+            response.public_key,
+            response.backend_version,
+        )
+    }
+
+    /// Ensure and enroll one pending Nix binary-cache key.
+    pub async fn enroll_nix_cache_key(
+        &mut self,
+        key_id: &str,
+        batch_id: [u8; 16],
+        request_id: [u8; 16],
+    ) -> Result<NixCacheEnrollment> {
+        validate_nix_cache_key_id(key_id)?;
+        validate_correlation_ids(&batch_id, &request_id)?;
+        let response = Self::bounded(
+            self.default_timeout,
+            self.nix_cache
+                .enroll_nix_cache_key(pb::EnrollNixCacheKeyRequest {
+                    key_id: key_id.to_string(),
+                    batch_id: batch_id.to_vec(),
+                    request_id: request_id.to_vec(),
+                }),
+        )
+        .await?
+        .into_inner();
+        validate_echoes(
+            &response.batch_id,
+            &response.request_id,
+            &batch_id,
+            &request_id,
+        )?;
+        let disposition = pb::NixCacheEnrollmentDisposition::try_from(response.disposition)
+            .map_err(|_| Error::Protocol("invalid Nix cache enrollment disposition".to_string()))?;
+        Ok(NixCacheEnrollment {
+            key: nix_cache_key(
+                response.key_name,
+                response.public_key,
+                response.backend_version,
+            )?,
+            disposition,
+        })
+    }
+
+    /// Sign one canonical `PATH_INFO_V1` fingerprint.
+    pub async fn sign_nix_cache_fingerprint(
+        &mut self,
+        key_id: &str,
+        fingerprint: &[u8],
+        batch_id: [u8; 16],
+        request_id: [u8; 16],
+    ) -> Result<NixCacheSignature> {
+        validate_nix_cache_key_id(key_id)?;
+        validate_nix_cache_fingerprint(fingerprint)?;
+        validate_correlation_ids(&batch_id, &request_id)?;
+        let response = Self::bounded(
+            self.default_timeout,
+            self.nix_cache
+                .sign_nix_cache_fingerprint(pb::SignNixCacheFingerprintRequest {
+                    key_id: key_id.to_string(),
+                    profile: "PATH_INFO_V1".to_string(),
+                    fingerprint: fingerprint.to_vec(),
+                    batch_id: batch_id.to_vec(),
+                    request_id: request_id.to_vec(),
+                }),
+        )
+        .await?
+        .into_inner();
+        validate_echoes(
+            &response.batch_id,
+            &response.request_id,
+            &batch_id,
+            &request_id,
+        )?;
+        let signature = response
+            .signature
+            .try_into()
+            .map_err(|_| Error::Protocol("Nix cache signature is not 64 bytes".to_string()))?;
+        Ok(NixCacheSignature {
+            key: nix_cache_key(
+                response.key_name,
+                response.public_key,
+                response.backend_version,
+            )?,
+            signature,
+        })
     }
 
     /// Sign with an explicit gRPC signing algorithm. Use
@@ -1837,6 +1984,84 @@ impl Client {
     }
 }
 
+fn validate_correlation_ids(batch_id: &[u8; 16], request_id: &[u8; 16]) -> Result<()> {
+    if batch_id.iter().all(|byte| *byte == 0) {
+        return Err(Error::Protocol(
+            "Nix cache batch ID must not be all zero".to_string(),
+        ));
+    }
+    if request_id.iter().all(|byte| *byte == 0) {
+        return Err(Error::Protocol(
+            "Nix cache request ID must not be all zero".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_nix_cache_key_id(key_id: &str) -> Result<()> {
+    if !(1..=256).contains(&key_id.len()) {
+        return Err(Error::Protocol(format!(
+            "Nix cache key ID is {} bytes; expected 1..=256",
+            key_id.len()
+        )));
+    }
+    if key_id.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
+        return Err(Error::Protocol(
+            "Nix cache key ID contains a control byte".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_nix_cache_fingerprint(fingerprint: &[u8]) -> Result<()> {
+    if !(1..=524_626).contains(&fingerprint.len()) {
+        return Err(Error::Protocol(format!(
+            "Nix cache fingerprint is {} bytes; expected 1..=524626",
+            fingerprint.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_echoes(
+    actual_batch: &[u8],
+    actual_request: &[u8],
+    expected_batch: &[u8; 16],
+    expected_request: &[u8; 16],
+) -> Result<()> {
+    if actual_batch != expected_batch {
+        return Err(Error::Protocol(
+            "Nix cache response changed the batch ID".to_string(),
+        ));
+    }
+    if actual_request != expected_request {
+        return Err(Error::Protocol(
+            "Nix cache response changed the request ID".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn nix_cache_key(
+    key_name: String,
+    public_key: Vec<u8>,
+    backend_version: u32,
+) -> Result<NixCacheKey> {
+    let public_key = public_key
+        .try_into()
+        .map_err(|_| Error::Protocol("Nix cache public key is not 32 bytes".to_string()))?;
+    if backend_version != 1 {
+        return Err(Error::Protocol(format!(
+            "Nix cache backend version is {backend_version}; expected 1"
+        )));
+    }
+    Ok(NixCacheKey {
+        key_name,
+        public_key,
+        backend_version,
+    })
+}
+
 async fn uds_channel(path: &str, timeout_secs: u64) -> Result<Channel> {
     let path = path.to_string();
     let endpoint =
@@ -2283,7 +2508,9 @@ mod nats_client_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{broker_error_info, status_error};
+    use super::{
+        broker_error_info, status_error, validate_nix_cache_fingerprint, validate_nix_cache_key_id,
+    };
     use basil_proto::broker::v1::BrokerErrorInfo;
     use prost::Message;
     use tonic::Code;
@@ -2351,5 +2578,20 @@ mod tests {
         ] {
             assert_eq!(proto_key_type(domain), wire as i32);
         }
+    }
+
+    #[test]
+    fn nix_cache_inputs_enforce_frozen_bounds_before_transport() {
+        assert!(validate_nix_cache_key_id("k").is_ok());
+        assert!(validate_nix_cache_key_id(&"k".repeat(256)).is_ok());
+        assert!(validate_nix_cache_key_id("").is_err());
+        assert!(validate_nix_cache_key_id(&"k".repeat(257)).is_err());
+        assert!(validate_nix_cache_key_id("key\0name").is_err());
+        assert!(validate_nix_cache_key_id("key\u{7f}name").is_err());
+
+        assert!(validate_nix_cache_fingerprint(b"x").is_ok());
+        assert!(validate_nix_cache_fingerprint(&vec![b'x'; 524_626]).is_ok());
+        assert!(validate_nix_cache_fingerprint(&[]).is_err());
+        assert!(validate_nix_cache_fingerprint(&vec![b'x'; 524_627]).is_err());
     }
 }

@@ -1231,6 +1231,7 @@ fn allow_via_token(via: &AllowVia) -> String {
 fn deny_reason_token(reason: DenyReason) -> String {
     match reason {
         DenyReason::UnknownKey => "unknown_key",
+        DenyReason::NixCachePurposeBound => "nix_cache_purpose_bound",
         DenyReason::NotWritable => "not_writable",
         DenyReason::IssuerRawSign => "issuer_raw_sign",
         DenyReason::NotPermitted => "not_permitted",

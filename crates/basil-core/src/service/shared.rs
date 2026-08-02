@@ -361,6 +361,8 @@ pub(super) fn manager_status(op: &'static str, err: &ManagerError) -> Status {
         | ManagerError::AlgorithmMismatch { .. }
         | ManagerError::KemAlgorithmMismatch { .. }
         | ManagerError::ValueRotateNeedsSet(_)
+        | ManagerError::NixCacheEnrollment { .. }
+        | ManagerError::NixCacheRotationForbidden(_)
         // A malformed sealing key/envelope is a client input fault; the opaque
         // unseal-authentication failure is handled separately below.
         | ManagerError::Sealing(SealingFailure::Malformed)

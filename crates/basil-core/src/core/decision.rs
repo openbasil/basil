@@ -385,6 +385,7 @@ fn allow_via_str(via: &AllowVia) -> String {
 const fn deny_reason_str(reason: DenyReason) -> &'static str {
     match reason {
         DenyReason::UnknownKey => "unknown_key",
+        DenyReason::NixCachePurposeBound => "nix_cache_purpose_bound",
         DenyReason::NotWritable => "not_writable",
         DenyReason::IssuerRawSign => "issuer_raw_sign",
         DenyReason::NotPermitted => "not_permitted",
@@ -483,6 +484,7 @@ mod tests {
     fn deny_reasons_have_stable_tokens() {
         for (reason, token) in [
             (DenyReason::UnknownKey, "unknown_key"),
+            (DenyReason::NixCachePurposeBound, "nix_cache_purpose_bound"),
             (DenyReason::NotWritable, "not_writable"),
             (DenyReason::IssuerRawSign, "issuer_raw_sign"),
             (DenyReason::NotPermitted, "not_permitted"),
