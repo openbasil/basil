@@ -22,6 +22,9 @@ pub const RESPONSE_SUBJECT: i64 = -70005;
 pub const SIGNER_CERTIFICATES_JWT: i64 = -70006;
 /// Deterministic public Ed25519 proof `COSE_Key` (bstr).
 pub const SIGNER_PUBLIC_KEY_COSE: i64 = -70007;
+/// Server-issued single-use freshness challenge (bstr, 32 bytes). Requests
+/// only, optional; required by the remote CI sealed-invocation profile.
+pub const FRESHNESS_CHALLENGE: i64 = -70008;
 
 /// COSE header parameter: algorithm.
 pub(crate) const HDR_ALG: i64 = 1;

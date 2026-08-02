@@ -63,6 +63,7 @@ fn peer_claims(sender: &KeyId) -> Claims {
         response_subject: None,
         in_reply_to: None,
         request_hash: None,
+        freshness_challenge: None,
     }
 }
 
@@ -942,6 +943,160 @@ fn sealed_request_response_roles_round_trip() {
         .unwrap_err(),
         VerifyError::Claims(ClaimsError::MissingClaim { .. } | ClaimsError::ForbiddenClaim { .. })
     ));
+}
+
+#[test]
+fn sealed_request_freshness_challenge_round_trips() {
+    let s = signer();
+    let v = verifier_for(&s);
+    let r = recipient();
+    let mut challenge_bytes = [0x41_u8; 32];
+    challenge_bytes[0] = 0x01; // distinct instance-ID prefix byte
+    let challenge = FreshnessChallenge::new(challenge_bytes);
+
+    let mut p = seal_params(b"req", ContentAlgorithm::A256Gcm, r.public());
+    p.role = MessageRole::Request;
+    p.claims.response_key_id = Some(kid("alice-response"));
+    p.claims.freshness_challenge = Some(challenge);
+    let req = block_on(build_sealed(&p, &s)).unwrap();
+
+    // The challenge is signature-trusted and readable pre-decrypt.
+    let verified = block_on(verify_sealed(
+        req.as_bytes(),
+        &v,
+        &VerifySealedParams {
+            signature_aad: ExternalAad::empty(),
+            validation: &validation(MessageRole::Request),
+        },
+    ))
+    .unwrap();
+    assert_eq!(verified.claims.freshness_challenge, Some(challenge));
+    assert_eq!(
+        verified
+            .claims
+            .freshness_challenge
+            .as_ref()
+            .map(|c| *c.as_bytes()),
+        Some(challenge_bytes)
+    );
+
+    // The strict decoder re-encodes and byte-compares, so a verified message
+    // proves the -70008 claim encoding (position and crit entry) canonical.
+    let opened = block_on(verified.open(&r, &ExternalAad::empty(), None)).unwrap();
+    assert_eq!(opened.plaintext.as_slice(), b"req");
+
+    // A request without the claim stays valid: the shape is optional at the
+    // profile layer; the broker enforces presence for remote CI requests.
+    let mut p = seal_params(b"req", ContentAlgorithm::A256Gcm, r.public());
+    p.role = MessageRole::Request;
+    p.claims.response_key_id = Some(kid("alice-response"));
+    let bare = block_on(build_sealed(&p, &s)).unwrap();
+    let verified_bare = block_on(verify_sealed(
+        bare.as_bytes(),
+        &v,
+        &VerifySealedParams {
+            signature_aad: ExternalAad::empty(),
+            validation: &validation(MessageRole::Request),
+        },
+    ))
+    .unwrap();
+    assert_eq!(verified_bare.claims.freshness_challenge, None);
+}
+
+#[test]
+fn freshness_challenge_is_forbidden_outside_requests() {
+    let challenge = FreshnessChallenge::new([0x41; 32]);
+
+    // Response role.
+    let mut c = peer_claims(&kid("alice"));
+    c.in_reply_to = Some(MessageId::from_bytes(vec![1]).unwrap());
+    c.request_hash = Some(RequestHash([0; 32]));
+    c.freshness_challenge = Some(challenge);
+    assert_eq!(
+        c.validate_role(MessageRole::Response),
+        Err(ClaimsError::ForbiddenClaim {
+            label: label::FRESHNESS_CHALLENGE
+        })
+    );
+
+    // Peer role.
+    let mut c = peer_claims(&kid("alice"));
+    c.freshness_challenge = Some(challenge);
+    assert_eq!(
+        c.validate_role(MessageRole::Peer),
+        Err(ClaimsError::ForbiddenClaim {
+            label: label::FRESHNESS_CHALLENGE
+        })
+    );
+
+    // Building a sealed response carrying the claim is rejected before any
+    // crypto.
+    let s = signer();
+    let r = recipient();
+    let mut p = seal_params(b"resp", ContentAlgorithm::A256Gcm, r.public());
+    p.role = MessageRole::Response;
+    p.claims.in_reply_to = Some(MessageId::from_bytes(vec![1]).unwrap());
+    p.claims.request_hash = Some(RequestHash([0; 32]));
+    p.claims.freshness_challenge = Some(challenge);
+    assert_eq!(
+        block_on(build_sealed(&p, &s)).unwrap_err(),
+        BuildError::RoleShape(ClaimsError::ForbiddenClaim {
+            label: label::FRESHNESS_CHALLENGE
+        })
+    );
+}
+
+#[test]
+fn freshness_challenge_wire_length_is_exactly_32_bytes() {
+    assert!(FreshnessChallenge::from_bytes(&[0x41; 32]).is_ok());
+    for wrong in [0_usize, 16, 31, 33, 64] {
+        assert_eq!(
+            FreshnessChallenge::from_bytes(&vec![0x41; wrong]),
+            Err(ProfileError::FreshnessChallengeLength { actual: wrong }),
+            "{wrong}"
+        );
+    }
+}
+
+#[test]
+fn signed_request_orders_freshness_challenge_after_signer_headers() {
+    // In a bare signed message the claims and the -70006/-70007 signer
+    // headers share one protected map; -70008 must sort after both or the
+    // strict decoder's re-encode comparison rejects the message.
+    let s = signer();
+    let v = verifier_for(&s);
+    let mut claims = peer_claims(s.key_id());
+    claims.response_key_id = Some(kid("alice-response"));
+    claims.freshness_challenge = Some(FreshnessChallenge::new([0x42; 32]));
+    let protected_headers = ProtectedHeaders {
+        signer_certificates_jwt: vec!["eyJhbGciOiJFZERTQSJ9.cert.one.sig".to_string()],
+        signer_public_key_cose: Some(vec![0xA0]),
+    };
+    let msg = block_on(build_signed_with_headers(
+        &SignParams {
+            content_type: ct(),
+            payload: b"hello",
+            claims: Some(claims),
+            external_aad: ExternalAad::empty(),
+        },
+        &protected_headers,
+        &s,
+    ))
+    .unwrap();
+    let out = block_on(verify_signed(
+        msg.as_bytes(),
+        &v,
+        &VerifySignedParams {
+            external_aad: ExternalAad::empty(),
+            validation: Some(&validation(MessageRole::Request)),
+        },
+    ))
+    .unwrap();
+    assert_eq!(
+        out.claims.as_ref().and_then(|c| c.freshness_challenge),
+        Some(FreshnessChallenge::new([0x42; 32]))
+    );
+    assert_eq!(out.protected_headers, protected_headers);
 }
 
 // ---------------------------------------------------------------------------

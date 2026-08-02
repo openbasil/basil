@@ -9,6 +9,7 @@ use std::time::Duration;
 use basil_proto::broker::v1 as pb;
 use basil_proto::broker::v1::admin_service_client::AdminServiceClient;
 use basil_proto::broker::v1::aead_service_client::AeadServiceClient;
+use basil_proto::broker::v1::invocation_service_client::InvocationServiceClient;
 use basil_proto::broker::v1::minting_service_client::MintingServiceClient;
 use basil_proto::broker::v1::nats_service_client::NatsServiceClient;
 use basil_proto::broker::v1::secret_service_client::SecretServiceClient;
@@ -845,6 +846,22 @@ pub struct AgentExplanation {
     pub matched_rule: Option<MatchedRule>,
 }
 
+/// A single-use invocation freshness challenge issued by the broker.
+///
+/// Issued by `InvocationService.GetInvocationChallenge` for one self-asserted
+/// proof-key thumbprint, embedded verbatim in the sealed invocation's
+/// encrypted-layer claim `-70008`, and consumed exactly once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvocationChallenge {
+    /// The 32 challenge bytes: a 16-byte issuing-instance ID prefix followed
+    /// by 16 CSPRNG bytes.
+    pub challenge: [u8; 32],
+    /// Serving generation the challenge is bound to.
+    pub generation: u64,
+    /// Unix seconds when the challenge expires (at most 60 seconds out).
+    pub expires_at_unix: i64,
+}
+
 /// An async client for Basil's broker gRPC services over a Unix socket.
 #[derive(Clone)]
 pub struct Client {
@@ -853,6 +870,7 @@ pub struct Client {
     secrets: SecretServiceClient<Channel>,
     minting: MintingServiceClient<Channel>,
     nats: NatsServiceClient<Channel>,
+    invocation: InvocationServiceClient<Channel>,
     admin: AdminServiceClient<Channel>,
     default_timeout: u64,
 }
@@ -873,6 +891,7 @@ impl Client {
             secrets: SecretServiceClient::new(channel.clone()),
             minting: MintingServiceClient::new(channel.clone()),
             nats: NatsServiceClient::new(channel.clone()),
+            invocation: InvocationServiceClient::new(channel.clone()),
             admin: AdminServiceClient::new(channel),
             default_timeout,
         })
@@ -1556,6 +1575,44 @@ impl Client {
             cert_chain_der: std::mem::take(&mut body.cert_chain_der),
             private_key_der: std::mem::take(&mut body.private_key_der),
             ca_chain_der: std::mem::take(&mut body.ca_chain_der),
+        })
+    }
+
+    /// Fetch a single-use invocation freshness challenge bound to `jkt`, the
+    /// self-asserted RFC 7638 SHA-256 proof-key thumbprint.
+    ///
+    /// `courier_observed_source` is set only by a trusted courier in front of
+    /// the broker to partition issuance rate limits per client source; direct
+    /// local callers pass `None`. Declined issuance under capacity or
+    /// rate-limit pressure surfaces as a `ResourceExhausted` status with the
+    /// stable reason token `CHALLENGE_ISSUANCE_DECLINED` and may be retried
+    /// unchanged after backoff. Until broker challenge issuance lands the
+    /// agent answers `Unimplemented`.
+    pub async fn get_invocation_challenge(
+        &mut self,
+        jkt: &[u8; 32],
+        courier_observed_source: Option<&str>,
+    ) -> Result<InvocationChallenge> {
+        let response = Self::bounded(
+            self.default_timeout,
+            self.invocation
+                .get_invocation_challenge(pb::GetInvocationChallengeRequest {
+                    jkt: jkt.to_vec(),
+                    courier_observed_source: courier_observed_source.map(str::to_string),
+                }),
+        )
+        .await?;
+        let body = response.into_inner();
+        let challenge: [u8; 32] = body.challenge.as_slice().try_into().map_err(|_| {
+            Error::Protocol(format!(
+                "freshness challenge must be exactly 32 bytes, got {}",
+                body.challenge.len()
+            ))
+        })?;
+        Ok(InvocationChallenge {
+            challenge,
+            generation: body.generation,
+            expires_at_unix: body.expires_at_unix,
         })
     }
 

@@ -14,12 +14,12 @@ looking for what actually crosses Basil's Unix socket, it is defined here and no
 `build.rs` compiles the vendored `.proto` sources under `proto/` with `tonic-prost-build` at
 build time (server and client stubs both):
 
-| Module       | Source                               | Purpose                                                                                                                                 |
-| ------------ | ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `broker`     | `proto/basil/broker/v1/broker.proto` | Basil's own broker API: signing, AEAD, secrets, minting, admin, and the sealed-invocation carrier (`SealedRequest` / `SealedResponse`). |
-| `spiffe`     | `proto/spiffe/workloadapi.proto`     | The upstream SPIFFE Workload API, vendored unmodified so SVID clients interoperate.                                                     |
-| Envoy SDS    | `proto/envoy/**`, `proto/xds/**`     | The Envoy secret discovery service surface Basil serves for TLS material delivery.                                                      |
-| `google.rpc` | `proto/google/rpc/status.proto`      | Structured error details.                                                                                                               |
+| Module       | Source                               | Purpose                                                                                                                                                                                                 |
+| ------------ | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `broker`     | `proto/basil/broker/v1/broker.proto` | Basil's own broker API: signing, AEAD, secrets, minting, admin, and the sealed-invocation carrier (`SealedRequest` / `SealedResponse`, plus the single-use `GetInvocationChallenge` freshness surface). |
+| `spiffe`     | `proto/spiffe/workloadapi.proto`     | The upstream SPIFFE Workload API, vendored unmodified so SVID clients interoperate.                                                                                                                     |
+| Envoy SDS    | `proto/envoy/**`, `proto/xds/**`     | The Envoy secret discovery service surface Basil serves for TLS material delivery.                                                                                                                      |
+| `google.rpc` | `proto/google/rpc/status.proto`      | Structured error details.                                                                                                                                                                               |
 
 Vendoring the protos keeps builds hermetic: no network fetch, no drift against an upstream tag you
 did not choose.

@@ -1,0 +1,85 @@
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Repo-local gate (treefmt) config. Copy of the installed gate's built-in
+# treefmt.toml plus repo-specific excludes; dprint.json / biome.json /
+# ruff.toml intentionally stay on the gate built-ins.
+#
+# Excluded paths and why:
+#
+# - crates/basil-tests/fixtures/release-manifest/v1/cosign-3.1.1-conformance/
+#   Verbatim, signature-bound fixture bytes. `pinned-payload.json` embeds the
+#   SHA-256 of `pinned-manifest.json`, the pinned-key signature covers the
+#   payload bytes, and the signing key was discarded, so any reformat breaks
+#   the chain irreparably. The authoritative hashes live in the fixture's
+#   `index.json` and are enforced by its `verify.sh`. Same policy as the
+#   verbatim upstream `workloadapi.proto`: never reformat.
+#
+# - clients/go/
+#   Git submodule owned by the maintainer; its files cannot be committed from
+#   this repo, so the repo-level formatter must not touch or flag them.
+
+excludes = [
+  "**/*-lock.json",
+  "*-lock.json",
+  "*.lock",
+  "**/*.lock",
+  "crates/basil-tests/fixtures/release-manifest/v1/cosign-3.1.1-conformance/*",
+  "clients/go/**",
+]
+on-unmatched = "debug"
+
+[formatter.biome]
+command = "biome"
+includes = [
+  "*.css",
+  "*.graphql",
+  "*.gql",
+  "*.js",
+  "*.mjs",
+  "*.cjs",
+  "*.jsx",
+  "*.ts",
+  "*.mts",
+  "*.cts",
+  "*.tsx",
+  "*.vue",
+]
+options = ["format", "--write", "--config-path=@GATE_BIOME_CONFIG@"]
+
+[formatter.dprint]
+command = "dprint"
+includes = [
+  "*.json",
+  "*.jsonc",
+  "*.json5",
+  "*.md",
+  "*.markdown",
+  "*.toml",
+  "*.yaml",
+  "*.yml",
+  "*.kdl",
+  "*.html",
+  "*.htm",
+]
+options = ["fmt", "--config", "@GATE_DPRINT_CONFIG@", "--config-discovery=ignore-descendants"]
+
+[formatter.just]
+command = "just"
+includes = ["justfile", ".justfile", "*.just"]
+options = ["--unstable", "--fmt", "-f"]
+
+[formatter.nixfmt]
+command = "nixfmt"
+includes = ["*.nix"]
+
+[formatter.ruff]
+command = "ruff"
+includes = ["*.py", "*.pyi"]
+options = ["format", "--config", "@GATE_RUFF_CONFIG@"]
+
+[formatter.rustfmt]
+command = "rustfmt"
+includes = ["*.rs"]
+options = ["--edition", "2024"]

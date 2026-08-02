@@ -27,7 +27,9 @@ use crate::error::DecodeError;
 use crate::hash::RequestHash;
 use crate::kdf::{KdfParties, PartyIdentity};
 use crate::label::{self, canonical_sort_key};
-use crate::types::{ContentType, KeyId, MessageId, ResponseSubject, Subject, UnixTime};
+use crate::types::{
+    ContentType, FreshnessChallenge, KeyId, MessageId, ResponseSubject, Subject, UnixTime,
+};
 
 /// Internal encode failure. Statically unreachable for profile-valid input
 /// (encoding into a `Vec` cannot fail); kept so no build path can panic.
@@ -46,13 +48,14 @@ pub const X25519_LEN: usize = 32;
 
 /// Labels that constitute claims; finding one in an unprotected header is
 /// [`DecodeError::ClaimsInUnprotected`].
-const CLAIM_LABELS: [i64; 6] = [
+const CLAIM_LABELS: [i64; 7] = [
     label::HDR_CWT_CLAIMS,
     label::IN_REPLY_TO,
     label::REQUEST_HASH,
     label::SENDER_KEY_ID,
     label::RESPONSE_KEY_ID,
     label::RESPONSE_SUBJECT,
+    label::FRESHNESS_CHALLENGE,
 ];
 
 type EncResult = Result<(), minicbor::encode::Error<core::convert::Infallible>>;
@@ -87,6 +90,9 @@ fn basil_labels(claims: &Claims) -> Vec<i64> {
     }
     if claims.response_subject.is_some() {
         labels.push(label::RESPONSE_SUBJECT);
+    }
+    if claims.freshness_challenge.is_some() {
+        labels.push(label::FRESHNESS_CHALLENGE);
     }
     labels
 }
@@ -194,6 +200,11 @@ fn write_claims_capable_tail(
         && let Some(key) = &headers.signer_public_key_cose
     {
         e.i64(label::SIGNER_PUBLIC_KEY_COSE)?.bytes(key)?;
+    }
+    // `-70008` sorts after the `-70006`/`-70007` protected headers, so the
+    // freshness challenge is written last to keep the map canonical.
+    if let Some(v) = claims.and_then(|c| c.freshness_challenge.as_ref()) {
+        e.i64(label::FRESHNESS_CHALLENGE)?.bytes(v.as_bytes())?;
     }
     Ok(())
 }
@@ -637,6 +648,7 @@ struct ClaimsParts {
     sender_key_id: Option<KeyId>,
     response_key_id: Option<KeyId>,
     response_subject: Option<ResponseSubject>,
+    freshness_challenge: Option<FreshnessChallenge>,
     cwt_present: bool,
     basil_present: bool,
 }
@@ -669,6 +681,7 @@ impl ClaimsParts {
             response_subject: self.response_subject,
             in_reply_to: self.in_reply_to,
             request_hash: self.request_hash,
+            freshness_challenge: self.freshness_challenge,
         }))
     }
 }
@@ -735,6 +748,16 @@ fn parse_basil_label(
         }
         label::RESPONSE_SUBJECT => {
             parts.response_subject = Some(ResponseSubject::new(read_str(d, l)?)?);
+        }
+        label::FRESHNESS_CHALLENGE => {
+            let raw = read_bytes(d, l)?;
+            let challenge =
+                FreshnessChallenge::from_bytes(&raw).map_err(|_| DecodeError::InvalidLength {
+                    label: l,
+                    expected: 32,
+                    actual: raw.len(),
+                })?;
+            parts.freshness_challenge = Some(challenge);
         }
         _ => return Ok(false),
     }

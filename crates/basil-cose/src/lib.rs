@@ -36,8 +36,9 @@
 //! ## Claims
 //!
 //! Claims ride in the protected header as a CWT map (header 15) plus basil
-//! private labels (`-70001..=-70005`, see [`label`]). [`ValidationParams`]
-//! parameterizes skew/TTL/audience bounds; `now` is injected, never sampled.
+//! private labels (`-70001..=-70005` and `-70008`, see [`label`]).
+//! [`ValidationParams`] parameterizes skew/TTL/audience bounds; `now` is
+//! injected, never sampled.
 //!
 //! The crate is `no_std` + `alloc` and obtains production randomness through
 //! `getrandom`.
@@ -101,8 +102,8 @@ pub use sign::{
 };
 pub use traits::{OpenRequest, Recipient, Signer, Verifier};
 pub use types::{
-    ContentType, CoseBytes, ExternalAad, KeyId, MessageId, ResponseSubject, SealedAad, Signature,
-    Subject, UnixTime,
+    ContentType, CoseBytes, ExternalAad, FreshnessChallenge, KeyId, MessageId, ResponseSubject,
+    SealedAad, Signature, Subject, UnixTime,
 };
 
 // Re-exported so trait implementors and callers name the same zeroizing

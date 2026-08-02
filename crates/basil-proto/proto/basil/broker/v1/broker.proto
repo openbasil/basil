@@ -241,11 +241,48 @@ message SealedResponse {
   optional string response_subject = 2;
 }
 
+// Request a single-use invocation freshness challenge. Issuance is
+// unauthenticated and reachable through the invocation courier; the
+// thumbprint is self-asserted here and grants nothing.
+message GetInvocationChallengeRequest {
+  // RFC 7638 SHA-256 thumbprint (exactly 32 bytes) of the Ed25519 proof key
+  // the caller intends to sign the sealed invocation with. Binds the issued
+  // challenge to one proof key and partitions issuance rate limits.
+  bytes jkt = 1;
+  // Opaque client source observed by a trusted local courier in front of the
+  // broker (for example a normalized client IP), used only to partition
+  // issuance rate limits. At most 128 bytes; never an identity or
+  // authorization input. Absent means the caller reached the broker
+  // locally/directly, not through a courier.
+  optional string courier_observed_source = 2;
+}
+
+// A single-use freshness challenge bound to the requested proof-key
+// thumbprint and the issuing serving generation.
+message GetInvocationChallengeResponse {
+  // Exactly 32 bytes: a 16-byte issuing-instance ID prefix followed by 16
+  // CSPRNG bytes. Carried verbatim in the sealed invocation's encrypted-layer
+  // freshness-challenge claim (COSE label -70008) and consumed exactly once.
+  bytes challenge = 1;
+  // Serving generation the challenge is bound to. Consumption requires the
+  // request's pinned serving generation to match.
+  uint64 generation = 2;
+  // Unix seconds when the challenge expires, at most 60 seconds out.
+  int64 expires_at_unix = 3;
+}
+
 // Disabled-by-default transport-neutral invocation service. Local clients keep
 // using the typed gRPC services over Unix sockets.
 service InvocationService {
   // Submit a sealed invocation message.
   rpc Invoke(SealedRequest) returns (SealedResponse);
+  // Issue a single-use freshness challenge for a sealed invocation. Declined
+  // issuance under capacity or rate-limit pressure fails with
+  // `RESOURCE_EXHAUSTED` and the stable reason token
+  // `CHALLENGE_ISSUANCE_DECLINED`; that denial is retryable with the same
+  // request after backoff. Until broker challenge issuance lands this method
+  // returns `UNIMPLEMENTED`.
+  rpc GetInvocationChallenge(GetInvocationChallengeRequest) returns (GetInvocationChallengeResponse);
 }
 
 // Create, import, and use asymmetric signing keys. Private key material is

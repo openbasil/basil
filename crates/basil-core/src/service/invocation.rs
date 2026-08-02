@@ -68,6 +68,17 @@ impl InvocationService for BrokerGrpc {
                 response_protection_failed()
             })
     }
+
+    // Wire-surface stub (basil-jjgi.3.1): broker challenge issuance lands
+    // with the follow-on broker child (basil-jjgi.3.2).
+    async fn get_invocation_challenge(
+        &self,
+        _request: Request<pb::GetInvocationChallengeRequest>,
+    ) -> GrpcResult<pb::GetInvocationChallengeResponse> {
+        Err(Status::unimplemented(
+            "GetInvocationChallenge is not implemented yet",
+        ))
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -530,6 +541,7 @@ impl BrokerGrpc {
             response_subject: None,
             in_reply_to: Some(prepared.claims.message_id.clone()),
             request_hash: Some(request_hash(&prepared.request_message)),
+            freshness_challenge: None,
         };
         let message = build_sealed(
             &SealParams {
@@ -1413,6 +1425,7 @@ mod tests {
             response_subject: Some(ResponseSubject::new("reply.client".to_string()).unwrap()),
             in_reply_to: None,
             request_hash: None,
+            freshness_challenge: None,
         }
     }
 

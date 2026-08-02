@@ -31,9 +31,9 @@ pub use client::{
     AgentConnectionListener, AgentConnectionSelector, AgentDecision, AgentExplanation, AgentHealth,
     AgentListenerChange, AgentListenerImpact, AgentReadiness, AgentReload, AgentRevocation,
     AgentRewireDiagnostic, AgentStatus, AgentSystemdIdentity, AllowedNatsSigner, Client,
-    ImportEntry, IssuedCertificate, KeyHandle, MatchedRule, MintedJwt, NatsJwtValidation,
-    NatsJwtValidationReason, NatsUserPermissions, ReadinessReason, ReloadRejection, SecretValue,
-    SignNatsJwtOptions,
+    ImportEntry, InvocationChallenge, IssuedCertificate, KeyHandle, MatchedRule, MintedJwt,
+    NatsJwtValidation, NatsJwtValidationReason, NatsUserPermissions, ReadinessReason,
+    ReloadRejection, SecretValue, SignNatsJwtOptions,
 };
 pub use client_sync::BlockingClient;
 pub use error::{Error, Result};

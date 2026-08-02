@@ -282,6 +282,10 @@ const SDS: &str = "envoy.service.secret.v3.SecretDiscoveryService";
 const CLASSIFICATION_TABLE: &[ClassificationEntry] = &[
     // Sealed invocation.
     unary(INVOCATION, "Invoke"),
+    // Freshness-challenge issuance (basil-jjgi.3.1 wire surface; handler is
+    // an UNIMPLEMENTED stub until basil-jjgi.3.2). Conservatively
+    // `NoAutomaticReplay`: issuance mints bounded broker state.
+    unary(INVOCATION, "GetInvocationChallenge"),
     // Signing.
     unary(SIGNING, "NewKey"),
     unary(SIGNING, "Import"),

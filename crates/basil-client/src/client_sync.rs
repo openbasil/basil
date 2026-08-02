@@ -11,8 +11,8 @@ use crate::Client;
 use crate::client::{
     AgentConnection, AgentConnectionDrop, AgentConnectionSelector, AgentExplanation, AgentHealth,
     AgentReadiness, AgentReload, AgentRevocation, AgentStatus, AllowedNatsSigner, ImportEntry,
-    IssuedCertificate, KeyHandle, MintedJwt, NatsJwtValidation, NatsUserPermissions, SecretValue,
-    SignNatsJwtOptions,
+    InvocationChallenge, IssuedCertificate, KeyHandle, MintedJwt, NatsJwtValidation,
+    NatsUserPermissions, SecretValue, SignNatsJwtOptions,
 };
 use crate::constants::DEFAULT_CONN_TIMEOUT;
 use crate::error::Result;
@@ -70,6 +70,19 @@ impl BlockingClient {
     pub fn verify(&mut self, key_id: &str, message: &[u8], signature: &[u8]) -> Result<bool> {
         self.runtime
             .block_on(self.inner.verify(key_id, message, signature))
+    }
+
+    /// Fetch a single-use invocation freshness challenge bound to `jkt`. See
+    /// [`Client::get_invocation_challenge`].
+    pub fn get_invocation_challenge(
+        &mut self,
+        jkt: &[u8; 32],
+        courier_observed_source: Option<&str>,
+    ) -> Result<InvocationChallenge> {
+        self.runtime.block_on(
+            self.inner
+                .get_invocation_challenge(jkt, courier_observed_source),
+        )
     }
 
     /// Fetch a public key by catalog name and optional version.

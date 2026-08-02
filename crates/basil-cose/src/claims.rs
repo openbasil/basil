@@ -16,7 +16,7 @@ use core::time::Duration;
 use crate::error::ClaimsError;
 use crate::hash::RequestHash;
 use crate::label;
-use crate::types::{KeyId, MessageId, ResponseSubject, Subject, UnixTime};
+use crate::types::{FreshnessChallenge, KeyId, MessageId, ResponseSubject, Subject, UnixTime};
 
 /// The claim set carried in a protected header (CWT map, header 15, plus the
 /// basil private labels).
@@ -46,6 +46,10 @@ pub struct Claims {
     pub in_reply_to: Option<MessageId>,
     /// `-70002`: SHA3-256 of the complete request bytes (responses).
     pub request_hash: Option<RequestHash>,
+    /// `-70008`: the server-issued single-use freshness challenge (requests
+    /// only, optional). The remote CI sealed-invocation profile requires it;
+    /// enforcement of its presence is the broker's, not the claim shape's.
+    pub freshness_challenge: Option<FreshnessChallenge>,
 }
 
 /// Additional protected header values carried outside the CWT claim map.
@@ -186,14 +190,22 @@ impl Claims {
                 require(self.in_reply_to.is_some(), label::IN_REPLY_TO)?;
                 require(self.request_hash.is_some(), label::REQUEST_HASH)?;
                 forbid(self.response_key_id.is_some(), label::RESPONSE_KEY_ID)?;
-                forbid(self.response_subject.is_some(), label::RESPONSE_SUBJECT)
+                forbid(self.response_subject.is_some(), label::RESPONSE_SUBJECT)?;
+                forbid(
+                    self.freshness_challenge.is_some(),
+                    label::FRESHNESS_CHALLENGE,
+                )
             }
             MessageRole::Peer => {
                 require(self.sender_key_id.is_some(), label::SENDER_KEY_ID)?;
                 forbid(self.in_reply_to.is_some(), label::IN_REPLY_TO)?;
                 forbid(self.request_hash.is_some(), label::REQUEST_HASH)?;
                 forbid(self.response_key_id.is_some(), label::RESPONSE_KEY_ID)?;
-                forbid(self.response_subject.is_some(), label::RESPONSE_SUBJECT)
+                forbid(self.response_subject.is_some(), label::RESPONSE_SUBJECT)?;
+                forbid(
+                    self.freshness_challenge.is_some(),
+                    label::FRESHNESS_CHALLENGE,
+                )
             }
         }
     }
@@ -217,6 +229,7 @@ mod tests {
             response_subject: None,
             in_reply_to: None,
             request_hash: None,
+            freshness_challenge: None,
         }
     }
 

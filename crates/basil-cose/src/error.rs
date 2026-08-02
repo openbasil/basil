@@ -32,6 +32,11 @@ pub enum ProfileError {
     EmptyPartyIdentity,
     /// A signature must be non-empty.
     EmptySignature,
+    /// A freshness challenge must be exactly 32 bytes.
+    FreshnessChallengeLength {
+        /// The length actually supplied.
+        actual: usize,
+    },
 }
 
 impl fmt::Display for ProfileError {
@@ -50,6 +55,12 @@ impl fmt::Display for ProfileError {
             ),
             Self::EmptyPartyIdentity => write!(f, "party identity must be non-empty when present"),
             Self::EmptySignature => write!(f, "signature must be non-empty"),
+            Self::FreshnessChallengeLength { actual } => {
+                write!(
+                    f,
+                    "freshness challenge must be exactly 32 bytes, got {actual}"
+                )
+            }
         }
     }
 }

@@ -154,6 +154,41 @@ impl ContentType {
     }
 }
 
+/// The `-70008` server-issued single-use freshness challenge (bstr, 32 bytes).
+///
+/// The value is a 16-byte issuing-instance ID prefix followed by 16 CSPRNG
+/// bytes, issued by the broker's `GetInvocationChallenge` and consumed
+/// exactly once. Requests only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FreshnessChallenge([u8; 32]);
+
+impl FreshnessChallenge {
+    /// Wrap an already-sized 32-byte challenge.
+    #[must_use]
+    pub const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Build a freshness challenge from raw bytes.
+    ///
+    /// # Errors
+    /// [`ProfileError::FreshnessChallengeLength`] unless exactly 32 bytes.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ProfileError> {
+        bytes
+            .try_into()
+            .map(Self)
+            .map_err(|_| ProfileError::FreshnessChallengeLength {
+                actual: bytes.len(),
+            })
+    }
+
+    /// The raw challenge bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
 /// Seconds since the Unix epoch (CWT `iat`/`exp`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UnixTime(pub i64);

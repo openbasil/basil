@@ -52,7 +52,10 @@ use basil_nats_bridge::{BasilConfig, BridgeConfig, Config, NatsConfig};
 use basil_proto::broker::v1::invocation_service_server::{
     InvocationService, InvocationServiceServer,
 };
-use basil_proto::broker::v1::{SealedRequest, SealedResponse, SigningAlgorithm};
+use basil_proto::broker::v1::{
+    GetInvocationChallengeRequest, GetInvocationChallengeResponse, SealedRequest, SealedResponse,
+    SigningAlgorithm,
+};
 use basil_proto::invocation::{
     CONTENT_TYPE_SIGN_REQUEST, CONTENT_TYPE_SIGN_RESPONSE, InvocationStatus, SignInvocationRequest,
     SignInvocationResponse,
@@ -93,6 +96,17 @@ impl InvocationService for FakeInvocationService {
             // No response_subject => the bridge replies on the NATS reply subject.
             response_subject: None,
         }))
+    }
+
+    // The courier never calls this RPC; mirror the broker's wire-surface stub
+    // (basil-jjgi.3.1) so the fake stays a faithful `InvocationService`.
+    async fn get_invocation_challenge(
+        &self,
+        _request: Request<GetInvocationChallengeRequest>,
+    ) -> Result<Response<GetInvocationChallengeResponse>, Status> {
+        Err(Status::unimplemented(
+            "GetInvocationChallenge is not part of the courier round-trip",
+        ))
     }
 }
 
@@ -188,6 +202,17 @@ impl InvocationService for VerifyingInvocationService {
             response_subject: None,
         }))
     }
+
+    // The courier never calls this RPC; mirror the broker's wire-surface stub
+    // (basil-jjgi.3.1) so the fake stays a faithful `InvocationService`.
+    async fn get_invocation_challenge(
+        &self,
+        _request: Request<GetInvocationChallengeRequest>,
+    ) -> Result<Response<GetInvocationChallengeResponse>, Status> {
+        Err(Status::unimplemented(
+            "GetInvocationChallenge is not part of the courier round-trip",
+        ))
+    }
 }
 
 /// RAII guard that reaps the spawned `nats-server` on drop (incl. on panic).
@@ -241,6 +266,7 @@ fn request_claims(
         response_subject: None,
         in_reply_to: None,
         request_hash: None,
+        freshness_challenge: None,
     }
 }
 
@@ -263,6 +289,7 @@ fn response_claims(
         response_subject: None,
         in_reply_to: Some(in_reply_to),
         request_hash: Some(request_hash),
+        freshness_challenge: None,
     }
 }
 

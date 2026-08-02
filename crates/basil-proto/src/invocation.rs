@@ -76,6 +76,17 @@ impl fmt::Display for InvocationError {
 
 impl std::error::Error for InvocationError {}
 
+/// Stable reason token for declined freshness-challenge issuance.
+///
+/// Attached to the `RESOURCE_EXHAUSTED` gRPC status when
+/// `GetInvocationChallenge` declines under capacity or rate-limit pressure.
+/// The denial is retryable with the same request after backoff.
+pub const REASON_CHALLENGE_ISSUANCE_DECLINED: &str = "CHALLENGE_ISSUANCE_DECLINED";
+/// Status reason for [`InvocationStatusCode::ChallengeUnknown`].
+pub const REASON_CHALLENGE_UNKNOWN: &str = "CHALLENGE_UNKNOWN";
+/// Status reason for [`InvocationStatusCode::PerRunQuotaExceeded`].
+pub const REASON_PER_RUN_QUOTA_EXCEEDED: &str = "PER_RUN_QUOTA_EXCEEDED";
+
 /// Status code carried inside encrypted invocation response bodies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvocationStatusCode {
@@ -87,6 +98,16 @@ pub enum InvocationStatusCode {
     InvalidRequest = 3,
     /// The broker hit an internal operation error.
     InternalError = 4,
+    /// The presented freshness challenge could not be consumed: it was never
+    /// issued by this instance, already consumed, expired, bound to a
+    /// different proof key or serving generation, or routed to a replica that
+    /// did not issue it. Never retried with the same message; the caller
+    /// obtains a fresh challenge and rebuilds the request.
+    ChallengeUnknown = 5,
+    /// The rule's `max_operations_per_run` quota is exhausted for this
+    /// `(rule, run_id, run_attempt)`. Retryable-never within the same run
+    /// attempt; a new run attempt or an agent restart resets the counter.
+    PerRunQuotaExceeded = 6,
 }
 
 impl InvocationStatusCode {
@@ -98,6 +119,8 @@ impl InvocationStatusCode {
             2 => Some(Self::Denied),
             3 => Some(Self::InvalidRequest),
             4 => Some(Self::InternalError),
+            5 => Some(Self::ChallengeUnknown),
+            6 => Some(Self::PerRunQuotaExceeded),
             _ => None,
         }
     }
@@ -158,6 +181,33 @@ impl InvocationStatus {
             reason: "INTERNAL_ERROR".to_string(),
             message: None,
             retryable: true,
+        }
+    }
+
+    /// Freshness-denial status: the challenge could not be consumed.
+    ///
+    /// `retryable` is `false` because the same message must never be
+    /// resubmitted; the caller obtains a fresh challenge, mints a fresh
+    /// message ID, and rebuilds the request.
+    #[must_use]
+    pub fn challenge_unknown() -> Self {
+        Self {
+            code: InvocationStatusCode::ChallengeUnknown,
+            reason: REASON_CHALLENGE_UNKNOWN.to_string(),
+            message: None,
+            retryable: false,
+        }
+    }
+
+    /// Per-run operation quota exhausted for this `(rule, run_id,
+    /// run_attempt)`. Retryable-never within the same run attempt.
+    #[must_use]
+    pub fn per_run_quota_exceeded() -> Self {
+        Self {
+            code: InvocationStatusCode::PerRunQuotaExceeded,
+            reason: REASON_PER_RUN_QUOTA_EXCEEDED.to_string(),
+            message: None,
+            retryable: false,
         }
     }
 
@@ -879,6 +929,70 @@ mod tests {
                 hex(bytes)
             );
         }
+    }
+
+    #[test]
+    fn freshness_status_codes_round_trip_in_sign_responses() {
+        for status in [
+            InvocationStatus::challenge_unknown(),
+            InvocationStatus::per_run_quota_exceeded(),
+        ] {
+            assert!(!status.retryable, "{}", status.reason);
+            let response = SignInvocationResponse {
+                status: status.clone(),
+                policy_generation: 7,
+                signature: None,
+            };
+            let decoded =
+                SignInvocationResponse::from_cbor_bytes(&response.to_cbor_bytes()).unwrap();
+            assert_eq!(decoded, response);
+            assert_eq!(decoded.status, status);
+        }
+        assert_eq!(
+            InvocationStatusCode::from_u64(5),
+            Some(InvocationStatusCode::ChallengeUnknown)
+        );
+        assert_eq!(
+            InvocationStatusCode::from_u64(6),
+            Some(InvocationStatusCode::PerRunQuotaExceeded)
+        );
+        assert_eq!(InvocationStatusCode::from_u64(7), None);
+    }
+
+    #[test]
+    fn invocation_challenge_messages_round_trip_on_the_wire() {
+        use prost::Message as _;
+
+        use crate::broker::v1::{GetInvocationChallengeRequest, GetInvocationChallengeResponse};
+
+        let request = GetInvocationChallengeRequest {
+            jkt: vec![0x5a; 32],
+            courier_observed_source: Some("203.0.113.7".to_string()),
+        };
+        let decoded =
+            GetInvocationChallengeRequest::decode(request.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, request);
+
+        // Absent courier source means local/direct and must stay absent.
+        let local = GetInvocationChallengeRequest {
+            jkt: vec![0x5a; 32],
+            courier_observed_source: None,
+        };
+        let decoded =
+            GetInvocationChallengeRequest::decode(local.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded.courier_observed_source, None);
+
+        let mut challenge = vec![0x11; 16];
+        challenge.extend_from_slice(&[0x22; 16]);
+        let response = GetInvocationChallengeResponse {
+            challenge,
+            generation: 3,
+            expires_at_unix: 1_760_000_060,
+        };
+        let decoded =
+            GetInvocationChallengeResponse::decode(response.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, response);
+        assert_eq!(decoded.challenge.len(), 32);
     }
 
     #[test]

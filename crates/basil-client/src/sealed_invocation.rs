@@ -15,11 +15,11 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use basil_cose::{
-    BuildError, Claims, ContentAlgorithm, ContentType, Ed25519Verifier, ExternalAad, KdfParties,
-    KeyId, MessageId, MessageRole, OpenError, OpenRequest, Recipient, RequestHash, SealParams,
-    SealedAad, SignError, Signature, SignatureAlgorithm, Signer, Subject, UnixTime,
-    ValidationParams, VerifyError, VerifySealedParams, X25519Recipient, X25519RecipientPublic,
-    Zeroizing, build_sealed, request_hash, verify_sealed,
+    BuildError, Claims, ContentAlgorithm, ContentType, Ed25519Verifier, ExternalAad,
+    FreshnessChallenge, KdfParties, KeyId, MessageId, MessageRole, OpenError, OpenRequest,
+    Recipient, RequestHash, SealParams, SealedAad, SignError, Signature, SignatureAlgorithm,
+    Signer, Subject, UnixTime, ValidationParams, VerifyError, VerifySealedParams, X25519Recipient,
+    X25519RecipientPublic, Zeroizing, build_sealed, request_hash, verify_sealed,
 };
 use basil_proto::broker::v1 as pb;
 use basil_proto::invocation::{
@@ -62,6 +62,11 @@ pub struct SealedInvocationOptions {
     pub recipient_subject: Option<String>,
     /// Caller-controlled response encryption key id.
     pub response_encryption_key_id: String,
+    /// Optional server-issued single-use freshness challenge (exactly 32
+    /// bytes), obtained from `InvocationService.GetInvocationChallenge` and
+    /// carried as encrypted-layer claim `-70008`. Remote CI invocations must
+    /// set it; local direct invocations leave it `None`.
+    pub freshness_challenge: Option<[u8; 32]>,
 }
 
 /// A prepared raw COSE invocation request plus the client-side correlation
@@ -338,6 +343,7 @@ pub async fn prepare_sealed_invocation<S: Signer>(
         response_subject: None,
         in_reply_to: None,
         request_hash: None,
+        freshness_challenge: options.freshness_challenge.map(FreshnessChallenge::new),
     };
     let message_id = claims.message_id.as_bytes().to_vec();
 
@@ -656,6 +662,9 @@ where
             recipient_key_id: self.config.broker_request_key_id.clone(),
             recipient_subject: self.config.broker_request_subject.clone(),
             response_encryption_key_id: self.config.response_encryption_key_id.clone(),
+            // The carrier signer is a local trusted path, not a remote CI
+            // invocation; it presents no freshness challenge.
+            freshness_challenge: None,
         };
         let prepared = prepare_sealed_invocation(
             options,
@@ -774,6 +783,7 @@ mod tests {
             recipient_key_id: "broker-recipient".to_string(),
             recipient_subject: Some("broker".to_string()),
             response_encryption_key_id: "client-response".to_string(),
+            freshness_challenge: None,
         }
     }
 
@@ -823,6 +833,7 @@ mod tests {
                 MessageId::from_bytes(prepared.message_id.clone()).expect("message id"),
             ),
             request_hash: Some(RequestHash(prepared.request_hash)),
+            freshness_challenge: None,
         };
         let cose = build_sealed(
             &SealParams {
@@ -902,6 +913,7 @@ mod tests {
                 response_subject: None,
                 in_reply_to: Some(verified.claims.message_id.clone()),
                 request_hash: Some(RequestHash(hash)),
+                freshness_challenge: None,
             };
             let cose = build_sealed(
                 &SealParams {
@@ -937,6 +949,65 @@ mod tests {
             default_ttl: Duration::from_secs(120),
             allowed_audiences: BTreeSet::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn prepared_invocation_carries_the_freshness_challenge_claim() {
+        let client_signer = signer("client-sign", 7);
+        let broker_recipient = recipient("broker-recipient", 9);
+        let mut challenge = [0x77_u8; 32];
+        challenge[..16].copy_from_slice(&[0x10; 16]);
+        let challenged_options = SealedInvocationOptions {
+            freshness_challenge: Some(challenge),
+            ..options()
+        };
+        let prepared = prepare_sealed_invocation(
+            challenged_options,
+            &broker_recipient.public().public,
+            &sign_body(),
+            &client_signer,
+        )
+        .await
+        .expect("request seals");
+
+        let verifier =
+            Ed25519Verifier::from_key(key_id("client-sign"), &client_signer.public_key_bytes())
+                .expect("verifier");
+        let checked = verify_sealed(
+            &prepared.message,
+            &verifier,
+            &VerifySealedParams {
+                signature_aad: ExternalAad::empty(),
+                validation: &validation(MessageRole::Request),
+            },
+        )
+        .await
+        .expect("request verifies");
+        assert_eq!(
+            checked.claims.freshness_challenge,
+            Some(FreshnessChallenge::new(challenge))
+        );
+
+        // Local requests without a challenge keep the claim absent.
+        let bare = prepare_sealed_invocation(
+            options(),
+            &broker_recipient.public().public,
+            &sign_body(),
+            &client_signer,
+        )
+        .await
+        .expect("request seals");
+        let checked = verify_sealed(
+            &bare.message,
+            &verifier,
+            &VerifySealedParams {
+                signature_aad: ExternalAad::empty(),
+                validation: &validation(MessageRole::Request),
+            },
+        )
+        .await
+        .expect("request verifies");
+        assert_eq!(checked.claims.freshness_challenge, None);
     }
 
     #[tokio::test]
@@ -1225,6 +1296,7 @@ mod tests {
                 MessageId::from_bytes(prepared.message_id.clone()).expect("message id"),
             ),
             request_hash: Some(RequestHash(prepared.request_hash)),
+            freshness_challenge: None,
         };
         let cose = build_sealed(
             &SealParams {

@@ -24,6 +24,11 @@ pub enum Error {
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// The agent's reply violated the wire contract (for example a
+    /// freshness challenge that is not exactly 32 bytes).
+    #[error("protocol violation: {0}")]
+    Protocol(String),
+
     /// The agent returned a gRPC status.
     #[error("agent status [{code:?}/{reason}]: {message}")]
     Status {

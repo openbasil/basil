@@ -1,10 +1,1 @@
-{
-  "critical": {
-    "identity": { "docker-reference": "registry.example/team/app" },
-    "image": {
-      "docker-manifest-digest": "sha256:05cc270278271fe266f155ec2a47703127c5874237b0a12f2e8a146531fd9a4e"
-    },
-    "type": "cosign container image signature"
-  },
-  "optional": null
-}
+{"critical":{"identity":{"docker-reference":"registry.example/team/app"},"image":{"docker-manifest-digest":"sha256:05cc270278271fe266f155ec2a47703127c5874237b0a12f2e8a146531fd9a4e"},"type":"cosign container image signature"},"optional":null}

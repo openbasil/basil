@@ -460,6 +460,24 @@ pub enum Command {
         command: ConnectionsCommand,
     },
 
+    /// Fetch a single-use sealed-invocation freshness challenge bound to a
+    /// proof-key thumbprint (CI federation). The thumbprint is self-asserted
+    /// and grants nothing; the broker binds the issued challenge to it and to
+    /// the serving generation. Prints the 32 challenge bytes as hex plus the
+    /// generation and expiry. The courier-observed source stays absent here:
+    /// this CLI is a direct local caller, and only a trusted courier may
+    /// assert a client source. Until broker challenge issuance lands the
+    /// agent answers `UNIMPLEMENTED`.
+    InvocationChallenge {
+        /// Proof-key thumbprint (RFC 7638 SHA-256, 32 bytes) as 64 hex chars
+        /// or unpadded base64url.
+        #[arg(long)]
+        jkt: String,
+        /// Emit a machine-readable JSON object instead of human lines.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Revoke a JWT-SVID by trust-domain and jti. Requires the dedicated
     /// `revoke` admin permission over `broker.revoke` and a configured
     /// persistent `revocation_store=jwt-svid` value key.
@@ -696,6 +714,9 @@ async fn dispatch(client: &mut Client, command: Command) -> Result<()> {
         Command::Ready { json } => ready(client, json).await,
         Command::Reload { check, json } => reload(client, check, json).await,
         Command::Connections { command } => connections(client, command).await,
+        Command::InvocationChallenge { jkt, json } => {
+            invocation_challenge(client, &jkt, json).await
+        }
         Command::Revoke {
             trust_domain,
             jti,
@@ -1687,6 +1708,44 @@ fn explain_json(explanation: &basil::AgentExplanation) -> serde_json::Value {
 }
 
 /// Live JWT-SVID revocation against the running broker's deny-list.
+/// Decode a proof-key thumbprint argument: 64 hex chars or unpadded
+/// base64url, 32 bytes either way.
+fn parse_jkt(jkt: &str) -> Result<[u8; 32]> {
+    let bytes = if jkt.len() == 64 && jkt.bytes().all(|b| b.is_ascii_hexdigit()) {
+        hex::decode(jkt).context("decoding --jkt hex")?
+    } else {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(jkt)
+            .context("decoding --jkt (expected 64 hex chars or unpadded base64url)")?
+    };
+    match bytes.as_slice().try_into() {
+        Ok(jkt) => Ok(jkt),
+        Err(_) => bail!("--jkt must decode to exactly 32 bytes, got {}", bytes.len()),
+    }
+}
+
+async fn invocation_challenge(client: &mut Client, jkt: &str, json: bool) -> Result<()> {
+    let jkt = parse_jkt(jkt)?;
+    let issued = client.get_invocation_challenge(&jkt, None).await?;
+    if json {
+        println!("{}", invocation_challenge_json(&issued));
+        return Ok(());
+    }
+    println!("challenge: {}", hex::encode(issued.challenge));
+    println!("generation: {}", issued.generation);
+    println!("expires_at_unix: {}", issued.expires_at_unix);
+    Ok(())
+}
+
+/// Stable JSON shape for `basil invocation-challenge --json`.
+fn invocation_challenge_json(issued: &basil::InvocationChallenge) -> serde_json::Value {
+    serde_json::json!({
+        "challenge": hex::encode(issued.challenge),
+        "generation": issued.generation,
+        "expires_at_unix": issued.expires_at_unix,
+    })
+}
+
 async fn revoke(
     client: &mut Client,
     trust_domain: &str,

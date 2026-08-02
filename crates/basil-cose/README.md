@@ -52,9 +52,11 @@ parameter of every encrypting entry point. ES256 signing is deterministic
 ## Claims
 
 Claims ride in the protected header as a CWT map (header 15) plus the basil
-private labels (`-70001..=-70005`, module `label`): in-reply-to, request
-hash (SHA3-256, helper `request_hash`), sender key id (must equal the outer
-`kid`), response key id, and response subject. `MessageRole`
+private labels (`-70001..=-70005` and `-70008`, module `label`): in-reply-to,
+request hash (SHA3-256, helper `request_hash`), sender key id (must equal the
+outer `kid`), response key id, response subject, and the server-issued
+single-use freshness challenge (`-70008`, exactly 32 bytes, requests only,
+consumed by the broker before authorization). `MessageRole`
 (request/response/peer) validators enforce claim shape;
 `ValidationParams` parameterizes clock skew, TTL bounds, and the audience
 allow-list (`now` is injected, never sampled: the crate is state-free and
