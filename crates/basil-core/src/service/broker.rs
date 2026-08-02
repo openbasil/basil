@@ -51,8 +51,12 @@ pub struct InvocationRuntimeConfig {
     pub max_ttl_secs: u32,
     /// Allowed clock skew in seconds for issue and expiry timestamps.
     pub clock_skew_secs: u32,
-    /// Maximum replay-cache entries retained in memory.
-    pub replay_cache_capacity: usize,
+    /// Freshness-challenge table shape (`[invocation.challenge]`): global
+    /// capacity of outstanding challenges (SPEC default 16,384), issuance
+    /// rate buckets, and the tracked rate-limit partition bound. The per-key
+    /// outstanding cap and the challenge TTL are spec-fixed and clamped by
+    /// the table itself.
+    pub challenge_table: crate::core::challenge::ChallengeTableConfig,
     /// Maximum distinct tracked per-run quota buckets **per federation
     /// rule** (`invocation.run-quota-buckets-per-rule`). The bound is per
     /// rule so one federated tenant's runs can never exhaust another
@@ -78,7 +82,7 @@ impl Default for InvocationRuntimeConfig {
             request_encryption_key_id: None,
             max_ttl_secs: basil_proto::invocation::DEFAULT_EXPIRES_AFTER_SECS,
             clock_skew_secs: 30,
-            replay_cache_capacity: 4096,
+            challenge_table: crate::core::challenge::ChallengeTableConfig::default(),
             run_quota_buckets_per_rule:
                 crate::core::ci_federation::DEFAULT_MAX_TRACKED_RUN_BUCKETS_PER_RULE,
             require_challenge: false,
@@ -92,8 +96,7 @@ impl Default for InvocationRuntimeConfig {
 pub struct BrokerGrpc {
     pub(super) state: Arc<BrokerState>,
     pub(super) invocation: InvocationRuntimeConfig,
-    pub(super) invocation_replay_cache:
-        Arc<Mutex<crate::service::invocation::InvocationReplayCache>>,
+    pub(super) invocation_tables: Arc<Mutex<crate::service::invocation::InvocationTables>>,
 }
 
 impl BrokerGrpc {
@@ -121,14 +124,14 @@ impl BrokerGrpc {
         state: Arc<BrokerState>,
         invocation: InvocationRuntimeConfig,
     ) -> Self {
-        let capacity = invocation.replay_cache_capacity;
+        let challenge_table = invocation.challenge_table;
         let run_quota_buckets_per_rule = invocation.run_quota_buckets_per_rule;
         Self {
             state,
             invocation,
-            invocation_replay_cache: Arc::new(Mutex::new(
-                crate::service::invocation::InvocationReplayCache::new(
-                    capacity,
+            invocation_tables: Arc::new(Mutex::new(
+                crate::service::invocation::InvocationTables::new(
+                    challenge_table,
                     run_quota_buckets_per_rule,
                 ),
             )),

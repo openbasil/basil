@@ -120,7 +120,7 @@ impl InvocationService for BrokerGrpc {
         let generation = self.state.load_generation().id();
         let now = i64::from(self.invocation_now_unix());
         let issued = self
-            .invocation_replay_cache
+            .invocation_tables
             .lock()
             .map_err(|_| challenge_table_unavailable(CHALLENGE_OP))?
             .issue(jkt, source, generation, now);
@@ -262,7 +262,7 @@ enum ChallengeDenial {
     #[error("missing required freshness challenge")]
     Missing,
     #[error("{0}")]
-    Denied(crate::ci_federation::challenge::ConsumeDenied),
+    Denied(crate::core::challenge::ConsumeDenied),
 }
 
 impl BrokerGrpc {
@@ -497,7 +497,7 @@ impl BrokerGrpc {
         // (stated behavior), and a denied charge consumes no quota.
         if let Some(charge) = run_quota_charge {
             let outcome = self
-                .invocation_replay_cache
+                .invocation_tables
                 .lock()
                 .map_err(|_| challenge_table_unavailable(INVOKE_OP))?
                 .charge_run_quota(
@@ -645,7 +645,7 @@ impl BrokerGrpc {
         };
         let now = i64::from(self.invocation_now_unix());
         let outcome = self
-            .invocation_replay_cache
+            .invocation_tables
             .lock()
             .map_err(|_| challenge_table_unavailable(INVOKE_OP))?
             .consume(challenge.as_bytes(), &jkt, generation_id, now);
@@ -955,51 +955,15 @@ impl BrokerGrpc {
         token_kid: &str,
         now: std::time::SystemTime,
     ) -> Result<Option<crate::core::ci_federation::GenerationJwks>, Status> {
-        use crate::core::ci_federation::ServeDecision;
-        let decision = generation
-            .jwks_caches()
-            .lock()
-            .map_err(|_| unauthorized_invocation())?
-            .get_mut(rule_id)
-            .map(|cache| cache.serve_or_revalidate(token_kid, now));
-        let Some(decision) = decision else {
-            return Ok(None);
-        };
-        match decision {
-            ServeDecision::Fresh(keys) => Ok(Some(keys)),
-            ServeDecision::Revalidate {
-                refresh_allowed,
-                stale,
-            } => {
-                let fetched = if refresh_allowed {
-                    crate::ci_federation::fetch_generation_jwks(client, generation.id(), provider)
-                        .await
-                        .ok()
-                } else {
-                    None
-                };
-                match fetched {
-                    Some(keys) => {
-                        install_generation_jwks(generation, rule_id, &keys, now)?;
-                        Ok(Some(keys))
-                    }
-                    None => Ok(stale),
-                }
+        let generation_id = generation.id();
+        resolve_rule_jwks_via(generation, rule_id, token_kid, now, &mut || {
+            let client = client.clone();
+            let provider = provider.clone();
+            async move {
+                crate::ci_federation::fetch_generation_jwks(&client, generation_id, &provider).await
             }
-            ServeDecision::UnknownKid { refresh_allowed } => {
-                if !refresh_allowed {
-                    return Ok(None);
-                }
-                let Ok(keys) =
-                    crate::ci_federation::fetch_generation_jwks(client, generation.id(), provider)
-                        .await
-                else {
-                    return Ok(None);
-                };
-                install_generation_jwks(generation, rule_id, &keys, now)?;
-                Ok(Some(keys))
-            }
-        }
+        })
+        .await
     }
 
     async fn verify_provider_evidence(
@@ -1092,6 +1056,73 @@ impl BrokerGrpc {
             }
         }
         Err(unauthorized_invocation())
+    }
+}
+
+/// Serving-path JWKS resolution for one federation rule (the body of
+/// [`BrokerGrpc::resolve_rule_jwks`], which documents the contract).
+///
+/// Generic over the fetch so the wiring is testable with a stub: `fetch` is
+/// invoked only after the cache decision admits a refresh (fresh hits never
+/// fetch, a missing generation cache entry never fetches and fails closed,
+/// and the cooldown gate records the attempt before the fetch so a failed
+/// fetch still consumes it). Production supplies the bounded HTTPS
+/// discovery + JWKS fetch.
+async fn resolve_rule_jwks_via<F, Fut>(
+    generation: &std::sync::Arc<crate::state::Generation>,
+    rule_id: &str,
+    token_kid: &str,
+    now: std::time::SystemTime,
+    fetch: &mut F,
+) -> Result<Option<crate::core::ci_federation::GenerationJwks>, Status>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<
+            Output = Result<
+                crate::core::ci_federation::GenerationJwks,
+                crate::core::ci_federation::FederationError,
+            >,
+        >,
+{
+    use crate::core::ci_federation::ServeDecision;
+    let decision = generation
+        .jwks_caches()
+        .lock()
+        .map_err(|_| unauthorized_invocation())?
+        .get_mut(rule_id)
+        .map(|cache| cache.serve_or_revalidate(token_kid, now));
+    let Some(decision) = decision else {
+        return Ok(None);
+    };
+    match decision {
+        ServeDecision::Fresh(keys) => Ok(Some(keys)),
+        ServeDecision::Revalidate {
+            refresh_allowed,
+            stale,
+        } => {
+            let fetched = if refresh_allowed {
+                fetch().await.ok()
+            } else {
+                None
+            };
+            match fetched {
+                Some(keys) => {
+                    install_generation_jwks(generation, rule_id, &keys, now)?;
+                    Ok(Some(keys))
+                }
+                None => Ok(stale),
+            }
+        }
+        ServeDecision::UnknownKid { refresh_allowed } => {
+            if !refresh_allowed {
+                return Ok(None);
+            }
+            let Ok(keys) = fetch().await else {
+                return Ok(None);
+            };
+            install_generation_jwks(generation, rule_id, &keys, now)?;
+            Ok(Some(keys))
+        }
     }
 }
 
@@ -1347,61 +1378,63 @@ struct RunQuotaCharge {
     retention_secs: u64,
 }
 
-/// Transitional name for the invocation freshness and quota state, behind
+/// The invocation freshness-challenge table and per-run quota table, behind
 /// the one broker mutex.
 ///
-/// The legacy message-ID replay cache is removed (SPEC rev 4 Freshness): the
-/// COSE message ID is correlation-only, and freshness rests on server-issued
-/// single-use challenges; the per-run operation quota (SPEC rev 4, Per-run
-/// quota and kill switch) shares the same in-memory, restart-resetting
-/// lifecycle and therefore the same lock. The name survives because the
-/// broker adapter (`service/broker.rs`) constructs
-/// `InvocationReplayCache::new(capacity)` with its `replay_cache_capacity`
-/// knob, now the challenge table's global capacity; renaming that field and
-/// knob is tracked as a follow-up.
+/// There is no message-ID replay cache (SPEC rev 4 Freshness): the COSE
+/// message ID is correlation-only, and freshness rests on server-issued
+/// single-use challenges held in the [`ChallengeTable`]
+/// ([`crate::core::challenge`]); the per-run operation quota (SPEC rev 4,
+/// Per-run quota and kill switch) shares the same in-memory,
+/// restart-resetting lifecycle and therefore the same lock. The broker
+/// adapter (`service/broker.rs`) constructs this from the
+/// `invocation.challenge_table` and `invocation.run_quota_buckets_per_rule`
+/// runtime settings.
+///
+/// [`ChallengeTable`]: crate::core::challenge::ChallengeTable
 #[derive(Debug)]
-pub(super) struct InvocationReplayCache {
-    challenges: crate::ci_federation::challenge::ChallengeTable,
+pub(super) struct InvocationTables {
+    challenges: crate::core::challenge::ChallengeTable,
     run_quota: crate::ci_federation::RunQuotaTable,
 }
 
-impl InvocationReplayCache {
-    /// Build the invocation state tables; `global_capacity` bounds the
-    /// challenge table (the legacy construction seam used by the broker
-    /// adapter) and `run_quota_buckets_per_rule` bounds the distinct
-    /// tracked per-run quota buckets for each federation rule
+impl InvocationTables {
+    /// Build the invocation state tables; `challenge_table` shapes the
+    /// freshness-challenge table (`[invocation.challenge]`) and
+    /// `run_quota_buckets_per_rule` bounds the distinct tracked per-run
+    /// quota buckets for each federation rule
     /// (`invocation.run-quota-buckets-per-rule`).
-    pub(super) fn new(global_capacity: usize, run_quota_buckets_per_rule: usize) -> Self {
+    pub(super) fn new(
+        challenge_table: crate::core::challenge::ChallengeTableConfig,
+        run_quota_buckets_per_rule: usize,
+    ) -> Self {
         Self {
-            challenges: crate::ci_federation::challenge::ChallengeTable::new(global_capacity),
+            challenges: crate::core::challenge::ChallengeTable::with_config(challenge_table),
             run_quota: crate::ci_federation::RunQuotaTable::new(run_quota_buckets_per_rule),
         }
     }
 
     /// Issue a single-use freshness challenge
-    /// ([`ChallengeTable::issue`][crate::ci_federation::challenge::ChallengeTable::issue]).
+    /// ([`ChallengeTable::issue`][crate::core::challenge::ChallengeTable::issue]).
     fn issue(
         &mut self,
         jkt: [u8; 32],
         source: Option<&str>,
         generation: u64,
         now_unix: i64,
-    ) -> Result<
-        crate::ci_federation::challenge::IssuedChallenge,
-        crate::ci_federation::challenge::IssueDecline,
-    > {
+    ) -> Result<crate::core::challenge::IssuedChallenge, crate::core::challenge::IssueDecline> {
         self.challenges.issue(jkt, source, generation, now_unix)
     }
 
     /// Atomically consume a freshness challenge
-    /// ([`ChallengeTable::consume`][crate::ci_federation::challenge::ChallengeTable::consume]).
+    /// ([`ChallengeTable::consume`][crate::core::challenge::ChallengeTable::consume]).
     fn consume(
         &mut self,
         challenge: &[u8],
         jkt: &[u8; 32],
         generation: u64,
         now_unix: i64,
-    ) -> Result<(), crate::ci_federation::challenge::ConsumeDenied> {
+    ) -> Result<(), crate::core::challenge::ConsumeDenied> {
         self.challenges
             .consume(challenge, jkt, generation, now_unix)
     }
@@ -1724,7 +1757,10 @@ mod tests {
                 request_encryption_key_id: Some(REQUEST_SEALING_KEY.to_string()),
                 max_ttl_secs: DEFAULT_EXPIRES_AFTER_SECS,
                 clock_skew_secs: 5,
-                replay_cache_capacity: 16,
+                challenge_table: crate::core::challenge::ChallengeTableConfig {
+                    global_capacity: 16,
+                    ..Default::default()
+                },
                 run_quota_buckets_per_rule: 16,
                 require_challenge: false,
                 now_unix_override: Some(NOW),
@@ -2329,12 +2365,13 @@ mod tests {
     }
 
     #[test]
-    fn replay_cache_charges_the_generation_scoped_run_quota() {
+    fn invocation_tables_charge_the_generation_scoped_run_quota() {
         // The broker-held table delegates to the generation-scoped quota
         // counters: exhaustion denies, a reload (new generation) resets.
         const RETENTION: u64 = 630;
         const QUOTA_NOW: i64 = 1_700_000_000;
-        let mut cache = InvocationReplayCache::new(16, 16);
+        let mut cache =
+            InvocationTables::new(crate::core::challenge::ChallengeTableConfig::default(), 16);
         let key = crate::ci_federation::RunQuotaKey {
             rule_id: "release".to_string(),
             run_id: 900,
@@ -2355,6 +2392,199 @@ mod tests {
             cache.charge_run_quota(8, &key, None, RETENTION, QUOTA_NOW),
             Err(crate::ci_federation::RunQuotaDenied::QuotaUnavailable)
         );
+    }
+
+    /// One valid GitHub federation rule for serving-path JWKS tests.
+    fn federation_rule(id: &str) -> crate::core::ci_federation::ProviderRule {
+        use crate::core::ci_federation::{GithubActionsRule, ProviderConfig, ProviderRule};
+        const ISSUER: &str = "https://token.actions.githubusercontent.com";
+        ProviderRule {
+            id: id.to_string(),
+            subject: "ci/release".to_string(),
+            audience: "urn:basil:ci".to_string(),
+            operation_profiles: vec!["artifact-sign".to_string()],
+            max_token_age_secs: 900,
+            clock_skew_secs: 30,
+            max_operations_per_run: Some(64),
+            provider: ProviderConfig::GithubActions(GithubActionsRule {
+                issuer: ISSUER.to_string(),
+                discovery_url: format!("{ISSUER}/.well-known/openid-configuration"),
+                jwks_url: format!("{ISSUER}/.well-known/jwks"),
+                audience_prefix: "urn:basil:ci:jkt:".to_string(),
+                repository_id: 42,
+                repository_owner_id: 7,
+                job_workflow_ref: "openbasil/basil/.github/workflows/release.yml@refs/heads/main"
+                    .to_string(),
+                job_workflow_sha: "a".repeat(40),
+                protected_refs: vec!["refs/heads/main".to_string()],
+                events: vec!["push".to_string()],
+                runner_environments: vec!["github-hosted".to_string()],
+                environment: None,
+                max_token_age_secs: 900,
+                clock_skew_secs: 30,
+            }),
+        }
+    }
+
+    /// A generation carrying one federation rule, so its constructor builds
+    /// the per-rule JWKS cache map the serving path resolves against.
+    fn federation_generation(id: u64) -> Arc<crate::state::Generation> {
+        let client_signer = signer(CLIENT_SIGNING_KEY, [7; 32]);
+        let mallory_signer = signer(MALLORY_SIGNING_KEY, [8; 32]);
+        let (catalog, resolved, config, warnings) = load(
+            &catalog_json(),
+            &policy_json(&client_signer, &mallory_signer),
+        )
+        .expect("fixture inputs load");
+        assert!(warnings.is_empty(), "fixture warnings: {warnings:?}");
+        let rules =
+            crate::core::ci_federation::ProviderCatalog::new(vec![federation_rule("release")])
+                .expect("rule validates");
+        Arc::new(
+            crate::state::Generation::new_with_overrides_oci_listeners_and_federation(
+                id,
+                catalog,
+                resolved,
+                config,
+                Vec::new(),
+                None,
+                crate::transport::listener::ListenerConfigSet::default(),
+                Some(Arc::new(rules)),
+            ),
+        )
+    }
+
+    fn parsed_jwks(generation: u64, kid: &str) -> crate::core::ci_federation::GenerationJwks {
+        let modulus = URL_SAFE_NO_PAD.encode([0x80; 256]);
+        let body = format!(
+            r#"{{"keys":[{{"kty":"RSA","kid":"{kid}","alg":"RS256","use":"sig","n":"{modulus}","e":"AQAB"}}]}}"#
+        );
+        crate::core::ci_federation::GenerationJwks::parse(generation, body.as_bytes())
+            .expect("test JWKS parses")
+    }
+
+    /// Pins the serving-path wiring of `resolve_rule_jwks_via` (the body of
+    /// `resolve_rule_jwks`) against a stub fetch: a rule without a generation
+    /// cache entry never fetches and fails closed; an unknown key ID admits
+    /// at most one fetch per cooldown window with a failed fetch consuming
+    /// the attempt; a fresh hit never fetches; past `max_age` the stale set
+    /// serves only within `stale_if_error` while revalidation fails; and a
+    /// successful revalidation reinstalls fresh serving.
+    #[tokio::test]
+    async fn resolve_rule_jwks_pins_refresh_gating_stale_service_and_fail_closed() {
+        use std::cell::{Cell, RefCell};
+        use std::collections::VecDeque;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        use crate::core::ci_federation::{FederationError, GenerationJwks};
+
+        // Default cache policy (what `Generation` installs): max_age 300s,
+        // stale_if_error 30s, refresh_cooldown 1s.
+        let generation = federation_generation(1);
+        let calls = Cell::new(0_u32);
+        let script: RefCell<VecDeque<Result<GenerationJwks, FederationError>>> =
+            RefCell::new(VecDeque::new());
+        let mut fetch = || {
+            calls.set(calls.get() + 1);
+            std::future::ready(
+                script
+                    .borrow_mut()
+                    .pop_front()
+                    .unwrap_or(Err(FederationError::FetchRejected)),
+            )
+        };
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_000_000);
+
+        // A rule with no generation cache entry fails closed without a fetch.
+        let absent = resolve_rule_jwks_via(&generation, "absent", "kid-a", t0, &mut fetch)
+            .await
+            .expect("no envelope error");
+        assert!(absent.is_none(), "unknown rule must fail closed");
+        assert_eq!(calls.get(), 0, "no cache entry must mean no fetch");
+
+        // Unknown key ID: the cooldown admits one fetch; the failure consumes
+        // the attempt, so an immediate retry does not fetch again.
+        let miss = resolve_rule_jwks_via(&generation, "release", "kid-a", t0, &mut fetch)
+            .await
+            .expect("no envelope error");
+        assert!(miss.is_none(), "failed refresh serves nothing");
+        assert_eq!(calls.get(), 1);
+        let gated = resolve_rule_jwks_via(&generation, "release", "kid-a", t0, &mut fetch)
+            .await
+            .expect("no envelope error");
+        assert!(gated.is_none());
+        assert_eq!(calls.get(), 1, "failed fetch must consume the attempt");
+
+        // Past the cooldown a successful fetch installs the key set.
+        let install_now = t0 + Duration::from_secs(2);
+        script.borrow_mut().push_back(Ok(parsed_jwks(1, "kid-a")));
+        let installed =
+            resolve_rule_jwks_via(&generation, "release", "kid-a", install_now, &mut fetch)
+                .await
+                .expect("no envelope error")
+                .expect("fetched set serves");
+        assert!(installed.key("kid-a").is_some());
+        assert_eq!(calls.get(), 2);
+
+        // A cached key ID inside max_age serves fresh with no fetch.
+        let fresh_now = install_now + Duration::from_secs(100);
+        let fresh = resolve_rule_jwks_via(&generation, "release", "kid-a", fresh_now, &mut fetch)
+            .await
+            .expect("no envelope error")
+            .expect("fresh hit serves");
+        assert!(fresh.key("kid-a").is_some());
+        assert_eq!(calls.get(), 2, "fresh hits must never fetch");
+
+        // Past max_age: revalidation is attempted; on failure the stale set
+        // still serves within stale_if_error, and the cooldown gates the
+        // second attempt without losing stale service.
+        let stale_now = install_now + Duration::from_secs(301);
+        let stale = resolve_rule_jwks_via(&generation, "release", "kid-a", stale_now, &mut fetch)
+            .await
+            .expect("no envelope error")
+            .expect("stale set serves inside the window");
+        assert!(stale.key("kid-a").is_some());
+        assert_eq!(calls.get(), 3);
+        let stale_gated =
+            resolve_rule_jwks_via(&generation, "release", "kid-a", stale_now, &mut fetch)
+                .await
+                .expect("no envelope error")
+                .expect("cooldown-gated revalidation still serves stale");
+        assert!(stale_gated.key("kid-a").is_some());
+        assert_eq!(calls.get(), 3, "cooldown must gate the second attempt");
+
+        // Beyond max_age + stale_if_error the rule fails closed while the
+        // fetch keeps failing.
+        let expired_now = install_now + Duration::from_secs(331);
+        let expired =
+            resolve_rule_jwks_via(&generation, "release", "kid-a", expired_now, &mut fetch)
+                .await
+                .expect("no envelope error");
+        assert!(expired.is_none(), "stale set must not outlive its window");
+        assert_eq!(calls.get(), 4);
+
+        // A successful revalidation restores fresh serving.
+        let recover_now = install_now + Duration::from_secs(333);
+        script.borrow_mut().push_back(Ok(parsed_jwks(1, "kid-a")));
+        let recovered =
+            resolve_rule_jwks_via(&generation, "release", "kid-a", recover_now, &mut fetch)
+                .await
+                .expect("no envelope error")
+                .expect("successful revalidation serves");
+        assert!(recovered.key("kid-a").is_some());
+        assert_eq!(calls.get(), 5);
+        let fresh_again = resolve_rule_jwks_via(
+            &generation,
+            "release",
+            "kid-a",
+            recover_now + Duration::from_secs(1),
+            &mut fetch,
+        )
+        .await
+        .expect("no envelope error")
+        .expect("reinstalled set serves fresh");
+        assert!(fresh_again.key("kid-a").is_some());
+        assert_eq!(calls.get(), 5, "reinstalled set must serve without a fetch");
     }
 
     #[tokio::test]

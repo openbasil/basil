@@ -254,7 +254,9 @@ audience = ["basil://example/cose-nats-demo"]
 request-encryption-key-id = "broker.request"
 max-ttl-secs = 60
 clock-skew-secs = 30
-replay-cache-capacity = 128
+
+[invocation.challenge]
+capacity = 128
 TOML
 }
 

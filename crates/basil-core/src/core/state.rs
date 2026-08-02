@@ -198,13 +198,37 @@ impl Generation {
                     .rules()
                     .iter()
                     .filter_map(|rule| {
-                        crate::core::ci_federation::GenerationJwksCache::new(
+                        match crate::core::ci_federation::GenerationJwksCache::new(
                             id,
                             &rule.provider,
                             crate::core::ci_federation::JwksCachePolicy::default(),
-                        )
-                        .ok()
-                        .map(|cache| (rule.id.clone(), cache))
+                        ) {
+                            Ok(cache) => Some((rule.id.clone(), cache)),
+                            Err(error) => {
+                                // Unreachable for a loaded catalog:
+                                // `ProviderCatalog` construction validates every
+                                // rule (URLs included), and the default cache
+                                // policy is always in bounds. If it ever
+                                // happens anyway, the serving path fails closed
+                                // for exactly this rule (no cache entry means
+                                // no fetch and no authorization), so surface it
+                                // loudly instead of dropping it silently.
+                                debug_assert!(
+                                    false,
+                                    "pre-validated federation rule {} failed \
+                                     JWKS cache construction: {error}",
+                                    rule.id,
+                                );
+                                tracing::error!(
+                                    rule = %rule.id,
+                                    %error,
+                                    "federation rule JWKS cache construction \
+                                     failed; the rule fails closed (no fetch, \
+                                     no authorization) for this generation",
+                                );
+                                None
+                            }
+                        }
                     })
                     .collect()
             })

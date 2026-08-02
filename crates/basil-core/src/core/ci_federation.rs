@@ -7,13 +7,9 @@
 //! This module deliberately does not deserialize provider claims into a map.
 //! The provider, issuer, key locations, and claim selectors are trusted
 //! configuration; the token supplies evidence only.
-
-// The freshness-challenge table lives beside this module as
-// `core/challenge.rs`; it is mounted here (rather than in `core/mod.rs`) so
-// the whole challenge subsystem stays within the CI-federation ownership
-// boundary. Public path: `crate::ci_federation::challenge`.
-#[path = "challenge.rs"]
-pub mod challenge;
+//!
+//! The single-use freshness-challenge table for sealed invocations lives in
+//! the sibling [`crate::core::challenge`] module.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

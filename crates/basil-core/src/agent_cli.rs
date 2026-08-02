@@ -58,7 +58,10 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 const MAX_INVOCATION_TTL_SECS: u32 = 300;
 const MAX_INVOCATION_CLOCK_SKEW_SECS: u32 = 300;
-const MAX_INVOCATION_REPLAY_CACHE_CAPACITY: usize = 1_000_000;
+/// Upper bound for the in-memory invocation tables: the challenge-table
+/// capacity, its tracked rate-limit partitions, and the per-rule run-quota
+/// bucket allowance.
+const MAX_INVOCATION_TABLE_CAPACITY: usize = 1_000_000;
 const BROKER_KEY_USE_LABEL: &str = "broker_key_use";
 const BROKER_RESPONSE_SIGNING_USE: &str = "response-signing";
 const BROKER_REQUEST_ENCRYPTION_USE: &str = "request-encryption";
@@ -941,8 +944,8 @@ pub(crate) struct InvocationConfigFile {
     max_ttl_secs: u32,
     /// Allowed clock skew in seconds.
     clock_skew_secs: u32,
-    /// Maximum in-memory replay-cache entries.
-    replay_cache_capacity: usize,
+    /// Freshness-challenge table shape (`[invocation.challenge]`).
+    challenge: ChallengeConfigFile,
     /// Maximum distinct tracked per-run quota buckets per federation rule.
     /// The bound is per rule so one federated tenant's runs can never
     /// exhaust another tenant's tracking allowance.
@@ -961,10 +964,79 @@ impl Default for InvocationConfigFile {
             request_encryption_key_id: None,
             max_ttl_secs: basil_proto::invocation::DEFAULT_EXPIRES_AFTER_SECS,
             clock_skew_secs: 30,
-            replay_cache_capacity: 4096,
+            challenge: ChallengeConfigFile::default(),
             run_quota_buckets_per_rule:
                 crate::core::ci_federation::DEFAULT_MAX_TRACKED_RUN_BUCKETS_PER_RULE,
             require_challenge: false,
+        }
+    }
+}
+
+/// The `[invocation.challenge]` section: the freshness-challenge table shape.
+///
+/// Defaults mirror the SPEC (`docs/ci-oidc-federation/SPEC.md`, Capacity,
+/// rate limiting, and restart): global capacity 16,384. The per-key
+/// outstanding cap (8) and the challenge TTL (60 seconds) are spec-fixed and
+/// not configurable.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub(crate) struct ChallengeConfigFile {
+    /// Global maximum of outstanding challenges. Default `16384`.
+    capacity: usize,
+    /// Maximum tracked issuance rate-limit partitions per partition kind
+    /// (per proof key and per courier-observed source). When a new partition
+    /// cannot be tracked, issuance is declined rather than served unmetered.
+    /// Default `16384`.
+    tracked_partitions: usize,
+    /// Global issuance token bucket. Default `{ burst = 512,
+    /// refill-per-sec = 128 }`.
+    global_rate: RateConfigFile,
+    /// Per proof-key-thumbprint issuance token bucket. Default `{ burst = 8,
+    /// refill-per-sec = 4 }`.
+    per_jkt_rate: RateConfigFile,
+    /// Per courier-observed-source issuance token bucket. Default
+    /// `{ burst = 64, refill-per-sec = 16 }`.
+    per_source_rate: RateConfigFile,
+}
+
+impl Default for ChallengeConfigFile {
+    fn default() -> Self {
+        let defaults = crate::core::challenge::ChallengeTableConfig::default();
+        Self {
+            capacity: defaults.global_capacity,
+            tracked_partitions: defaults.tracked_partitions,
+            global_rate: RateConfigFile::from(defaults.global_rate),
+            per_jkt_rate: RateConfigFile::from(defaults.per_jkt_rate),
+            per_source_rate: RateConfigFile::from(defaults.per_source_rate),
+        }
+    }
+}
+
+/// One issuance token bucket: maximum burst and sustained refill per second.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub(crate) struct RateConfigFile {
+    /// Maximum tokens held (and the initial fill).
+    burst: u32,
+    /// Tokens restored per elapsed second, up to `burst`. Zero makes the
+    /// bucket burst-only.
+    refill_per_sec: u32,
+}
+
+impl From<crate::core::challenge::TokenBucketConfig> for RateConfigFile {
+    fn from(config: crate::core::challenge::TokenBucketConfig) -> Self {
+        Self {
+            burst: config.burst,
+            refill_per_sec: config.refill_per_sec,
+        }
+    }
+}
+
+impl From<RateConfigFile> for crate::core::challenge::TokenBucketConfig {
+    fn from(file: RateConfigFile) -> Self {
+        Self {
+            burst: file.burst,
+            refill_per_sec: file.refill_per_sec,
         }
     }
 }
@@ -1448,20 +1520,13 @@ fn resolve_invocation_config(
             "invocation.clock-skew-secs must be at most {MAX_INVOCATION_CLOCK_SKEW_SECS} seconds"
         );
     }
-    if file.replay_cache_capacity == 0 {
-        bail!("invocation.replay-cache-capacity must be greater than zero");
-    }
-    if file.replay_cache_capacity > MAX_INVOCATION_REPLAY_CACHE_CAPACITY {
-        bail!(
-            "invocation.replay-cache-capacity must be at most {MAX_INVOCATION_REPLAY_CACHE_CAPACITY}"
-        );
-    }
+    let challenge_table = resolve_challenge_config(&file.challenge)?;
     if file.run_quota_buckets_per_rule == 0 {
         bail!("invocation.run-quota-buckets-per-rule must be greater than zero");
     }
-    if file.run_quota_buckets_per_rule > MAX_INVOCATION_REPLAY_CACHE_CAPACITY {
+    if file.run_quota_buckets_per_rule > MAX_INVOCATION_TABLE_CAPACITY {
         bail!(
-            "invocation.run-quota-buckets-per-rule must be at most {MAX_INVOCATION_REPLAY_CACHE_CAPACITY}"
+            "invocation.run-quota-buckets-per-rule must be at most {MAX_INVOCATION_TABLE_CAPACITY}"
         );
     }
     let broker_identity = resolve_broker_identity_config(identity_file)?;
@@ -1498,10 +1563,48 @@ fn resolve_invocation_config(
         request_encryption_key_id,
         max_ttl_secs: file.max_ttl_secs,
         clock_skew_secs: file.clock_skew_secs,
-        replay_cache_capacity: file.replay_cache_capacity,
+        challenge_table,
         run_quota_buckets_per_rule: file.run_quota_buckets_per_rule,
         require_challenge: file.require_challenge,
         now_unix_override: None,
+    })
+}
+
+/// Validate `[invocation.challenge]` and build the challenge-table shape.
+fn resolve_challenge_config(
+    file: &ChallengeConfigFile,
+) -> Result<crate::core::challenge::ChallengeTableConfig> {
+    if file.capacity == 0 {
+        bail!("invocation.challenge.capacity must be greater than zero");
+    }
+    if file.capacity > MAX_INVOCATION_TABLE_CAPACITY {
+        bail!("invocation.challenge.capacity must be at most {MAX_INVOCATION_TABLE_CAPACITY}");
+    }
+    if file.tracked_partitions == 0 {
+        bail!("invocation.challenge.tracked-partitions must be greater than zero");
+    }
+    if file.tracked_partitions > MAX_INVOCATION_TABLE_CAPACITY {
+        bail!(
+            "invocation.challenge.tracked-partitions must be at most {MAX_INVOCATION_TABLE_CAPACITY}"
+        );
+    }
+    for (name, rate) in [
+        ("global-rate", file.global_rate),
+        ("per-jkt-rate", file.per_jkt_rate),
+        ("per-source-rate", file.per_source_rate),
+    ] {
+        if rate.burst == 0 {
+            // A zero burst would silently decline every issuance forever.
+            bail!("invocation.challenge.{name}.burst must be greater than zero");
+        }
+    }
+    Ok(crate::core::challenge::ChallengeTableConfig {
+        global_capacity: file.capacity,
+        tracked_partitions: file.tracked_partitions,
+        global_rate: file.global_rate.into(),
+        per_jkt_rate: file.per_jkt_rate.into(),
+        per_source_rate: file.per_source_rate.into(),
+        ..crate::core::challenge::ChallengeTableConfig::default()
     })
 }
 
@@ -3956,6 +4059,32 @@ bundle = "/cfg/bundle.sealed"
         std::fs::remove_file(config).expect("remove temp config");
     }
 
+    fn assert_challenge_config_defaults(challenge: &ChallengeConfigFile) {
+        assert_eq!(challenge.capacity, 16_384, "SPEC default capacity");
+        assert_eq!(challenge.tracked_partitions, 16_384);
+        assert_eq!(challenge.global_rate.burst, 512);
+        assert_eq!(challenge.global_rate.refill_per_sec, 128);
+        assert_eq!(challenge.per_jkt_rate.burst, 8);
+        assert_eq!(challenge.per_jkt_rate.refill_per_sec, 4);
+        assert_eq!(challenge.per_source_rate.burst, 64);
+        assert_eq!(challenge.per_source_rate.refill_per_sec, 16);
+    }
+
+    /// The `[invocation.challenge]` values written by the loaded-config test.
+    fn assert_challenge_table_overrides(table: &crate::core::challenge::ChallengeTableConfig) {
+        assert_eq!(table.global_capacity, 128);
+        assert_eq!(table.tracked_partitions, 32);
+        assert_eq!(table.global_rate.burst, 100);
+        assert_eq!(table.global_rate.refill_per_sec, 10);
+        assert_eq!(table.per_jkt_rate.burst, 4);
+        assert_eq!(table.per_jkt_rate.refill_per_sec, 2);
+        assert_eq!(table.per_source_rate.burst, 20);
+        assert_eq!(table.per_source_rate.refill_per_sec, 5);
+        // Spec-fixed bounds stay at their defaults regardless of the file.
+        assert_eq!(table.per_jkt_capacity, 8);
+        assert_eq!(table.ttl_secs, 60);
+    }
+
     #[test]
     fn invocation_service_requires_explicit_config_enable() {
         let defaults = InvocationConfigFile::default();
@@ -3965,7 +4094,7 @@ bundle = "/cfg/bundle.sealed"
         );
         assert_eq!(defaults.max_ttl_secs, 60);
         assert_eq!(defaults.clock_skew_secs, 30);
-        assert_eq!(defaults.replay_cache_capacity, 4096);
+        assert_challenge_config_defaults(&defaults.challenge);
         assert_eq!(defaults.run_quota_buckets_per_rule, 4096);
         assert!(
             !defaults.require_challenge,
@@ -4002,9 +4131,15 @@ audience = ["basil://prod/us-east-1/agent-a"]
 request-encryption-key-id = "broker.request"
 max-ttl-secs = 45
 clock-skew-secs = 7
-replay-cache-capacity = 128
 run-quota-buckets-per-rule = 64
 require-challenge = true
+
+[invocation.challenge]
+capacity = 128
+tracked-partitions = 32
+global-rate = { burst = 100, refill-per-sec = 10 }
+per-jkt-rate = { burst = 4, refill-per-sec = 2 }
+per-source-rate = { burst = 20, refill-per-sec = 5 }
 "#,
         );
         let args = overrides_for(config.clone());
@@ -4027,7 +4162,7 @@ require-challenge = true
         );
         assert_eq!(loaded.invocation.max_ttl_secs, 45);
         assert_eq!(loaded.invocation.clock_skew_secs, 7);
-        assert_eq!(loaded.invocation.replay_cache_capacity, 128);
+        assert_challenge_table_overrides(&loaded.invocation.challenge_table);
         assert_eq!(loaded.invocation.run_quota_buckets_per_rule, 64);
         assert!(loaded.invocation.require_challenge);
 
@@ -4285,7 +4420,7 @@ file = "/run/credentials/auth.json"
             request_encryption_key_id: Some("broker.request".to_string()),
             max_ttl_secs: 60,
             clock_skew_secs: 30,
-            replay_cache_capacity: 4096,
+            challenge_table: crate::core::challenge::ChallengeTableConfig::default(),
             run_quota_buckets_per_rule: 4096,
             require_challenge: false,
             now_unix_override: None,

@@ -457,7 +457,9 @@ fn build_config_toml(args: &InitArgs, layout: &Layout) -> String {
     out.push_str("# request-encryption-key-id = \"broker.request_encryption.2026q3\"\n");
     out.push_str("# max-ttl-secs = 60\n");
     out.push_str("# clock-skew-secs = 30\n");
-    out.push_str("# replay-cache-capacity = 4096\n");
+    out.push('\n');
+    out.push_str("# [invocation.challenge]\n");
+    out.push_str("# capacity = 16384\n");
     out
 }
 

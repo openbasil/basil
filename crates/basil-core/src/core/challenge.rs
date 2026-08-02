@@ -216,16 +216,6 @@ pub struct ChallengeTable {
 }
 
 impl ChallengeTable {
-    /// Build a table with the default shape and a configured global
-    /// capacity (the legacy construction seam used by the broker adapter).
-    #[must_use]
-    pub fn new(global_capacity: usize) -> Self {
-        Self::with_config(ChallengeTableConfig {
-            global_capacity: global_capacity.max(1),
-            ..ChallengeTableConfig::default()
-        })
-    }
-
     /// Build a table with an explicit configuration.
     #[must_use]
     pub fn with_config(config: ChallengeTableConfig) -> Self {
