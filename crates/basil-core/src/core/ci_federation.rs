@@ -8,6 +8,13 @@
 //! The provider, issuer, key locations, and claim selectors are trusted
 //! configuration; the token supplies evidence only.
 
+// The freshness-challenge table lives beside this module as
+// `core/challenge.rs`; it is mounted here (rather than in `core/mod.rs`) so
+// the whole challenge subsystem stays within the CI-federation ownership
+// boundary. Public path: `crate::ci_federation::challenge`.
+#[path = "challenge.rs"]
+pub mod challenge;
+
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1199,12 +1206,19 @@ fn decimal(value: &str) -> Result<u64, FederationError> {
         .ok_or(FederationError::Malformed)
 }
 
-fn thumbprint(public_key: &[u8]) -> String {
+fn thumbprint(public_key: &[u8; 32]) -> String {
+    URL_SAFE_NO_PAD.encode(proof_key_thumbprint(public_key))
+}
+
+/// Return the raw RFC 7638 SHA-256 thumbprint (`jkt`) bytes for an Ed25519
+/// proof key: the value bound by challenge issuance and consumption.
+#[must_use]
+pub fn proof_key_thumbprint(public_key: &[u8; 32]) -> [u8; 32] {
     let jwk = format!(
         r#"{{"crv":"Ed25519","kty":"OKP","x":"{}"}}"#,
         URL_SAFE_NO_PAD.encode(public_key)
     );
-    URL_SAFE_NO_PAD.encode(Sha256::digest(jwk.as_bytes()))
+    Sha256::digest(jwk.as_bytes()).into()
 }
 
 /// Construct the only audience accepted for an ephemeral Ed25519 proof key.

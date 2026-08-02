@@ -4,7 +4,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -41,6 +41,9 @@ use crate::transport::{broker_status, peer_from_request};
 const BROKER_KEY_USE_LABEL: &str = "broker_key_use";
 const BROKER_RESPONSE_ENCRYPTION_USE: &str = "response-encryption";
 const INVOKE_OP: &str = "invoke";
+const CHALLENGE_OP: &str = "get_invocation_challenge";
+/// Wire bound on `courier_observed_source`: a rate-limit partition key only.
+const MAX_COURIER_SOURCE_BYTES: usize = 128;
 
 #[tonic::async_trait]
 impl InvocationService for BrokerGrpc {
@@ -53,31 +56,85 @@ impl InvocationService for BrokerGrpc {
                 "InvocationService is disabled; set invocation.enable=true to accept sealed invocations",
             ));
         }
-        let prepared = self.prepare_invocation(&request).await?;
-        tracing::debug!(
-            sender_subject = %prepared.actor.subject,
-            recipient_key_id = %prepared.recipient_key_id,
-            plaintext_len = prepared.body.len(),
-            "sealed invocation preflight accepted",
-        );
-        self.execute_invocation(prepared)
-            .await
-            .map(Response::new)
-            .map_err(|error| {
-                tracing::warn!(%error, "sealed invocation response protection failed");
-                response_protection_failed()
-            })
+        match self.prepare_invocation(&request).await? {
+            PreparedRequest::Proceed(prepared) => {
+                tracing::debug!(
+                    sender_subject = %prepared.actor.subject,
+                    recipient_key_id = %prepared.recipient_key_id,
+                    plaintext_len = prepared.body.len(),
+                    "sealed invocation preflight accepted",
+                );
+                self.execute_invocation(*prepared)
+                    .await
+                    .map(Response::new)
+                    .map_err(|error| {
+                        tracing::warn!(%error, "sealed invocation response protection failed");
+                        response_protection_failed()
+                    })
+            }
+            PreparedRequest::ChallengeDenied(denied) => self
+                .protect_challenge_denied(&denied)
+                .await
+                .map(Response::new)
+                .map_err(|error| {
+                    tracing::warn!(%error, "sealed invocation response protection failed");
+                    response_protection_failed()
+                }),
+        }
     }
 
-    // Wire-surface stub (basil-jjgi.3.1): broker challenge issuance lands
-    // with the follow-on broker child (basil-jjgi.3.2).
+    /// Issue a single-use freshness challenge (SPEC rev 4 Freshness).
+    ///
+    /// Reachable without authentication: the requested `jkt` is self-asserted
+    /// and grants nothing; it only binds the issued challenge to one proof
+    /// key and partitions issuance rate limits. Declined issuance under
+    /// capacity or rate-limit pressure is `RESOURCE_EXHAUSTED` with the
+    /// stable reason `CHALLENGE_ISSUANCE_DECLINED`, retryable with the same
+    /// request after backoff.
     async fn get_invocation_challenge(
         &self,
-        _request: Request<pb::GetInvocationChallengeRequest>,
+        request: Request<pb::GetInvocationChallengeRequest>,
     ) -> GrpcResult<pb::GetInvocationChallengeResponse> {
-        Err(Status::unimplemented(
-            "GetInvocationChallenge is not implemented yet",
-        ))
+        if !self.invocation.enabled {
+            return Err(broker_status(
+                Code::FailedPrecondition,
+                "INVOCATION_DISABLED",
+                CHALLENGE_OP,
+                "InvocationService is disabled; set invocation.enable=true to issue challenges",
+            ));
+        }
+        let body = request.get_ref();
+        let Ok(jkt) = <[u8; 32]>::try_from(body.jkt.as_slice()) else {
+            return Err(invalid_request(
+                CHALLENGE_OP,
+                "jkt must be exactly 32 bytes",
+            ));
+        };
+        let source = body.courier_observed_source.as_deref();
+        if source.is_some_and(|source| source.len() > MAX_COURIER_SOURCE_BYTES) {
+            return Err(invalid_request(
+                CHALLENGE_OP,
+                "courier_observed_source exceeds 128 bytes",
+            ));
+        }
+        let generation = self.state.load_generation().id();
+        let now = i64::from(self.invocation_now_unix());
+        let issued = self
+            .invocation_replay_cache
+            .lock()
+            .map_err(|_| challenge_table_unavailable(CHALLENGE_OP))?
+            .issue(jkt, source, generation, now);
+        match issued {
+            Ok(issued) => Ok(Response::new(pb::GetInvocationChallengeResponse {
+                challenge: issued.challenge.to_vec(),
+                generation,
+                expires_at_unix: issued.expires_at_unix,
+            })),
+            Err(decline) => {
+                tracing::debug!(reason = %decline, "invocation challenge issuance declined");
+                Err(challenge_issuance_declined())
+            }
+        }
     }
 }
 
@@ -103,6 +160,15 @@ impl fmt::Debug for DecryptedInvocationBody {
     }
 }
 
+/// Outcome of the invocation preflight: proceed to the typed operation, or
+/// answer a freshness denial with a sealed non-retryable `CHALLENGE_UNKNOWN`
+/// without touching authorization, quota, or the backend.
+#[derive(Debug)]
+enum PreparedRequest {
+    Proceed(Box<PreparedInvocation>),
+    ChallengeDenied(DeniedInvocation),
+}
+
 #[derive(Debug)]
 struct PreparedInvocation {
     generation: std::sync::Arc<crate::state::Generation>,
@@ -116,6 +182,60 @@ struct PreparedInvocation {
     body: DecryptedInvocationBody,
 }
 
+impl PreparedInvocation {
+    fn envelope(&self) -> ResponseEnvelope<'_> {
+        ResponseEnvelope {
+            response_key_id: &self.response_key_id,
+            response_subject: self.response_subject.as_deref(),
+            request_message: &self.request_message,
+            request_message_id: &self.claims.message_id,
+        }
+    }
+}
+
+/// A request denied at the freshness-challenge step. Carries exactly what is
+/// needed to protect the sealed denial response; the request body is never
+/// decrypted.
+#[derive(Debug)]
+struct DeniedInvocation {
+    generation: std::sync::Arc<crate::state::Generation>,
+    response_key_id: String,
+    response_subject: Option<String>,
+    request_message_id: MessageId,
+    request_message: Vec<u8>,
+}
+
+impl DeniedInvocation {
+    fn envelope(&self) -> ResponseEnvelope<'_> {
+        ResponseEnvelope {
+            response_key_id: &self.response_key_id,
+            response_subject: self.response_subject.as_deref(),
+            request_message: &self.request_message,
+            request_message_id: &self.request_message_id,
+        }
+    }
+}
+
+/// The request-derived inputs of response protection, shared by success,
+/// operation-status, and challenge-denial responses.
+struct ResponseEnvelope<'a> {
+    response_key_id: &'a str,
+    response_subject: Option<&'a str>,
+    request_message: &'a [u8],
+    request_message_id: &'a MessageId,
+}
+
+/// Why the freshness-challenge step denied the request. Every variant maps
+/// to the sealed `CHALLENGE_UNKNOWN` (`retryable = false`); the client
+/// obtains a fresh challenge and rebuilds with a fresh message ID.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+enum ChallengeDenial {
+    #[error("missing required freshness challenge")]
+    Missing,
+    #[error("{0}")]
+    Denied(crate::ci_federation::challenge::ConsumeDenied),
+}
+
 impl BrokerGrpc {
     #[allow(
         clippy::too_many_lines,
@@ -124,7 +244,7 @@ impl BrokerGrpc {
     async fn prepare_invocation(
         &self,
         request: &Request<pb::SealedRequest>,
-    ) -> Result<PreparedInvocation, Status> {
+    ) -> Result<PreparedRequest, Status> {
         let message = request.get_ref();
         if message.message.is_empty() {
             return Err(invalid_request(INVOKE_OP, "missing sealed COSE message"));
@@ -203,7 +323,8 @@ impl BrokerGrpc {
         {
             return Err(invalid_request(INVOKE_OP, "missing proof key"));
         }
-        if let Some(proof_key) = &sealed.protected_headers.signer_public_key_cose {
+        let proof_public = if let Some(proof_key) = &sealed.protected_headers.signer_public_key_cose
+        {
             let public = crate::ci_federation::decode_proof_key_cose(proof_key)
                 .map_err(|_| invalid_request(INVOKE_OP, "malformed proof key"))?;
             let expected_audience = crate::ci_federation::proof_audience(&public);
@@ -215,7 +336,10 @@ impl BrokerGrpc {
             if sealed.protected_headers.signer_certificates_jwt.is_empty() {
                 return Err(invalid_request(INVOKE_OP, "missing signer certificate"));
             }
-        }
+            Some(public)
+        } else {
+            None
+        };
 
         let Some(uid) = peer.uid else {
             self.state
@@ -230,6 +354,49 @@ impl BrokerGrpc {
                 ));
             return Err(unauthorized_invocation());
         };
+
+        // Freshness (SPEC rev 4, step 4): consume the single-use challenge
+        // after the outer signature verified and the thumbprint is known,
+        // and before subject resolution, the per-run quota hook
+        // (basil-jjgi.3.4 slots in after subject resolution below),
+        // authorization, or any backend use of the requested operation. A
+        // denial is answered as a sealed non-retryable `CHALLENGE_UNKNOWN`
+        // without decrypting the request body.
+        if let Err(denial) = self.consume_freshness_challenge(
+            generation_id,
+            &sealed.claims,
+            proof_public.as_ref(),
+            &policy_verifier,
+        )? {
+            tracing::debug!(reason = %denial, "sealed invocation freshness challenge denied");
+            self.state
+                .record_decision(&DecisionRecord::from_resolution_error(
+                    generation_id,
+                    &peer,
+                    Op::Decrypt,
+                    key_id_for_audit(&sealed.recipient_key_id),
+                    None,
+                    EvidenceState::NoMatch,
+                    &format!("freshness_challenge_denied: {denial}"),
+                ));
+            let response_key_id = required_response_key_id(&sealed.claims)?.to_string();
+            self.validate_response_encryption_key(&generation, &response_key_id)
+                .await?;
+            let response_subject = sealed
+                .claims
+                .response_subject
+                .as_ref()
+                .map(ResponseSubject::as_str)
+                .map(str::to_string);
+            return Ok(PreparedRequest::ChallengeDenied(DeniedInvocation {
+                generation,
+                response_key_id,
+                response_subject,
+                request_message_id: sealed.claims.message_id.clone(),
+                request_message: message.message.clone(),
+            }));
+        }
+
         let actor = if let Some(provider) = provider_evidence {
             let Some(mut actor) = generation.pdp().resolve_subject_actor(&provider.subject) else {
                 return Err(unauthorized_invocation());
@@ -279,12 +446,7 @@ impl BrokerGrpc {
 
         let recipient_key_id = catalog_key_id(&sealed.recipient_key_id, "recipient key id")?;
         self.validate_request_recipient_key(recipient_key_id)?;
-        let response_key_id = sealed
-            .claims
-            .response_key_id
-            .as_ref()
-            .ok_or_else(|| invalid_request(INVOKE_OP, "missing response encryption key"))?;
-        let response_key_id = catalog_key_id(response_key_id, "response encryption key")?;
+        let response_key_id = required_response_key_id(&sealed.claims)?;
 
         let decision = generation
             .pdp()
@@ -303,11 +465,6 @@ impl BrokerGrpc {
 
         self.validate_response_encryption_key(&generation, response_key_id)
             .await?;
-        self.check_replay(
-            &sealed.signer_key_id,
-            &sealed.claims.message_id,
-            effective_expires_at_unix(&sealed.claims)?,
-        )?;
 
         let opened = sealed
             .open(
@@ -330,7 +487,7 @@ impl BrokerGrpc {
             .as_ref()
             .map(ResponseSubject::as_str)
             .map(str::to_string);
-        Ok(PreparedInvocation {
+        Ok(PreparedRequest::Proceed(Box::new(PreparedInvocation {
             generation,
             actor,
             recipient_key_id: recipient_key_id.to_string(),
@@ -340,7 +497,71 @@ impl BrokerGrpc {
             claims: sealed.claims,
             request_message: message.message.clone(),
             body: DecryptedInvocationBody::new(opened.plaintext),
-        })
+        })))
+    }
+
+    /// Consume the request's single-use freshness challenge.
+    ///
+    /// Proof-bound requests (an ephemeral proof key in the signer headers)
+    /// must present a challenge. Subject-key requests may — and must when the
+    /// broker is configured with `invocation.require-challenge` (courier
+    /// deployments); when present it is enforced identically, bound to the
+    /// verified Ed25519 subject key's RFC 7638 thumbprint. `Ok(Err(_))` is a
+    /// freshness denial that surfaces as the sealed non-retryable
+    /// `CHALLENGE_UNKNOWN`; `Err(_)` is an envelope error.
+    fn consume_freshness_challenge(
+        &self,
+        generation_id: u64,
+        claims: &Claims,
+        proof_public: Option<&[u8; 32]>,
+        verifier: &PolicyVerifier<'_>,
+    ) -> Result<Result<(), ChallengeDenial>, Status> {
+        let Some(challenge) = claims.freshness_challenge else {
+            if proof_public.is_some() || self.invocation.require_challenge {
+                return Ok(Err(ChallengeDenial::Missing));
+            }
+            return Ok(Ok(()));
+        };
+        let jkt = if let Some(public) = proof_public {
+            crate::ci_federation::proof_key_thumbprint(public)
+        } else {
+            let evidence = verifier.verified_key()?;
+            if evidence.algorithm != SignatureKeyAlgorithm::Ed25519 {
+                return Err(invalid_request(
+                    INVOKE_OP,
+                    "freshness challenge requires an Ed25519 invocation signature key",
+                ));
+            }
+            let public = decode_ed25519_public(&evidence.public)
+                .ok_or_else(|| invalid_request(INVOKE_OP, "verified signature key is malformed"))?;
+            crate::ci_federation::proof_key_thumbprint(&public)
+        };
+        let now = i64::from(self.invocation_now_unix());
+        let outcome = self
+            .invocation_replay_cache
+            .lock()
+            .map_err(|_| challenge_table_unavailable(INVOKE_OP))?
+            .consume(challenge.as_bytes(), &jkt, generation_id, now);
+        Ok(outcome.map_err(ChallengeDenial::Denied))
+    }
+
+    /// Protect the sealed `CHALLENGE_UNKNOWN` denial for a request whose
+    /// freshness challenge did not consume.
+    async fn protect_challenge_denied(
+        &self,
+        denied: &DeniedInvocation,
+    ) -> Result<pb::SealedResponse, ResponseProtectionError> {
+        let body = SignInvocationResponse {
+            status: InvocationStatus::challenge_unknown(),
+            policy_generation: denied.generation.id(),
+            signature: None,
+        };
+        self.protect_response(
+            &denied.envelope(),
+            CONTENT_TYPE_SIGN_RESPONSE,
+            &body.to_cbor_bytes(),
+        )
+        .await
     }
 
     async fn execute_invocation(
@@ -355,8 +576,12 @@ impl BrokerGrpc {
                 policy_generation: prepared.generation.id(),
                 signature: None,
             };
-            self.protect_response(&prepared, CONTENT_TYPE_SIGN_RESPONSE, &body.to_cbor_bytes())
-                .await
+            self.protect_response(
+                &prepared.envelope(),
+                CONTENT_TYPE_SIGN_RESPONSE,
+                &body.to_cbor_bytes(),
+            )
+            .await
         }
     }
 
@@ -438,8 +663,12 @@ impl BrokerGrpc {
             policy_generation,
             signature: Some(signature),
         };
-        self.protect_response(&prepared, CONTENT_TYPE_SIGN_RESPONSE, &body.to_cbor_bytes())
-            .await
+        self.protect_response(
+            &prepared.envelope(),
+            CONTENT_TYPE_SIGN_RESPONSE,
+            &body.to_cbor_bytes(),
+        )
+        .await
     }
 
     async fn protect_sign_status_response(
@@ -453,8 +682,12 @@ impl BrokerGrpc {
             policy_generation,
             signature: None,
         };
-        self.protect_response(prepared, CONTENT_TYPE_SIGN_RESPONSE, &body.to_cbor_bytes())
-            .await
+        self.protect_response(
+            &prepared.envelope(),
+            CONTENT_TYPE_SIGN_RESPONSE,
+            &body.to_cbor_bytes(),
+        )
+        .await
     }
 
     fn validate_request_recipient_key(&self, recipient_key_id: &str) -> Result<(), Status> {
@@ -510,7 +743,7 @@ impl BrokerGrpc {
 
     async fn protect_response(
         &self,
-        prepared: &PreparedInvocation,
+        envelope: &ResponseEnvelope<'_>,
         content_type: &str,
         plaintext_body: &[u8],
     ) -> Result<pb::SealedResponse, ResponseProtectionError> {
@@ -522,7 +755,7 @@ impl BrokerGrpc {
         let recipient_public = self
             .state
             .manager()
-            .sealing_public_key(&prepared.response_key_id)
+            .sealing_public_key(envelope.response_key_id)
             .await
             .map_err(ResponseProtectionError::Manager)?;
         let now = self.invocation_now_unix();
@@ -539,8 +772,8 @@ impl BrokerGrpc {
             sender_key_id: Some(signer_key_id.clone()),
             response_key_id: None,
             response_subject: None,
-            in_reply_to: Some(prepared.claims.message_id.clone()),
-            request_hash: Some(request_hash(&prepared.request_message)),
+            in_reply_to: Some(envelope.request_message_id.clone()),
+            request_hash: Some(request_hash(envelope.request_message)),
             freshness_challenge: None,
         };
         let message = build_sealed(
@@ -550,7 +783,7 @@ impl BrokerGrpc {
                 claims,
                 role: MessageRole::Response,
                 recipient: X25519RecipientPublic {
-                    key_id: KeyId::from_text(&prepared.response_key_id)?,
+                    key_id: KeyId::from_text(envelope.response_key_id)?,
                     public: recipient_public,
                 },
                 content_algorithm: ContentAlgorithm::A256Gcm,
@@ -565,7 +798,7 @@ impl BrokerGrpc {
         .await?;
         Ok(pb::SealedResponse {
             message: message.into_vec(),
-            response_subject: prepared.response_subject.clone(),
+            response_subject: envelope.response_subject.map(str::to_string),
         })
     }
 
@@ -591,29 +824,6 @@ impl BrokerGrpc {
             allowed_audiences,
             role: MessageRole::Request,
         })
-    }
-
-    fn check_replay(
-        &self,
-        sender_sign_id: &KeyId,
-        message_id: &MessageId,
-        expires_at_unix: u32,
-    ) -> Result<(), Status> {
-        let sender = encode_id(sender_sign_id.as_bytes());
-        let message = encode_id(message_id.as_bytes());
-        let mut cache = self
-            .invocation_replay_cache
-            .lock()
-            .map_err(|_| invalid_request(INVOKE_OP, "invocation replay cache unavailable"))?;
-        cache
-            .check_and_insert(
-                &sender,
-                &message,
-                expires_at_unix,
-                self.invocation.clock_skew_secs,
-                self.invocation_now_unix(),
-            )
-            .map_err(|e| invalid_request(INVOKE_OP, e.to_string()))
     }
 
     /// Resolve the JWKS to verify against for one federation rule.
@@ -830,15 +1040,37 @@ fn encode_id(bytes: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
-fn effective_expires_at_unix(claims: &Claims) -> Result<u32, Status> {
-    let effective = match claims.expires_at {
-        Some(UnixTime(exp)) => exp,
-        None => claims
-            .issued_at
-            .0
-            .saturating_add(i64::from(DEFAULT_EXPIRES_AFTER_SECS)),
-    };
-    u32::try_from(effective).map_err(|_| invalid_request(INVOKE_OP, "claim expiry out of range"))
+/// Parse the required response-encryption key ID out of the request claims.
+fn required_response_key_id(claims: &Claims) -> Result<&str, Status> {
+    let response_key_id = claims
+        .response_key_id
+        .as_ref()
+        .ok_or_else(|| invalid_request(INVOKE_OP, "missing response encryption key"))?;
+    catalog_key_id(response_key_id, "response encryption key")
+}
+
+/// The stable, retryable decline for challenge issuance under capacity or
+/// rate-limit pressure. The same request may be retried after backoff.
+fn challenge_issuance_declined() -> Status {
+    broker_status(
+        Code::ResourceExhausted,
+        "CHALLENGE_ISSUANCE_DECLINED",
+        CHALLENGE_OP,
+        "challenge issuance declined; retry after backoff",
+    )
+}
+
+/// Internal broker fault: the challenge-table mutex is poisoned. Unreachable
+/// under the no-panic rule, and honestly labeled as a server error rather
+/// than a client error or a retryable decline (a poisoned mutex never
+/// recovers).
+fn challenge_table_unavailable(op: &'static str) -> Status {
+    broker_status(
+        Code::Internal,
+        "CHALLENGE_TABLE_UNAVAILABLE",
+        op,
+        "challenge table unavailable",
+    )
 }
 
 struct PolicyVerifier<'a> {
@@ -991,59 +1223,15 @@ impl Signer for ManagerSigner<'_> {
     }
 }
 
-#[derive(Debug)]
-pub(super) struct InvocationReplayCache {
-    capacity: usize,
-    order: VecDeque<(String, String)>,
-    entries: HashMap<(String, String), u32>,
-}
-
-impl InvocationReplayCache {
-    pub(super) fn new(capacity: usize) -> Self {
-        Self {
-            capacity: capacity.max(1),
-            order: VecDeque::new(),
-            entries: HashMap::new(),
-        }
-    }
-
-    fn check_and_insert(
-        &mut self,
-        sender_sign_id: &str,
-        message_id: &str,
-        expires_at_unix: u32,
-        clock_skew_secs: u32,
-        now_unix: u32,
-    ) -> Result<(), ReplayError> {
-        self.evict_expired(now_unix);
-        let key = (sender_sign_id.to_string(), message_id.to_string());
-        if self.entries.contains_key(&key) {
-            return Err(ReplayError::ReplayedMessageId);
-        }
-        while self.entries.len() >= self.capacity {
-            if let Some(oldest) = self.order.pop_front() {
-                self.entries.remove(&oldest);
-            } else {
-                break;
-            }
-        }
-        self.order.push_back(key.clone());
-        self.entries
-            .insert(key, expires_at_unix.saturating_add(clock_skew_secs));
-        Ok(())
-    }
-
-    fn evict_expired(&mut self, now_unix: u32) {
-        self.entries.retain(|_, expires_at| *expires_at >= now_unix);
-        self.order.retain(|key| self.entries.contains_key(key));
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-enum ReplayError {
-    #[error("replayed `message_id`")]
-    ReplayedMessageId,
-}
+/// Transitional name for the single-use freshness-challenge table.
+///
+/// The legacy message-ID replay cache is removed (SPEC rev 4 Freshness): the
+/// COSE message ID is correlation-only, and freshness rests on server-issued
+/// single-use challenges. The name survives because the broker adapter
+/// (`service/broker.rs`) constructs `InvocationReplayCache::new(capacity)`
+/// with its `replay_cache_capacity` knob, now the challenge table's global
+/// capacity; renaming that field and knob is tracked as a follow-up.
+pub(super) type InvocationReplayCache = crate::ci_federation::challenge::ChallengeTable;
 
 fn expression_signature_verifies(
     expression: &crate::catalog::EvidenceExpression,
@@ -1349,6 +1537,7 @@ mod tests {
                 max_ttl_secs: DEFAULT_EXPIRES_AFTER_SECS,
                 clock_skew_secs: 5,
                 replay_cache_capacity: 16,
+                require_challenge: false,
                 now_unix_override: Some(NOW),
             },
         );
@@ -1697,17 +1886,6 @@ mod tests {
     }
 
     #[test]
-    fn replay_cache_rejects_duplicate_sender_message_pair() {
-        let mut cache = InvocationReplayCache::new(8);
-        assert_eq!(cache.check_and_insert("s", "m", 20, 0, 10), Ok(()));
-        assert_eq!(
-            cache.check_and_insert("s", "m", 20, 0, 10),
-            Err(ReplayError::ReplayedMessageId)
-        );
-        assert_eq!(cache.check_and_insert("s", "other", 20, 0, 10), Ok(()));
-    }
-
-    #[test]
     fn request_hash_uses_complete_request_bytes() {
         let h1 = request_hash(b"request-a");
         let h2 = request_hash(b"request-b");
@@ -1733,17 +1911,235 @@ mod tests {
         assert_eq!(body.signature.as_ref().unwrap().len(), 64);
     }
 
-    #[tokio::test]
-    async fn replay_is_rejected_before_second_open() {
-        let fixture = fixture();
-        let request_message = valid_request(&fixture).await;
-        fixture
+    fn client_jkt(fixture: &Fixture) -> [u8; 32] {
+        crate::ci_federation::proof_key_thumbprint(&fixture.client_signer.public_key_bytes())
+    }
+
+    async fn issue_challenge(fixture: &Fixture, jkt: [u8; 32]) -> [u8; 32] {
+        let issued = fixture
             .service
-            .prepare_invocation(&request(request_message.clone()))
+            .get_invocation_challenge(Request::new(pb::GetInvocationChallengeRequest {
+                jkt: jkt.to_vec(),
+                courier_observed_source: None,
+            }))
             .await
-            .unwrap();
-        let status = assert_prepare_code(&fixture, request_message, Code::InvalidArgument).await;
-        assert!(status.message().contains("replayed"));
+            .expect("challenge issues")
+            .into_inner();
+        assert_eq!(issued.expires_at_unix, i64::from(NOW) + 60);
+        issued.challenge.as_slice().try_into().expect("32 bytes")
+    }
+
+    async fn challenged_request(fixture: &Fixture, message_id: &[u8]) -> Vec<u8> {
+        let challenge = issue_challenge(fixture, client_jkt(fixture)).await;
+        let mut claims = request_claims(message_id);
+        claims.freshness_challenge = Some(basil_cose::FreshnessChallenge::new(challenge));
+        sealed_request_with(fixture, claims, CONTENT_TYPE_SIGN_REQUEST, &sign_body()).await
+    }
+
+    #[tokio::test]
+    async fn challenged_request_consumes_exactly_once_and_replay_is_sealed_unknown() {
+        let fixture = fixture();
+        let message = challenged_request(&fixture, b"challenged").await;
+        let first = fixture
+            .service
+            .invoke(request(message.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        let (_, body) = verify_response(&fixture, &first, &message).await;
+        assert_eq!(body.status, InvocationStatus::ok());
+
+        // The identical message replays as a sealed non-retryable
+        // CHALLENGE_UNKNOWN: the challenge was consumed exactly once.
+        let replayed = fixture
+            .service
+            .invoke(request(message.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        let (verified, body) = verify_response(&fixture, &replayed, &message).await;
+        assert_eq!(body.status, InvocationStatus::challenge_unknown());
+        assert!(body.signature.is_none());
+        assert_eq!(verified.claims.in_reply_to, Some(message_id(b"challenged")));
+    }
+
+    #[tokio::test]
+    async fn challenge_bound_to_another_key_is_denied_sealed() {
+        let fixture = fixture();
+        let mallory_jkt =
+            crate::ci_federation::proof_key_thumbprint(&fixture.mallory_signer.public_key_bytes());
+        let challenge = issue_challenge(&fixture, mallory_jkt).await;
+        let mut claims = request_claims(b"stolen-challenge");
+        claims.freshness_challenge = Some(basil_cose::FreshnessChallenge::new(challenge));
+        let message =
+            sealed_request_with(&fixture, claims, CONTENT_TYPE_SIGN_REQUEST, &sign_body()).await;
+        let response = fixture
+            .service
+            .invoke(request(message.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        let (_, body) = verify_response(&fixture, &response, &message).await;
+        assert_eq!(body.status, InvocationStatus::challenge_unknown());
+    }
+
+    #[tokio::test]
+    async fn foreign_instance_challenge_is_denied_sealed() {
+        let fixture = fixture();
+        // A challenge from a different agent instance (or a pre-restart one)
+        // has an unknown instance-ID prefix and denies without table state.
+        let mut claims = request_claims(b"foreign-instance");
+        claims.freshness_challenge = Some(basil_cose::FreshnessChallenge::new([0x5A; 32]));
+        let message =
+            sealed_request_with(&fixture, claims, CONTENT_TYPE_SIGN_REQUEST, &sign_body()).await;
+        let response = fixture
+            .service
+            .invoke(request(message.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        let (_, body) = verify_response(&fixture, &response, &message).await;
+        assert_eq!(body.status, InvocationStatus::challenge_unknown());
+    }
+
+    #[tokio::test]
+    async fn without_a_challenge_the_message_id_is_correlation_only() {
+        // SPEC rev 4 removed the message-ID replay table: a subject-key
+        // request that presents no challenge is accepted, and its message ID
+        // is correlation-only (a duplicate is not rejected on that basis).
+        let fixture = fixture();
+        let message = valid_request(&fixture).await;
+        for _ in 0..2 {
+            let response = fixture
+                .service
+                .invoke(request(message.clone()))
+                .await
+                .unwrap()
+                .into_inner();
+            let (_, body) = verify_response(&fixture, &response, &message).await;
+            assert_eq!(body.status, InvocationStatus::ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn require_challenge_denies_challenge_less_subject_key_requests() {
+        // With `invocation.require-challenge` set (courier deployments), a
+        // subject-key request without a challenge is the sealed non-retryable
+        // CHALLENGE_UNKNOWN — restoring the courier replay invariant — while
+        // a challenged request still succeeds.
+        let fixture = fixture();
+        let strict = BrokerGrpc::new_with_invocation_config(
+            Arc::clone(&fixture.service.state),
+            InvocationRuntimeConfig {
+                require_challenge: true,
+                ..fixture.service.invocation.clone()
+            },
+        );
+
+        let bare = valid_request(&fixture).await;
+        let response = strict
+            .invoke(request(bare.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        let (_, body) = verify_response(&fixture, &response, &bare).await;
+        assert_eq!(body.status, InvocationStatus::challenge_unknown());
+        assert!(body.signature.is_none());
+
+        // The challenge must come from the strict service instance: the
+        // table (and its instance ID) is per-BrokerGrpc.
+        let issued = strict
+            .get_invocation_challenge(Request::new(pb::GetInvocationChallengeRequest {
+                jkt: client_jkt(&fixture).to_vec(),
+                courier_observed_source: None,
+            }))
+            .await
+            .expect("challenge issues")
+            .into_inner();
+        let challenge: [u8; 32] = issued.challenge.as_slice().try_into().expect("32 bytes");
+        let mut claims = request_claims(b"strict-challenged");
+        claims.freshness_challenge = Some(basil_cose::FreshnessChallenge::new(challenge));
+        let challenged =
+            sealed_request_with(&fixture, claims, CONTENT_TYPE_SIGN_REQUEST, &sign_body()).await;
+        let response = strict
+            .invoke(request(challenged.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        let (_, body) = verify_response(&fixture, &response, &challenged).await;
+        assert_eq!(body.status, InvocationStatus::ok());
+    }
+
+    #[tokio::test]
+    async fn proof_bound_requests_must_present_a_challenge() {
+        let fixture = fixture();
+        let generation = fixture.service.state.load_generation().to_owned();
+        let policy = generation.policy().clone();
+        let verifier = PolicyVerifier::new(&policy);
+        let claims = request_claims(b"no-challenge");
+        let outcome = fixture
+            .service
+            .consume_freshness_challenge(generation.id(), &claims, Some(&[9; 32]), &verifier)
+            .expect("no envelope error");
+        assert!(matches!(outcome, Err(ChallengeDenial::Missing)));
+    }
+
+    #[tokio::test]
+    async fn challenge_issuance_validates_the_wire_shape() {
+        let fixture = fixture();
+        let bad_jkt = fixture
+            .service
+            .get_invocation_challenge(Request::new(pb::GetInvocationChallengeRequest {
+                jkt: vec![0x22; 31],
+                courier_observed_source: None,
+            }))
+            .await
+            .expect_err("31-byte jkt rejected");
+        assert_eq!(bad_jkt.code(), Code::InvalidArgument);
+
+        let oversized_source = fixture
+            .service
+            .get_invocation_challenge(Request::new(pb::GetInvocationChallengeRequest {
+                jkt: vec![0x22; 32],
+                courier_observed_source: Some("s".repeat(129)),
+            }))
+            .await
+            .expect_err("129-byte source rejected");
+        assert_eq!(oversized_source.code(), Code::InvalidArgument);
+
+        let disabled = BrokerGrpc::new_with_invocation_config(
+            Arc::clone(&fixture.service.state),
+            InvocationRuntimeConfig {
+                enabled: false,
+                ..fixture.service.invocation.clone()
+            },
+        );
+        let status = disabled
+            .get_invocation_challenge(Request::new(pb::GetInvocationChallengeRequest {
+                jkt: vec![0x22; 32],
+                courier_observed_source: None,
+            }))
+            .await
+            .expect_err("disabled service declines issuance");
+        assert_eq!(status.code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn challenge_issuance_pressure_is_resource_exhausted() {
+        let fixture = fixture();
+        let jkt = [0x33_u8; 32];
+        for _ in 0..8 {
+            issue_challenge(&fixture, jkt).await;
+        }
+        let status = fixture
+            .service
+            .get_invocation_challenge(Request::new(pb::GetInvocationChallengeRequest {
+                jkt: jkt.to_vec(),
+                courier_observed_source: None,
+            }))
+            .await
+            .expect_err("ninth outstanding challenge for one jkt declines");
+        assert_eq!(status.code(), Code::ResourceExhausted);
     }
 
     #[tokio::test]

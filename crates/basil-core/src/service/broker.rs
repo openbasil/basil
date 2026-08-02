@@ -53,6 +53,12 @@ pub struct InvocationRuntimeConfig {
     pub clock_skew_secs: u32,
     /// Maximum replay-cache entries retained in memory.
     pub replay_cache_capacity: usize,
+    /// Require a single-use freshness challenge on every sealed invocation,
+    /// including subject-key requests. Proof-bound requests always require
+    /// one. Deployments that accept courier-borne traffic (for example the
+    /// NATS bridge) must enable this: without it a captured subject-key
+    /// envelope replays until claims expiry.
+    pub require_challenge: bool,
     /// Fixed current time override for deterministic tests. Leave unset in
     /// production.
     pub now_unix_override: Option<u32>,
@@ -68,6 +74,7 @@ impl Default for InvocationRuntimeConfig {
             max_ttl_secs: basil_proto::invocation::DEFAULT_EXPIRES_AFTER_SECS,
             clock_skew_secs: 30,
             replay_cache_capacity: 4096,
+            require_challenge: false,
             now_unix_override: None,
         }
     }

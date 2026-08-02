@@ -943,6 +943,10 @@ pub(crate) struct InvocationConfigFile {
     clock_skew_secs: u32,
     /// Maximum in-memory replay-cache entries.
     replay_cache_capacity: usize,
+    /// Require a freshness challenge on every sealed invocation, including
+    /// subject-key requests. Default `false`. Deployments that accept
+    /// courier-borne traffic (for example the NATS bridge) must enable this.
+    require_challenge: bool,
 }
 
 impl Default for InvocationConfigFile {
@@ -954,6 +958,7 @@ impl Default for InvocationConfigFile {
             max_ttl_secs: basil_proto::invocation::DEFAULT_EXPIRES_AFTER_SECS,
             clock_skew_secs: 30,
             replay_cache_capacity: 4096,
+            require_challenge: false,
         }
     }
 }
@@ -1480,6 +1485,7 @@ fn resolve_invocation_config(
         max_ttl_secs: file.max_ttl_secs,
         clock_skew_secs: file.clock_skew_secs,
         replay_cache_capacity: file.replay_cache_capacity,
+        require_challenge: file.require_challenge,
         now_unix_override: None,
     })
 }
@@ -3945,6 +3951,10 @@ bundle = "/cfg/bundle.sealed"
         assert_eq!(defaults.max_ttl_secs, 60);
         assert_eq!(defaults.clock_skew_secs, 30);
         assert_eq!(defaults.replay_cache_capacity, 4096);
+        assert!(
+            !defaults.require_challenge,
+            "subject-key challenges are opt-in (courier deployments enable them)"
+        );
 
         let config = temp_config(
             r#"
@@ -3977,6 +3987,7 @@ request-encryption-key-id = "broker.request"
 max-ttl-secs = 45
 clock-skew-secs = 7
 replay-cache-capacity = 128
+require-challenge = true
 "#,
         );
         let args = overrides_for(config.clone());
@@ -4000,6 +4011,7 @@ replay-cache-capacity = 128
         assert_eq!(loaded.invocation.max_ttl_secs, 45);
         assert_eq!(loaded.invocation.clock_skew_secs, 7);
         assert_eq!(loaded.invocation.replay_cache_capacity, 128);
+        assert!(loaded.invocation.require_challenge);
 
         std::fs::remove_file(config).expect("remove temp config");
 
@@ -4256,6 +4268,7 @@ file = "/run/credentials/auth.json"
             max_ttl_secs: 60,
             clock_skew_secs: 30,
             replay_cache_capacity: 4096,
+            require_challenge: false,
             now_unix_override: None,
         };
         let valid = catalog_with_invocation_keys(
