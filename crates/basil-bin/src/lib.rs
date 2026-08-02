@@ -12,6 +12,7 @@
 #![cfg_attr(test, allow(clippy::indexing_slicing))]
 
 pub mod client_cli;
+pub mod nix_cache_cli;
 pub mod nix_cli;
 pub mod nix_provider;
 

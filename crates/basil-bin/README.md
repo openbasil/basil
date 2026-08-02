@@ -31,6 +31,7 @@ Online docs: **[CLI overview](https://docs.openbasil.org/cli/overview/)** and **
 | `basil bundle …`  | Create and manage the sealed credential bundle (seal, verify, `set-backend`, …).                                                                                                                                                                                       |
 | `basil nix key …` | Enroll or inspect a Nix binary-cache signing key held in backend custody. The commands return public material only.                                                                                                                                                     |
 | `basil nix signer serve` | Serve one backend-custodied Nix cache key through the purpose-specific local external-signer protocol.                                                                                                                                                        |
+| `basil nix cache …` | Add, replace, or remove signatures in a local binary-cache directory with byte-preserving, atomic-per-record updates.                                                                                                                                            |
 | `basil explain`   | Explain a policy decision offline from the catalog + policy files; `--live` asks the running broker instead.                                                                                                                                                           |
 | `basil doctor`    | Preflight environment and deployment checks.                                                                                                                                                                                                                           |
 | `basil cache …`   | Inspect the private OCI evidence cache or preview and confirm exact-ID/reference pruning.                                                                                                                                                                              |
@@ -55,6 +56,17 @@ user to expose one enrolled key to a local Nix client. The socket parent must be
 owned by that user with mode `0700`; Basil publishes the socket at mode `0600` and admits only peers
 with the same effective UID. Requests contain canonical public fingerprints only. Private key bytes
 stay in backend custody.
+
+Maintain a local cache with `basil nix cache sign`, `replace`, or `remove`.
+Select canonical `/nix/store` paths with repeated `--path`, or use `--all`;
+destructive `replace --all` and `remove --all` require `--yes`. A dry run
+performs safe, bounded preview reads without taking or creating the cache
+mutation lock. Signing and replacement verify existing signatures for the
+selected key and every returned signature locally against the enrolled public
+key before any record changes.
+Cache mutation supports local directories only, preserves unrecognized
+`.narinfo` fields byte for byte, and commits each record atomically so a failed
+batch can be rerun safely.
 
 ## basil-measure-helper
 

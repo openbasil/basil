@@ -21,11 +21,12 @@ use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path};
 use std::time::{Duration, Instant};
 
-use rustix::fs::{AtFlags, FileType, FlockOperation, Mode, OFlags};
+use rustix::fs::{AtFlags, Dir, FileType, FlockOperation, Mode, OFlags};
 use thiserror::Error;
 
 /// Stable root-relative lock-file name used by all cache mutations.
@@ -197,6 +198,36 @@ pub struct NarinfoSnapshot {
     identity: FileIdentity,
 }
 
+/// Descriptor-held, read-only cache root used for safe mutation previews.
+///
+/// This type applies the same no-symlink, ownership, mode, link-count, size,
+/// and descriptor/path identity checks as [`LockedCacheRoot`], but never opens
+/// or creates [`CACHE_LOCK_FILE`]. It must not be used to commit a mutation.
+#[derive(Debug)]
+pub struct ReadOnlyCacheRoot {
+    root: OwnedFd,
+}
+
+impl ReadOnlyCacheRoot {
+    /// Open a cache root for descriptor-relative preview reads without locking.
+    pub fn open(cache_root: &Path) -> Result<Self, NixCacheFileError> {
+        let root = open_cache_root(cache_root)?;
+        validate_mutation_directory(&root)?;
+        Ok(Self { root })
+    }
+
+    /// Read a fresh, bounded snapshot without opening the mutation lock.
+    pub fn read_narinfo(&self, relative: &Path) -> Result<NarinfoSnapshot, NixCacheFileError> {
+        let (directory, name) = open_parent(&self.root, relative)?;
+        read_snapshot_at(&directory, &name)
+    }
+
+    /// Enumerate root `.narinfo` names through the held descriptor.
+    pub fn root_narinfo_names(&self, limit: usize) -> Result<Vec<OsString>, NixCacheFileError> {
+        root_narinfo_names(&self.root, limit)
+    }
+}
+
 impl NarinfoSnapshot {
     /// Return the exact bytes read from the target.
     #[must_use]
@@ -257,8 +288,13 @@ impl LockedCacheRoot {
 
     /// Read a fresh, bounded snapshot of a root-relative regular file.
     pub fn read_narinfo(&self, relative: &Path) -> Result<NarinfoSnapshot, NixCacheFileError> {
-        let (directory, name) = self.open_parent(relative)?;
+        let (directory, name) = open_parent(&self.root, relative)?;
         read_snapshot_at(&directory, &name)
+    }
+
+    /// Enumerate root `.narinfo` names while the cooperative lock is held.
+    pub fn root_narinfo_names(&self, limit: usize) -> Result<Vec<OsString>, NixCacheFileError> {
+        root_narinfo_names(&self.root, limit)
     }
 
     /// Apply `mutation` and atomically commit it when the target is unchanged.
@@ -303,7 +339,7 @@ impl LockedCacheRoot {
             return Err(NixCacheFileError::NarinfoTooLarge);
         }
         validate_narinfo(replacement)?;
-        let (directory, name) = self.open_parent(relative)?;
+        let (directory, name) = open_parent(&self.root, relative)?;
         let current = read_snapshot_at(&directory, &name)?;
         if current.identity != expected.identity || current.bytes != expected.bytes {
             return Err(NixCacheFileError::Interference);
@@ -381,45 +417,61 @@ impl LockedCacheRoot {
         }
     }
 
-    fn open_parent(&self, relative: &Path) -> Result<(OwnedFd, OsString), NixCacheFileError> {
-        if relative.is_absolute() {
-            return Err(NixCacheFileError::InvalidPath);
-        }
-        let mut components = relative.components().peekable();
-        let mut directory = rustix::io::fcntl_dupfd_cloexec(&self.root, 0)?;
-        validate_mutation_directory(&directory)?;
-        let mut name = None;
-
-        while let Some(component) = components.next() {
-            let Component::Normal(value) = component else {
-                return Err(NixCacheFileError::InvalidPath);
-            };
-            if components.peek().is_none() {
-                name = Some(value.to_owned());
-                break;
-            }
-            directory = rustix::fs::openat(
-                &directory,
-                value,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-                Mode::empty(),
-            )
-            .map_err(|_| NixCacheFileError::UnsafeLayout)?;
-            validate_mutation_directory(&directory)?;
-        }
-
-        let name = name.ok_or(NixCacheFileError::InvalidPath)?;
-        if name == OsStr::new(CACHE_LOCK_FILE) {
-            return Err(NixCacheFileError::InvalidPath);
-        }
-        Ok((directory, name))
-    }
-
     /// Keep the lock descriptor observably live for callers and tests.
     #[must_use]
     pub fn holds_lock(&self) -> bool {
         rustix::fs::fstat(&self.lock).is_ok()
     }
+}
+
+fn root_narinfo_names(root: &OwnedFd, limit: usize) -> Result<Vec<OsString>, NixCacheFileError> {
+    let mut names = Vec::new();
+    let mut directory = Dir::read_from(root)?;
+    for entry in directory.by_ref() {
+        let entry = entry?;
+        if entry.file_name().to_bytes().ends_with(b".narinfo") {
+            if names.len() >= limit {
+                return Err(NixCacheFileError::InvalidPath);
+            }
+            names.push(OsStr::from_bytes(entry.file_name().to_bytes()).to_os_string());
+        }
+    }
+    names.sort_unstable();
+    Ok(names)
+}
+
+fn open_parent(root: &OwnedFd, relative: &Path) -> Result<(OwnedFd, OsString), NixCacheFileError> {
+    if relative.is_absolute() {
+        return Err(NixCacheFileError::InvalidPath);
+    }
+    let mut components = relative.components().peekable();
+    let mut directory = rustix::io::fcntl_dupfd_cloexec(root, 0)?;
+    validate_mutation_directory(&directory)?;
+    let mut name = None;
+
+    while let Some(component) = components.next() {
+        let Component::Normal(value) = component else {
+            return Err(NixCacheFileError::InvalidPath);
+        };
+        if components.peek().is_none() {
+            name = Some(value.to_owned());
+            break;
+        }
+        directory = rustix::fs::openat(
+            &directory,
+            value,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|_| NixCacheFileError::UnsafeLayout)?;
+        validate_mutation_directory(&directory)?;
+    }
+
+    let name = name.ok_or(NixCacheFileError::InvalidPath)?;
+    if name == OsStr::new(CACHE_LOCK_FILE) {
+        return Err(NixCacheFileError::InvalidPath);
+    }
+    Ok((directory, name))
 }
 
 fn create_temporary(directory: &OwnedFd) -> Result<(String, OwnedFd), NixCacheFileError> {

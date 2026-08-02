@@ -14,6 +14,7 @@ use basil::{Client, NixCacheEnrollment, NixCacheEnrollmentDisposition, NixCacheK
 use clap::Subcommand;
 use serde::Serialize;
 
+use crate::nix_cache_cli::{NixCacheCommand, run as run_cache};
 use crate::nix_provider::{ProviderServeArgs, serve as serve_provider};
 
 const CORRELATION_ID_LEN: usize = 16;
@@ -27,6 +28,9 @@ const CUSTODY_GUIDANCE: &str = concat!(
 /// Nix integration commands.
 #[derive(Debug, Subcommand)]
 pub enum NixCommand {
+    /// Add, replace, or remove signatures in a local Nix binary cache.
+    #[command(subcommand)]
+    Cache(NixCacheCommand),
     /// Manage backend-custodied Nix binary-cache keys.
     #[command(subcommand)]
     Key(NixKeyCommand),
@@ -175,15 +179,24 @@ fn random_correlation_id(
 pub async fn run(socket: Option<String>, command: NixCommand) -> Result<()> {
     reject_legacy_input(&command)?;
     let socket = socket.unwrap_or_else(|| basil::constants::DEFAULT_SOCKET_PATH.to_string());
-    if let NixCommand::Signer(NixSignerCommand::Serve(args)) = command {
-        return serve_provider(&socket, args).await;
+    match command {
+        NixCommand::Signer(NixSignerCommand::Serve(args)) => {
+            return serve_provider(&socket, args).await;
+        }
+        NixCommand::Cache(command) => return run_cache(&socket, command).await,
+        NixCommand::Key(command) => {
+            return run_key(&socket, command).await;
+        }
     }
-    let mut client = Client::connect(&socket)
+}
+
+async fn run_key(socket: &str, command: NixKeyCommand) -> Result<()> {
+    let mut client = Client::connect(socket)
         .await
         .with_context(|| format!("connecting to agent at {socket}"))?;
     let mut ids = SystemCorrelationIds;
     let mut output = Vec::new();
-    dispatch(&mut client, command, &mut ids, &mut output).await?;
+    dispatch(&mut client, NixCommand::Key(command), &mut ids, &mut output).await?;
     drop(client);
     std::io::stdout()
         .lock()
