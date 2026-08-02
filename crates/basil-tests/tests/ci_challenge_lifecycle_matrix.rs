@@ -862,6 +862,7 @@ async fn build_challenge_request(
         freshness_challenge: Some(
             FreshnessChallenge::from_bytes(challenge).expect("wire challenge is 32 bytes"),
         ),
+        response_public_key_cose: None,
     };
     build_sealed(
         &SealParams {

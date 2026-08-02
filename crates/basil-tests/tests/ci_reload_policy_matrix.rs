@@ -855,6 +855,7 @@ async fn build_subject_message(
         freshness_challenge: challenge.map(|bytes| {
             FreshnessChallenge::from_bytes(bytes).expect("wire challenge is 32 bytes")
         }),
+        response_public_key_cose: None,
     };
     build_sealed(&seal_params(claims), signer)
         .await
@@ -881,6 +882,7 @@ async fn build_proof_bound_message(proof: &Ed25519Signer, marker: &str) -> Vec<u
         in_reply_to: None,
         request_hash: None,
         freshness_challenge: None,
+        response_public_key_cose: None,
     };
     build_sealed_with_headers(
         &seal_params(claims),

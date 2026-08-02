@@ -783,6 +783,10 @@ fn connection_info(record: &ConnectionRecord) -> pb::ConnectionInfo {
         listener_type: match context.listener_type() {
             ListenerType::Host => pb::ConnectionListenerType::Host,
             ListenerType::Container => pb::ConnectionListenerType::Container,
+            // Courier connections are not given a broader legacy inventory
+            // classification. Their exact profile is reported only by the
+            // invocation capability RPC on that listener.
+            ListenerType::Courier => pb::ConnectionListenerType::Unspecified,
         }
         .into(),
         pid: peer.pid,

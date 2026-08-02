@@ -96,6 +96,7 @@ impl Default for InvocationRuntimeConfig {
 pub struct BrokerGrpc {
     pub(super) state: Arc<BrokerState>,
     pub(super) invocation: InvocationRuntimeConfig,
+    pub(super) listener_type: crate::transport::grpc_server::ListenerType,
     pub(super) invocation_tables: Arc<Mutex<crate::service::invocation::InvocationTables>>,
 }
 
@@ -124,11 +125,32 @@ impl BrokerGrpc {
         state: Arc<BrokerState>,
         invocation: InvocationRuntimeConfig,
     ) -> Self {
+        Self::new_with_invocation_config_for_listener(
+            state,
+            invocation,
+            crate::transport::grpc_server::ListenerType::Host,
+        )
+    }
+
+    /// Build a gRPC service adapter with this listener's effective invocation settings.
+    ///
+    /// Courier listeners force freshness challenges independently of the
+    /// broker-wide compatibility default.
+    #[must_use]
+    pub fn new_with_invocation_config_for_listener(
+        state: Arc<BrokerState>,
+        mut invocation: InvocationRuntimeConfig,
+        listener_type: crate::transport::grpc_server::ListenerType,
+    ) -> Self {
+        if listener_type == crate::transport::grpc_server::ListenerType::Courier {
+            invocation.require_challenge = true;
+        }
         let challenge_table = invocation.challenge_table;
         let run_quota_buckets_per_rule = invocation.run_quota_buckets_per_rule;
         Self {
             state,
             invocation,
+            listener_type,
             invocation_tables: Arc::new(Mutex::new(
                 crate::service::invocation::InvocationTables::new(
                     challenge_table,

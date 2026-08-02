@@ -267,6 +267,7 @@ fn request_claims(
         in_reply_to: None,
         request_hash: None,
         freshness_challenge: None,
+        response_public_key_cose: None,
     }
 }
 
@@ -290,6 +291,7 @@ fn response_claims(
         in_reply_to: Some(in_reply_to),
         request_hash: Some(request_hash),
         freshness_challenge: None,
+        response_public_key_cose: None,
     }
 }
 

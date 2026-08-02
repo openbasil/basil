@@ -394,6 +394,17 @@ fn build_config_toml(args: &InitArgs, layout: &Layout) -> String {
     out.push_str("# Socket mode defaults to 0600 (owner-only); widen deliberately if a peer\n");
     out.push_str("# group must connect, e.g. socket-mode = \"0660\" + socket-group = \"basil\".\n");
     out.push_str("socket-mode = \"0600\"\n");
+    out.push_str("# For a remote invocation courier, replace the legacy socket keys above with\n");
+    out.push_str(
+        "# named host and courier listeners. Courier exposes only InvocationService and\n",
+    );
+    out.push_str("# forces require-challenge=true regardless of the compatibility default.\n");
+    out.push_str("# [listeners.host]\n");
+    out.push_str("# type = \"host\"\n");
+    out.push_str("# path = \"/run/basil/host.sock\"\n");
+    out.push_str("# [listeners.courier]\n");
+    out.push_str("# type = \"courier\"\n");
+    out.push_str("# path = \"/run/basil/courier.sock\"\n");
 
     if args.backend == InitBackend::Keystore {
         out.push_str("\n# db-keystore backend: the local AEAD cipher for the at-rest DB.\n");
@@ -966,6 +977,10 @@ mod tests {
         // Socket mode default is 0600 (owner-only).
         let mode = file.socket_mode.expect("socket-mode set");
         assert_eq!(mode.0, 0o600);
+        let rendered = std::fs::read_to_string(&layout.config).expect("read generated config");
+        assert!(rendered.contains("# [listeners.courier]"));
+        assert!(rendered.contains("# type = \"courier\""));
+        assert!(rendered.contains("# forces require-challenge=true"));
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -3895,6 +3895,41 @@ bundle = "/cfg/bundle.sealed"
     }
 
     #[test]
+    fn named_courier_listener_parses_as_a_closed_type() {
+        let config = temp_config(
+            r#"
+catalog = "/cfg/catalog.json"
+policy = "/cfg/policy.json"
+bundle = "/cfg/bundle.sealed"
+
+[listeners.host]
+type = "host"
+path = "/run/basil/host.sock"
+
+[listeners.courier]
+type = "courier"
+path = "/run/basil/courier.sock"
+"#,
+        );
+        let args = ConfigOverrides {
+            config: Some(config.clone()),
+            values: Vec::new(),
+        };
+
+        let loaded = load_run_config(&args).expect("courier listener parses");
+        assert_eq!(
+            loaded
+                .listeners
+                .get("courier")
+                .expect("courier listener")
+                .listener_type(),
+            crate::transport::grpc_server::ListenerType::Courier
+        );
+
+        std::fs::remove_file(config).expect("remove temp config");
+    }
+
+    #[test]
     fn logging_defaults_stdout_and_journald_on_otel_off() {
         let config = AgentConfigFile::default();
         assert_eq!(config.logging.stdout.enable, None);

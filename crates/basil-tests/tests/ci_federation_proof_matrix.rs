@@ -901,6 +901,7 @@ async fn build_baseline(proof: &Ed25519Signer, token: &str) -> Vec<u8> {
         freshness_challenge: Some(
             basil_cose::FreshnessChallenge::from_bytes(&[0x5a; 32]).expect("challenge"),
         ),
+        response_public_key_cose: None,
     };
     build_sealed_with_headers(
         &seal_params(claims),
@@ -929,6 +930,7 @@ async fn build_subject_request(signer: &Ed25519Signer, response_key: &str) -> Ve
         in_reply_to: None,
         request_hash: None,
         freshness_challenge: None,
+        response_public_key_cose: None,
     };
     basil_cose::build_sealed(&seal_params(claims), signer)
         .await

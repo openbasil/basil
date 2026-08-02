@@ -215,6 +215,10 @@ pub(crate) fn enforce_listener_domain_info(
             AuthorizationDomain::HostProcess | AuthorizationDomain::SystemdUnit
         ),
         grpc_server::ListenerType::Container => actor.domain == AuthorizationDomain::Container,
+        // Courier RPCs resolve their gateway and remote evidence inside the
+        // sealed-invocation service. No ordinary authorization domain is
+        // admitted on this closed listener surface.
+        grpc_server::ListenerType::Courier => false,
     };
     if admitted {
         return Ok(());
