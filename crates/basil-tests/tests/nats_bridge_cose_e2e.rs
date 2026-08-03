@@ -229,7 +229,7 @@ impl InvocationService for VerifyingInvocationService {
     }
 }
 
-fn local_invocation_capabilities() -> GetInvocationCapabilitiesResponse {
+const fn local_invocation_capabilities() -> GetInvocationCapabilitiesResponse {
     GetInvocationCapabilitiesResponse {
         listener_profile: ListenerProfile::Host as i32,
         require_challenge: false,
