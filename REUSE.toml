@@ -52,6 +52,25 @@ precedence = "override"
 SPDX-FileCopyrightText = "2026 OpenBasil Contributors"
 SPDX-License-Identifier = "Apache-2.0"
 
+# The canonical external-signer patch series modifies LGPL-licensed Nix
+# sources. Licensing is declared here so provenance checks can pin the exact
+# patch bytes.
+[[annotations]]
+path = [
+  "nix/patched-nix/nix-components-packaging.patch",
+  "nix/patched-nix/nix-external-signer.patch",
+  "nix/patched-nix/nix-master-compat.patch",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "The Nix Authors"
+SPDX-License-Identifier = "LGPL-2.1-or-later"
+
+[[annotations]]
+path = "nix/patched-nix/pins.json"
+precedence = "override"
+SPDX-FileCopyrightText = "NONE"
+SPDX-License-Identifier = "CC0-1.0"
+
 # Code and other first-party project files.
 [[annotations]]
 path = [
@@ -71,6 +90,7 @@ path = [
   "interop-tests/**/*.md",
   "examples/**/*.md",
   "examples/**/*.sh",
+  "nix/patched-nix/README.md",
   "README.md",
 ]
 precedence = "aggregate"

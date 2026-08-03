@@ -105,6 +105,11 @@ opt-in Cachix `1.11.1` package for self-managed cache uploads. It signs through
 Basil without giving Cachix private key material and does not replace the host
 Cachix installation.
 
+The patched Nix external-signer pilot is available through the explicit
+`nix-pilot-cli` and `nix-pilot-full` flake outputs. The default package and
+development shells keep the repository's standard Nix. See the
+[pilot provenance and build guide](nix/patched-nix/README.md).
+
 See [installation](https://docs.openbasil.org/getting-started/installation/)
 for details and backend prerequisites.
 

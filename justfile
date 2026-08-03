@@ -143,6 +143,47 @@ check-sh:
 check: check-rust check-go check-sh
     typos
 
+# Validate the pinned source, patch, corpora, version, and platform manifest
+# without compiling the complete Nix package.
+check-nix-pilot-provenance:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    pilot_system="$(nix eval --raw --impure --expr builtins.currentSystem)"
+    nix build --no-link ".#checks.${pilot_system}.nix-pilot-provenance"
+
+# Evaluate both opt-in pilot outputs and their declared tier on every supported
+# platform. Foreign-platform packages are evaluated, not built.
+check-nix-pilot-matrix:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for pilot_system in x86_64-linux aarch64-linux aarch64-darwin; do
+      nix eval --raw ".#packages.${pilot_system}.nix-pilot-cli.drvPath" >/dev/null
+      nix eval --raw ".#packages.${pilot_system}.nix-pilot-full.drvPath" >/dev/null
+      pilot_tier="$(nix eval --raw ".#packages.${pilot_system}.nix-pilot-cli.basilPilot.platform.tier")"
+      pilot_evidence="$(nix eval --raw ".#packages.${pilot_system}.nix-pilot-cli.basilPilot.platform.qualification.mode")"
+      pilot_status="$(nix eval --raw ".#packages.${pilot_system}.nix-pilot-cli.basilPilot.platform.qualification.status")"
+      pilot_patch_flags="$(nix eval --json ".#packages.${pilot_system}.nix-pilot-cli.basilPilot.sourcePatchFlags")"
+      test "${pilot_patch_flags}" = '["-p1","--fuzz=0"]'
+      case "${pilot_system}:${pilot_tier}:${pilot_evidence}:${pilot_status}" in
+        x86_64-linux:production:native-full-build:passed) ;;
+        aarch64-linux:production:native-full-build:pending) ;;
+        aarch64-darwin:development:evaluation-only:passed) ;;
+        *) echo "unexpected Nix pilot evidence: ${pilot_system}:${pilot_tier}:${pilot_evidence}:${pilot_status}" >&2; exit 1 ;;
+      esac
+    done
+
+# Build both explicit pilot outputs for the native platform.
+build-nix-pilot:
+    nix build --no-link .#nix-pilot-cli .#nix-pilot-full
+
+# Rebuild and test the compatibility-only patch against its exact pinned
+# official-master revision, including semantic equivalence with the base patch.
+check-nix-pilot-master-compat:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    pilot_system="$(nix eval --raw --impure --expr builtins.currentSystem)"
+    nix build --no-link ".#checks.${pilot_system}.nix-pilot-master-compatibility"
+
 # format all go sources
 format-go:
     fd -e go -E vendor -x gofmt -w

@@ -1,0 +1,93 @@
+{
+  "schema": 1,
+  "upstream": {
+    "owner": "NixOS",
+    "repo": "nix",
+    "baseRev": "00c341b4f746dadd5947c3aa4673d5231226a028",
+    "baseNarHash": "sha256-lzFOjvHKYqHYBa1PigllKqXtQzoU9Lt26M5Hm7rSdpM=",
+    "version": "2.36.0"
+  },
+  "patchSeries": [
+    {
+      "order": 1,
+      "path": "nix-external-signer.patch",
+      "sha256": "9392f43884cf251193962cbebc95e780540ed2f5cb0864cde8a08afe43eb2dbb",
+      "bytes": 139875,
+      "lines": 3378
+    },
+    {
+      "order": 2,
+      "path": "nix-components-packaging.patch",
+      "sha256": "d1b908ed5352301aa2645839494c99e2a19b455df2bd21affc3fa4b4315ee2cf",
+      "bytes": 409,
+      "lines": 11
+    }
+  ],
+  "corpora": {
+    "pathInfoV1Sha256": "c4d31875e779e11d2a8b9dcd071e34fc832f545dca5784f0c72540dff8ee3823",
+    "narinfoFidelitySha256": "fef4433a5fdfab4220f795ce8e85c092d2cb472d676645cef8cc7b59a3212548"
+  },
+  "compatibility": {
+    "officialMasterTestedRev": "b1939e7d1abec240fb16a0ffa92fb4c28a24e4f0",
+    "officialMasterTestedNarHash": "sha256-jBCkvlSdCoMIMzEx6TYHlVgsEC0zZiB45t9YOg3mjA0=",
+    "patch": {
+      "path": "nix-master-compat.patch",
+      "sha256": "66baa4157ce7f4c1702178b5f3040acc37e3a5bfc43f78adde6320838f91848a",
+      "bytes": 140384,
+      "lines": 3390
+    },
+    "testedAt": "2026-08-04",
+    "releaseDependency": false
+  },
+  "semanticEquivalence": {
+    "addedFiles": [
+      {
+        "path": "src/libutil-tests/external-signer.cc",
+        "sha256": "47acfe3c212102aa39d420a5b7292cc6fdc20b21b5ee2cae642bd26e55665fda",
+        "executable": false
+      },
+      {
+        "path": "src/libutil/include/nix/util/signature/external-signer.hh",
+        "sha256": "2252798f0e8f132554b920608b46bae924f088bd26f7f8aaac610bc82772a27f",
+        "executable": false
+      },
+      {
+        "path": "src/libutil/signature/external-signer.cc",
+        "sha256": "b0596c2c8668c0c92a8a90b362c5c45f192cba2ab8208a2ba8740fabf87cbebe",
+        "executable": false
+      },
+      {
+        "path": "tests/functional/external-signing.sh",
+        "sha256": "5dbba714bbb3e2aa1eecc62543716dc298a21c7fcae8e0177af49a7c181eac3d",
+        "executable": false
+      },
+      {
+        "path": "tests/functional/nix-cache-signing/DIGESTS",
+        "sha256": "7bc85078bbd7aec7538e8d09c510540de4c44ef6bfff5424633937700695e836",
+        "executable": false
+      },
+      {
+        "path": "tests/functional/nix-cache-signing/external-signer.py",
+        "sha256": "1cd0508e5b8ed81de65aafe13323c227dae3ccbb036a52ae1102d8bf123f77c9",
+        "executable": false
+      },
+      {
+        "path": "tests/functional/nix-cache-signing/path-info-v1.json",
+        "sha256": "c4d31875e779e11d2a8b9dcd071e34fc832f545dca5784f0c72540dff8ee3823",
+        "executable": false
+      },
+      {
+        "path": "tests/functional/nix-cache-signing/validate-path-info-v1.py",
+        "sha256": "227e770dd552539be75a116009f04a3b9576adc0485118ae6f875a1a7ee20a06",
+        "executable": true
+      }
+    ],
+    "modifiedFiles": [
+      "src/libutil-tests/meson.build",
+      "src/libutil/include/nix/util/meson.build",
+      "src/libutil/meson.build",
+      "src/nix/sigs.cc",
+      "tests/functional/meson.build"
+    ]
+  }
+}

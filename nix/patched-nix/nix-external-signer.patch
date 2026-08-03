@@ -1,0 +1,3378 @@
+diff --git a/src/libutil-tests/external-signer.cc b/src/libutil-tests/external-signer.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..c5f71327a489cbe2350990fa0068b20a9d1f6bfd
+--- /dev/null
++++ b/src/libutil-tests/external-signer.cc
+@@ -0,0 +1,771 @@
++#include "nix/util/signature/external-signer.hh"
++#include "nix/util/file-system.hh"
++#include "nix/util/file-descriptor.hh"
++#include "nix/util/unix-domain-socket.hh"
++#include "nix/util/error.hh"
++
++#include <gtest/gtest.h>
++#include <nlohmann/json.hpp>
++#include <sodium.h>
++
++#include <algorithm>
++#include <cerrno>
++#include <cstdlib>
++#include <fstream>
++#include <functional>
++#include <limits>
++#include <memory>
++#include <string_view>
++#include <thread>
++#include <vector>
++
++#ifndef _WIN32
++#  include <sys/socket.h>
++#  include <sys/stat.h>
++#  include <unistd.h>
++#endif
++
++namespace nix::externalSigner {
++
++namespace {
++
++constexpr std::string_view canonicalFingerprint =
++    "1;/nix/store/00000000000000000000000000000000-hello;sha256:0000000000000000000000000000000000000000000000000000;1;";
++
++std::vector<uint8_t> decodeHex(std::string_view encoded)
++{
++    if (encoded.size() % 2 != 0)
++        throw Error("odd hex length");
++    std::vector<uint8_t> result;
++    result.reserve(encoded.size() / 2);
++    auto digit = [](char value) -> uint8_t {
++        if (value >= '0' && value <= '9')
++            return static_cast<uint8_t>(value - '0');
++        if (value >= 'a' && value <= 'f')
++            return static_cast<uint8_t>(value - 'a' + 10);
++        throw Error("invalid lowercase hex");
++    };
++    for (size_t index = 0; index < encoded.size(); index += 2)
++        result.push_back(static_cast<uint8_t>((digit(encoded[index]) << 4) | digit(encoded[index + 1])));
++    return result;
++}
++
++std::string encodeCounter(size_t value, std::string_view alphabet, size_t width)
++{
++    std::string encoded(width, alphabet.front());
++    for (size_t index = width; index > 0; --index) {
++        encoded[index - 1] = alphabet[value % alphabet.size()];
++        value /= alphabet.size();
++    }
++    if (value != 0)
++        throw Error("counter exceeds construction width");
++    return encoded;
++}
++
++std::string expandConstruction(const nlohmann::json & construction)
++{
++    const auto & parameters = construction.at("parameters");
++    const auto count = parameters.at("reference_count").get<size_t>();
++    const auto start = parameters.at("reference_hash_counter_start").get<size_t>();
++    const auto width = parameters.at("reference_hash_counter_width").get<size_t>();
++    const auto alphabet = parameters.at("reference_hash_alphabet").get<std::string>();
++    const auto prefix = parameters.at("reference_hash_prefix").get<std::string>();
++    const auto referenceName = parameters.at("reference_name_byte").get<std::string>();
++    const auto referenceNameLength = parameters.at("reference_name_length").get<size_t>();
++    const auto lastReferenceNameLength = parameters.at("last_reference_name_length").get<size_t>();
++    std::string result = parameters.at("version").get<std::string>() + ";/nix/store/"
++                         + parameters.at("store_hash").get<std::string>() + "-"
++                         + std::string(
++                             parameters.at("store_name_length").get<size_t>(),
++                             parameters.at("store_name_byte").get<std::string>().front())
++                         + ";sha256:" + parameters.at("nar_hash").get<std::string>() + ";"
++                         + parameters.at("nar_size").get<std::string>() + ";";
++    for (size_t offset = 0; offset < count; ++offset) {
++        if (offset != 0)
++            result.push_back(',');
++        const auto nameLength = offset + 1 == count ? lastReferenceNameLength : referenceNameLength;
++        result += "/nix/store/" + prefix + encodeCounter(start + offset, alphabet, width) + "-"
++                  + std::string(nameLength, referenceName.front());
++    }
++    return result;
++}
++
++std::vector<uint8_t> encodeDescribeBody(
++    std::string_view keyName, std::span<const uint8_t, 32> publicKey, std::span<const uint8_t, 16> endpointId)
++{
++    std::vector<uint8_t> body{
++        static_cast<uint8_t>(keyName.size() >> 8),
++        static_cast<uint8_t>(keyName.size()),
++    };
++    body.insert(body.end(), keyName.begin(), keyName.end());
++    body.push_back(ed25519Algorithm);
++    body.insert(body.end(), publicKey.begin(), publicKey.end());
++    body.insert(body.end(), endpointId.begin(), endpointId.end());
++    return body;
++}
++
++std::vector<uint8_t> encodeSignBody(
++    std::string_view keyName,
++    std::span<const uint8_t, 32> publicKey,
++    std::span<const uint8_t, 16> endpointId,
++    std::span<const uint8_t, 64> signature)
++{
++    std::vector<uint8_t> body{
++        static_cast<uint8_t>(keyName.size() >> 8),
++        static_cast<uint8_t>(keyName.size()),
++    };
++    body.insert(body.end(), keyName.begin(), keyName.end());
++    body.insert(body.end(), publicKey.begin(), publicKey.end());
++    body.insert(body.end(), endpointId.begin(), endpointId.end());
++    body.insert(body.end(), signature.begin(), signature.end());
++    return body;
++}
++
++#ifndef _WIN32
++
++using ServerHandler = std::function<void(Descriptor, const Header &, std::span<const uint8_t>)>;
++
++struct TestServer
++{
++    std::filesystem::path directory = createTempDir("", "nxsg-test", 0700);
++    AutoDelete deleteDirectory{directory, true};
++    std::filesystem::path path = directory / "signer.sock";
++    AutoCloseFD listener = createUnixDomainSocket(path, 0600);
++    std::thread thread;
++
++    explicit TestServer(std::vector<ServerHandler> handlers)
++        : thread([this, handlers = std::move(handlers)] {
++            try {
++                for (const auto & handler : handlers) {
++                    AutoCloseFD connection(accept(listener.get(), nullptr, nullptr));
++                    if (!connection)
++                        return;
++                    std::array<uint8_t, headerSize> headerBytes{};
++                    readFull(connection.get(), reinterpret_cast<char *>(headerBytes.data()), headerBytes.size());
++                    const auto header = decodeHeader(headerBytes);
++                    std::vector<uint8_t> body(header.bodySize);
++                    readFull(connection.get(), reinterpret_cast<char *>(body.data()), body.size());
++                    char extra = 0;
++                    if (read(connection.get(), {reinterpret_cast<std::byte *>(&extra), 1}) != 0)
++                        return;
++                    handler(connection.get(), header, body);
++                }
++            } catch (...) {
++                // Negative client tests deliberately close while the fake
++                // peer is still writing or waiting.
++            }
++        })
++    {
++    }
++
++    ~TestServer()
++    {
++        join();
++    }
++
++    void join()
++    {
++        if (thread.joinable())
++            thread.join();
++    }
++};
++
++void sendWithoutSigPipe(Descriptor connection, std::span<const uint8_t> bytes)
++{
++#  if defined(SO_NOSIGPIPE) && !defined(MSG_NOSIGNAL)
++    constexpr int enabled = 1;
++    if (setsockopt(connection, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled)) < 0)
++        throw Error("test server could not disable SIGPIPE");
++#  elif !defined(MSG_NOSIGNAL)
++    throw Error("test platform cannot suppress SIGPIPE");
++#  endif
++    while (!bytes.empty()) {
++#  ifdef MSG_NOSIGNAL
++        const auto count = ::send(connection, bytes.data(), bytes.size(), MSG_NOSIGNAL);
++#  else
++        const auto count = ::send(connection, bytes.data(), bytes.size(), 0);
++#  endif
++        if (count < 0 && errno == EINTR)
++            continue;
++        if (count <= 0)
++            throw Error("test server could not write response");
++        bytes = bytes.subspan(static_cast<size_t>(count));
++    }
++}
++
++void sendResponse(
++    Descriptor connection,
++    const Header & request,
++    MessageType type,
++    Status status,
++    std::span<const uint8_t> body,
++    bool trailing = false,
++    bool wrongRequestId = false)
++{
++    auto requestId = request.requestId;
++    if (wrongRequestId)
++        requestId.front() ^= 0x80;
++    const auto header = encodeHeader(
++        Header{
++            .type = type,
++            .status = status,
++            .bodySize = static_cast<uint32_t>(body.size()),
++            .batchId = request.batchId,
++            .requestId = requestId,
++        });
++    sendWithoutSigPipe(connection, header);
++    sendWithoutSigPipe(connection, body);
++    if (trailing) {
++        constexpr std::array<uint8_t, 1> trailingByte{'x'};
++        sendWithoutSigPipe(connection, trailingByte);
++    }
++}
++
++#endif
++
++} // namespace
++
++struct ExternalSignerClientTestAccess
++{
++    static void
++    commitIdentity(Client & client, DescribeKeyResponse response, std::chrono::steady_clock::time_point deadline)
++    {
++        client.commitIdentity(std::move(response), deadline);
++    }
++};
++
++TEST(external_signer, roundTripsNetworkHeader)
++{
++    Header input{
++        .type = MessageType::signPathInfoRequest,
++        .status = Status::ok,
++        .bodySize = 42,
++        .batchId = {1},
++        .requestId = {2},
++    };
++
++    auto encoded = encodeHeader(input);
++    EXPECT_EQ(encoded[0], 'N');
++    EXPECT_EQ(encoded[12], 0);
++    EXPECT_EQ(encoded[15], 42);
++    EXPECT_EQ(decodeHeader(encoded).bodySize, 42);
++    EXPECT_EQ(decodeHeader(encoded).type, input.type);
++    EXPECT_EQ(decodeHeader(encoded).batchId, input.batchId);
++}
++
++TEST(external_signer, rejectsDeclaredBodiesAboveTheirProtocolBounds)
++{
++    Header input{
++        .type = MessageType::describeKeyRequest,
++        .status = Status::ok,
++        .bodySize = 1,
++        .batchId = {1},
++        .requestId = {2},
++    };
++    EXPECT_THROW(encodeHeader(input), Error);
++
++    input.type = MessageType::describeKeyResponse;
++    input.bodySize = maxDescribeKeyResponseBodySize + 1;
++    EXPECT_THROW(encodeHeader(input), Error);
++
++    input.status = Status::malformed;
++    input.bodySize = maxErrorResponseBodySize + 1;
++    EXPECT_THROW(encodeHeader(input), Error);
++
++    input.type = MessageType::signPathInfoRequest;
++    input.status = Status::ok;
++    input.bodySize = maxSignPathInfoRequestBodySize + 1;
++    EXPECT_THROW(encodeHeader(input), Error);
++
++    input.type = MessageType::signPathInfoResponse;
++    input.bodySize = maxSignPathInfoResponseBodySize + 1;
++    EXPECT_THROW(encodeHeader(input), Error);
++
++    input.bodySize = 0;
++    input.batchId = {};
++    EXPECT_THROW(encodeHeader(input), Error);
++}
++
++TEST(external_signer, rejectsOversizedDeclaredBodyWhenDecodingHeader)
++{
++    Header input{
++        .type = MessageType::signPathInfoResponse,
++        .status = Status::ok,
++        .bodySize = maxSignPathInfoResponseBodySize,
++        .batchId = {1},
++        .requestId = {2},
++    };
++    auto encoded = encodeHeader(input);
++    encoded[12] = static_cast<uint8_t>((maxSignPathInfoResponseBodySize + 1) >> 24);
++    encoded[13] = static_cast<uint8_t>((maxSignPathInfoResponseBodySize + 1) >> 16);
++    encoded[14] = static_cast<uint8_t>((maxSignPathInfoResponseBodySize + 1) >> 8);
++    encoded[15] = static_cast<uint8_t>(maxSignPathInfoResponseBodySize + 1);
++    EXPECT_THROW(decodeHeader(encoded), Error);
++}
++
++TEST(external_signer, rejectsUnknownFlagsAndVersion)
++{
++    Header input{
++        .type = MessageType::describeKeyRequest,
++        .status = Status::ok,
++        .bodySize = 0,
++        .batchId = {1},
++        .requestId = {2},
++    };
++    auto encoded = encodeHeader(input);
++    encoded[8] = 1;
++    EXPECT_THROW(decodeHeader(encoded), Error);
++    encoded = encodeHeader(input);
++    encoded[4] = 2;
++    EXPECT_THROW(decodeHeader(encoded), Error);
++
++    encoded = encodeHeader(input);
++    encoded[7] = 1;
++    EXPECT_THROW(decodeHeader(encoded), Error);
++}
++
++TEST(external_signer, rejectsEveryUnknownTypeAndStatus)
++{
++    Header input{
++        .type = MessageType::describeKeyResponse,
++        .status = Status::ok,
++        .bodySize = 0,
++        .batchId = {1},
++        .requestId = {2},
++    };
++    const auto validType = [](uint8_t value) {
++        return value == 0x01 || value == 0x81 || value == 0x02 || value == 0x82;
++    };
++    for (unsigned int value = 0; value <= std::numeric_limits<uint8_t>::max(); ++value) {
++        if (validType(static_cast<uint8_t>(value)))
++            continue;
++        auto encoded = encodeHeader(input);
++        encoded[6] = static_cast<uint8_t>(value);
++        EXPECT_THROW(decodeHeader(encoded), Error) << "type " << value;
++    }
++    for (unsigned int value = 10; value <= std::numeric_limits<uint8_t>::max(); ++value) {
++        auto encoded = encodeHeader(input);
++        encoded[7] = static_cast<uint8_t>(value);
++        EXPECT_THROW(decodeHeader(encoded), Error) << "status " << value;
++    }
++
++    auto encoded = encodeHeader(input);
++    std::fill(encoded.begin() + 32, encoded.end(), 0);
++    EXPECT_THROW(decodeHeader(encoded), Error);
++    encoded = encodeHeader(input);
++    encoded[0] = 'B';
++    EXPECT_THROW(decodeHeader(encoded), Error);
++}
++
++TEST(external_signer, validatesDescribeKeyBodies)
++{
++    validateDescribeKeyRequest(std::span<const uint8_t>{});
++    const std::array<uint8_t, 1> nonEmptyBody{0};
++    EXPECT_THROW(validateDescribeKeyRequest(nonEmptyBody), Error);
++
++    std::vector<uint8_t> body{0, 4, 'k', 'e', 'y', '1', ed25519Algorithm};
++    body.insert(body.end(), 32, 0x42);
++    body.insert(body.end(), 16, 0x43);
++    const auto response = decodeDescribeKeyResponse(body);
++    EXPECT_EQ(response.keyName, "key1");
++    EXPECT_EQ(response.algorithm, ed25519Algorithm);
++    EXPECT_EQ(response.publicKey[0], 0x42);
++
++    body.push_back(0);
++    EXPECT_THROW(decodeDescribeKeyResponse(body), Error);
++    body.pop_back();
++    body[6] = 2;
++    EXPECT_THROW(decodeDescribeKeyResponse(body), Error);
++
++    body[6] = ed25519Algorithm;
++    std::fill(body.begin() + 39, body.begin() + 55, 0);
++    EXPECT_THROW(decodeDescribeKeyResponse(body), Error);
++    body.resize(39);
++    EXPECT_THROW(decodeDescribeKeyResponse(body), Error);
++}
++
++TEST(external_signer, validatesSignPathInfoBodiesExactly)
++{
++    std::vector<uint8_t> body{0, 4, 'k', 'e', 'y', '1'};
++    body.insert(body.end(), 32, 0x11);
++    body.insert(body.end(), 16, 0x12);
++    constexpr std::string_view fingerprint =
++        "1;/nix/store/00000000000000000000000000000000-hello;sha256:0000000000000000000000000000000000000000000000000000;1;";
++    const auto length = fingerprint.size();
++    body.insert(
++        body.end(),
++        {static_cast<uint8_t>(length >> 24),
++         static_cast<uint8_t>(length >> 16),
++         static_cast<uint8_t>(length >> 8),
++         static_cast<uint8_t>(length)});
++    body.insert(body.end(), fingerprint.begin(), fingerprint.end());
++    const auto request = decodeSignPathInfoRequest(body);
++    EXPECT_EQ(request.keyName, "key1");
++    EXPECT_EQ(request.fingerprint, fingerprint);
++
++    body.push_back(0);
++    EXPECT_THROW(decodeSignPathInfoRequest(body), Error);
++    body.pop_back();
++    std::fill(body.begin() + 38, body.begin() + 54, 0);
++    EXPECT_THROW(decodeSignPathInfoRequest(body), Error);
++
++    body.resize(38);
++    EXPECT_THROW(decodeSignPathInfoRequest(body), Error);
++
++    std::vector<uint8_t> response{0, 4, 'k', 'e', 'y', '1'};
++    response.insert(response.end(), 32, 0x11);
++    response.insert(response.end(), 16, 0x12);
++    response.insert(response.end(), 64, 0x22);
++    EXPECT_EQ(decodeSignPathInfoResponse(response).signature[63], 0x22);
++    response.push_back(0);
++    EXPECT_THROW(decodeSignPathInfoResponse(response), Error);
++    response.pop_back();
++    std::fill(response.begin() + 38, response.begin() + 54, 0);
++    EXPECT_THROW(decodeSignPathInfoResponse(response), Error);
++
++    response.resize(38);
++    EXPECT_THROW(decodeSignPathInfoResponse(response), Error);
++}
++
++TEST(external_signer, encodesSignPathInfoRequestExactly)
++{
++    SignPathInfoRequest request{
++        .keyName = "cache",
++        .publicKey = {0x11},
++        .endpointId = {0x12},
++        .fingerprint = std::string(canonicalFingerprint),
++    };
++    const auto encoded = encodeSignPathInfoRequest(request);
++    const auto decoded = decodeSignPathInfoRequest(encoded);
++    EXPECT_EQ(decoded.keyName, request.keyName);
++    EXPECT_EQ(decoded.publicKey, request.publicKey);
++    EXPECT_EQ(decoded.endpointId, request.endpointId);
++    EXPECT_EQ(decoded.fingerprint, request.fingerprint);
++    EXPECT_TRUE(encodeDescribeKeyRequest().empty());
++
++    request.endpointId = {};
++    EXPECT_THROW(encodeSignPathInfoRequest(request), Error);
++    request.endpointId = {1};
++    request.keyName = "bad:key";
++    EXPECT_THROW(encodeSignPathInfoRequest(request), Error);
++}
++
++TEST(external_signer, validatesTypedErrorBodyExactly)
++{
++    const std::vector<uint8_t> valid{0, 4, 'b', 'u', 's', 'y'};
++    EXPECT_EQ(decodeErrorResponse(valid), "busy");
++    const std::vector<uint8_t> validUtf8{0, 7, 'b', 'u', 's', 'y', 0xe2, 0x82, 0xac};
++    EXPECT_EQ(decodeErrorResponse(validUtf8).size(), 7);
++    auto invalid = valid;
++    invalid.push_back(0);
++    EXPECT_THROW(decodeErrorResponse(invalid), Error);
++    invalid = {0, 1, 0};
++    EXPECT_THROW(decodeErrorResponse(invalid), Error);
++    invalid = {0, 3, 0xe0, 0x80, 0x80};
++    EXPECT_THROW(decodeErrorResponse(invalid), Error);
++    invalid = {0, 3, 0xed, 0xa0, 0x80};
++    EXPECT_THROW(decodeErrorResponse(invalid), Error);
++    invalid = {0, 2, 0xc2, 0x9b};
++    EXPECT_THROW(decodeErrorResponse(invalid), Error);
++    invalid = {0, 2, 0x1b, '['};
++    EXPECT_THROW(decodeErrorResponse(invalid), Error);
++    invalid = {0, 2, 0xc0, 0x80};
++    EXPECT_THROW(decodeErrorResponse(invalid), Error);
++}
++
++TEST(external_signer, validatesNormativePathInfoV1Corpus)
++{
++    const auto * corpusPath = std::getenv("_NIX_TEST_EXTERNAL_SIGNER_CORPUS");
++    ASSERT_NE(corpusPath, nullptr);
++    std::ifstream input(corpusPath);
++    ASSERT_TRUE(input.good());
++    const auto corpus = nlohmann::json::parse(input);
++    ASSERT_EQ(corpus.at("profile"), "PATH_INFO_V1");
++    for (const auto & vector : corpus.at("vectors")) {
++        const auto name = vector.at("name").get<std::string>();
++        SCOPED_TRACE(name);
++        std::string fingerprint;
++        if (vector.contains("input")) {
++            const auto bytes = decodeHex(vector.at("input").get<std::string>());
++            fingerprint.assign(reinterpret_cast<const char *>(bytes.data()), bytes.size());
++        } else {
++            fingerprint = expandConstruction(vector.at("construction"));
++            EXPECT_EQ(fingerprint.size(), vector.at("input_length").get<size_t>());
++        }
++        if (vector.at("result") == "accept") {
++            EXPECT_NO_THROW(validatePathInfoV1(fingerprint));
++            if (vector.contains("canonical")) {
++                const auto canonical = decodeHex(vector.at("canonical").get<std::string>());
++                EXPECT_EQ(fingerprint, std::string(reinterpret_cast<const char *>(canonical.data()), canonical.size()));
++            }
++        } else {
++            EXPECT_THROW(validatePathInfoV1(fingerprint), Error);
++        }
++    }
++}
++
++#ifndef _WIN32
++
++TEST(external_signer, rejectsUntrustedOrSymlinkSocketPath)
++{
++    auto directory = createTempDir("", "nxsg-path", 0700);
++    AutoDelete deleteDirectory(directory, true);
++    const auto socketPath = directory / "signer.sock";
++    auto listener = createUnixDomainSocket(socketPath, 0600);
++    EXPECT_EQ(canonicalizeSocketPath(socketPath), socketPath);
++
++    const auto linkPath = directory / "link.sock";
++    ASSERT_EQ(symlink(socketPath.c_str(), linkPath.c_str()), 0);
++    EXPECT_THROW(canonicalizeSocketPath(linkPath), Error);
++
++    ASSERT_EQ(::chmod(socketPath.c_str(), 0660), 0);
++    EXPECT_THROW(canonicalizeSocketPath(socketPath), Error);
++    ASSERT_EQ(::chmod(socketPath.c_str(), 0600), 0);
++    ASSERT_EQ(::chmod(directory.c_str(), 0755), 0);
++    EXPECT_THROW(canonicalizeSocketPath(socketPath), Error);
++}
++
++TEST(external_signer, rejectsFilesystemSocketReplacementBeforeDescribe)
++{
++    auto directory = createTempDir("", "nxsg-replace", 0700);
++    AutoDelete deleteDirectory(directory, true);
++    const auto socketPath = directory / "signer.sock";
++    auto original = createUnixDomainSocket(socketPath, 0600);
++    Client client(socketPath);
++
++    original.close();
++    ASSERT_TRUE(std::filesystem::remove(socketPath));
++    auto replacement = createUnixDomainSocket(socketPath, 0600);
++    EXPECT_THROW(client.describeKey(), Error);
++}
++
++TEST(external_signer, rejectsFilesystemSocketReplacementAfterDescribe)
++{
++    const std::array<uint8_t, 32> publicKey{0x11};
++    const std::array<uint8_t, 16> endpointId{0x12};
++    const auto describeBody = encodeDescribeBody("cache", publicKey, endpointId);
++    TestServer server({
++        [describeBody](Descriptor connection, const Header & request, std::span<const uint8_t>) {
++            sendResponse(connection, request, MessageType::describeKeyResponse, Status::ok, describeBody);
++        },
++    });
++    Client client(server.path);
++    static_cast<void>(client.describeKey());
++    server.join();
++
++    server.listener.close();
++    ASSERT_TRUE(std::filesystem::remove(server.path));
++    auto replacement = createUnixDomainSocket(server.path, 0600);
++    EXPECT_THROW(client.signPathInfoV1(canonicalFingerprint), Error);
++}
++
++TEST(external_signer, performsPinnedDescribeAndVerifiedSignExchanges)
++{
++    std::array<uint8_t, 32> publicKey{};
++    std::array<uint8_t, 64> secretKey{};
++    ASSERT_EQ(crypto_sign_keypair(publicKey.data(), secretKey.data()), 0);
++    const std::array<uint8_t, 16> endpointId{0x42};
++    const auto describeBody = encodeDescribeBody("cache", publicKey, endpointId);
++    TestServer server({
++        [describeBody](Descriptor connection, const Header & request, std::span<const uint8_t> body) {
++            EXPECT_EQ(request.type, MessageType::describeKeyRequest);
++            EXPECT_TRUE(body.empty());
++            sendResponse(connection, request, MessageType::describeKeyResponse, Status::ok, describeBody);
++        },
++        [publicKey, secretKey, endpointId](
++            Descriptor connection, const Header & request, std::span<const uint8_t> body) {
++            EXPECT_EQ(request.type, MessageType::signPathInfoRequest);
++            const auto decoded = decodeSignPathInfoRequest(body);
++            EXPECT_EQ(decoded.keyName, "cache");
++            EXPECT_EQ(decoded.publicKey, publicKey);
++            EXPECT_EQ(decoded.endpointId, endpointId);
++            EXPECT_EQ(decoded.fingerprint, canonicalFingerprint);
++            std::array<uint8_t, 64> signature{};
++            ASSERT_EQ(
++                crypto_sign_detached(
++                    signature.data(),
++                    nullptr,
++                    reinterpret_cast<const unsigned char *>(decoded.fingerprint.data()),
++                    decoded.fingerprint.size(),
++                    secretKey.data()),
++                0);
++            const auto response = encodeSignBody("cache", publicKey, endpointId, signature);
++            sendResponse(connection, request, MessageType::signPathInfoResponse, Status::ok, response);
++        },
++    });
++    Client client(server.path);
++    const auto & identity = client.describeKey();
++    EXPECT_EQ(identity.keyName, "cache");
++    EXPECT_THROW(client.describeKey(), Error);
++    const auto response = client.signPathInfoV1(canonicalFingerprint);
++    EXPECT_EQ(response.endpointId, endpointId);
++}
++
++TEST(external_signer, rejectsWrongCorrelationAndTrailingResponseBytes)
++{
++    std::array<uint8_t, 32> publicKey{0x11};
++    std::array<uint8_t, 16> endpointId{0x12};
++    const auto describeBody = encodeDescribeBody("cache", publicKey, endpointId);
++    TestServer wrongId({[describeBody](Descriptor connection, const Header & request, std::span<const uint8_t>) {
++        sendResponse(connection, request, MessageType::describeKeyResponse, Status::ok, describeBody, false, true);
++    }});
++    Client wrongIdClient(wrongId.path);
++    EXPECT_THROW(wrongIdClient.describeKey(), Error);
++
++    TestServer trailing({[describeBody](Descriptor connection, const Header & request, std::span<const uint8_t>) {
++        sendResponse(connection, request, MessageType::describeKeyResponse, Status::ok, describeBody, true);
++    }});
++    Client trailingClient(trailing.path);
++    EXPECT_THROW(trailingClient.describeKey(), Error);
++}
++
++TEST(external_signer, rejectsWrongResponseTypeAndEarlyEof)
++{
++    TestServer wrongType({[](Descriptor connection, const Header & request, std::span<const uint8_t>) {
++        const std::array<uint8_t, 0> body{};
++        sendResponse(connection, request, MessageType::signPathInfoResponse, Status::ok, body);
++    }});
++    Client wrongTypeClient(wrongType.path);
++    EXPECT_THROW(wrongTypeClient.describeKey(), Error);
++
++    TestServer earlyEof({[](Descriptor connection, const Header &, std::span<const uint8_t>) {
++        writeFull(connection, "NXSG", false);
++    }});
++    Client earlyEofClient(earlyEof.path);
++    EXPECT_THROW(earlyEofClient.describeKey(), Error);
++}
++
++TEST(external_signer, surfacesBoundedTypedErrorAndRejectsMalformedDiagnostic)
++{
++    TestServer typedError({[](Descriptor connection, const Header & request, std::span<const uint8_t>) {
++        const std::vector<uint8_t> body{0, 4, 'b', 'u', 's', 'y'};
++        sendResponse(connection, request, MessageType::describeKeyResponse, Status::overloaded, body);
++    }});
++    Client typedErrorClient(typedError.path);
++    try {
++        static_cast<void>(typedErrorClient.describeKey());
++        FAIL() << "expected typed signer error";
++    } catch (const ExternalSignerError & error) {
++        EXPECT_EQ(error.status, Status::overloaded);
++    }
++
++    TestServer malformed({[](Descriptor connection, const Header & request, std::span<const uint8_t>) {
++        const std::vector<uint8_t> body{0, 4, 'b'};
++        sendResponse(connection, request, MessageType::describeKeyResponse, Status::internal, body);
++    }});
++    Client malformedClient(malformed.path);
++    EXPECT_THROW(malformedClient.describeKey(), Error);
++}
++
++TEST(external_signer, enforcesOneEndToEndDeadline)
++{
++    TestServer delayed({[](Descriptor connection, const Header & request, std::span<const uint8_t>) {
++        std::this_thread::sleep_for(std::chrono::milliseconds(100));
++        const std::array<uint8_t, 0> body{};
++        sendResponse(connection, request, MessageType::describeKeyResponse, Status::ok, body);
++    }});
++    Client client(delayed.path, std::chrono::milliseconds(25));
++    EXPECT_THROW(client.describeKey(), Error);
++}
++
++TEST(external_signer, deadlineFailureBeforeIdentityCommitLeavesDescribeRetryable)
++{
++    std::array<uint8_t, 32> publicKey{};
++    std::array<uint8_t, 64> secretKey{};
++    ASSERT_EQ(crypto_sign_keypair(publicKey.data(), secretKey.data()), 0);
++    const std::array<uint8_t, 16> endpointId{0x42};
++    const auto describeBody = encodeDescribeBody("cache", publicKey, endpointId);
++    TestServer server({
++        [describeBody](Descriptor connection, const Header & request, std::span<const uint8_t>) {
++            sendResponse(connection, request, MessageType::describeKeyResponse, Status::ok, describeBody);
++        },
++        [publicKey, secretKey, endpointId](
++            Descriptor connection, const Header & request, std::span<const uint8_t> body) {
++            const auto decoded = decodeSignPathInfoRequest(body);
++            std::array<uint8_t, 64> signature{};
++            ASSERT_EQ(
++                crypto_sign_detached(
++                    signature.data(),
++                    nullptr,
++                    reinterpret_cast<const unsigned char *>(decoded.fingerprint.data()),
++                    decoded.fingerprint.size(),
++                    secretKey.data()),
++                0);
++            const auto response = encodeSignBody("cache", publicKey, endpointId, signature);
++            sendResponse(connection, request, MessageType::signPathInfoResponse, Status::ok, response);
++        },
++    });
++    Client client(server.path);
++    const DescribeKeyResponse identity{
++        .keyName = "cache",
++        .algorithm = ed25519Algorithm,
++        .publicKey = publicKey,
++        .endpointId = endpointId,
++    };
++
++    EXPECT_THROW(
++        ExternalSignerClientTestAccess::commitIdentity(
++            client, identity, std::chrono::steady_clock::now() - std::chrono::milliseconds(1)),
++        Error);
++    EXPECT_THROW(client.signPathInfoV1(canonicalFingerprint), Error);
++
++    EXPECT_EQ(client.describeKey().endpointId, endpointId);
++    EXPECT_EQ(client.signPathInfoV1(canonicalFingerprint).endpointId, endpointId);
++}
++
++TEST(external_signer, rejectsEndpointReplacementAfterDescribe)
++{
++    std::array<uint8_t, 32> publicKey{};
++    std::array<uint8_t, 64> secretKey{};
++    ASSERT_EQ(crypto_sign_keypair(publicKey.data(), secretKey.data()), 0);
++    const std::array<uint8_t, 16> firstEndpoint{0x11};
++    const std::array<uint8_t, 16> replacementEndpoint{0x22};
++    const auto describeBody = encodeDescribeBody("cache", publicKey, firstEndpoint);
++    TestServer server({
++        [describeBody](Descriptor connection, const Header & request, std::span<const uint8_t>) {
++            sendResponse(connection, request, MessageType::describeKeyResponse, Status::ok, describeBody);
++        },
++        [publicKey, secretKey, replacementEndpoint](
++            Descriptor connection, const Header & request, std::span<const uint8_t> body) {
++            const auto decoded = decodeSignPathInfoRequest(body);
++            std::array<uint8_t, 64> signature{};
++            ASSERT_EQ(
++                crypto_sign_detached(
++                    signature.data(),
++                    nullptr,
++                    reinterpret_cast<const unsigned char *>(decoded.fingerprint.data()),
++                    decoded.fingerprint.size(),
++                    secretKey.data()),
++                0);
++            const auto response = encodeSignBody("cache", publicKey, replacementEndpoint, signature);
++            sendResponse(connection, request, MessageType::signPathInfoResponse, Status::ok, response);
++        },
++    });
++    Client client(server.path);
++    static_cast<void>(client.describeKey());
++    EXPECT_THROW(client.signPathInfoV1(canonicalFingerprint), Error);
++}
++
++TEST(external_signer, rejectsInvalidReturnedSignature)
++{
++    const std::array<uint8_t, 32> publicKey{0x11};
++    const std::array<uint8_t, 16> endpointId{0x12};
++    const std::array<uint8_t, 64> signature{0x13};
++    const auto describeBody = encodeDescribeBody("cache", publicKey, endpointId);
++    const auto signBody = encodeSignBody("cache", publicKey, endpointId, signature);
++    TestServer server({
++        [describeBody](Descriptor connection, const Header & request, std::span<const uint8_t>) {
++            sendResponse(connection, request, MessageType::describeKeyResponse, Status::ok, describeBody);
++        },
++        [signBody](Descriptor connection, const Header & request, std::span<const uint8_t>) {
++            sendResponse(connection, request, MessageType::signPathInfoResponse, Status::ok, signBody);
++        },
++    });
++    Client client(server.path);
++    static_cast<void>(client.describeKey());
++    EXPECT_THROW(client.signPathInfoV1(canonicalFingerprint), Error);
++}
++
++#endif
++
++} // namespace nix::externalSigner
+diff --git a/src/libutil-tests/meson.build b/src/libutil-tests/meson.build
+index aa12feb7d273bb3770fa18ba57b4738ba634f69e..16b883f3aa4864887fb50a1a2dc45c77525a2358 100644
+--- a/src/libutil-tests/meson.build
++++ b/src/libutil-tests/meson.build
+@@ -39,6 +39,9 @@ deps_private += gmock
+ zstd = dependency('libzstd', version : '>= 1.4.0')
+ deps_private += zstd
+ 
++sodium = dependency('libsodium', 'sodium')
++deps_private += sodium
++
+ if host_machine.system() == 'windows'
+   # Boost.ASIO needs this unconditionally.
+   socket = cxx.find_library('ws2_32')
+@@ -68,6 +71,7 @@ sources = files(
+   'compression.cc',
+   'config.cc',
+   'executable-path.cc',
++  'external-signer.cc',
+   'file-content-address.cc',
+   'file-descriptor.cc',
+   'file-system-at.cc',
+@@ -128,6 +132,7 @@ test(
+   this_exe,
+   env : {
+     '_NIX_TEST_UNIT_DATA' : meson.current_source_dir() / 'data',
++    '_NIX_TEST_EXTERNAL_SIGNER_CORPUS' : meson.current_source_dir() / '..' / '..' / 'tests' / 'functional' / 'nix-cache-signing' / 'path-info-v1.json',
+   },
+   protocol : 'gtest',
+ )
+@@ -151,6 +156,7 @@ if host_machine.system() == 'linux'
+       ],
+       env : {
+         '_NIX_TEST_UNIT_DATA' : meson.current_source_dir() / 'data',
++        '_NIX_TEST_EXTERNAL_SIGNER_CORPUS' : meson.current_source_dir() / '..' / '..' / 'tests' / 'functional' / 'nix-cache-signing' / 'path-info-v1.json',
+       },
+       protocol : 'gtest',
+     )
+diff --git a/src/libutil/include/nix/util/signature/external-signer.hh b/src/libutil/include/nix/util/signature/external-signer.hh
+new file mode 100644
+index 0000000000000000000000000000000000000000..b78de65ba43f9b3de32283af9274a45765d0f0c0
+--- /dev/null
++++ b/src/libutil/include/nix/util/signature/external-signer.hh
+@@ -0,0 +1,168 @@
++#pragma once
++
++#include "nix/util/types.hh"
++#include "nix/util/error.hh"
++
++#include <array>
++#include <chrono>
++#include <cstdint>
++#include <filesystem>
++#include <optional>
++#include <span>
++#include <string>
++#include <vector>
++
++namespace nix::externalSigner {
++
++constexpr size_t headerSize = 48;
++constexpr uint32_t maxDescribeKeyResponseBodySize = 179;
++constexpr uint32_t maxErrorResponseBodySize = 1026;
++constexpr uint32_t maxSignPathInfoRequestBodySize = 524808;
++constexpr uint32_t maxSignPathInfoResponseBodySize = 242;
++constexpr uint32_t maxFingerprintSize = 524626;
++constexpr size_t maxReferences = 2048;
++constexpr uint8_t ed25519Algorithm = 1;
++
++enum class MessageType : uint8_t {
++    describeKeyRequest = 0x01,
++    describeKeyResponse = 0x81,
++    signPathInfoRequest = 0x02,
++    signPathInfoResponse = 0x82,
++};
++
++enum class Status : uint8_t {
++    ok = 0,
++    malformed = 1,
++    unsupportedVersion = 2,
++    unauthorized = 3,
++    keyMismatch = 4,
++    invalidFingerprint = 5,
++    unavailable = 6,
++    deadlineExceeded = 7,
++    internal = 8,
++    overloaded = 9,
++};
++
++struct Header
++{
++    MessageType type;
++    Status status;
++    uint32_t bodySize;
++    std::array<uint8_t, 16> batchId;
++    std::array<uint8_t, 16> requestId;
++};
++
++struct DescribeKeyResponse
++{
++    std::string keyName;
++    uint8_t algorithm;
++    std::array<uint8_t, 32> publicKey;
++    std::array<uint8_t, 16> endpointId;
++};
++
++struct SignPathInfoRequest
++{
++    std::string keyName;
++    std::array<uint8_t, 32> publicKey;
++    std::array<uint8_t, 16> endpointId;
++    std::string fingerprint;
++};
++
++struct SignPathInfoResponse
++{
++    std::string keyName;
++    std::array<uint8_t, 32> publicKey;
++    std::array<uint8_t, 16> endpointId;
++    std::array<uint8_t, 64> signature;
++};
++
++/** An error status returned by an external signer. */
++class ExternalSignerError final : public CloneableError<ExternalSignerError, Error>
++{
++public:
++    Status status;
++
++    ExternalSignerError(Status status, std::string diagnostic);
++};
++
++/** Encode one validated NXSG 1.0 header in network byte order. */
++std::array<uint8_t, headerSize> encodeHeader(const Header & header);
++
++/** Decode and validate one complete NXSG 1.0 header. */
++Header decodeHeader(std::span<const uint8_t, headerSize> bytes);
++
++/** Return whether an opaque protocol ID contains at least one non-zero byte. */
++bool validId(std::span<const uint8_t, 16> id) noexcept;
++
++/** Validate the empty `DescribeKeyRequest` body. */
++void validateDescribeKeyRequest(std::span<const uint8_t> body);
++
++/** Encode the empty `DescribeKeyRequest` body. */
++std::vector<uint8_t> encodeDescribeKeyRequest();
++
++/** Decode a successful `DescribeKeyResponse` body. */
++DescribeKeyResponse decodeDescribeKeyResponse(std::span<const uint8_t> body);
++
++/** Decode a `SignPathInfoV1Request` body with exact field lengths. */
++SignPathInfoRequest decodeSignPathInfoRequest(std::span<const uint8_t> body);
++
++/** Encode a validated `SignPathInfoV1Request` body. */
++std::vector<uint8_t> encodeSignPathInfoRequest(const SignPathInfoRequest & request);
++
++/** Decode a successful `SignPathInfoV1Response` body. */
++SignPathInfoResponse decodeSignPathInfoResponse(std::span<const uint8_t> body);
++
++/** Decode and validate a bounded non-success diagnostic body. */
++std::string decodeErrorResponse(std::span<const uint8_t> body);
++
++/** Validate one canonical `PATH_INFO_V1` fingerprint. */
++void validatePathInfoV1(std::string_view fingerprint);
++
++/**
++ * Canonicalize and validate a signer socket path without following its final
++ * component.
++ */
++std::filesystem::path canonicalizeSocketPath(const std::filesystem::path & path);
++
++/**
++ * Client for one key served by one `NXSG` 1.0 Unix socket.
++ *
++ * One client pins the identity returned by exactly one `DescribeKey` call.
++ * Every exchange uses a fresh connection and request ID under one command
++ * batch ID.
++ */
++class Client
++{
++public:
++    explicit Client(
++        const std::filesystem::path & socketPath, std::chrono::milliseconds deadline = std::chrono::seconds(5));
++
++    /** Discover and pin the signer identity. May be called exactly once. */
++    const DescribeKeyResponse & describeKey();
++
++    /** Validate and sign one canonical `PATH_INFO_V1` fingerprint. */
++    SignPathInfoResponse signPathInfoV1(std::string_view fingerprint);
++
++    /** Return the canonical socket pathname used by this client. */
++    const std::filesystem::path & path() const noexcept
++    {
++        return socketPath;
++    }
++
++private:
++    friend struct ExternalSignerClientTestAccess;
++
++    std::filesystem::path socketPath;
++    std::chrono::milliseconds deadline;
++    std::array<uint8_t, 16> batchId;
++    std::optional<DescribeKeyResponse> identity;
++    uintmax_t socketDevice = 0;
++    uintmax_t socketInode = 0;
++
++    std::vector<uint8_t>
++    exchange(MessageType type, std::span<const uint8_t> body, std::chrono::steady_clock::time_point operationDeadline);
++
++    void commitIdentity(DescribeKeyResponse response, std::chrono::steady_clock::time_point operationDeadline);
++};
++
++} // namespace nix::externalSigner
+diff --git a/src/libutil/meson.build b/src/libutil/meson.build
+index 112a39d8afe747cd37ff9cc51212b87d99d6da19..c7c4eacae2e6c37498e2fd9bdda12e3e3f30a5dd 100644
+--- a/src/libutil/meson.build
++++ b/src/libutil/meson.build
+@@ -181,6 +181,7 @@ sources = [ config_priv_h ] + files(
+   'register-library-versions.cc',
+   'serialise.cc',
+   'signature/local-keys.cc',
++  'signature/external-signer.cc',
+   'signature/signer.cc',
+   'source-accessor.cc',
+   'source-path.cc',
+diff --git a/src/libutil/signature/external-signer.cc b/src/libutil/signature/external-signer.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..f99248f97a0cc5a1fdc12fa32d85b17fd71dd5b1
+--- /dev/null
++++ b/src/libutil/signature/external-signer.cc
+@@ -0,0 +1,907 @@
++#include "nix/util/signature/external-signer.hh"
++
++#include "nix/util/error.hh"
++#include "nix/util/file-descriptor.hh"
++#include "nix/util/signature/local-keys.hh"
++
++#include <algorithm>
++#include <charconv>
++#include <cerrno>
++#include <chrono>
++#include <cstddef>
++#include <cstring>
++#include <limits>
++#include <ranges>
++#include <string_view>
++#include <system_error>
++
++#include <sodium.h>
++
++#ifndef _WIN32
++#  include <fcntl.h>
++#  include <poll.h>
++#  include <sys/socket.h>
++#  include <sys/stat.h>
++#  include <sys/types.h>
++#  include <sys/un.h>
++#  include <unistd.h>
++#  if defined(__APPLE__) || defined(__FreeBSD__)
++#    include <sys/ucred.h>
++#  endif
++#endif
++
++namespace nix::externalSigner {
++
++namespace {
++
++constexpr std::array<uint8_t, 4> magic{'N', 'X', 'S', 'G'};
++constexpr std::string_view nix32Alphabet = "0123456789abcdfghijklmnpqrsvwxyz";
++constexpr std::string_view storePrefix = "/nix/store/";
++
++bool validType(uint8_t value) noexcept
++{
++    return value == static_cast<uint8_t>(MessageType::describeKeyRequest)
++           || value == static_cast<uint8_t>(MessageType::describeKeyResponse)
++           || value == static_cast<uint8_t>(MessageType::signPathInfoRequest)
++           || value == static_cast<uint8_t>(MessageType::signPathInfoResponse);
++}
++
++bool validStatus(uint8_t value) noexcept
++{
++    return value <= static_cast<uint8_t>(Status::overloaded);
++}
++
++constexpr uint32_t bodySizeLimit(MessageType type, Status status) noexcept
++{
++    if (status != Status::ok)
++        return maxErrorResponseBodySize;
++
++    switch (type) {
++    case MessageType::describeKeyRequest:
++        return 0;
++    case MessageType::describeKeyResponse:
++        return maxDescribeKeyResponseBodySize;
++    case MessageType::signPathInfoRequest:
++        return maxSignPathInfoRequestBodySize;
++    case MessageType::signPathInfoResponse:
++        return maxSignPathInfoResponseBodySize;
++    }
++    return 0;
++}
++
++uint32_t readU32(std::span<const uint8_t, headerSize> bytes, size_t offset) noexcept
++{
++    return (static_cast<uint32_t>(bytes[offset]) << 24) | (static_cast<uint32_t>(bytes[offset + 1]) << 16)
++           | (static_cast<uint32_t>(bytes[offset + 2]) << 8) | static_cast<uint32_t>(bytes[offset + 3]);
++}
++
++void writeU32(std::span<uint8_t, headerSize> bytes, size_t offset, uint32_t value) noexcept
++{
++    bytes[offset] = static_cast<uint8_t>(value >> 24);
++    bytes[offset + 1] = static_cast<uint8_t>(value >> 16);
++    bytes[offset + 2] = static_cast<uint8_t>(value >> 8);
++    bytes[offset + 3] = static_cast<uint8_t>(value);
++}
++
++uint16_t readU16(std::span<const uint8_t> bytes, size_t offset) noexcept
++{
++    return static_cast<uint16_t>((static_cast<uint16_t>(bytes[offset]) << 8) | bytes[offset + 1]);
++}
++
++void appendU16(std::vector<uint8_t> & bytes, uint16_t value)
++{
++    bytes.push_back(static_cast<uint8_t>(value >> 8));
++    bytes.push_back(static_cast<uint8_t>(value));
++}
++
++void appendU32(std::vector<uint8_t> & bytes, uint32_t value)
++{
++    bytes.push_back(static_cast<uint8_t>(value >> 24));
++    bytes.push_back(static_cast<uint8_t>(value >> 16));
++    bytes.push_back(static_cast<uint8_t>(value >> 8));
++    bytes.push_back(static_cast<uint8_t>(value));
++}
++
++[[noreturn]] void invalidBody(std::string_view what)
++{
++    throw Error("invalid NXSG 1.0 %s body", what);
++}
++
++void requireBytes(std::span<const uint8_t> body, size_t offset, size_t count, std::string_view what)
++{
++    if (offset > body.size() || count > body.size() - offset)
++        invalidBody(what);
++}
++
++bool validText(std::span<const uint8_t> bytes) noexcept
++{
++    size_t index = 0;
++    while (index < bytes.size()) {
++        uint32_t codePoint = bytes[index++];
++        size_t continuation = 0;
++        if (codePoint < 0x80) {
++        } else if (codePoint >= 0xc2 && codePoint <= 0xdf) {
++            continuation = 1;
++            codePoint &= 0x1f;
++        } else if (codePoint >= 0xe0 && codePoint <= 0xef) {
++            continuation = 2;
++            codePoint &= 0x0f;
++        } else if (codePoint >= 0xf0 && codePoint <= 0xf4) {
++            continuation = 3;
++            codePoint &= 0x07;
++        } else {
++            return false;
++        }
++        if (continuation > bytes.size() - index)
++            return false;
++        for (size_t i = 0; i < continuation; ++i) {
++            const auto byte = bytes[index++];
++            if ((byte & 0xc0) != 0x80)
++                return false;
++            codePoint = (codePoint << 6) | (byte & 0x3f);
++        }
++        if ((continuation == 2 && codePoint < 0x800) || (continuation == 3 && codePoint < 0x10000)
++            || codePoint > 0x10ffff || (codePoint >= 0xd800 && codePoint <= 0xdfff))
++            return false;
++        if (codePoint < 0x20 || (codePoint >= 0x7f && codePoint <= 0x9f))
++            return false;
++    }
++    return true;
++}
++
++std::string readKeyName(std::span<const uint8_t> body, size_t & offset)
++{
++    requireBytes(body, offset, 2, "key identity");
++    const auto length = readU16(body, offset);
++    offset += 2;
++    requireBytes(body, offset, length, "key identity");
++    const auto bytes = body.subspan(offset, length);
++    offset += length;
++    if (bytes.empty() || bytes.size() > 128 || !validText(bytes))
++        invalidBody("key identity");
++    for (size_t i = 0; i < bytes.size(); ++i) {
++        const auto byte = bytes[i];
++        const bool first = i == 0;
++        if ((first && !((byte >= 'A' && byte <= 'Z') || (byte >= 'a' && byte <= 'z') || (byte >= '0' && byte <= '9')))
++            || (!first
++                && !(
++                    (byte >= 'A' && byte <= 'Z') || (byte >= 'a' && byte <= 'z') || (byte >= '0' && byte <= '9')
++                    || byte == '.' || byte == '_' || byte == '-')))
++            invalidBody("key identity");
++    }
++    return {reinterpret_cast<const char *>(bytes.data()), bytes.size()};
++}
++
++void appendKeyName(std::vector<uint8_t> & body, std::string_view keyName)
++{
++    if (keyName.empty() || keyName.size() > 128)
++        invalidBody("key identity");
++    std::vector<uint8_t> encoded;
++    encoded.reserve(keyName.size() + 2);
++    appendU16(encoded, static_cast<uint16_t>(keyName.size()));
++    encoded.insert(encoded.end(), keyName.begin(), keyName.end());
++    size_t offset = 0;
++    if (readKeyName(encoded, offset) != keyName || offset != encoded.size())
++        invalidBody("key identity");
++    body.insert(body.end(), encoded.begin(), encoded.end());
++}
++
++bool validNix32(std::string_view value) noexcept
++{
++    return std::ranges::all_of(value, [](char character) { return nix32Alphabet.contains(character); });
++}
++
++void validateStorePath(std::string_view path)
++{
++    if (!path.starts_with(storePrefix))
++        throw Error("invalid PATH_INFO_V1 store path prefix");
++    const auto base = path.substr(storePrefix.size());
++    if (base.size() < 34 || base[32] != '-' || !validNix32(base.substr(0, 32)))
++        throw Error("invalid PATH_INFO_V1 store path shape");
++    const auto name = base.substr(33);
++    if (name.empty() || name.size() > 211)
++        throw Error("invalid PATH_INFO_V1 store path name length");
++    if (name == "." || name == ".." || name.starts_with(".-") || name.starts_with("..-"))
++        throw Error("invalid PATH_INFO_V1 reserved store path name");
++    for (const auto character : name) {
++        const bool alphaNumeric = (character >= '0' && character <= '9') || (character >= 'a' && character <= 'z')
++                                  || (character >= 'A' && character <= 'Z');
++        if (!alphaNumeric && !std::string_view{"+-._?="}.contains(character))
++            throw Error("invalid PATH_INFO_V1 store path name character");
++    }
++}
++
++std::array<std::string_view, 5> splitFingerprint(std::string_view fingerprint)
++{
++    std::array<std::string_view, 5> fields{};
++    size_t start = 0;
++    for (size_t index = 0; index < fields.size() - 1; ++index) {
++        const auto separator = fingerprint.find(';', start);
++        if (separator == std::string_view::npos)
++            throw Error("invalid PATH_INFO_V1 field count");
++        fields[index] = fingerprint.substr(start, separator - start);
++        start = separator + 1;
++    }
++    if (fingerprint.find(';', start) != std::string_view::npos)
++        throw Error("invalid PATH_INFO_V1 field count");
++    fields.back() = fingerprint.substr(start);
++    return fields;
++}
++
++using Clock = std::chrono::steady_clock;
++
++[[noreturn]] void deadlineError()
++{
++    throw Error("NXSG 1.0 exchange exceeded its deadline");
++}
++
++void requireBeforeDeadline(Clock::time_point deadline)
++{
++    if (Clock::now() >= deadline)
++        deadlineError();
++}
++
++#ifndef _WIN32
++
++struct SocketIdentity
++{
++    uintmax_t device;
++    uintmax_t inode;
++
++    bool operator==(const SocketIdentity &) const = default;
++};
++
++int remainingMilliseconds(Clock::time_point deadline)
++{
++    const auto now = Clock::now();
++    if (now >= deadline)
++        deadlineError();
++    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
++    if (remaining.count() >= std::numeric_limits<int>::max())
++        return std::numeric_limits<int>::max();
++    return std::max(1, static_cast<int>(remaining.count()));
++}
++
++void waitFor(int fd, short events, Clock::time_point deadline)
++{
++    while (true) {
++        struct pollfd pollFd{
++            .fd = fd,
++            .events = events,
++            .revents = 0,
++        };
++        const auto result = poll(&pollFd, 1, remainingMilliseconds(deadline));
++        if (result == 0)
++            deadlineError();
++        if (result < 0) {
++            if (errno == EINTR)
++                continue;
++            throw SysError("polling NXSG 1.0 socket");
++        }
++        if (pollFd.revents & POLLNVAL)
++            throw Error("NXSG 1.0 socket became invalid");
++        if (pollFd.revents & (events | POLLERR | POLLHUP))
++            return;
++    }
++}
++
++SocketIdentity validateSocketForConnect(const std::filesystem::path & path)
++{
++    struct stat parentStatus{};
++    const auto parent = path.parent_path();
++    if (::stat(parent.c_str(), &parentStatus) < 0)
++        throw SysError("checking NXSG 1.0 socket parent %s", PathFmt(parent));
++    if (!S_ISDIR(parentStatus.st_mode) || parentStatus.st_uid != geteuid() || (parentStatus.st_mode & 0077) != 0)
++        throw Error("NXSG 1.0 socket parent is not an owner-only directory owned by the effective UID");
++
++    struct stat socketStatus{};
++    if (lstat(path.c_str(), &socketStatus) < 0)
++        throw SysError("checking NXSG 1.0 socket %s", PathFmt(path));
++    if (S_ISLNK(socketStatus.st_mode))
++        throw Error("NXSG 1.0 socket path must not be a symlink");
++    if (!S_ISSOCK(socketStatus.st_mode) || socketStatus.st_uid != geteuid() || (socketStatus.st_mode & 0077) != 0)
++        throw Error("NXSG 1.0 socket is not an owner-only socket owned by the effective UID");
++    return {
++        .device = static_cast<uintmax_t>(socketStatus.st_dev),
++        .inode = static_cast<uintmax_t>(socketStatus.st_ino),
++    };
++}
++
++void connectWithDeadline(int fd, const std::filesystem::path & path, Clock::time_point deadline)
++{
++    struct sockaddr_un address{};
++    address.sun_family = AF_UNIX;
++    const auto nativePath = path.string();
++    if (nativePath.size() >= sizeof(address.sun_path))
++        throw Error("NXSG 1.0 socket path is too long: %s", PathFmt(path));
++    std::memcpy(address.sun_path, nativePath.c_str(), nativePath.size() + 1);
++    while (true) {
++        if (Clock::now() >= deadline)
++            deadlineError();
++        if (::connect(fd, reinterpret_cast<struct sockaddr *>(&address), sizeof(address)) == 0)
++            return;
++        const auto connectError = errno;
++        if (connectError == EINTR)
++            continue;
++        if (connectError == EISCONN)
++            return;
++        if (connectError != EINPROGRESS && connectError != EAGAIN && connectError != EALREADY) {
++            errno = connectError;
++            throw SysError("connecting to NXSG 1.0 socket %s", PathFmt(path));
++        }
++
++        while (true) {
++            waitFor(fd, POLLOUT, deadline);
++            int socketError = 0;
++            socklen_t length = sizeof(socketError);
++            int result;
++            do {
++                if (Clock::now() >= deadline)
++                    deadlineError();
++                length = sizeof(socketError);
++                result = getsockopt(fd, SOL_SOCKET, SO_ERROR, &socketError, &length);
++            } while (result < 0 && errno == EINTR);
++            if (result < 0)
++                throw SysError("checking NXSG 1.0 socket connection");
++            if (length != sizeof(socketError))
++                throw Error("NXSG 1.0 socket returned malformed connection status");
++            if (socketError == 0)
++                return;
++            if (socketError == EINPROGRESS || socketError == EAGAIN || socketError == EALREADY)
++                continue;
++            errno = socketError;
++            throw SysError("connecting to NXSG 1.0 socket %s", PathFmt(path));
++        }
++    }
++}
++
++void requirePeerPath(int fd, const std::filesystem::path & expectedPath, Clock::time_point deadline)
++{
++    requireBeforeDeadline(deadline);
++    struct sockaddr_un address{};
++    socklen_t length = sizeof(address);
++    while (getpeername(fd, reinterpret_cast<struct sockaddr *>(&address), &length) < 0) {
++        if (errno != EINTR)
++            throw SysError("reading NXSG 1.0 peer address");
++        if (Clock::now() >= deadline)
++            deadlineError();
++        length = sizeof(address);
++    }
++    requireBeforeDeadline(deadline);
++    constexpr auto pathOffset = offsetof(struct sockaddr_un, sun_path);
++    if (address.sun_family != AF_UNIX || length <= pathOffset)
++        throw Error("NXSG 1.0 peer did not report a pathname Unix address");
++    const auto available = std::min(static_cast<size_t>(length - pathOffset), sizeof(address.sun_path));
++    const auto actualLength = strnlen(address.sun_path, available);
++    if (actualLength == available || std::string_view(address.sun_path, actualLength) != expectedPath.string())
++        throw Error("NXSG 1.0 peer address does not match the validated socket path");
++    requireBeforeDeadline(deadline);
++}
++
++uid_t peerUid(int fd, Clock::time_point deadline)
++{
++#  if defined(SO_PEERCRED)
++#    if defined(__OpenBSD__)
++    struct sockpeercred credentials{};
++#    else
++    struct ucred credentials{};
++#    endif
++    while (true) {
++        if (Clock::now() >= deadline)
++            deadlineError();
++        socklen_t length = sizeof(credentials);
++        if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credentials, &length) == 0) {
++            requireBeforeDeadline(deadline);
++            if (length != sizeof(credentials))
++                throw Error("NXSG 1.0 socket returned malformed peer credentials");
++            return credentials.uid;
++        }
++        if (errno != EINTR)
++            throw SysError("reading NXSG 1.0 peer credentials");
++    }
++#  elif defined(LOCAL_PEERCRED)
++#    if !defined(SOL_LOCAL)
++#      define SOL_LOCAL 0
++#    endif
++    struct xucred credentials{};
++    while (true) {
++        if (Clock::now() >= deadline)
++            deadlineError();
++        socklen_t length = sizeof(credentials);
++        if (getsockopt(fd, SOL_LOCAL, LOCAL_PEERCRED, &credentials, &length) == 0) {
++            requireBeforeDeadline(deadline);
++            if (length != sizeof(credentials))
++                throw Error("NXSG 1.0 socket returned malformed peer credentials");
++            return credentials.cr_uid;
++        }
++        if (errno != EINTR)
++            throw SysError("reading NXSG 1.0 peer credentials");
++    }
++#  elif defined(__APPLE__) || defined(__FreeBSD__)
++    uid_t uid = 0;
++    gid_t gid = 0;
++    while (true) {
++        if (Clock::now() >= deadline)
++            deadlineError();
++        if (getpeereid(fd, &uid, &gid) == 0) {
++            requireBeforeDeadline(deadline);
++            return uid;
++        }
++        if (errno != EINTR)
++            throw SysError("reading NXSG 1.0 peer credentials");
++    }
++#  else
++    throw Error("this platform has no trusted Unix peer-credential primitive for NXSG 1.0");
++#  endif
++}
++
++void requireSameEffectiveUid(int fd, Clock::time_point deadline)
++{
++    const auto uid = peerUid(fd, deadline);
++    requireBeforeDeadline(deadline);
++    if (uid != geteuid())
++        throw Error("NXSG 1.0 peer effective UID does not match the client");
++    requireBeforeDeadline(deadline);
++}
++
++void shutdownWrite(int fd, Clock::time_point deadline)
++{
++    requireBeforeDeadline(deadline);
++    while (shutdown(fd, SHUT_WR) < 0) {
++        if (errno != EINTR)
++            throw SysError("half-closing NXSG 1.0 request");
++        if (Clock::now() >= deadline)
++            deadlineError();
++    }
++    requireBeforeDeadline(deadline);
++}
++
++AutoCloseFD createClientSocket()
++{
++    int type = SOCK_STREAM;
++#  ifdef SOCK_CLOEXEC
++    type |= SOCK_CLOEXEC;
++#  endif
++#  ifdef SOCK_NONBLOCK
++    type |= SOCK_NONBLOCK;
++#  endif
++    AutoCloseFD socket(toDescriptor(::socket(AF_UNIX, type, 0)));
++    if (!socket)
++        throw SysError("creating NXSG 1.0 socket");
++    unix::closeOnExec(socket.get());
++    const auto flags = fcntl(socket.get(), F_GETFL, 0);
++    if (flags < 0 || fcntl(socket.get(), F_SETFL, flags | O_NONBLOCK) < 0)
++        throw SysError("making NXSG 1.0 socket non-blocking");
++#  if defined(SO_NOSIGPIPE) && !defined(MSG_NOSIGNAL)
++    constexpr int enabled = 1;
++    if (setsockopt(socket.get(), SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled)) < 0)
++        throw SysError("disabling SIGPIPE on NXSG 1.0 socket");
++#  elif !defined(MSG_NOSIGNAL)
++    throw Error("this platform cannot suppress SIGPIPE for NXSG 1.0 socket writes");
++#  endif
++    return socket;
++}
++
++void writeAll(int fd, std::span<const uint8_t> bytes, Clock::time_point deadline)
++{
++    while (!bytes.empty()) {
++        if (Clock::now() >= deadline)
++            deadlineError();
++#  ifdef MSG_NOSIGNAL
++        const auto count = send(fd, bytes.data(), bytes.size(), MSG_NOSIGNAL);
++#  else
++        const auto count = send(fd, bytes.data(), bytes.size(), 0);
++#  endif
++        if (count > 0) {
++            bytes = bytes.subspan(static_cast<size_t>(count));
++            continue;
++        }
++        if (count < 0 && errno == EINTR)
++            continue;
++        if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
++            waitFor(fd, POLLOUT, deadline);
++            continue;
++        }
++        throw SysError("writing NXSG 1.0 request");
++    }
++}
++
++void readExact(int fd, std::span<uint8_t> bytes, Clock::time_point deadline)
++{
++    while (!bytes.empty()) {
++        if (Clock::now() >= deadline)
++            deadlineError();
++        const auto count = recv(fd, bytes.data(), bytes.size(), 0);
++        if (count > 0) {
++            bytes = bytes.subspan(static_cast<size_t>(count));
++            continue;
++        }
++        if (count == 0)
++            throw EndOfFile("early EOF reading NXSG 1.0 response");
++        if (errno == EINTR)
++            continue;
++        if (errno == EAGAIN || errno == EWOULDBLOCK) {
++            waitFor(fd, POLLIN, deadline);
++            continue;
++        }
++        throw SysError("reading NXSG 1.0 response");
++    }
++}
++
++void requireEof(int fd, Clock::time_point deadline)
++{
++    uint8_t trailing = 0;
++    while (true) {
++        if (Clock::now() >= deadline)
++            deadlineError();
++        const auto count = recv(fd, &trailing, 1, 0);
++        if (count == 0)
++            return;
++        if (count > 0)
++            throw Error("NXSG 1.0 response contains trailing bytes");
++        if (errno == EINTR)
++            continue;
++        if (errno == EAGAIN || errno == EWOULDBLOCK) {
++            waitFor(fd, POLLIN, deadline);
++            continue;
++        }
++        throw SysError("checking NXSG 1.0 response EOF");
++    }
++}
++
++#endif
++
++template<size_t N>
++std::array<uint8_t, N> readFixed(std::span<const uint8_t> body, size_t & offset, std::string_view what)
++{
++    requireBytes(body, offset, N, what);
++    std::array<uint8_t, N> result{};
++    std::ranges::copy(body.subspan(offset, N), result.begin());
++    offset += N;
++    return result;
++}
++
++} // namespace
++
++ExternalSignerError::ExternalSignerError(Status status, std::string diagnostic)
++    : CloneableError("NXSG 1.0 signer returned status %d: %s", static_cast<unsigned int>(status), diagnostic)
++    , status(status)
++{
++}
++
++bool validId(std::span<const uint8_t, 16> id) noexcept
++{
++    return std::ranges::any_of(id, [](uint8_t byte) { return byte != 0; });
++}
++
++std::array<uint8_t, headerSize> encodeHeader(const Header & header)
++{
++    if (!validType(static_cast<uint8_t>(header.type)) || !validStatus(static_cast<uint8_t>(header.status))
++        || (static_cast<uint8_t>(header.type) < 0x80 && header.status != Status::ok)
++        || header.bodySize > bodySizeLimit(header.type, header.status) || !validId(header.batchId)
++        || !validId(header.requestId))
++        throw Error("invalid NXSG 1.0 header");
++
++    std::array<uint8_t, headerSize> bytes{};
++    std::ranges::copy(magic, bytes.begin());
++    bytes[4] = 1;
++    bytes[5] = 0;
++    bytes[6] = static_cast<uint8_t>(header.type);
++    bytes[7] = static_cast<uint8_t>(header.status);
++    writeU32(bytes, 8, 0);
++    writeU32(bytes, 12, header.bodySize);
++    std::ranges::copy(header.batchId, bytes.begin() + 16);
++    std::ranges::copy(header.requestId, bytes.begin() + 32);
++    return bytes;
++}
++
++Header decodeHeader(std::span<const uint8_t, headerSize> bytes)
++{
++    if (!std::ranges::equal(std::span{bytes}.subspan<0, 4>(), magic) || bytes[4] != 1 || bytes[5] != 0
++        || !validType(bytes[6]) || !validStatus(bytes[7]) || (bytes[6] < 0x80 && bytes[7] != 0)
++        || readU32(bytes, 8) != 0
++        || readU32(bytes, 12) > bodySizeLimit(static_cast<MessageType>(bytes[6]), static_cast<Status>(bytes[7])))
++        throw Error("invalid NXSG 1.0 header");
++
++    Header header{
++        .type = static_cast<MessageType>(bytes[6]),
++        .status = static_cast<Status>(bytes[7]),
++        .bodySize = readU32(bytes, 12),
++    };
++    std::ranges::copy(bytes.subspan<16, 16>(), header.batchId.begin());
++    std::ranges::copy(bytes.subspan<32, 16>(), header.requestId.begin());
++    if (!validId(header.batchId) || !validId(header.requestId))
++        throw Error("NXSG 1.0 header contains an all-zero ID");
++    return header;
++}
++
++void validateDescribeKeyRequest(std::span<const uint8_t> body)
++{
++    if (!body.empty())
++        invalidBody("DescribeKey request");
++}
++
++std::vector<uint8_t> encodeDescribeKeyRequest()
++{
++    return {};
++}
++
++DescribeKeyResponse decodeDescribeKeyResponse(std::span<const uint8_t> body)
++{
++    size_t offset = 0;
++    auto result = DescribeKeyResponse{
++        .keyName = readKeyName(body, offset),
++        .algorithm = 0,
++        .publicKey = {},
++    };
++    requireBytes(body, offset, 1, "DescribeKey response");
++    result.algorithm = body[offset++];
++    if (result.algorithm != ed25519Algorithm)
++        invalidBody("DescribeKey response algorithm");
++    result.publicKey = readFixed<32>(body, offset, "DescribeKey response public key");
++    result.endpointId = readFixed<16>(body, offset, "DescribeKey response endpoint ID");
++    if (!validId(result.endpointId))
++        invalidBody("DescribeKey response endpoint ID");
++    if (offset != body.size())
++        invalidBody("DescribeKey response trailing bytes");
++    return result;
++}
++
++SignPathInfoRequest decodeSignPathInfoRequest(std::span<const uint8_t> body)
++{
++    size_t offset = 0;
++    auto result = SignPathInfoRequest{
++        .keyName = readKeyName(body, offset),
++        .publicKey = readFixed<32>(body, offset, "SignPathInfo request public key"),
++        .endpointId = readFixed<16>(body, offset, "SignPathInfo request endpoint ID"),
++        .fingerprint = {},
++    };
++    if (!validId(result.endpointId))
++        invalidBody("SignPathInfo request endpoint ID");
++    requireBytes(body, offset, 4, "SignPathInfo request fingerprint length");
++    const auto length = (static_cast<uint32_t>(body[offset]) << 24) | (static_cast<uint32_t>(body[offset + 1]) << 16)
++                        | (static_cast<uint32_t>(body[offset + 2]) << 8) | body[offset + 3];
++    offset += 4;
++    requireBytes(body, offset, length, "SignPathInfo request fingerprint");
++    if (length != body.size() - offset || length == 0 || !validText(body.subspan(offset, length)))
++        invalidBody("SignPathInfo request fingerprint");
++    result.fingerprint.assign(reinterpret_cast<const char *>(body.data() + offset), length);
++    offset += length;
++    if (offset != body.size())
++        invalidBody("SignPathInfo request trailing bytes");
++    return result;
++}
++
++std::vector<uint8_t> encodeSignPathInfoRequest(const SignPathInfoRequest & request)
++{
++    validatePathInfoV1(request.fingerprint);
++    if (!validId(request.endpointId))
++        invalidBody("SignPathInfo request endpoint ID");
++    std::vector<uint8_t> body;
++    body.reserve(request.keyName.size() + 54 + request.fingerprint.size());
++    appendKeyName(body, request.keyName);
++    body.insert(body.end(), request.publicKey.begin(), request.publicKey.end());
++    body.insert(body.end(), request.endpointId.begin(), request.endpointId.end());
++    appendU32(body, static_cast<uint32_t>(request.fingerprint.size()));
++    body.insert(body.end(), request.fingerprint.begin(), request.fingerprint.end());
++    if (body.size() > maxSignPathInfoRequestBodySize)
++        invalidBody("SignPathInfo request size");
++    return body;
++}
++
++SignPathInfoResponse decodeSignPathInfoResponse(std::span<const uint8_t> body)
++{
++    size_t offset = 0;
++    auto result = SignPathInfoResponse{
++        .keyName = readKeyName(body, offset),
++        .publicKey = readFixed<32>(body, offset, "SignPathInfo response public key"),
++        .endpointId = readFixed<16>(body, offset, "SignPathInfo response endpoint ID"),
++        .signature = readFixed<64>(body, offset, "SignPathInfo response signature"),
++    };
++    if (!validId(result.endpointId))
++        invalidBody("SignPathInfo response endpoint ID");
++    if (offset != body.size())
++        invalidBody("SignPathInfo response trailing bytes");
++    return result;
++}
++
++std::string decodeErrorResponse(std::span<const uint8_t> body)
++{
++    if (body.size() < 2)
++        invalidBody("error response");
++    const auto length = readU16(body, 0);
++    if (length > 1024 || body.size() != static_cast<size_t>(length) + 2 || !validText(body.subspan(2)))
++        invalidBody("error response");
++    return {reinterpret_cast<const char *>(body.data() + 2), length};
++}
++
++void validatePathInfoV1(std::string_view fingerprint)
++{
++    if (fingerprint.empty() || fingerprint.size() > maxFingerprintSize)
++        throw Error("invalid PATH_INFO_V1 fingerprint length");
++    for (const auto raw : fingerprint) {
++        const auto byte = static_cast<unsigned char>(raw);
++        if (byte > 0x7f || byte < 0x20 || byte == 0x7f)
++            throw Error("invalid PATH_INFO_V1 non-ASCII or control byte");
++    }
++
++    const auto fields = splitFingerprint(fingerprint);
++    if (fields[0] != "1")
++        throw Error("invalid PATH_INFO_V1 profile version");
++    validateStorePath(fields[1]);
++    if (!fields[2].starts_with("sha256:") || fields[2].size() != 59 || !validNix32(fields[2].substr(7)))
++        throw Error("invalid PATH_INFO_V1 NAR hash");
++    if (fields[3].empty() || (fields[3].size() > 1 && fields[3].front() == '0')
++        || !std::ranges::all_of(fields[3], [](char character) { return character >= '0' && character <= '9'; }))
++        throw Error("invalid PATH_INFO_V1 NAR size syntax");
++    uint64_t narSize = 0;
++    const auto [end, error] = std::from_chars(fields[3].data(), fields[3].data() + fields[3].size(), narSize);
++    if (error != std::errc{} || end != fields[3].data() + fields[3].size() || narSize == 0)
++        throw Error("invalid PATH_INFO_V1 NAR size range");
++
++    if (!fields[4].empty()) {
++        size_t count = 0;
++        size_t start = 0;
++        std::string_view previous;
++        while (true) {
++            const auto separator = fields[4].find(',', start);
++            const auto reference = fields[4].substr(
++                start, separator == std::string_view::npos ? std::string_view::npos : separator - start);
++            if (++count > maxReferences)
++                throw Error("PATH_INFO_V1 reference count exceeds %d", maxReferences);
++            validateStorePath(reference);
++            if (!previous.empty() && previous >= reference)
++                throw Error("PATH_INFO_V1 references are duplicate or unsorted");
++            previous = reference;
++            if (separator == std::string_view::npos)
++                break;
++            start = separator + 1;
++        }
++    }
++}
++
++std::filesystem::path canonicalizeSocketPath(const std::filesystem::path & path)
++{
++#ifdef _WIN32
++    throw Error("NXSG 1.0 Unix sockets are unavailable on this platform");
++#else
++    if (path.empty() || path.filename().empty() || path.filename() == "." || path.filename() == "..")
++        throw Error("invalid NXSG 1.0 socket path");
++    std::filesystem::path parent;
++    try {
++        parent = std::filesystem::canonical(path.parent_path().empty() ? "." : path.parent_path());
++    } catch (const std::filesystem::filesystem_error & error) {
++        throw Error("cannot canonicalize NXSG 1.0 socket parent: %s", error.what());
++    }
++    const auto canonical = parent / path.filename();
++    static_cast<void>(validateSocketForConnect(canonical));
++    return canonical;
++#endif
++}
++
++Client::Client(const std::filesystem::path & socketPath, std::chrono::milliseconds deadline)
++    : socketPath(canonicalizeSocketPath(socketPath))
++    , deadline(deadline)
++    , batchId{}
++{
++    if (deadline <= std::chrono::milliseconds::zero() || deadline > std::chrono::seconds(5))
++        throw Error("NXSG 1.0 deadline must be greater than zero and at most five seconds");
++#ifndef _WIN32
++    const auto socketIdentity = validateSocketForConnect(this->socketPath);
++    socketDevice = socketIdentity.device;
++    socketInode = socketIdentity.inode;
++#endif
++    randombytes_buf(batchId.data(), batchId.size());
++    if (!validId(batchId))
++        batchId.front() = 1;
++}
++
++std::vector<uint8_t>
++Client::exchange(MessageType type, std::span<const uint8_t> body, Clock::time_point operationDeadline)
++{
++#ifdef _WIN32
++    throw Error("NXSG 1.0 Unix sockets are unavailable on this platform");
++#else
++    requireBeforeDeadline(operationDeadline);
++    std::array<uint8_t, 16> requestId{};
++    randombytes_buf(requestId.data(), requestId.size());
++    if (!validId(requestId))
++        requestId.front() = 1;
++    const Header requestHeader{
++        .type = type,
++        .status = Status::ok,
++        .bodySize = static_cast<uint32_t>(body.size()),
++        .batchId = batchId,
++        .requestId = requestId,
++    };
++    const auto encodedHeader = encodeHeader(requestHeader);
++    requireBeforeDeadline(operationDeadline);
++
++    auto socket = createClientSocket();
++    requireBeforeDeadline(operationDeadline);
++    const auto beforeConnect = validateSocketForConnect(socketPath);
++    if (beforeConnect.device != socketDevice || beforeConnect.inode != socketInode)
++        throw Error("NXSG 1.0 socket was replaced after client construction");
++    requireBeforeDeadline(operationDeadline);
++    connectWithDeadline(socket.get(), socketPath, operationDeadline);
++    const auto afterConnect = validateSocketForConnect(socketPath);
++    if (afterConnect != beforeConnect)
++        throw Error("NXSG 1.0 socket was replaced while connecting");
++    requireBeforeDeadline(operationDeadline);
++    requirePeerPath(socket.get(), socketPath, operationDeadline);
++    requireSameEffectiveUid(socket.get(), operationDeadline);
++    writeAll(socket.get(), encodedHeader, operationDeadline);
++    writeAll(socket.get(), body, operationDeadline);
++    shutdownWrite(socket.get(), operationDeadline);
++
++    std::array<uint8_t, headerSize> responseHeaderBytes{};
++    readExact(socket.get(), responseHeaderBytes, operationDeadline);
++    const auto responseHeader = decodeHeader(responseHeaderBytes);
++    const auto expectedType =
++        type == MessageType::describeKeyRequest ? MessageType::describeKeyResponse : MessageType::signPathInfoResponse;
++    if (responseHeader.type != expectedType || responseHeader.batchId != batchId
++        || responseHeader.requestId != requestId)
++        throw Error("NXSG 1.0 response type or correlation ID does not match the request");
++    std::vector<uint8_t> responseBody(responseHeader.bodySize);
++    readExact(socket.get(), responseBody, operationDeadline);
++    requireEof(socket.get(), operationDeadline);
++    if (Clock::now() >= operationDeadline)
++        deadlineError();
++    if (responseHeader.status != Status::ok)
++        throw ExternalSignerError(responseHeader.status, decodeErrorResponse(responseBody));
++    return responseBody;
++#endif
++}
++
++const DescribeKeyResponse & Client::describeKey()
++{
++    const auto operationDeadline = Clock::now() + deadline;
++    if (identity)
++        throw Error("NXSG 1.0 signer identity was already described");
++    auto request = encodeDescribeKeyRequest();
++    requireBeforeDeadline(operationDeadline);
++    auto response = decodeDescribeKeyResponse(exchange(MessageType::describeKeyRequest, request, operationDeadline));
++    commitIdentity(std::move(response), operationDeadline);
++    return *identity;
++}
++
++void Client::commitIdentity(DescribeKeyResponse response, Clock::time_point operationDeadline)
++{
++    requireBeforeDeadline(operationDeadline);
++    identity.emplace(std::move(response));
++}
++
++SignPathInfoResponse Client::signPathInfoV1(std::string_view fingerprint)
++{
++    const auto operationDeadline = Clock::now() + deadline;
++    if (!identity)
++        throw Error("NXSG 1.0 signer identity must be described before signing");
++    validatePathInfoV1(fingerprint);
++    requireBeforeDeadline(operationDeadline);
++    const auto requestBody = encodeSignPathInfoRequest(
++        SignPathInfoRequest{
++            .keyName = identity->keyName,
++            .publicKey = identity->publicKey,
++            .endpointId = identity->endpointId,
++            .fingerprint = std::string(fingerprint),
++        });
++    requireBeforeDeadline(operationDeadline);
++    auto response =
++        decodeSignPathInfoResponse(exchange(MessageType::signPathInfoRequest, requestBody, operationDeadline));
++    requireBeforeDeadline(operationDeadline);
++    if (response.keyName != identity->keyName || response.publicKey != identity->publicKey
++        || response.endpointId != identity->endpointId)
++        throw Error("NXSG 1.0 signer identity changed after DescribeKey");
++    requireBeforeDeadline(operationDeadline);
++    if (crypto_sign_verify_detached(
++            response.signature.data(),
++            reinterpret_cast<const unsigned char *>(fingerprint.data()),
++            fingerprint.size(),
++            identity->publicKey.data())
++        != 0)
++        throw Error("NXSG 1.0 signer returned an invalid Ed25519 signature");
++    requireBeforeDeadline(operationDeadline);
++    return response;
++}
++
++} // namespace nix::externalSigner
+diff --git a/src/nix/sigs.cc b/src/nix/sigs.cc
+index bcc577317983a969af5d98af16b3670d5e67d4ee..938f9c27d2e31bafff5eac11345fec379de3bf48 100644
+--- a/src/nix/sigs.cc
++++ b/src/nix/sigs.cc
+@@ -2,10 +2,13 @@
+ #include "nix/cmd/command.hh"
+ #include "nix/main/shared.hh"
+ #include "nix/store/store-open.hh"
++#include "nix/util/base-n.hh"
++#include "nix/util/signature/external-signer.hh"
+ #include "nix/util/thread-pool.hh"
+ #include "nix/store/filetransfer.hh"
+ 
+ #include <atomic>
++#include <memory>
+ 
+ namespace nix {
+ 
+@@ -100,6 +103,8 @@ static auto rCmdCopySigs = registerCommand2<CmdCopySigs>({"store", "copy-sigs"})
+ struct CmdSign : StorePathsCommand
+ {
+     std::filesystem::path secretKeyFile;
++    bool secretKeyFileSpecified = false;
++    std::vector<std::filesystem::path> signerSocketPaths;
+ 
+     CmdSign()
+     {
+@@ -108,19 +113,36 @@ struct CmdSign : StorePathsCommand
+             .shortName = 'k',
+             .description = "File containing the secret signing key.",
+             .labels = {"file"},
+-            .handler = {&secretKeyFile},
++            .handler = {[&](std::string path) {
++                secretKeyFile = std::move(path);
++                secretKeyFileSpecified = true;
++            }},
++            .completer = completePath,
++        });
++        addFlag({
++            .longName = "signer-socket",
++            .description = "Unix socket for an external signing provider. May be specified more than once.",
++            .labels = {"path"},
++            .handler = {[&](std::string path) { signerSocketPaths.emplace_back(std::move(path)); }},
+             .completer = completePath,
+-            .required = true,
+         });
+     }
+ 
+     std::string description() override
+     {
+-        return "sign store paths with a local key";
++        return "sign store paths";
+     }
+ 
+     void run(ref<Store> store, StorePaths && storePaths) override
+     {
++        if (secretKeyFileSpecified == !signerSocketPaths.empty())
++            throw UsageError("you must specify exactly one of '--key-file' or '--signer-socket'");
++
++        if (!signerSocketPaths.empty()) {
++            runExternal(store, storePaths);
++            return;
++        }
++
+         SecretKey secretKey(readFile(secretKeyFile));
+         LocalSigner signer(std::move(secretKey));
+ 
+@@ -142,6 +164,81 @@ struct CmdSign : StorePathsCommand
+ 
+         printInfo("added %d signatures", added);
+     }
++
++private:
++
++    void runExternal(ref<Store> store, const StorePaths & storePaths)
++    {
++        std::set<std::filesystem::path> canonicalPaths;
++        std::vector<std::unique_ptr<externalSigner::Client>> signers;
++        signers.reserve(signerSocketPaths.size());
++        for (const auto & path : signerSocketPaths) {
++            checkInterrupt();
++            auto canonicalPath = externalSigner::canonicalizeSocketPath(path);
++            if (!canonicalPaths.insert(canonicalPath).second)
++                throw UsageError(
++                    "external signer socket path '%s' was specified more than once", PathFmt(canonicalPath));
++            signers.push_back(std::make_unique<externalSigner::Client>(canonicalPath));
++        }
++
++        std::set<std::string> keyNames;
++        std::vector<PublicKey> publicKeys;
++        publicKeys.reserve(signers.size());
++        for (const auto & signer : signers) {
++            checkInterrupt();
++            const auto & identity = signer->describeKey();
++            checkInterrupt();
++            if (!keyNames.insert(identity.keyName).second)
++                throw Error("external signer key identity '%s' was returned by more than one socket", identity.keyName);
++            publicKeys.emplace_back(
++                identity.keyName + ":" + base64::encode(std::as_bytes(std::span{identity.publicKey})));
++        }
++
++        struct PendingSignatures
++        {
++            StorePath path;
++            std::set<Signature> signatures;
++        };
++
++        std::vector<PendingSignatures> pending;
++        pending.reserve(storePaths.size());
++
++        for (const auto & storePath : storePaths) {
++            checkInterrupt();
++            auto info = store->queryPathInfo(storePath);
++            const auto fingerprint = info->fingerprint(*store);
++            std::set<Signature> signatures;
++            for (size_t index = 0; index < signers.size(); ++index) {
++                checkInterrupt();
++                const auto response = signers[index]->signPathInfoV1(fingerprint);
++                checkInterrupt();
++                Signature signature{
++                    .keyName = response.keyName,
++                    .sig = std::string(
++                        reinterpret_cast<const char *>(response.signature.data()), response.signature.size()),
++                };
++                if (!publicKeys[index].verifyDetached(fingerprint, signature))
++                    throw Error("external signer '%s' returned an invalid signature", publicKeys[index].name);
++                if (!info->sigs.count(signature))
++                    signatures.insert(std::move(signature));
++            }
++            pending.push_back(
++                PendingSignatures{
++                    .path = storePath,
++                    .signatures = std::move(signatures),
++                });
++        }
++
++        checkInterrupt();
++        size_t added = 0;
++        for (const auto & item : pending) {
++            if (item.signatures.empty())
++                continue;
++            store->addSignatures(item.path, item.signatures);
++            added += item.signatures.size();
++        }
++        printInfo("added %d signatures", added);
++    }
+ };
+ 
+ static auto rCmdSign = registerCommand2<CmdSign>({"store", "sign"});
+diff --git a/tests/functional/external-signing.sh b/tests/functional/external-signing.sh
+new file mode 100644
+index 0000000000000000000000000000000000000000..377be3175dd5c14de9bbc0c92daea13c60230ff1
+--- /dev/null
++++ b/tests/functional/external-signing.sh
+@@ -0,0 +1,191 @@
++#!/usr/bin/env bash
++
++source common.sh
++
++# NXSG's PATH_INFO_V1 profile deliberately signs canonical /nix/store paths.
++# Keep the test store isolated on disk while preserving that logical store dir.
++export NIX_STORE_DIR=/nix/store
++export NIX_REMOTE="local?root=$TEST_ROOT/external-store"
++
++helper="$functionalTestsDir/nix-cache-signing/external-signer.py"
++seed1=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
++seed2=202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f
++seed3=404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f
++signerPids=()
++
++cleanupSigners() {
++    for pid in "${signerPids[@]}"; do
++        if kill -0 "$pid" 2>/dev/null; then
++            kill "$pid" 2>/dev/null || true
++        fi
++        wait "$pid" 2>/dev/null || true
++    done
++}
++trap cleanupSigners EXIT
++
++startSigner() {
++    local id=$1
++    local keyName=$2
++    local seed=$3
++    local mode=${4:-good}
++    local requests=${5:-2}
++    signerDir="$TEST_ROOT/signers/$id"
++    signerSocket="$signerDir/signer.sock"
++    signerState="$signerDir/state.json"
++    mkdir -p "$signerDir"
++    chmod 0700 "$signerDir"
++    python3 "$helper" \
++        --socket "$signerSocket" \
++        --state "$signerState" \
++        --key-name "$keyName" \
++        --seed "$seed" \
++        --mode "$mode" \
++        --requests "$requests" &
++    signerPid=$!
++    signerPids+=("$signerPid")
++    for _ in {1..500}; do
++        if [[ -S "$signerSocket" && -e "${signerState%.json}.ready" ]]; then
++            return
++        fi
++        if ! kill -0 "$signerPid" 2>/dev/null; then
++            wait "$signerPid"
++            return 1
++        fi
++        sleep 0.01
++    done
++    echo "external signer $id did not become ready" >&2
++    return 1
++}
++
++assertUnsigned() {
++    nix path-info --json --json-format 2 "$@" | jq -e '.info.[] | .signatures == []'
++}
++
++printf 'external signing fixture one\n' > "$TEST_ROOT/fixture-one"
++printf 'external signing fixture two\n' > "$TEST_ROOT/fixture-two"
++outPath=$(nix store add-file "$TEST_ROOT/fixture-one")
++outPath2=$(nix store add-file "$TEST_ROOT/fixture-two")
++assertUnsigned "$outPath" "$outPath2"
++
++nix-store --generate-binary-cache-key local.example.org "$TEST_ROOT/local.sk" "$TEST_ROOT/local.pk"
++expect 1 nix store sign "$outPath"
++expect 1 nix store sign --key-file "$TEST_ROOT/local.sk" --signer-socket "$TEST_ROOT/absent.sock" "$outPath"
++assertUnsigned "$outPath"
++
++# Canonical aliases of one socket are duplicates and fail before DescribeKey.
++startSigner duplicate-path cache-path.example.org "$seed1" idle 0
++duplicatePid=$signerPid
++duplicateSocket=$signerSocket
++ln -s "$signerDir" "$TEST_ROOT/signer-alias"
++expect 1 nix store sign \
++    --signer-socket "$duplicateSocket" \
++    --signer-socket "$TEST_ROOT/signer-alias/signer.sock" \
++    "$outPath"
++kill "$duplicatePid"
++wait "$duplicatePid" || true
++assertUnsigned "$outPath"
++
++# Different sockets claiming one Nix key identity are rejected after one DescribeKey each.
++startSigner duplicate-key-a cache-duplicate.example.org "$seed1" good 1
++duplicateKeyPidA=$signerPid
++duplicateKeySocketA=$signerSocket
++duplicateKeyStateA=$signerState
++startSigner duplicate-key-b cache-duplicate.example.org "$seed2" good 1
++duplicateKeyPidB=$signerPid
++duplicateKeySocketB=$signerSocket
++duplicateKeyStateB=$signerState
++expect 1 nix store sign \
++    --signer-socket "$duplicateKeySocketA" \
++    --signer-socket "$duplicateKeySocketB" \
++    "$outPath"
++wait "$duplicateKeyPidA"
++wait "$duplicateKeyPidB"
++jq -e '.requests | map(.type) == [1]' "$duplicateKeyStateA"
++jq -e '.requests | map(.type) == [1]' "$duplicateKeyStateB"
++assertUnsigned "$outPath"
++
++# Malformed replies, bad signatures, outage, and socket replacement never mutate the store.
++for mode in malformed bad-sign outage replacement; do
++    startSigner "$mode" "cache-$mode.example.org" "$seed1" "$mode" 2
++    failurePid=$signerPid
++    failureSocket=$signerSocket
++    expect 1 nix store sign --signer-socket "$failureSocket" "$outPath"
++    wait "$failurePid"
++    assertUnsigned "$outPath"
++done
++
++# A failure on a later path verifies that all signatures are collected before mutation.
++startSigner atomic cache-atomic.example.org "$seed1" bad-second 3
++atomicPid=$signerPid
++atomicSocket=$signerSocket
++expect 1 nix store sign --signer-socket "$atomicSocket" "$outPath" "$outPath2"
++wait "$atomicPid"
++assertUnsigned "$outPath" "$outPath2"
++
++# Interrupting an in-flight request is observed before mutation.
++startSigner cancel cache-cancel.example.org "$seed1" delay 2
++cancelPid=$signerPid
++cancelSocket=$signerSocket
++nix store sign --signer-socket "$cancelSocket" "$outPath" &
++commandPid=$!
++sleep 0.2
++kill -INT "$commandPid"
++if wait "$commandPid"; then
++    echo "cancelled external signing unexpectedly succeeded" >&2
++    exit 1
++fi
++wait "$cancelPid"
++assertUnsigned "$outPath"
++
++# An unresponsive provider hits the fixed five-second end-to-end deadline.
++startSigner timeout cache-timeout.example.org "$seed1" timeout 2
++timeoutPid=$signerPid
++timeoutSocket=$signerSocket
++expect 1 nix store sign --signer-socket "$timeoutSocket" "$outPath"
++wait "$timeoutPid"
++assertUnsigned "$outPath"
++
++# Distinct repeatable providers sign successfully with one batch ID per socket.
++startSigner success-a cache-external-a.example.org "$seed1" good 2
++successPidA=$signerPid
++successSocketA=$signerSocket
++successStateA=$signerState
++successPublicA=${signerState%.json}.public
++startSigner success-b cache-external-b.example.org "$seed2" good 2
++successPidB=$signerPid
++successSocketB=$signerSocket
++successStateB=$signerState
++successPublicB=${signerState%.json}.public
++nix store sign --signer-socket "$successSocketA" --signer-socket "$successSocketB" "$outPath"
++wait "$successPidA"
++wait "$successPidB"
++nix store verify --sigs-needed 2 --trusted-public-keys "$(cat "$successPublicA") $(cat "$successPublicB")" "$outPath"
++
++for state in "$successStateA" "$successStateB"; do
++    jq -e '
++        (.requests | map(.type)) == [1, 2]
++        and (.requests | map(.batch) | unique | length) == 1
++        and (.requests | all(.batch | length == 32 and . != "00000000000000000000000000000000"))
++        and (.requests | map(.request) | unique | length) == 2
++        and (.requests | all(.request | length == 32 and . != "00000000000000000000000000000000"))
++    ' "$state"
++done
++
++# Existing key-file behavior remains usable.
++nix store sign --key-file "$TEST_ROOT/local.sk" "$outPath"
++nix store verify --sigs-needed 3 \
++    --trusted-public-keys "$(cat "$successPublicA") $(cat "$successPublicB") $(cat "$TEST_ROOT/local.pk")" \
++    "$outPath"
++
++# External signing mutates file-cache metadata through the existing store API.
++mkdir -p "$cacheDir"
++nix copy --to "file://$cacheDir" "$outPath"
++startSigner file-cache cache-external-file.example.org "$seed3" good 2
++fileCachePid=$signerPid
++fileCacheSocket=$signerSocket
++fileCachePublic=${signerState%.json}.public
++nix store sign --store "file://$cacheDir" --signer-socket "$fileCacheSocket" "$outPath"
++wait "$fileCachePid"
++nix store verify --store "file://$cacheDir" --sigs-needed 4 \
++    --trusted-public-keys "$(cat "$successPublicA") $(cat "$successPublicB") $(cat "$TEST_ROOT/local.pk") $(cat "$fileCachePublic")" \
++    "$outPath"
+diff --git a/tests/functional/meson.build b/tests/functional/meson.build
+index af1c7b9eaca719f20e0d3ee36deb81da0954d5e1..1b94077dd05ee02ab9f3e306bd107d6b4aeaf2bc 100644
+--- a/tests/functional/meson.build
++++ b/tests/functional/meson.build
+@@ -15,6 +15,7 @@ fs = import('fs')
+ 
+ nix = find_program('nix')
+ bash = find_program('bash', native : true)
++python3 = find_program('python3', native : true)
+ busybox = find_program('busybox', native : true, required : false)
+ # Look up `coreutils` package by searching for `ls` binary.
+ # Previously we looked up `coreutils` on `linux`, but that is not
+@@ -24,6 +25,18 @@ dot = find_program('dot', native : true, required : false)
+ 
+ nix_bin_dir = fs.parent(nix.full_path())
+ 
++nix_cache_signing_corpus_files = files(
++  'nix-cache-signing/validate-path-info-v1.py',
++  'nix-cache-signing/path-info-v1.json',
++  'nix-cache-signing/DIGESTS',
++)
++test(
++  'nix-cache-signing-corpus',
++  python3,
++  args : nix_cache_signing_corpus_files,
++  suite : 'main',
++)
++
+ subdir('nix-meson-build-support/default-system-cpu')
+ 
+ test_confdata = {
+@@ -90,6 +103,7 @@ suites = [
+       'eval-store.sh',
+       'eval.sh',
+       'experimental-features.sh',
++      'external-signing.sh',
+       'export-graph.sh',
+       'export.sh',
+       'external-builders.sh',
+diff --git a/tests/functional/nix-cache-signing/DIGESTS b/tests/functional/nix-cache-signing/DIGESTS
+new file mode 100644
+index 0000000000000000000000000000000000000000..f72ead611680824ffac397315729a7cc944311a2
+--- /dev/null
++++ b/tests/functional/nix-cache-signing/DIGESTS
+@@ -0,0 +1 @@
++c4d31875e779e11d2a8b9dcd071e34fc832f545dca5784f0c72540dff8ee3823  path-info-v1.json
+diff --git a/tests/functional/nix-cache-signing/external-signer.py b/tests/functional/nix-cache-signing/external-signer.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a62a4d60fc84425c337c8bf9cca290537f4bf31f
+--- /dev/null
++++ b/tests/functional/nix-cache-signing/external-signer.py
+@@ -0,0 +1,276 @@
++#!/usr/bin/env python3
++
++import argparse
++import base64
++import ctypes
++import ctypes.util
++import json
++import os
++import socket
++import struct
++import time
++from pathlib import Path
++
++
++HEADER = struct.Struct("!4sBBBBII16s16s")
++DESCRIBE_REQUEST = 0x01
++DESCRIBE_RESPONSE = 0x81
++SIGN_REQUEST = 0x02
++SIGN_RESPONSE = 0x82
++ZERO_ID = "00" * 16
++
++
++def load_sodium():
++    name = ctypes.util.find_library("sodium")
++    if name is None:
++        raise RuntimeError("could not find libsodium")
++    try:
++        library = ctypes.CDLL(name)
++    except OSError as original_error:
++        # Component builds expose libnixutil through the test library path;
++        # loading it globally also loads its version-pinned libsodium dependency.
++        library_paths = os.pathsep.join(
++            os.environ.get(variable, "") for variable in ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH")
++        )
++        for directory in library_paths.split(os.pathsep):
++            if not directory:
++                continue
++            for candidate in Path(directory).glob("libnixutil*"):
++                if not candidate.is_file():
++                    continue
++                try:
++                    ctypes.CDLL(str(candidate), mode=ctypes.RTLD_GLOBAL)
++                    library = ctypes.CDLL(name)
++                    break
++                except OSError:
++                    continue
++            else:
++                continue
++            break
++        else:
++            raise original_error
++    byte_pointer = ctypes.POINTER(ctypes.c_ubyte)
++    library.sodium_init.restype = ctypes.c_int
++    library.crypto_sign_seed_keypair.argtypes = [byte_pointer, byte_pointer, byte_pointer]
++    library.crypto_sign_seed_keypair.restype = ctypes.c_int
++    library.crypto_sign_detached.argtypes = [
++        byte_pointer,
++        ctypes.POINTER(ctypes.c_ulonglong),
++        byte_pointer,
++        ctypes.c_ulonglong,
++        byte_pointer,
++    ]
++    library.crypto_sign_detached.restype = ctypes.c_int
++    if library.sodium_init() < 0:
++        raise RuntimeError("could not initialize libsodium")
++    return library
++
++
++def keypair(library, seed):
++    public_key = (ctypes.c_ubyte * 32)()
++    secret_key = (ctypes.c_ubyte * 64)()
++    seed_buffer = (ctypes.c_ubyte * 32).from_buffer_copy(seed)
++    if library.crypto_sign_seed_keypair(public_key, secret_key, seed_buffer) != 0:
++        raise RuntimeError("could not derive Ed25519 keypair")
++    return bytes(public_key), secret_key
++
++
++def sign(library, secret_key, message):
++    signature = (ctypes.c_ubyte * 64)()
++    signature_length = ctypes.c_ulonglong()
++    message_buffer = (ctypes.c_ubyte * len(message)).from_buffer_copy(message)
++    if (
++        library.crypto_sign_detached(
++            signature,
++            ctypes.byref(signature_length),
++            message_buffer,
++            len(message),
++            secret_key,
++        )
++        != 0
++        or signature_length.value != 64
++    ):
++        raise RuntimeError("could not sign fingerprint")
++    return bytes(signature)
++
++
++def read_exact(connection, length):
++    result = bytearray()
++    while len(result) < length:
++        chunk = connection.recv(length - len(result))
++        if not chunk:
++            raise RuntimeError("early EOF")
++        result.extend(chunk)
++    return bytes(result)
++
++
++def read_request(connection):
++    fields = HEADER.unpack(read_exact(connection, HEADER.size))
++    magic, major, minor, message_type, status, flags, body_length, batch_id, request_id = fields
++    if (
++        magic != b"NXSG"
++        or major != 1
++        or minor != 0
++        or status != 0
++        or flags != 0
++        or message_type not in (DESCRIBE_REQUEST, SIGN_REQUEST)
++        or batch_id == bytes(16)
++        or request_id == bytes(16)
++    ):
++        raise RuntimeError("invalid request header")
++    body = read_exact(connection, body_length)
++    if connection.recv(1) != b"":
++        raise RuntimeError("request was not half-closed exactly")
++    return message_type, body, batch_id, request_id
++
++
++def response_header(message_type, body, batch_id, request_id):
++    return HEADER.pack(b"NXSG", 1, 0, message_type, 0, 0, len(body), batch_id, request_id)
++
++
++def describe_body(key_name, public_key, endpoint_id):
++    encoded_name = key_name.encode()
++    return struct.pack("!H", len(encoded_name)) + encoded_name + b"\x01" + public_key + endpoint_id
++
++
++def decode_sign_request(body, key_name, public_key, endpoint_id):
++    if len(body) < 2:
++        raise RuntimeError("short sign request")
++    name_length = struct.unpack("!H", body[:2])[0]
++    offset = 2
++    actual_name = body[offset : offset + name_length]
++    offset += name_length
++    actual_public_key = body[offset : offset + 32]
++    offset += 32
++    actual_endpoint_id = body[offset : offset + 16]
++    offset += 16
++    if len(body) < offset + 4:
++        raise RuntimeError("short sign fingerprint")
++    fingerprint_length = struct.unpack("!I", body[offset : offset + 4])[0]
++    offset += 4
++    fingerprint = body[offset : offset + fingerprint_length]
++    offset += fingerprint_length
++    if (
++        offset != len(body)
++        or actual_name != key_name.encode()
++        or actual_public_key != public_key
++        or actual_endpoint_id != endpoint_id
++    ):
++        raise RuntimeError("sign request did not pin described identity")
++    return fingerprint
++
++
++def sign_body(key_name, public_key, endpoint_id, signature):
++    encoded_name = key_name.encode()
++    return struct.pack("!H", len(encoded_name)) + encoded_name + public_key + endpoint_id + signature
++
++
++def write_state(path, requests):
++    temporary = path.with_suffix(".tmp")
++    temporary.write_text(json.dumps({"requests": requests}, indent=2) + "\n", encoding="utf-8")
++    temporary.replace(path)
++
++
++def replace_listener(listener, path):
++    listener.close()
++    path.unlink()
++    replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++    replacement.bind(str(path))
++    os.chmod(path, 0o600)
++    replacement.listen()
++    return replacement
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--socket", type=Path, required=True)
++    parser.add_argument("--state", type=Path, required=True)
++    parser.add_argument("--key-name", required=True)
++    parser.add_argument("--seed", required=True)
++    parser.add_argument("--requests", type=int, default=2)
++    parser.add_argument(
++        "--mode",
++        choices=("good", "idle", "malformed", "bad-sign", "bad-second", "delay", "timeout", "outage", "replacement"),
++        default="good",
++    )
++    args = parser.parse_args()
++
++    seed = bytes.fromhex(args.seed)
++    if len(seed) != 32:
++        raise RuntimeError("seed must contain exactly 32 bytes")
++    library = load_sodium()
++    public_key, secret_key = keypair(library, seed)
++    endpoint_id = bytes.fromhex("0123456789abcdeffedcba9876543210")
++    args.socket.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
++    os.chmod(args.socket.parent, 0o700)
++    args.socket.unlink(missing_ok=True)
++    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++    replacement = None
++    requests = []
++    sign_count = 0
++    try:
++        listener.bind(str(args.socket))
++        os.chmod(args.socket, 0o600)
++        listener.listen()
++        args.state.with_suffix(".public").write_text(
++            args.key_name + ":" + base64.b64encode(public_key).decode() + "\n", encoding="utf-8"
++        )
++        args.state.with_suffix(".ready").touch()
++        if args.mode == "idle":
++            while True:
++                time.sleep(60)
++        for _ in range(args.requests):
++            connection, _ = listener.accept()
++            with connection:
++                message_type, body, batch_id, request_id = read_request(connection)
++                request = {
++                    "type": message_type,
++                    "batch": batch_id.hex(),
++                    "request": request_id.hex(),
++                }
++                requests.append(request)
++                write_state(args.state, requests)
++                if message_type == DESCRIBE_REQUEST:
++                    if body:
++                        raise RuntimeError("DescribeKey body was not empty")
++                    response = describe_body(args.key_name, public_key, endpoint_id)
++                    connection.sendall(response_header(DESCRIBE_RESPONSE, response, batch_id, request_id) + response)
++                    if args.mode == "outage":
++                        listener.close()
++                        args.socket.unlink()
++                        break
++                    if args.mode == "replacement":
++                        replacement = replace_listener(listener, args.socket)
++                        break
++                    continue
++                fingerprint = decode_sign_request(body, args.key_name, public_key, endpoint_id)
++                request["fingerprint"] = fingerprint.decode()
++                write_state(args.state, requests)
++                sign_count += 1
++                if args.mode == "delay":
++                    time.sleep(1)
++                elif args.mode == "timeout":
++                    time.sleep(6)
++                if args.mode == "malformed":
++                    response = b"\x00"
++                else:
++                    signature = sign(library, secret_key, fingerprint)
++                    if args.mode == "bad-sign" or (args.mode == "bad-second" and sign_count == 2):
++                        signature = bytes(64)
++                    response = sign_body(args.key_name, public_key, endpoint_id, signature)
++                try:
++                    connection.sendall(response_header(SIGN_RESPONSE, response, batch_id, request_id) + response)
++                except BrokenPipeError:
++                    if args.mode not in ("delay", "timeout"):
++                        raise
++        if replacement is not None:
++            time.sleep(1)
++    finally:
++        listener.close()
++        if replacement is not None:
++            replacement.close()
++        args.socket.unlink(missing_ok=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/functional/nix-cache-signing/path-info-v1.json b/tests/functional/nix-cache-signing/path-info-v1.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..87bdd8abfb6be59a001f24ef745d19fd0904a90f
+--- /dev/null
++++ b/tests/functional/nix-cache-signing/path-info-v1.json
+@@ -0,0 +1,374 @@
++{
++  "version": 1,
++  "profile": "PATH_INFO_V1",
++  "generator_rules": ["sequential-max-store-path-references-v1"],
++  "vectors": [
++    {
++      "name": "empty-references-size-one",
++      "result": "accept",
++      "covers": ["empty-references", "nar-size-one", "canonical-inline"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d68656c6c6f3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b",
++      "canonical": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d68656c6c6f3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b"
++    },
++    {
++      "name": "ordinary-populated-references",
++      "result": "accept",
++      "covers": ["populated-references", "sorted-references", "ordinary-canonical"],
++      "input": "313b2f6e69782f73746f72652f32323232323232323232323232323232323232323232323232323232323232322d6d61696e3b7368613235363a3031323334353637383961626364666768696a6b6c6d6e70717273767778797a3031323334353637383961626364666768696a6b3b34323b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d616c7068612c2f6e69782f73746f72652f31313131313131313131313131313131313131313131313131313131313131312d62657461",
++      "canonical": "313b2f6e69782f73746f72652f32323232323232323232323232323232323232323232323232323232323232322d6d61696e3b7368613235363a3031323334353637383961626364666768696a6b6c6d6e70717273767778797a3031323334353637383961626364666768696a6b3b34323b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d616c7068612c2f6e69782f73746f72652f31313131313131313131313131313131313131313131313131313131313131312d62657461"
++    },
++    {
++      "name": "self-reference",
++      "result": "accept",
++      "covers": ["self-reference"],
++      "input": "313b2f6e69782f73746f72652f32323232323232323232323232323232323232323232323232323232323232322d6d61696e3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b2f6e69782f73746f72652f32323232323232323232323232323232323232323232323232323232323232322d6d61696e",
++      "canonical": "313b2f6e69782f73746f72652f32323232323232323232323232323232323232323232323232323232323232322d6d61696e3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b2f6e69782f73746f72652f32323232323232323232323232323232323232323232323232323232323232322d6d61696e"
++    },
++    {
++      "name": "allowed-store-name-characters",
++      "result": "accept",
++      "covers": ["store-name-allowed-characters"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d41302b2d2e5f3f3d7a3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b",
++      "canonical": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d41302b2d2e5f3f3d7a3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b"
++    },
++    {
++      "name": "empty-input",
++      "result": "reject",
++      "covers": ["non-fingerprint-input"],
++      "input": ""
++    },
++    {
++      "name": "arbitrary-input",
++      "result": "reject",
++      "covers": ["non-fingerprint-input"],
++      "input": "6e6f742d612d66696e6765727072696e74"
++    },
++    {
++      "name": "realisation-json",
++      "result": "reject",
++      "covers": ["realisation-json"],
++      "input": "7b226964223a227368613235363a6465616462656566216f7574227d"
++    },
++    {
++      "name": "non-ascii-input",
++      "result": "reject",
++      "covers": ["ascii-only"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d636166c3a93b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b"
++    },
++    {
++      "name": "control-byte-newline",
++      "result": "reject",
++      "covers": ["ascii-control-byte"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d68656c6c6f3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b0a"
++    },
++    {
++      "name": "missing-field",
++      "result": "reject",
++      "covers": ["missing-field"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d68656c6c6f3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b31"
++    },
++    {
++      "name": "extra-field",
++      "result": "reject",
++      "covers": ["extra-field"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d68656c6c6f3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b3b6578747261"
++    },
++    {
++      "name": "wrong-profile-version",
++      "result": "reject",
++      "covers": ["malformed-version"],
++      "input": "323b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d68656c6c6f3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b"
++    },
++    {
++      "name": "empty-profile-version",
++      "result": "reject",
++      "covers": ["malformed-version"],
++      "input": "3b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d68656c6c6f3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b"
++    },
++    {
++      "name": "store-wrong-prefix",
++      "result": "reject",
++      "covers": ["store-wrong-prefix", "malformed-store-path"],
++      "input": "313b2f676e752f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d68656c6c6f3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b"
++    },
++    {
++      "name": "store-illegal-base32-character",
++      "result": "reject",
++      "covers": ["store-illegal-base32", "malformed-store-path"],
++      "input": "313b2f6e69782f73746f72652f65303030303030303030303030303030303030303030303030303030303030302d68656c6c6f3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b"
++    },
++    {
++      "name": "store-uppercase-hash",
++      "result": "reject",
++      "covers": ["store-illegal-base32", "malformed-store-path"],
++      "input": "313b2f6e69782f73746f72652f41303030303030303030303030303030303030303030303030303030303030302d68656c6c6f3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b"
++    },
++    {
++      "name": "store-hash-too-short",
++      "result": "reject",
++      "covers": ["store-hash-length", "malformed-store-path"],
++      "input": "313b2f6e69782f73746f72652f303030303030303030303030303030303030303030303030303030303030302d68656c6c6f3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b"
++    },
++    {
++      "name": "store-hash-too-long",
++      "result": "reject",
++      "covers": ["store-hash-length", "malformed-store-path"],
++      "input": "313b2f6e69782f73746f72652f3030303030303030303030303030303030303030303030303030303030303030302d68656c6c6f3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b"
++    },
++    {
++      "name": "store-missing-dash",
++      "result": "reject",
++      "covers": ["store-missing-separator", "malformed-store-path"],
++      "input": "313b2f6e69782f73746f72652f303030303030303030303030303030303030303030303030303030303030303068656c6c6f3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b"
++    },
++    {
++      "name": "store-empty-name",
++      "result": "reject",
++      "covers": ["store-empty-name", "malformed-store-path"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b"
++    },
++    {
++      "name": "store-name-over-211",
++      "result": "reject",
++      "covers": ["store-name-over-211", "malformed-store-path"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b"
++    },
++    {
++      "name": "store-name-illegal-character",
++      "result": "reject",
++      "covers": ["store-name-illegal-character", "malformed-store-path"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d626164216e616d653b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b"
++    },
++    {
++      "name": "store-name-dot",
++      "result": "reject",
++      "covers": ["store-name-dot-form", "malformed-store-path"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d2e3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b"
++    },
++    {
++      "name": "store-name-dot-dot",
++      "result": "reject",
++      "covers": ["store-name-dot-form", "malformed-store-path"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d2e2e3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b"
++    },
++    {
++      "name": "store-name-dot-dash",
++      "result": "reject",
++      "covers": ["store-name-dot-form", "malformed-store-path"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d2e2d783b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b"
++    },
++    {
++      "name": "store-name-dot-dot-dash",
++      "result": "reject",
++      "covers": ["store-name-dot-form", "malformed-store-path"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d2e2e2d783b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b"
++    },
++    {
++      "name": "nar-hash-wrong-algorithm",
++      "result": "reject",
++      "covers": ["malformed-nar-hash"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d68656c6c6f3b7368613531323a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b"
++    },
++    {
++      "name": "nar-hash-invalid-nix32",
++      "result": "reject",
++      "covers": ["invalid-nix32", "malformed-nar-hash"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d68656c6c6f3b7368613235363a653030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b"
++    },
++    {
++      "name": "nar-hash-uppercase-nix32",
++      "result": "reject",
++      "covers": ["uppercase-nix32", "malformed-nar-hash"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d68656c6c6f3b7368613235363a413030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b"
++    },
++    {
++      "name": "nar-hash-too-short",
++      "result": "reject",
++      "covers": ["wrong-digest-length", "malformed-nar-hash"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d68656c6c6f3b7368613235363a3030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b"
++    },
++    {
++      "name": "nar-hash-too-long",
++      "result": "reject",
++      "covers": ["wrong-digest-length", "malformed-nar-hash"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d68656c6c6f3b7368613235363a30303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b"
++    },
++    {
++      "name": "nar-size-leading-zero",
++      "result": "reject",
++      "covers": ["size-leading-zero", "malformed-nar-size"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d68656c6c6f3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b30313b"
++    },
++    {
++      "name": "nar-size-plus-sign",
++      "result": "reject",
++      "covers": ["size-plus-sign", "malformed-nar-size"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d68656c6c6f3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b2b313b"
++    },
++    {
++      "name": "nar-size-leading-whitespace",
++      "result": "reject",
++      "covers": ["size-whitespace", "malformed-nar-size"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d68656c6c6f3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b20313b"
++    },
++    {
++      "name": "nar-size-trailing-whitespace",
++      "result": "reject",
++      "covers": ["size-whitespace", "malformed-nar-size"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d68656c6c6f3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b31203b"
++    },
++    {
++      "name": "nar-size-zero",
++      "result": "reject",
++      "covers": ["nar-size-zero", "malformed-nar-size"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d68656c6c6f3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b303b"
++    },
++    {
++      "name": "nar-size-u64-overflow",
++      "result": "reject",
++      "covers": ["size-u64-overflow", "malformed-nar-size"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d68656c6c6f3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b31383434363734343037333730393535313631363b"
++    },
++    {
++      "name": "nar-size-negative",
++      "result": "reject",
++      "covers": ["size-negative", "malformed-nar-size"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d68656c6c6f3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b2d313b"
++    },
++    {
++      "name": "nar-size-empty",
++      "result": "reject",
++      "covers": ["size-empty", "malformed-nar-size"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d68656c6c6f3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b3b"
++    },
++    {
++      "name": "nar-size-nondigit",
++      "result": "reject",
++      "covers": ["size-nondigit", "malformed-nar-size"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d68656c6c6f3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b6f6e653b"
++    },
++    {
++      "name": "invalid-reference",
++      "result": "reject",
++      "covers": ["invalid-reference", "malformed-references"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d68656c6c6f3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b2f676e752f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d68656c6c6f"
++    },
++    {
++      "name": "duplicate-references",
++      "result": "reject",
++      "covers": ["duplicate-references", "malformed-references"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d68656c6c6f3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d616c7068612c2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d616c706861"
++    },
++    {
++      "name": "unsorted-references",
++      "result": "reject",
++      "covers": ["unsorted-references", "malformed-references"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d68656c6c6f3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b2f6e69782f73746f72652f31313131313131313131313131313131313131313131313131313131313131312d626574612c2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d616c706861"
++    },
++    {
++      "name": "leading-empty-reference",
++      "result": "reject",
++      "covers": ["empty-reference-element", "malformed-references"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d68656c6c6f3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b2c2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d616c706861"
++    },
++    {
++      "name": "trailing-empty-reference",
++      "result": "reject",
++      "covers": ["empty-reference-element", "malformed-references"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d68656c6c6f3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d616c7068612c"
++    },
++    {
++      "name": "interior-empty-reference",
++      "result": "reject",
++      "covers": ["empty-reference-element", "malformed-references"],
++      "input": "313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d68656c6c6f3b7368613235363a303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303b313b2f6e69782f73746f72652f30303030303030303030303030303030303030303030303030303030303030302d616c7068612c2c2f6e69782f73746f72652f31313131313131313131313131313131313131313131313131313131313131312d62657461"
++    },
++    {
++      "name": "maximum-fingerprint",
++      "result": "accept",
++      "covers": [
++        "maximum-length-accepted",
++        "max-references-accepted",
++        "nar-size-u64-max",
++        "store-path-max-length",
++        "reference-path-max-length",
++        "canonical-construction"
++      ],
++      "construction": {
++        "rule": "sequential-max-store-path-references-v1",
++        "parameters": {
++          "version": "1",
++          "store_hash": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
++          "store_name_byte": "m",
++          "store_name_length": 211,
++          "nar_hash": "0000000000000000000000000000000000000000000000000000",
++          "nar_size": "18446744073709551615",
++          "reference_hash_alphabet": "0123456789abcdfghijklmnpqrsvwxyz",
++          "reference_hash_prefix": "00000000000000000000000000000",
++          "reference_hash_counter_width": 3,
++          "reference_hash_counter_start": 0,
++          "reference_name_byte": "r",
++          "reference_name_length": 211,
++          "last_reference_name_length": 211,
++          "reference_count": 2048
++        }
++      },
++      "input_length": 524626,
++      "input_sha256": "fda52be3795700709eef1166c200aac26af0a7605b080dc191eebdfba8c26531",
++      "canonical_length": 524626,
++      "canonical_sha256": "fda52be3795700709eef1166c200aac26af0a7605b080dc191eebdfba8c26531"
++    },
++    {
++      "name": "maximum-plus-one",
++      "result": "reject",
++      "covers": ["maximum-length-rejected", "reference-name-over-211", "malformed-references"],
++      "construction": {
++        "rule": "sequential-max-store-path-references-v1",
++        "parameters": {
++          "version": "1",
++          "store_hash": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
++          "store_name_byte": "m",
++          "store_name_length": 211,
++          "nar_hash": "0000000000000000000000000000000000000000000000000000",
++          "nar_size": "18446744073709551615",
++          "reference_hash_alphabet": "0123456789abcdfghijklmnpqrsvwxyz",
++          "reference_hash_prefix": "00000000000000000000000000000",
++          "reference_hash_counter_width": 3,
++          "reference_hash_counter_start": 0,
++          "reference_name_byte": "r",
++          "reference_name_length": 211,
++          "last_reference_name_length": 212,
++          "reference_count": 2048
++        }
++      },
++      "input_length": 524627,
++      "input_sha256": "4139c1d04a01a196226c5292deac7b92c2f2e933f34a06c6c582c5fcccc08021"
++    },
++    {
++      "name": "reference-count-2049",
++      "result": "reject",
++      "covers": ["max-references-rejected", "malformed-references"],
++      "construction": {
++        "rule": "sequential-max-store-path-references-v1",
++        "parameters": {
++          "version": "1",
++          "store_hash": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
++          "store_name_byte": "m",
++          "store_name_length": 211,
++          "nar_hash": "0000000000000000000000000000000000000000000000000000",
++          "nar_size": "18446744073709551615",
++          "reference_hash_alphabet": "0123456789abcdfghijklmnpqrsvwxyz",
++          "reference_hash_prefix": "00000000000000000000000000000",
++          "reference_hash_counter_width": 3,
++          "reference_hash_counter_start": 0,
++          "reference_name_byte": "r",
++          "reference_name_length": 1,
++          "last_reference_name_length": 1,
++          "reference_count": 2049
++        }
++      },
++      "input_length": 94592,
++      "input_sha256": "d6d12bf8d7e360bdd1bff124347ef2c722015f4925ccc807a326c0a2076521db"
++    }
++  ]
++}
+diff --git a/tests/functional/nix-cache-signing/validate-path-info-v1.py b/tests/functional/nix-cache-signing/validate-path-info-v1.py
+new file mode 100755
+index 0000000000000000000000000000000000000000..1c8c65a9bbe56cafa002e204d0b8db1df396eccb
+--- /dev/null
++++ b/tests/functional/nix-cache-signing/validate-path-info-v1.py
+@@ -0,0 +1,404 @@
++#!/usr/bin/env python3
++
++import hashlib
++import json
++import re
++import sys
++from pathlib import Path
++
++NIX32 = "0123456789abcdfghijklmnpqrsvwxyz"
++MAX_FINGERPRINT_LENGTH = 524_626
++MAX_REFERENCES = 2_048
++MAX_STORE_NAME_LENGTH = 211
++U64_MAX = 18_446_744_073_709_551_615
++RULE = "sequential-max-store-path-references-v1"
++REQUIRED_COVERAGE = {
++    "duplicate-references",
++    "empty-references",
++    "extra-field",
++    "invalid-nix32",
++    "invalid-reference",
++    "malformed-nar-hash",
++    "malformed-nar-size",
++    "malformed-references",
++    "malformed-store-path",
++    "malformed-version",
++    "max-references-accepted",
++    "max-references-rejected",
++    "maximum-length-accepted",
++    "maximum-length-rejected",
++    "missing-field",
++    "nar-size-one",
++    "nar-size-zero",
++    "non-fingerprint-input",
++    "populated-references",
++    "realisation-json",
++    "self-reference",
++    "size-leading-zero",
++    "size-plus-sign",
++    "size-u64-overflow",
++    "size-whitespace",
++    "store-empty-name",
++    "store-illegal-base32",
++    "store-name-over-211",
++    "store-wrong-prefix",
++    "unsorted-references",
++    "uppercase-nix32",
++    "wrong-digest-length",
++}
++
++
++class InvalidCorpus(ValueError):
++    pass
++
++
++class InvalidFingerprint(ValueError):
++    pass
++
++
++def require(condition: bool, message: str) -> None:
++    if not condition:
++        raise InvalidCorpus(message)
++
++
++def exact_keys(value: dict, expected: set[str], where: str) -> None:
++    actual = set(value)
++    require(actual == expected, f"{where}: keys {sorted(actual)} != {sorted(expected)}")
++
++
++def unique_object(pairs: list[tuple[str, object]]) -> dict:
++    result = {}
++    for key, value in pairs:
++        if key in result:
++            raise InvalidCorpus(f"duplicate JSON key: {key}")
++        result[key] = value
++    return result
++
++
++def decode_hex(value: object, where: str) -> bytes:
++    require(isinstance(value, str), f"{where}: hex value is not a string")
++    require(
++        re.fullmatch(r"(?:[0-9a-f]{2})*", value) is not None,
++        f"{where}: invalid lowercase hex",
++    )
++    return bytes.fromhex(value)
++
++
++def validate_store_path(value: str) -> str:
++    prefix = "/nix/store/"
++    if not value.startswith(prefix):
++        raise InvalidFingerprint("wrong store prefix")
++    base = value[len(prefix) :]
++    if len(base) < 34 or base[32] != "-":
++        raise InvalidFingerprint("invalid store-path shape")
++    hash_part = base[:32]
++    name = base[33:]
++    if any(character not in NIX32 for character in hash_part):
++        raise InvalidFingerprint("invalid store-path Nix32 hash")
++    if not 1 <= len(name) <= MAX_STORE_NAME_LENGTH:
++        raise InvalidFingerprint("invalid store-path name length")
++    if any(
++        not (character.isascii() and (character.isalnum() or character in "+-._?="))
++        for character in name
++    ):
++        raise InvalidFingerprint("invalid store-path name character")
++    if name in {".", ".."} or name.startswith((".-", "..-")):
++        raise InvalidFingerprint("reserved store-path name")
++    canonical = prefix + hash_part + "-" + name
++    if canonical != value:
++        raise InvalidFingerprint("noncanonical store path")
++    return canonical
++
++
++def parse_fingerprint(data: bytes) -> bytes:
++    if not 1 <= len(data) <= MAX_FINGERPRINT_LENGTH:
++        raise InvalidFingerprint("fingerprint length")
++    try:
++        text = data.decode("ascii")
++    except UnicodeDecodeError as error:
++        raise InvalidFingerprint("fingerprint is not ASCII") from error
++    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in text):
++        raise InvalidFingerprint("fingerprint contains a control byte")
++    fields = text.split(";")
++    if len(fields) != 5:
++        raise InvalidFingerprint("fingerprint field count")
++    version, store_path, nar_hash, nar_size, references_field = fields
++    if version != "1":
++        raise InvalidFingerprint("profile version")
++    store_path = validate_store_path(store_path)
++    if not nar_hash.startswith("sha256:"):
++        raise InvalidFingerprint("NAR hash algorithm")
++    digest = nar_hash[7:]
++    if len(digest) != 52 or any(character not in NIX32 for character in digest):
++        raise InvalidFingerprint("NAR hash Nix32 digest")
++    if not nar_size or not nar_size.isascii() or not nar_size.isdecimal():
++        raise InvalidFingerprint("NAR size syntax")
++    if len(nar_size) > 1 and nar_size[0] == "0":
++        raise InvalidFingerprint("NAR size leading zero")
++    size = int(nar_size)
++    if not 1 <= size <= U64_MAX:
++        raise InvalidFingerprint("NAR size range")
++    references = [] if references_field == "" else references_field.split(",")
++    if len(references) > MAX_REFERENCES:
++        raise InvalidFingerprint("reference count")
++    canonical_references = [validate_store_path(reference) for reference in references]
++    if len(set(canonical_references)) != len(canonical_references):
++        raise InvalidFingerprint("duplicate references")
++    if canonical_references != sorted(canonical_references):
++        raise InvalidFingerprint("unsorted references")
++    canonical = ";".join(
++        [
++            "1",
++            store_path,
++            "sha256:" + digest,
++            str(size),
++            ",".join(canonical_references),
++        ]
++    ).encode("ascii")
++    if canonical != data:
++        raise InvalidFingerprint("noncanonical fingerprint")
++    return canonical
++
++
++def encode_counter(value: int, alphabet: str, width: int) -> str:
++    digits = []
++    for _ in range(width):
++        digits.append(alphabet[value % len(alphabet)])
++        value //= len(alphabet)
++    require(value == 0, "construction: reference counter exceeds its width")
++    return "".join(reversed(digits))
++
++
++def expand_construction(construction: object, where: str) -> bytes:
++    require(isinstance(construction, dict), f"{where}: construction is not an object")
++    exact_keys(construction, {"rule", "parameters"}, where)
++    require(construction["rule"] == RULE, f"{where}: unknown generator rule")
++    parameters = construction["parameters"]
++    require(isinstance(parameters, dict), f"{where}: parameters are not an object")
++    exact_keys(
++        parameters,
++        {
++            "last_reference_name_length",
++            "nar_hash",
++            "nar_size",
++            "reference_count",
++            "reference_hash_alphabet",
++            "reference_hash_counter_start",
++            "reference_hash_counter_width",
++            "reference_hash_prefix",
++            "reference_name_byte",
++            "reference_name_length",
++            "store_hash",
++            "store_name_byte",
++            "store_name_length",
++            "version",
++        },
++        f"{where}.parameters",
++    )
++    alphabet = parameters["reference_hash_alphabet"]
++    prefix = parameters["reference_hash_prefix"]
++    width = parameters["reference_hash_counter_width"]
++    start = parameters["reference_hash_counter_start"]
++    count = parameters["reference_count"]
++    require(alphabet == NIX32, f"{where}: generator alphabet is not canonical Nix32")
++    require(
++        isinstance(prefix, str) and set(prefix) <= set(NIX32),
++        f"{where}: invalid hash prefix",
++    )
++    require(isinstance(width, int) and width > 0, f"{where}: invalid counter width")
++    require(len(prefix) + width == 32, f"{where}: reference hash is not 32 bytes")
++    require(isinstance(start, int) and start >= 0, f"{where}: invalid counter start")
++    require(
++        isinstance(count, int) and 1 <= count <= 4_096,
++        f"{where}: invalid reference count",
++    )
++    store_hash = parameters["store_hash"]
++    store_name_byte = parameters["store_name_byte"]
++    store_name_length = parameters["store_name_length"]
++    reference_name_byte = parameters["reference_name_byte"]
++    reference_name_length = parameters["reference_name_length"]
++    last_reference_name_length = parameters["last_reference_name_length"]
++    for label, byte in (("store", store_name_byte), ("reference", reference_name_byte)):
++        require(
++            isinstance(byte, str) and len(byte) == 1 and byte.isascii(),
++            f"{where}: {label} name byte",
++        )
++    for label, length in (
++        ("store", store_name_length),
++        ("reference", reference_name_length),
++        ("last reference", last_reference_name_length),
++    ):
++        require(
++            isinstance(length, int) and 1 <= length <= 212,
++            f"{where}: {label} name length",
++        )
++    require(
++        isinstance(store_hash, str) and len(store_hash) == 32,
++        f"{where}: store hash length",
++    )
++    require(set(store_hash) <= set(NIX32), f"{where}: store hash alphabet")
++    nar_hash = parameters["nar_hash"]
++    nar_size = parameters["nar_size"]
++    version = parameters["version"]
++    require(isinstance(nar_hash, str), f"{where}: NAR hash is not text")
++    require(isinstance(nar_size, str), f"{where}: NAR size is not text")
++    require(isinstance(version, str), f"{where}: version is not text")
++    references = []
++    for offset in range(count):
++        counter = encode_counter(start + offset, alphabet, width)
++        name_length = (
++            last_reference_name_length if offset == count - 1 else reference_name_length
++        )
++        references.append(
++            "/nix/store/" + prefix + counter + "-" + reference_name_byte * name_length
++        )
++    return (
++        version
++        + ";/nix/store/"
++        + store_hash
++        + "-"
++        + store_name_byte * store_name_length
++        + ";sha256:"
++        + nar_hash
++        + ";"
++        + nar_size
++        + ";"
++        + ",".join(references)
++    ).encode("ascii")
++
++
++def validate_digest(fixture: Path, digests: Path) -> None:
++    entries = {}
++    for line in digests.read_text(encoding="ascii").splitlines():
++        if not line:
++            continue
++        match = re.fullmatch(r"([0-9a-f]{64})  ([A-Za-z0-9._-]+)", line)
++        require(match is not None, f"DIGESTS: malformed line: {line!r}")
++        digest, name = match.groups()
++        require(name not in entries, f"DIGESTS: duplicate entry for {name}")
++        entries[name] = digest
++    require(fixture.name in entries, f"DIGESTS: missing {fixture.name}")
++    actual = hashlib.sha256(fixture.read_bytes()).hexdigest()
++    require(entries[fixture.name] == actual, f"DIGESTS: {fixture.name} is {actual}")
++
++
++def validate_vector(vector: object, index: int) -> tuple[str, set[str]]:
++    where = f"vectors[{index}]"
++    require(isinstance(vector, dict), f"{where}: vector is not an object")
++    name = vector.get("name")
++    result = vector.get("result")
++    covers = vector.get("covers")
++    require(isinstance(name, str) and name, f"{where}: invalid name")
++    require(result in {"accept", "reject"}, f"{where}: invalid result")
++    require(isinstance(covers, list) and covers, f"{where}: invalid coverage list")
++    require(
++        all(isinstance(item, str) and item for item in covers),
++        f"{where}: invalid coverage label",
++    )
++    require(len(set(covers)) == len(covers), f"{where}: duplicate coverage label")
++    if "input" in vector:
++        expected = {"name", "result", "covers", "input"}
++        if result == "accept":
++            expected.add("canonical")
++        exact_keys(vector, expected, where)
++        data = decode_hex(vector["input"], f"{where}.input")
++        canonical = (
++            decode_hex(vector["canonical"], f"{where}.canonical")
++            if result == "accept"
++            else None
++        )
++    else:
++        expected = {
++            "construction",
++            "covers",
++            "input_length",
++            "input_sha256",
++            "name",
++            "result",
++        }
++        if result == "accept":
++            expected |= {"canonical_length", "canonical_sha256"}
++        exact_keys(vector, expected, where)
++        data = expand_construction(vector["construction"], f"{where}.construction")
++        require(
++            vector["input_length"] == len(data), f"{where}: constructed input length"
++        )
++        actual_digest = hashlib.sha256(data).hexdigest()
++        require(
++            vector["input_sha256"] == actual_digest,
++            f"{where}: constructed input digest",
++        )
++        canonical = data if result == "accept" else None
++        if result == "accept":
++            require(
++                vector["canonical_length"] == len(canonical),
++                f"{where}: canonical length",
++            )
++            require(
++                vector["canonical_sha256"] == hashlib.sha256(canonical).hexdigest(),
++                f"{where}: canonical digest",
++            )
++    if result == "accept":
++        parsed = parse_fingerprint(data)
++        require(parsed == canonical, f"{where}: canonical bytes differ")
++    else:
++        try:
++            parse_fingerprint(data)
++        except InvalidFingerprint:
++            pass
++        else:
++            raise InvalidCorpus(f"{where}: rejected vector was accepted")
++    return name, set(covers)
++
++
++def main() -> int:
++    if len(sys.argv) != 3:
++        print(f"usage: {sys.argv[0]} PATH-INFO-V1.json DIGESTS", file=sys.stderr)
++        return 2
++    fixture = Path(sys.argv[1])
++    digests = Path(sys.argv[2])
++    try:
++        validate_digest(fixture, digests)
++        corpus = json.loads(
++            fixture.read_text(encoding="utf-8"),
++            object_pairs_hook=unique_object,
++        )
++        require(isinstance(corpus, dict), "corpus: top level is not an object")
++        exact_keys(
++            corpus, {"generator_rules", "profile", "vectors", "version"}, "corpus"
++        )
++        require(corpus["version"] == 1, "corpus: version is not 1")
++        require(corpus["profile"] == "PATH_INFO_V1", "corpus: wrong profile")
++        require(corpus["generator_rules"] == [RULE], "corpus: wrong generator rules")
++        vectors = corpus["vectors"]
++        require(isinstance(vectors, list) and vectors, "corpus: vectors are empty")
++        names = set()
++        coverage = set()
++        accepted = 0
++        for index, vector in enumerate(vectors):
++            name, vector_coverage = validate_vector(vector, index)
++            require(name not in names, f"corpus: duplicate vector name: {name}")
++            names.add(name)
++            coverage |= vector_coverage
++            accepted += vector["result"] == "accept"
++        missing = REQUIRED_COVERAGE - coverage
++        require(not missing, f"corpus: missing coverage: {sorted(missing)}")
++    except (
++        InvalidCorpus,
++        InvalidFingerprint,
++        OSError,
++        UnicodeError,
++        json.JSONDecodeError,
++    ) as error:
++        print(f"nix-cache-signing-corpus: {error}", file=sys.stderr)
++        return 1
++    print(
++        f"PATH_INFO_V1 corpus: {len(vectors)} vectors "
++        f"({accepted} accept, {len(vectors) - accepted} reject), "
++        f"{len(coverage)} coverage labels"
++    )
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
