@@ -876,7 +876,9 @@ dependencies = [
  "getrandom 0.4.3",
  "hex",
  "mimalloc",
+ "reqwest 0.13.4",
  "rustix 1.1.4",
+ "rustls 0.23.42",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -886,6 +888,7 @@ dependencies = [
  "tonic 0.14.6",
  "tracing",
  "tracing-subscriber",
+ "x25519-dalek 3.0.0",
  "zeroize",
 ]
 

@@ -11,6 +11,7 @@
 
 #![cfg_attr(test, allow(clippy::indexing_slicing))]
 
+pub mod ci_session;
 pub mod client_cli;
 pub mod nix_cache_cli;
 mod nix_cache_mutation_audit;
@@ -88,6 +89,9 @@ pub enum Command {
     /// Manage Nix binary-cache signing keys held in backend custody.
     #[command(subcommand)]
     Nix(nix_cli::NixCommand),
+    /// Run provider-neutral, job-scoped CI identity sessions.
+    #[command(subcommand)]
+    Ci(ci_session::CiCommand),
     /// Reserved built-in keystore maintenance surface; currently fails closed.
     #[cfg(feature = "db-keystore")]
     #[command(subcommand)]
@@ -247,6 +251,35 @@ mod tests {
             "passphrase:file=/run/pass",
         ]);
         assert!(matches!(cli.command, Command::Bundle(_)));
+    }
+
+    #[test]
+    fn ci_session_requires_pinned_executable_inputs() {
+        let cli = parse(&[
+            "basil",
+            "ci",
+            "session",
+            "--basil-executable",
+            "/opt/basil/bin/basil",
+            "--basil-executable-sha256",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--rule-max-token-age-seconds",
+            "300",
+        ]);
+        assert!(matches!(cli.command, Command::Ci(_)));
+        let error = Cli::try_parse_from([
+            "basil",
+            "ci",
+            "session",
+            "--basil-executable",
+            "/opt/basil/bin/basil",
+            "--basil-executable-sha256",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--rule-max-token-age-seconds",
+            "901",
+        ])
+        .expect_err("rule maximum token age is contract-bounded");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[cfg(feature = "db-keystore")]

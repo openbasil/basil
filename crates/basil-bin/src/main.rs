@@ -8,7 +8,7 @@
 //! tooling can render man pages; this entry point only parses and dispatches.
 
 use anyhow::Result;
-use basil_bin::{Cli, Command, ConfigCommand, client_cli, nix_cli};
+use basil_bin::{Cli, Command, ConfigCommand, ci_session, client_cli, nix_cli};
 #[cfg(feature = "compose")]
 use basil_bin::{ComposeCommand, ComposeFrontend, ComposeModelArgs};
 use basil_core::agent_cli;
@@ -67,6 +67,7 @@ async fn main() -> Result<()> {
             init_client_tracing();
             nix_cli::run(cli.socket, command).await
         }
+        Command::Ci(ci_session::CiCommand::Session(args)) => ci_session::run(args).await,
         #[cfg(feature = "db-keystore")]
         Command::Keystore(command) => basil_bin::run_keystore(*command),
         // Unified `explain`: offline file dry-run by default; `--live` queries the
