@@ -99,6 +99,11 @@ The deb, Arch, and Nix packages ship man pages and bash/zsh/fish completions
 included under `nix/`, and `nix build .#basil-oci-thin` builds a
 `docker load`-ready container image.
 
+The [Cachix external-custody proposal](packaging/cachix/README.md) is a pinned,
+opt-in Cachix `1.11.1` package for self-managed cache uploads. It signs through
+Basil without giving Cachix private key material and does not replace the host
+Cachix installation.
+
 See [installation](https://docs.openbasil.org/getting-started/installation/)
 for details and backend prerequisites.
 

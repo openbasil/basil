@@ -25,6 +25,14 @@ precedence = "override"
 SPDX-FileCopyrightText = "The SPIFFE Project & Scytale, Inc"
 SPDX-License-Identifier = "Apache-2.0"
 
+# Cachix external-signer proposal: the patch contains upstream context from
+# Cachix 1.11.1 alongside the OpenBasil integration.
+[[annotations]]
+path = "packaging/cachix/cachix-1.11.1-nxsg.patch"
+precedence = "override"
+SPDX-FileCopyrightText = ["2018 Domen Kozar", "2026 OpenBasil Contributors"]
+SPDX-License-Identifier = "Apache-2.0"
+
 # Exact upstream Sigstore conformance evidence. Licensing is declared here so
 # the signed payload, bundle, and trust snapshot remain byte-identical to their
 # pinned upstream sources.
