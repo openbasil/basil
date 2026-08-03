@@ -23,7 +23,8 @@ jobs:
   # Debian .deb packages for amd64 + arm64. dist 0.32.0 has no native .deb
   # support, so we assemble a package directly with dpkg-deb on NATIVE runners
   # (arm64 uses GitHub's hosted arm64 Linux runner -- no cross toolchain needed).
-  # Each .deb contains both shipped binaries (`basil` and `basil-nats-bridge`)
+  # Each .deb contains all shipped binaries (`basil`, `basil-nats-bridge`, and
+  # `basil-https-courier`)
   # plus their man pages, gets its own build-provenance attestation, and is
   # attached to the Release that the `host` job created.
   debian-packages:
@@ -71,9 +72,9 @@ jobs:
         # in. Optional HTTP server, TPM, AWS KMS, GCP KMS, OTLP, and secure
         # allocator surfaces are deliberately outside the default release build.
         # The profile strips symbols and uses fat LTO for shipped artifacts.
-        # `xtask` emits roff man pages for both shipped binaries.
+        # `xtask` emits roff man pages for all shipped binaries.
         run: |
-          cargo build --profile dist -p basil-bin -p basil-nats-bridge -p xtask
+          cargo build --profile dist -p basil-bin -p basil-nats-bridge -p basil-https-courier -p xtask
           target/dist/xtask -o target/dist/man
       - name: Assemble .deb
         id: deb
@@ -89,6 +90,7 @@ jobs:
           mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/usr/share/man/man1"
 
           install -Dm755 target/dist/basil "$root/usr/bin/basil"
+          install -Dm755 target/dist/basil-https-courier "$root/usr/bin/basil-https-courier"
           install -Dm755 target/dist/basil-nats-bridge "$root/usr/bin/basil-nats-bridge"
           cp target/dist/man/*.1 "$root/usr/share/man/man1/"
           gzip -9 -n "$root/usr/share/man/man1"/*.1
@@ -114,8 +116,8 @@ jobs:
           Description: Basil, a host-local secrets broker: your app never touches the key
            Basil brokers cryptographic operations, workload identity (SPIFFE),
            and short-lived leases, with keys kept in the backend and used in
-           place. Ships the unified basil broker/CLI and the basil-nats-bridge
-           NATS courier, plus their man pages.
+           place. Ships the unified basil broker/CLI, the basil-nats-bridge
+           NATS courier, and the basil-https-courier HTTPS courier, plus their man pages.
           EOF
 
           mkdir -p target/debian
@@ -129,7 +131,8 @@ jobs:
         run: gh release upload "${{ needs.plan.outputs.tag }}" "${{ steps.deb.outputs.path }}" --clobber
 
   # Arch Linux .pkg.tar.zst for x86_64 and aarch64, each built from the PUBLISHED
-  # basil-bin and basil-nats-bridge release archives of that arch inside an Arch
+  # basil-bin, basil-nats-bridge, and basil-https-courier release archives of
+  # that arch inside an Arch
   # container (dist has no native Arch support). x86_64 uses the official
   # `archlinux` image; aarch64 builds natively on an arm64 runner in an Arch
   # Linux ARM image. The PKGBUILD lives at

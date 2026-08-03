@@ -94,9 +94,10 @@ the verified-swap implementation and its adversarial review.
 
 Release artifacts are built in CI and carry GitHub artifact attestations;
 verify a download with `gh attestation verify <file> --repo openbasil/basil`.
-The deb, Arch, and Nix packages ship man pages and bash/zsh/fish completions
-(`basil completions <shell>` generates them anywhere else). A NixOS module is
-included under `nix/`, and `nix build .#basil-oci-thin` builds a
+The release archives, deb, Arch, and Nix packages ship `basil`,
+`basil-nats-bridge`, and `basil-https-courier`; packages also ship their man
+pages and bash/zsh/fish completions (`basil completions <shell>` generates them
+anywhere else). A NixOS module is included under `nix/`, and `nix build .#basil-oci-thin` builds a
 `docker load`-ready container image.
 
 The [Cachix external-custody proposal](packaging/cachix/README.md) is a pinned,

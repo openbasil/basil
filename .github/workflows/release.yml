@@ -56,7 +56,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
           submodules: recursive
@@ -120,7 +120,7 @@ jobs:
       - name: enable windows longpaths
         run: |
           git config --global core.longpaths true
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
           submodules: recursive
@@ -149,7 +149,7 @@ jobs:
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
       - name: Attest
-        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
         with:
           subject-path: "target/distrib/*${{ join(matrix.targets, ', ') }}*"
       - id: cargo-dist
@@ -183,7 +183,7 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
           submodules: recursive
@@ -233,7 +233,7 @@ jobs:
     outputs:
       val: ${{ steps.host.outputs.manifest }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
           submodules: recursive
@@ -298,7 +298,7 @@ jobs:
       GITHUB_EMAIL: "admin+bot@axo.dev"
     if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: true
           repository: "openbasil/homebrew-tap"
@@ -345,7 +345,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
           submodules: recursive
@@ -358,7 +358,8 @@ jobs:
   # Debian .deb packages for amd64 + arm64. dist 0.32.0 has no native .deb
   # support, so we assemble a package directly with dpkg-deb on NATIVE runners
   # (arm64 uses GitHub's hosted arm64 Linux runner -- no cross toolchain needed).
-  # Each .deb contains both shipped binaries (`basil` and `basil-nats-bridge`)
+  # Each .deb contains all shipped binaries (`basil`, `basil-nats-bridge`, and
+  # `basil-https-courier`)
   # plus their man pages, gets its own build-provenance attestation, and is
   # attached to the Release that the `host` job created.
   debian-packages:
@@ -383,7 +384,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       # Provision the toolchain pinned by rust-toolchain.toml (no hardcoded Rust
@@ -406,9 +407,9 @@ jobs:
         # in. Optional HTTP server, TPM, AWS KMS, GCP KMS, OTLP, and secure
         # allocator surfaces are deliberately outside the default release build.
         # The profile strips symbols and uses fat LTO for shipped artifacts.
-        # `xtask` emits roff man pages for both shipped binaries.
+        # `xtask` emits roff man pages for all shipped binaries.
         run: |
-          cargo build --profile dist -p basil-bin -p basil-nats-bridge -p xtask
+          cargo build --profile dist -p basil-bin -p basil-nats-bridge -p basil-https-courier -p xtask
           target/dist/xtask -o target/dist/man
       - name: Assemble .deb
         id: deb
@@ -424,6 +425,7 @@ jobs:
           mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/usr/share/man/man1"
 
           install -Dm755 target/dist/basil "$root/usr/bin/basil"
+          install -Dm755 target/dist/basil-https-courier "$root/usr/bin/basil-https-courier"
           install -Dm755 target/dist/basil-nats-bridge "$root/usr/bin/basil-nats-bridge"
           cp target/dist/man/*.1 "$root/usr/share/man/man1/"
           gzip -9 -n "$root/usr/share/man/man1"/*.1
@@ -449,8 +451,8 @@ jobs:
           Description: Basil, a host-local secrets broker: your app never touches the key
            Basil brokers cryptographic operations, workload identity (SPIFFE),
            and short-lived leases, with keys kept in the backend and used in
-           place. Ships the unified basil broker/CLI and the basil-nats-bridge
-           NATS courier, plus their man pages.
+           place. Ships the unified basil broker/CLI, the basil-nats-bridge
+           NATS courier, and the basil-https-courier HTTPS courier, plus their man pages.
           EOF
 
           mkdir -p target/debian
@@ -464,7 +466,8 @@ jobs:
         run: gh release upload "${{ needs.plan.outputs.tag }}" "${{ steps.deb.outputs.path }}" --clobber
 
   # Arch Linux .pkg.tar.zst for x86_64 and aarch64, each built from the PUBLISHED
-  # basil-bin and basil-nats-bridge release archives of that arch inside an Arch
+  # basil-bin, basil-nats-bridge, and basil-https-courier release archives of
+  # that arch inside an Arch
   # container (dist has no native Arch support). x86_64 uses the official
   # `archlinux` image; aarch64 builds natively on an arm64 runner in an Arch
   # Linux ARM image. The PKGBUILD lives at
@@ -496,7 +499,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - name: Derive pkgver from the tag

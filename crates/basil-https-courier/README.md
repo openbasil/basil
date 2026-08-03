@@ -67,3 +67,10 @@ together never exceed the configured connection limit.
 Start the courier with `basil-https-courier --config PATH`. Startup fails unless
 the local listener reports the `COURIER`, mandatory-challenge, protocol-v1
 capability tuple; that tuple is checked again before every forwarded call.
+
+## Installation
+
+The HTTPS courier ships as the separate `basil-https-courier` executable in
+release archives and the Debian, Arch, and Nix packages. It is not part of the
+`basil agent` process; install it only on an Internet-facing host configured to
+use the sealed-invocation courier boundary.

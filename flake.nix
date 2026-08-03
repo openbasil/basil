@@ -173,9 +173,9 @@
             nixosSystem = inputs.nixpkgs.lib.nixosSystem;
           };
 
-          # Distribution build for the `.deb`: the two shipped binaries plus the
+          # Distribution build for the `.deb`: the three shipped binaries plus the
           # roff man pages the `xtask` crate emits (via `clap_mangen`). Scoped to
-          # the two packages so no test suite runs and no example binaries leak
+          # the three packages so no test suite runs and no example binaries leak
           # in. Pages land gzipped under `share/man/man1`, ready to drop into
           # `/usr/share/man/man1`.
           basilDist = mkBasil {
@@ -183,6 +183,8 @@
             cargoBuildFlags = [
               "-p"
               "basil-bin"
+              "-p"
+              "basil-https-courier"
               "-p"
               "basil-nats-bridge"
               "-p"
@@ -299,7 +301,7 @@
                 };
               };
 
-            # A Debian package assembled with `dpkg-deb` (no ruby/fpm): the two
+            # A Debian package assembled with `dpkg-deb` (no ruby/fpm): the three
             # binaries under `/usr/bin` and the gzipped man pages under
             # `/usr/share/man/man1`, from the single `basilDist` build. The arch
             # is carried in the filename (`basil_<version>_<arch>.deb`) since we
@@ -313,7 +315,7 @@
                 {
                   nativeBuildInputs = [ pkgs.dpkg ];
                   meta = {
-                    description = "Debian package for the Basil broker and NATS bridge (${dockerArch}).";
+                    description = "Debian package for the Basil broker and couriers (${dockerArch}).";
                   };
                 }
                 ''
@@ -321,6 +323,7 @@
                   mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/usr/share/man/man1"
 
                   install -Dm755 ${basilDist}/bin/basil "$root/usr/bin/basil"
+                  install -Dm755 ${basilDist}/bin/basil-https-courier "$root/usr/bin/basil-https-courier"
                   install -Dm755 ${basilDist}/bin/basil-nats-bridge "$root/usr/bin/basil-nats-bridge"
                   cp ${basilDist}/share/man/man1/*.1.gz "$root/usr/share/man/man1/"
 
@@ -336,8 +339,8 @@
                     echo "Description: Basil, a host-local secrets broker: your app never touches the key"
                     echo " Basil brokers cryptographic operations, workload identity (SPIFFE),"
                     echo " and short-lived leases, with keys kept in the backend and used in"
-                    echo " place. Ships the unified basil broker/CLI and the basil-nats-bridge"
-                    echo " NATS courier, plus their man pages."
+                    echo " place. Ships the unified basil broker/CLI, the basil-nats-bridge"
+                    echo " NATS courier, and the basil-https-courier HTTPS courier, plus their man pages."
                   } > "$root/DEBIAN/control"
 
                   mkdir -p "$out"

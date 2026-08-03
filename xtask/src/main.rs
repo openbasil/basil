@@ -5,7 +5,7 @@
 //! `cargo xtask` automation for the Basil workspace.
 //!
 //! One command today: render roff man pages for the shipped binaries
-//! (`basil`, `basil-nats-bridge`) with `clap_mangen`. Each binary's top-level
+//! (`basil`, `basil-nats-bridge`, `basil-https-courier`) with `clap_mangen`. Each binary's top-level
 //! page plus one page per (recursively nested) subcommand is written to the
 //! output directory, so `man basil-agent`, `man basil-config-bundle`, and so on
 //! resolve once the pages are installed under `share/man/man1`.
@@ -17,7 +17,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 
 /// Command-line arguments for the `xtask` runner.
 #[derive(Debug, Parser)]
@@ -36,6 +36,7 @@ fn main() -> Result<()> {
     let mut count = 0usize;
     count += render_tree(&basil_bin::cli(), &cli.out)?;
     count += render_tree(&basil_nats_bridge::cli(), &cli.out)?;
+    count += render_tree(&basil_https_courier::Args::command(), &cli.out)?;
 
     println!("wrote {count} man page(s) to {}", cli.out.display());
     Ok(())

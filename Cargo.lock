@@ -7061,6 +7061,7 @@ version = "0.8.0-pre.1"
 dependencies = [
  "anyhow",
  "basil-bin",
+ "basil-https-courier",
  "basil-nats-bridge",
  "clap",
  "clap_mangen",

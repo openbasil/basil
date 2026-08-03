@@ -18,6 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 basil-bin = { workspace = true }
+basil-https-courier = { workspace = true }
 basil-nats-bridge = { workspace = true }
 
 anyhow = { workspace = true }

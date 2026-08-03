@@ -5,7 +5,8 @@ _default:
 rust-docs:
     cargo doc -p basil  -p basil-nats -p basil-proto -p basil-cose --all-features --no-deps
 
-# Generate roff man pages for the `basil` and `basil-nats-bridge` binaries into
+# Generate roff man pages for the `basil`, `basil-nats-bridge`, and
+# `basil-https-courier` binaries into
 # `target/man` (override with `just man-pages <dir>`). Pages are named
 # `basil.1`, `basil-agent.1`, ... one per (nested) subcommand.
 man-pages out="target/man":
