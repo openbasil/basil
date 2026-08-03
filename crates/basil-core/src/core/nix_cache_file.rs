@@ -146,14 +146,68 @@ pub enum NarinfoCommit {
     },
 }
 
+#[cfg(test)]
 type TemporaryBindingHook = fn(&OwnedFd, &str) -> Result<(), NixCacheFileError>;
+#[cfg(test)]
+type FinalComparisonHook = fn(&OwnedFd, &OsStr) -> Result<(), NixCacheFileError>;
+#[cfg(test)]
+type CommitStageHook = fn(CommitStage);
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommitStage {
+    BeforeWrite,
+    AfterWrite,
+    BeforeFileSync,
+    AfterFileSync,
+    BeforeRename,
+    AfterRename,
+    BeforeDirectorySync,
+    AfterDirectorySync,
+}
+
+#[cfg(test)]
+impl CommitStage {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::BeforeWrite => "before-write",
+            Self::AfterWrite => "after-write",
+            Self::BeforeFileSync => "before-file-sync",
+            Self::AfterFileSync => "after-file-sync",
+            Self::BeforeRename => "before-rename",
+            Self::AfterRename => "after-rename",
+            Self::BeforeDirectorySync => "before-directory-sync",
+            Self::AfterDirectorySync => "after-directory-sync",
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InjectedCommitFailure {
+    AfterWrite,
+    FileSync,
+    Rename,
+    DirectorySync,
+}
+
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 struct CommitHooks {
     before_temporary_binding: Option<TemporaryBindingHook>,
-    fail_file_sync: bool,
-    fail_post_rename_sync: bool,
+    before_final_comparison: Option<FinalComparisonHook>,
+    stage: Option<CommitStageHook>,
+    failure: Option<InjectedCommitFailure>,
     fail_cleanup_sync: bool,
+}
+
+#[cfg(test)]
+impl CommitHooks {
+    fn observe(self, stage: CommitStage) {
+        if let Some(hook) = self.stage {
+            hook(stage);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -323,15 +377,32 @@ impl LockedCacheRoot {
         expected: &NarinfoSnapshot,
         replacement: &[u8],
     ) -> Result<NarinfoCommit, NixCacheFileError> {
-        self.commit_narinfo_with_hooks(relative, expected, replacement, CommitHooks::default())
+        self.commit_narinfo_inner(
+            relative,
+            expected,
+            replacement,
+            #[cfg(test)]
+            CommitHooks::default(),
+        )
     }
 
+    #[cfg(test)]
     fn commit_narinfo_with_hooks(
         &self,
         relative: &Path,
         expected: &NarinfoSnapshot,
         replacement: &[u8],
         hooks: CommitHooks,
+    ) -> Result<NarinfoCommit, NixCacheFileError> {
+        self.commit_narinfo_inner(relative, expected, replacement, hooks)
+    }
+
+    fn commit_narinfo_inner(
+        &self,
+        relative: &Path,
+        expected: &NarinfoSnapshot,
+        replacement: &[u8],
+        #[cfg(test)] hooks: CommitHooks,
     ) -> Result<NarinfoCommit, NixCacheFileError> {
         let replacement_size =
             u64::try_from(replacement.len()).map_err(|_| NixCacheFileError::NarinfoTooLarge)?;
@@ -357,11 +428,18 @@ impl LockedCacheRoot {
             temporary,
             expected,
             replacement,
+            #[cfg(test)]
             hooks,
         );
         match result {
             Ok(outcome) => Ok(outcome),
-            Err(error) => Err(cleanup_temporary(&directory, &temporary_name, error, hooks)),
+            Err(error) => Err(cleanup_temporary(
+                &directory,
+                &temporary_name,
+                error,
+                #[cfg(test)]
+                hooks,
+            )),
         }
     }
 
@@ -372,10 +450,18 @@ impl LockedCacheRoot {
         temporary: OwnedFd,
         expected: &NarinfoSnapshot,
         replacement: &[u8],
-        hooks: CommitHooks,
+        #[cfg(test)] hooks: CommitHooks,
     ) -> Result<NarinfoCommit, NixCacheFileError> {
         let mut file = File::from(temporary);
+        #[cfg(test)]
+        hooks.observe(CommitStage::BeforeWrite);
         file.write_all(replacement)?;
+        #[cfg(test)]
+        hooks.observe(CommitStage::AfterWrite);
+        #[cfg(test)]
+        if hooks.failure == Some(InjectedCommitFailure::AfterWrite) {
+            return Err(injected_io_error("injected temporary write failure"));
+        }
 
         let temporary_stat = rustix::fs::fstat(&file)?;
         if temporary_stat.st_uid != expected.identity.owner
@@ -388,31 +474,62 @@ impl LockedCacheRoot {
             )?;
         }
         rustix::fs::fchmod(&file, expected.identity.mode)?;
-        if hooks.fail_file_sync {
+        #[cfg(test)]
+        hooks.observe(CommitStage::BeforeFileSync);
+        #[cfg(test)]
+        if hooks.failure == Some(InjectedCommitFailure::FileSync) {
             return Err(injected_io_error("injected pre-rename file sync failure"));
         }
         sync_file(&file)?;
+        #[cfg(test)]
+        hooks.observe(CommitStage::AfterFileSync);
 
+        #[cfg(test)]
+        if let Some(hook) = hooks.before_final_comparison {
+            hook(directory, name)?;
+        }
         let fresh = read_snapshot_at(directory, name)?;
         if fresh.identity != expected.identity || fresh.bytes != expected.bytes {
             return Err(NixCacheFileError::Interference);
         }
 
+        #[cfg(test)]
         if let Some(hook) = hooks.before_temporary_binding {
             hook(directory, temporary_name)?;
         }
         validate_mutation_directory(directory)?;
         validate_temporary_binding(directory, temporary_name, &file, expected)?;
+        #[cfg(test)]
+        hooks.observe(CommitStage::BeforeRename);
+        #[cfg(test)]
+        if hooks.failure == Some(InjectedCommitFailure::Rename) {
+            return Err(injected_io_error("injected atomic rename failure"));
+        }
         rustix::fs::renameat(directory, temporary_name, directory, name)?;
-        let sync_result = if hooks.fail_post_rename_sync {
-            Err(std::io::Error::other(
-                "injected post-rename directory sync failure",
-            ))
-        } else {
-            rustix::fs::fsync(directory).map_err(std::io::Error::from)
+        #[cfg(test)]
+        hooks.observe(CommitStage::AfterRename);
+        #[cfg(test)]
+        hooks.observe(CommitStage::BeforeDirectorySync);
+        let sync_result = {
+            #[cfg(test)]
+            if hooks.failure == Some(InjectedCommitFailure::DirectorySync) {
+                Err(std::io::Error::other(
+                    "injected post-rename directory sync failure",
+                ))
+            } else {
+                rustix::fs::fsync(directory).map_err(std::io::Error::from)
+            }
+            #[cfg(not(test))]
+            {
+                rustix::fs::fsync(directory).map_err(std::io::Error::from)
+            }
         };
         match sync_result {
-            Ok(()) => Ok(NarinfoCommit::Written),
+            Ok(()) => {
+                #[cfg(test)]
+                hooks.observe(CommitStage::AfterDirectorySync);
+                Ok(NarinfoCommit::Written)
+            }
             Err(error) => Ok(NarinfoCommit::CommittedDurabilityUncertain { error }),
         }
     }
@@ -533,17 +650,24 @@ fn cleanup_temporary(
     directory: &OwnedFd,
     temporary_name: &str,
     original: NixCacheFileError,
-    hooks: CommitHooks,
+    #[cfg(test)] hooks: CommitHooks,
 ) -> NixCacheFileError {
     if let Err(error) = rustix::fs::unlinkat(directory, temporary_name, AtFlags::empty()) {
         return NixCacheFileError::TemporaryCleanupFailed(std::io::Error::from(error));
     }
-    let sync_result = if hooks.fail_cleanup_sync {
-        Err(std::io::Error::other(
-            "injected temporary cleanup directory sync failure",
-        ))
-    } else {
-        rustix::fs::fsync(directory).map_err(std::io::Error::from)
+    let sync_result = {
+        #[cfg(test)]
+        if hooks.fail_cleanup_sync {
+            Err(std::io::Error::other(
+                "injected temporary cleanup directory sync failure",
+            ))
+        } else {
+            rustix::fs::fsync(directory).map_err(std::io::Error::from)
+        }
+        #[cfg(not(test))]
+        {
+            rustix::fs::fsync(directory).map_err(std::io::Error::from)
+        }
     };
     match sync_result {
         Ok(()) => original,
@@ -551,6 +675,7 @@ fn cleanup_temporary(
     }
 }
 
+#[cfg(test)]
 fn injected_io_error(message: &'static str) -> NixCacheFileError {
     NixCacheFileError::Io(std::io::Error::other(message))
 }
@@ -1035,9 +1160,13 @@ fn sync_file(file: &File) -> Result<(), NixCacheFileError> {
 mod tests {
     use std::cell::Cell;
     use std::fs;
+    use std::io::{BufRead as _, BufReader};
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
     use std::os::unix::net::UnixListener;
+    use std::os::unix::process::ExitStatusExt as _;
+    use std::process::{Child, Command, ExitStatus, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc;
 
     use serde::Deserialize;
 
@@ -1045,6 +1174,15 @@ mod tests {
 
     const NARINFO_CORPUS: &str =
         include_str!("../../../basil-tests/fixtures/nix-cache-signing/narinfo-fidelity.json");
+    const PROCESS_HELPER_ENV: &str = "BASIL_NIX_CACHE_COMMIT_HELPER";
+    const PROCESS_ROOT_ENV: &str = "BASIL_NIX_CACHE_COMMIT_ROOT";
+    const PROCESS_STAGE_ENV: &str = "BASIL_NIX_CACHE_COMMIT_STAGE";
+    const PROCESS_OCCURRENCE_ENV: &str = "BASIL_NIX_CACHE_COMMIT_OCCURRENCE";
+    const PROCESS_TARGETS_ENV: &str = "BASIL_NIX_CACHE_COMMIT_TARGETS";
+    const PROCESS_DEADLINE: Duration = Duration::from_secs(10);
+    const TEST_NARINFO: &[u8] =
+        b"NarHash: sha256:09ymwqf5i9q7d4dm7x4pjjcqqj0qrcp5lnznbh42gfsci5hcbqqm\n";
+    const TEST_SIGNATURE: &str = "crash-key:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 
     #[derive(Debug, Deserialize)]
     struct Corpus {
@@ -1143,17 +1281,36 @@ mod tests {
         Ok(())
     }
 
+    fn noncooperating_target_write(
+        directory: &OwnedFd,
+        name: &OsStr,
+    ) -> Result<(), NixCacheFileError> {
+        let descriptor = rustix::fs::openat(
+            directory,
+            name,
+            OFlags::WRONLY | OFlags::TRUNC | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )?;
+        let mut file = File::from(descriptor);
+        file.write_all(
+            b"NarHash: sha256:09ymwqf5i9q7d4dm7x4pjjcqqj0qrcp5lnznbh42gfsci5hcbqqm\nX-Writer: ignored-lock\n",
+        )?;
+        sync_file(&file)
+    }
+
     fn assert_no_temporary(directory: &Path) {
-        let has_temporary = fs::read_dir(directory)
+        assert!(temporary_names(directory).is_empty());
+    }
+
+    fn temporary_names(directory: &Path) -> Vec<OsString> {
+        let mut names = fs::read_dir(directory)
             .unwrap_or_else(|error| panic!("read directory: {error}"))
             .filter_map(Result::ok)
-            .any(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".basil-narinfo-tmp-")
-            });
-        assert!(!has_temporary);
+            .map(|entry| entry.file_name())
+            .filter(|name| name.to_string_lossy().starts_with(".basil-narinfo-tmp-"))
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names
     }
 
     fn apply_vector(vector: &Vector) -> Result<NarinfoEdit, NixCacheFileError> {
@@ -1179,6 +1336,234 @@ mod tests {
             }
         };
         edit_narinfo(vector.input.as_bytes(), mutation)
+    }
+
+    fn stage_barrier(stage: CommitStage) {
+        static HITS: AtomicU64 = AtomicU64::new(0);
+        let Ok(expected) = std::env::var(PROCESS_STAGE_ENV) else {
+            return;
+        };
+        if expected != stage.name() {
+            return;
+        }
+        let occurrence = std::env::var(PROCESS_OCCURRENCE_ENV)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1);
+        if HITS.fetch_add(1, Ordering::SeqCst).saturating_add(1) != occurrence {
+            return;
+        }
+        println!("BASIL_COMMIT_BARRIER={}", stage.name());
+        std::io::stdout()
+            .flush()
+            .unwrap_or_else(|error| panic!("flush barrier: {error}"));
+        let mut release = [0_u8; 1];
+        std::io::stdin()
+            .read_exact(&mut release)
+            .unwrap_or_else(|error| panic!("wait for barrier release: {error}"));
+    }
+
+    struct ChildGuard {
+        child: Option<Child>,
+    }
+
+    impl ChildGuard {
+        fn new(child: Child) -> Self {
+            Self { child: Some(child) }
+        }
+
+        fn child_mut(&mut self) -> &mut Child {
+            self.child
+                .as_mut()
+                .unwrap_or_else(|| panic!("child already reaped"))
+        }
+
+        fn signal_and_wait(&mut self, signal: rustix::process::Signal) -> ExitStatus {
+            let mut child = self
+                .child
+                .take()
+                .unwrap_or_else(|| panic!("child already reaped"));
+            let raw_pid = i32::try_from(child.id())
+                .unwrap_or_else(|error| panic!("child pid does not fit i32: {error}"));
+            let pid = rustix::process::Pid::from_raw(raw_pid)
+                .unwrap_or_else(|| panic!("child pid must be nonzero"));
+            rustix::process::kill_process(pid, signal)
+                .unwrap_or_else(|error| panic!("signal mutation child: {error}"));
+
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let _waiter = std::thread::spawn(move || {
+                let _ = sender.send(child.wait());
+            });
+            match receiver.recv_timeout(PROCESS_DEADLINE) {
+                Ok(result) => {
+                    result.unwrap_or_else(|error| panic!("wait for mutation child: {error}"))
+                }
+                Err(error) => {
+                    let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+                    match receiver.recv_timeout(PROCESS_DEADLINE) {
+                        Ok(_) => panic!("mutation child exceeded exit deadline: {error}"),
+                        Err(reap_error) => panic!(
+                            "mutation child could not be reaped after SIGKILL: {error}; {reap_error}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                let (sender, receiver) = mpsc::sync_channel(1);
+                let _waiter = std::thread::spawn(move || {
+                    let _ = sender.send(child.wait());
+                });
+                let _ = receiver.recv_timeout(PROCESS_DEADLINE);
+            }
+        }
+    }
+
+    struct BarrierChild {
+        process: ChildGuard,
+    }
+
+    impl BarrierChild {
+        fn kill_and_assert_sigkill(&mut self) {
+            let status = self.process.signal_and_wait(rustix::process::Signal::KILL);
+            assert_eq!(
+                status.signal(),
+                Some(rustix::process::Signal::KILL.as_raw())
+            );
+            assert_eq!(status.code(), None);
+        }
+    }
+
+    fn spawn_barrier_child(
+        root: &Path,
+        stage: CommitStage,
+        occurrence: u64,
+        targets: usize,
+    ) -> BarrierChild {
+        let executable = std::env::current_exe()
+            .unwrap_or_else(|error| panic!("locate current test executable: {error}"));
+        let child = Command::new(executable)
+            .arg("--exact")
+            .arg("core::nix_cache_file::tests::process_mutation_child")
+            .arg("--nocapture")
+            .env(PROCESS_HELPER_ENV, "1")
+            .env(PROCESS_ROOT_ENV, root)
+            .env(PROCESS_STAGE_ENV, stage.name())
+            .env(PROCESS_OCCURRENCE_ENV, occurrence.to_string())
+            .env(PROCESS_TARGETS_ENV, targets.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap_or_else(|error| panic!("spawn mutation child: {error}"));
+        let mut process = ChildGuard::new(child);
+        let stdout = process
+            .child_mut()
+            .stdout
+            .take()
+            .unwrap_or_else(|| panic!("mutation child stdout must be piped"));
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let _reader = std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let deadline = Instant::now()
+            .checked_add(PROCESS_DEADLINE)
+            .unwrap_or_else(|| panic!("process deadline overflow"));
+        let expected = format!("BASIL_COMMIT_BARRIER={}", stage.name());
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "mutation child barrier timed out");
+            match receiver.recv_timeout(remaining) {
+                Ok(Ok(line)) if line == expected => break,
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => panic!("read mutation child: {error}"),
+                Err(error) => panic!("mutation child barrier failed: {error}"),
+            }
+        }
+        BarrierChild { process }
+    }
+
+    fn count_test_signatures(bytes: &[u8]) -> usize {
+        bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| *line == format!("Sig: {TEST_SIGNATURE}").as_bytes())
+            .count()
+    }
+
+    fn rerun_target(locked: &LockedCacheRoot, index: usize) -> NarinfoCommit {
+        locked
+            .mutate_narinfo(
+                Path::new(&format!("path-{index}.narinfo")),
+                NarinfoMutation::Add {
+                    signature: TEST_SIGNATURE,
+                },
+            )
+            .unwrap_or_else(|error| panic!("rerun target {index}: {error}"))
+    }
+
+    fn prepare_process_targets(directory: &Path, count: usize) {
+        for index in 0..count {
+            fs::write(
+                directory.join(format!("path-{index}.narinfo")),
+                TEST_NARINFO,
+            )
+            .unwrap_or_else(|error| panic!("write process target {index}: {error}"));
+        }
+    }
+
+    #[test]
+    fn process_mutation_child() {
+        if std::env::var_os(PROCESS_HELPER_ENV).is_none() {
+            return;
+        }
+        let root = std::env::var_os(PROCESS_ROOT_ENV).map_or_else(
+            || panic!("mutation helper needs cache root"),
+            std::path::PathBuf::from,
+        );
+        let targets = std::env::var(PROCESS_TARGETS_ENV)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1);
+        let locked = LockedCacheRoot::try_acquire(&root)
+            .unwrap_or_else(|error| panic!("mutation helper lock: {error}"));
+        for index in 0..targets {
+            let relative = format!("path-{index}.narinfo");
+            let snapshot = locked
+                .read_narinfo(Path::new(&relative))
+                .unwrap_or_else(|error| panic!("mutation helper read: {error}"));
+            let replacement = match edit_narinfo(
+                snapshot.bytes(),
+                NarinfoMutation::Add {
+                    signature: TEST_SIGNATURE,
+                },
+            )
+            .unwrap_or_else(|error| panic!("mutation helper edit: {error}"))
+            {
+                NarinfoEdit::Changed(bytes) => bytes,
+                NarinfoEdit::Unchanged => continue,
+            };
+            let outcome = locked
+                .commit_narinfo_with_hooks(
+                    Path::new(&relative),
+                    &snapshot,
+                    &replacement,
+                    CommitHooks {
+                        stage: Some(stage_barrier),
+                        ..CommitHooks::default()
+                    },
+                )
+                .unwrap_or_else(|error| panic!("mutation helper commit: {error}"));
+            assert!(matches!(outcome, NarinfoCommit::Written));
+        }
     }
 
     #[test]
@@ -1348,7 +1733,7 @@ mod tests {
             &snapshot,
             replacement,
             CommitHooks {
-                fail_file_sync: true,
+                failure: Some(InjectedCommitFailure::FileSync),
                 ..CommitHooks::default()
             },
         );
@@ -1358,6 +1743,54 @@ mod tests {
             input
         );
         assert_no_temporary(directory.path());
+    }
+
+    #[test]
+    fn write_and_rename_failures_leave_old_target_and_clean_temp() {
+        for hooks in [
+            CommitHooks {
+                failure: Some(InjectedCommitFailure::AfterWrite),
+                ..CommitHooks::default()
+            },
+            CommitHooks {
+                failure: Some(InjectedCommitFailure::Rename),
+                ..CommitHooks::default()
+            },
+        ] {
+            let directory = temporary_directory();
+            let path = directory.path().join("example.narinfo");
+            fs::write(&path, TEST_NARINFO).unwrap_or_else(|error| panic!("write target: {error}"));
+            let locked = LockedCacheRoot::try_acquire(directory.path())
+                .unwrap_or_else(|error| panic!("lock: {error}"));
+            let snapshot = locked
+                .read_narinfo(Path::new("example.narinfo"))
+                .unwrap_or_else(|error| panic!("snapshot: {error}"));
+            let replacement = match edit_narinfo(
+                snapshot.bytes(),
+                NarinfoMutation::Add {
+                    signature: TEST_SIGNATURE,
+                },
+            )
+            .unwrap_or_else(|error| panic!("edit: {error}"))
+            {
+                NarinfoEdit::Changed(bytes) => bytes,
+                NarinfoEdit::Unchanged => panic!("test mutation must change target"),
+            };
+            assert!(matches!(
+                locked.commit_narinfo_with_hooks(
+                    Path::new("example.narinfo"),
+                    &snapshot,
+                    &replacement,
+                    hooks,
+                ),
+                Err(NixCacheFileError::Io(_))
+            ));
+            assert_eq!(
+                fs::read(&path).unwrap_or_else(|error| panic!("read target: {error}")),
+                TEST_NARINFO
+            );
+            assert_no_temporary(directory.path());
+        }
     }
 
     #[test]
@@ -1378,7 +1811,7 @@ mod tests {
                 &snapshot,
                 replacement,
                 CommitHooks {
-                    fail_post_rename_sync: true,
+                    failure: Some(InjectedCommitFailure::DirectorySync),
                     ..CommitHooks::default()
                 },
             )
@@ -1392,6 +1825,92 @@ mod tests {
             replacement
         );
         assert_no_temporary(directory.path());
+    }
+
+    #[test]
+    fn every_commit_boundary_survives_sigkill_and_idempotent_rerun() {
+        let stages = [
+            CommitStage::BeforeWrite,
+            CommitStage::AfterWrite,
+            CommitStage::BeforeFileSync,
+            CommitStage::AfterFileSync,
+            CommitStage::BeforeRename,
+            CommitStage::AfterRename,
+            CommitStage::BeforeDirectorySync,
+            CommitStage::AfterDirectorySync,
+        ];
+        for stage in stages {
+            let directory = temporary_directory();
+            prepare_process_targets(directory.path(), 1);
+            let mut child = spawn_barrier_child(directory.path(), stage, 1, 1);
+            let held_lock = fs::metadata(directory.path().join(CACHE_LOCK_FILE))
+                .unwrap_or_else(|error| panic!("held lock metadata: {error}"));
+            assert!(matches!(
+                LockedCacheRoot::try_acquire(directory.path()),
+                Err(NixCacheFileError::LockBusy)
+            ));
+            child.kill_and_assert_sigkill();
+
+            let before_rerun = fs::read(directory.path().join("path-0.narinfo"))
+                .unwrap_or_else(|error| panic!("read interrupted target: {error}"));
+            let renamed = matches!(
+                stage,
+                CommitStage::AfterRename
+                    | CommitStage::BeforeDirectorySync
+                    | CommitStage::AfterDirectorySync
+            );
+            assert_eq!(count_test_signatures(&before_rerun), usize::from(renamed));
+            let stale_temporaries = temporary_names(directory.path());
+            assert_eq!(stale_temporaries.len(), usize::from(!renamed));
+
+            let locked = LockedCacheRoot::try_acquire(directory.path())
+                .unwrap_or_else(|error| panic!("lock after SIGKILL: {error}"));
+            let stable_lock = fs::metadata(directory.path().join(CACHE_LOCK_FILE))
+                .unwrap_or_else(|error| panic!("stable lock metadata: {error}"));
+            assert_eq!(held_lock.dev(), stable_lock.dev());
+            assert_eq!(held_lock.ino(), stable_lock.ino());
+            let rerun = rerun_target(&locked, 0);
+            assert!(matches!(
+                (renamed, rerun),
+                (true, NarinfoCommit::Unchanged) | (false, NarinfoCommit::Written)
+            ));
+            let recovered = fs::read(directory.path().join("path-0.narinfo"))
+                .unwrap_or_else(|error| panic!("read recovered target: {error}"));
+            assert_eq!(count_test_signatures(&recovered), 1);
+            assert_eq!(temporary_names(directory.path()), stale_temporaries);
+        }
+    }
+
+    #[test]
+    fn sigkill_partial_batch_releases_lock_and_rerun_has_no_duplicates() {
+        let directory = temporary_directory();
+        prepare_process_targets(directory.path(), 2);
+        let mut child = spawn_barrier_child(directory.path(), CommitStage::BeforeRename, 2, 2);
+        assert_eq!(
+            count_test_signatures(
+                &fs::read(directory.path().join("path-0.narinfo"))
+                    .unwrap_or_else(|error| panic!("read first target: {error}"))
+            ),
+            1
+        );
+        assert_eq!(
+            fs::read(directory.path().join("path-1.narinfo"))
+                .unwrap_or_else(|error| panic!("read second target: {error}")),
+            TEST_NARINFO
+        );
+        child.kill_and_assert_sigkill();
+        assert_eq!(temporary_names(directory.path()).len(), 1);
+
+        let locked = LockedCacheRoot::try_acquire(directory.path())
+            .unwrap_or_else(|error| panic!("lock after SIGKILL: {error}"));
+        assert!(matches!(rerun_target(&locked, 0), NarinfoCommit::Unchanged));
+        assert!(matches!(rerun_target(&locked, 1), NarinfoCommit::Written));
+        for index in 0..2 {
+            let recovered = fs::read(directory.path().join(format!("path-{index}.narinfo")))
+                .unwrap_or_else(|error| panic!("read recovered target {index}: {error}"));
+            assert_eq!(count_test_signatures(&recovered), 1);
+        }
+        assert_eq!(temporary_names(directory.path()).len(), 1);
     }
 
     #[test]
@@ -1411,7 +1930,7 @@ mod tests {
             &snapshot,
             replacement,
             CommitHooks {
-                fail_file_sync: true,
+                failure: Some(InjectedCommitFailure::FileSync),
                 fail_cleanup_sync: true,
                 ..CommitHooks::default()
             },
@@ -1453,6 +1972,46 @@ mod tests {
             fs::read(&path).unwrap_or_else(|error| panic!("read target: {error}")),
             input
         );
+    }
+
+    #[test]
+    fn noncooperating_writer_before_final_comparison_fails_closed() {
+        let directory = temporary_directory();
+        let path = directory.path().join("example.narinfo");
+        fs::write(&path, TEST_NARINFO).unwrap_or_else(|error| panic!("write target: {error}"));
+        let locked = LockedCacheRoot::try_acquire(directory.path())
+            .unwrap_or_else(|error| panic!("lock: {error}"));
+        let snapshot = locked
+            .read_narinfo(Path::new("example.narinfo"))
+            .unwrap_or_else(|error| panic!("snapshot: {error}"));
+        let replacement = match edit_narinfo(
+            snapshot.bytes(),
+            NarinfoMutation::Add {
+                signature: TEST_SIGNATURE,
+            },
+        )
+        .unwrap_or_else(|error| panic!("edit: {error}"))
+        {
+            NarinfoEdit::Changed(bytes) => bytes,
+            NarinfoEdit::Unchanged => panic!("test mutation must change target"),
+        };
+        assert!(matches!(
+            locked.commit_narinfo_with_hooks(
+                Path::new("example.narinfo"),
+                &snapshot,
+                &replacement,
+                CommitHooks {
+                    before_final_comparison: Some(noncooperating_target_write),
+                    ..CommitHooks::default()
+                },
+            ),
+            Err(NixCacheFileError::Interference)
+        ));
+        let writer_bytes = fs::read(&path)
+            .unwrap_or_else(|error| panic!("read noncooperating writer bytes: {error}"));
+        assert!(writer_bytes.ends_with(b"X-Writer: ignored-lock\n"));
+        assert_eq!(count_test_signatures(&writer_bytes), 0);
+        assert_no_temporary(directory.path());
     }
 
     #[test]

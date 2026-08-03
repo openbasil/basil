@@ -91,9 +91,9 @@ jobs:
           ARCH: ${{ github.event_name == 'workflow_dispatch' && inputs.architecture || 'all' }}
         run: |
           all='[
-            {"arch":"x86_64-linux","runner":"ubuntu-latest","os":"linux","pkg_arch":"amd64"},
-            {"arch":"aarch64-linux","runner":"ubuntu-22.04-arm","os":"linux","pkg_arch":"arm64"},
-            {"arch":"aarch64-darwin","runner":"macos-14","os":"darwin","pkg_arch":""}
+            {"arch":"x86_64-linux","runner":"ubuntu-latest","os":"linux","pkg_arch":"amd64","nix_cache_tier":"production"},
+            {"arch":"aarch64-linux","runner":"ubuntu-22.04-arm","os":"linux","pkg_arch":"arm64","nix_cache_tier":"production"},
+            {"arch":"aarch64-darwin","runner":"macos-14","os":"darwin","pkg_arch":"","nix_cache_tier":"development-only"}
           ]'
           if [ "$ARCH" = "all" ]; then
             sel=$(jq -c . <<<"$all")
@@ -182,6 +182,15 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+      # This named qualification lane makes the support tier visible in the
+      # job log. It exercises real process signals and filesystem primitives on
+      # each native runner; macOS remains a development-only target. The matrix
+      # labels encode policy, while the completed native jobs provide evidence.
+      - name: Nix cache crash recovery (${{ matrix.nix_cache_tier }})
+        run: |
+          cargo test -p basil-core core::nix_cache_file::tests
+          cargo test -p basil-bin --test nix_cache_signals
 
       - name: Format check
         run: cargo fmt --all --check

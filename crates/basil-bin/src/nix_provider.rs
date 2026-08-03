@@ -505,13 +505,18 @@ async fn reject_overloaded(mut stream: UnixStream, deadline: Instant) {
 }
 
 fn same_uid(stream: &UnixStream) -> bool {
-    stream.peer_cred().is_ok_and(|credentials| {
-        peer_uid_is_authorized(credentials.uid(), rustix::process::geteuid().as_raw())
-    })
+    peer_uid_result_is_authorized(
+        stream.peer_cred().map(|credentials| credentials.uid()),
+        rustix::process::geteuid().as_raw(),
+    )
 }
 
 const fn peer_uid_is_authorized(peer_uid: u32, provider_uid: u32) -> bool {
     peer_uid == provider_uid
+}
+
+fn peer_uid_result_is_authorized<E>(peer_uid: Result<u32, E>, provider_uid: u32) -> bool {
+    peer_uid.is_ok_and(|uid| peer_uid_is_authorized(uid, provider_uid))
 }
 
 async fn read_request(
@@ -2041,6 +2046,11 @@ mod tests {
             effective.wrapping_add(1),
             effective
         ));
+        assert!(peer_uid_result_is_authorized::<()>(
+            Ok(effective),
+            effective
+        ));
+        assert!(!peer_uid_result_is_authorized::<()>(Err(()), effective));
     }
 
     #[tokio::test]
