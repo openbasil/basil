@@ -26,3 +26,5 @@ CLAUDE.md
 
 # Playwright MCP browser artifacts (snapshots/traces can capture on-screen secrets)
 .playwright-mcp/
+crates/basil-tests/tests/oidc_verifier_go/oidcverifier
+interop-tests/go-spiffe/basil-interop-go-spiffe
