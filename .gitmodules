@@ -1,6 +1,3 @@
 [submodule "clients/go"]
 	path = clients/go
 	url = https://github.com/openbasil/basil-go.git
-[submodule "docs"]
-	path = docs
-	url = ssh://basil-design/steve/basil-design
