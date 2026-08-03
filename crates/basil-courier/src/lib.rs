@@ -10,6 +10,8 @@
 //! before every forwarded call.
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use basil_proto::broker::v1::invocation_service_client::InvocationServiceClient;
@@ -27,6 +29,10 @@ use tower::service_fn;
 pub const COURIER_PROTOCOL_VERSION: u32 = 1;
 /// Maximum trusted-courier source partition length.
 pub const MAX_COURIER_SOURCE_BYTES: usize = 128;
+/// Maximum raw sealed invocation bytes accepted by a public courier.
+pub const MAX_RAW_INVOCATION_BYTES: usize = 4 * 1024 * 1024;
+/// Tonic message ceiling for a maximum raw invocation plus field tag and length.
+pub const MAX_COURIER_GRPC_MESSAGE_BYTES: usize = MAX_RAW_INVOCATION_BYTES + 5;
 
 /// Required ownership and permission policy for one Basil Unix socket.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -158,8 +164,19 @@ pub enum CourierConnectError {
 /// Typed, capability-checking client for a Basil courier listener.
 #[derive(Clone, Debug)]
 pub struct InvocationCourierClient {
-    client: InvocationServiceClient<Channel>,
+    policy: TrustedUdsPolicy,
+    connect_timeout: Duration,
     call_timeout: Duration,
+    #[cfg(test)]
+    forward_barrier: Option<Arc<TestForwardBarrier>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct TestForwardBarrier {
+    capability_complete: tokio::sync::Notify,
+    operation_release: tokio::sync::Notify,
+    reconnect_attempts: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Typed invocation-only client for a local Host or Container listener.
@@ -169,15 +186,17 @@ pub struct InvocationCourierClient {
 /// exposes no challenge issuance method.
 #[derive(Clone, Debug)]
 pub struct InvocationOnlyClient {
-    client: InvocationServiceClient<Channel>,
+    policy: TrustedUdsPolicy,
+    connect_timeout: Duration,
     call_timeout: Duration,
 }
 
 impl InvocationCourierClient {
     /// Connect through a trusted Unix socket and verify the listener profile.
     ///
-    /// The connector repeats the complete path, socket, and peer validation
-    /// whenever Tonic reconnects.
+    /// Each forwarded operation opens and verifies a fresh channel. Its
+    /// capability check and operation share that channel, which refuses
+    /// automatic reconnection if the transport is replaced between RPCs.
     ///
     /// # Errors
     ///
@@ -192,12 +211,15 @@ impl InvocationCourierClient {
         if connect_timeout.is_zero() || call_timeout.is_zero() {
             return Err(TrustedUdsError::InvalidPolicy.into());
         }
-        let channel = trusted_channel(policy, connect_timeout).await?;
-        let mut this = Self {
-            client: InvocationServiceClient::new(channel),
+        let this = Self {
+            policy,
+            connect_timeout,
             call_timeout,
+            #[cfg(test)]
+            forward_barrier: None,
         };
-        this.verify_capabilities()
+        let deadline = tokio::time::Instant::now() + call_timeout;
+        this.fresh_verified_client(deadline)
             .await
             .map_err(|_| CourierConnectError::CapabilityMismatch)?;
         Ok(this)
@@ -210,7 +232,7 @@ impl InvocationCourierClient {
     /// Returns a stable error when the caller supplied a source, the trusted
     /// source is invalid, capabilities changed, or Basil rejected the call.
     pub async fn get_challenge(
-        &mut self,
+        &self,
         mut request: GetInvocationChallengeRequest,
         courier_observed_source: &str,
     ) -> Result<GetInvocationChallengeResponse, CourierCallError> {
@@ -221,9 +243,10 @@ impl InvocationCourierClient {
             return Err(CourierCallError::InvalidRequest);
         }
         request.courier_observed_source = Some(courier_observed_source.to_owned());
-        self.verify_capabilities().await?;
-        let call = self.client.get_invocation_challenge(request);
-        let response = tokio::time::timeout(self.call_timeout, call)
+        let deadline = tokio::time::Instant::now() + self.call_timeout;
+        let mut client = self.fresh_verified_client(deadline).await?;
+        let call = client.get_invocation_challenge(request);
+        let response = tokio::time::timeout_at(deadline, call)
             .await
             .map_err(|_| CourierCallError::DeadlineBeforeForward)?
             .map_err(|status| classify_challenge_status(&status))?;
@@ -237,24 +260,49 @@ impl InvocationCourierClient {
     /// Returns a stable error when capabilities changed or Basil did not
     /// return a sealed response. Failures after forwarding are never marked
     /// retryable for the identical invocation.
-    pub async fn invoke(
-        &mut self,
-        request: SealedRequest,
-    ) -> Result<SealedResponse, CourierCallError> {
-        self.verify_capabilities().await?;
-        let call = self.client.invoke(request);
-        let response = tokio::time::timeout(self.call_timeout, call)
+    pub async fn invoke(&self, request: SealedRequest) -> Result<SealedResponse, CourierCallError> {
+        let deadline = tokio::time::Instant::now() + self.call_timeout;
+        let mut client = self.fresh_verified_client(deadline).await?;
+        #[cfg(test)]
+        if let Some(barrier) = &self.forward_barrier {
+            barrier.capability_complete.notify_one();
+            tokio::time::timeout_at(deadline, barrier.operation_release.notified())
+                .await
+                .map_err(|_| CourierCallError::DeadlineAfterForward)?;
+        }
+        let call = client.invoke(request);
+        let response = tokio::time::timeout_at(deadline, call)
             .await
             .map_err(|_| CourierCallError::DeadlineAfterForward)?
             .map_err(|status| classify_invoke_status(&status))?;
         Ok(response.into_inner())
     }
 
-    async fn verify_capabilities(&mut self) -> Result<(), CourierCallError> {
-        let call = self
-            .client
-            .get_invocation_capabilities(GetInvocationCapabilitiesRequest {});
-        let response = tokio::time::timeout(self.call_timeout, call)
+    async fn fresh_verified_client(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<InvocationServiceClient<Channel>, CourierCallError> {
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .ok_or(CourierCallError::DeadlineBeforeForward)?;
+        let connect_timeout = self.connect_timeout.min(remaining);
+        let channel = tokio::time::timeout_at(
+            deadline,
+            trusted_channel(
+                self.policy.clone(),
+                connect_timeout,
+                #[cfg(test)]
+                self.forward_barrier
+                    .as_ref()
+                    .map(|barrier| Arc::clone(&barrier.reconnect_attempts)),
+            ),
+        )
+        .await
+        .map_err(|_| CourierCallError::DeadlineBeforeForward)?
+        .map_err(|_| CourierCallError::UnavailableBeforeForward)?;
+        let mut client = bounded_client(channel);
+        let call = client.get_invocation_capabilities(GetInvocationCapabilitiesRequest {});
+        let response = tokio::time::timeout_at(deadline, call)
             .await
             .map_err(|_| CourierCallError::DeadlineBeforeForward)?
             .map_err(|status| classify_pre_forward_status(&status))?
@@ -265,7 +313,7 @@ impl InvocationCourierClient {
         {
             return Err(CourierCallError::CapabilityMismatch);
         }
-        Ok(())
+        Ok(client)
     }
 }
 
@@ -285,12 +333,13 @@ impl InvocationOnlyClient {
         if connect_timeout.is_zero() || call_timeout.is_zero() {
             return Err(TrustedUdsError::InvalidPolicy.into());
         }
-        let channel = trusted_channel(policy, connect_timeout).await?;
-        let mut this = Self {
-            client: InvocationServiceClient::new(channel),
+        let this = Self {
+            policy,
+            connect_timeout,
             call_timeout,
         };
-        this.verify_capabilities()
+        let deadline = tokio::time::Instant::now() + call_timeout;
+        this.fresh_verified_client(deadline)
             .await
             .map_err(|_| CourierConnectError::CapabilityMismatch)?;
         Ok(this)
@@ -302,24 +351,40 @@ impl InvocationOnlyClient {
     ///
     /// Returns a stable error when the listener profile changed or Basil did
     /// not return a sealed response. Post-forward failures are not retryable.
-    pub async fn invoke(
-        &mut self,
-        request: SealedRequest,
-    ) -> Result<SealedResponse, CourierCallError> {
-        self.verify_capabilities().await?;
-        let call = self.client.invoke(request);
-        let response = tokio::time::timeout(self.call_timeout, call)
+    pub async fn invoke(&self, request: SealedRequest) -> Result<SealedResponse, CourierCallError> {
+        let deadline = tokio::time::Instant::now() + self.call_timeout;
+        let mut client = self.fresh_verified_client(deadline).await?;
+        let call = client.invoke(request);
+        let response = tokio::time::timeout_at(deadline, call)
             .await
             .map_err(|_| CourierCallError::DeadlineAfterForward)?
             .map_err(|status| classify_invoke_status(&status))?;
         Ok(response.into_inner())
     }
 
-    async fn verify_capabilities(&mut self) -> Result<(), CourierCallError> {
-        let call = self
-            .client
-            .get_invocation_capabilities(GetInvocationCapabilitiesRequest {});
-        let response = tokio::time::timeout(self.call_timeout, call)
+    async fn fresh_verified_client(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<InvocationServiceClient<Channel>, CourierCallError> {
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .ok_or(CourierCallError::DeadlineBeforeForward)?;
+        let connect_timeout = self.connect_timeout.min(remaining);
+        let channel = tokio::time::timeout_at(
+            deadline,
+            trusted_channel(
+                self.policy.clone(),
+                connect_timeout,
+                #[cfg(test)]
+                None,
+            ),
+        )
+        .await
+        .map_err(|_| CourierCallError::DeadlineBeforeForward)?
+        .map_err(|_| CourierCallError::UnavailableBeforeForward)?;
+        let mut client = bounded_client(channel);
+        let call = client.get_invocation_capabilities(GetInvocationCapabilitiesRequest {});
+        let response = tokio::time::timeout_at(deadline, call)
             .await
             .map_err(|_| CourierCallError::DeadlineBeforeForward)?
             .map_err(|status| classify_pre_forward_status(&status))?
@@ -329,8 +394,14 @@ impl InvocationOnlyClient {
         if !local_profile || response.require_challenge {
             return Err(CourierCallError::CapabilityMismatch);
         }
-        Ok(())
+        Ok(client)
     }
+}
+
+fn bounded_client(channel: Channel) -> InvocationServiceClient<Channel> {
+    InvocationServiceClient::new(channel)
+        .max_encoding_message_size(MAX_COURIER_GRPC_MESSAGE_BYTES)
+        .max_decoding_message_size(MAX_COURIER_GRPC_MESSAGE_BYTES)
 }
 
 fn classify_pre_forward_status(status: &Status) -> CourierCallError {
@@ -366,10 +437,13 @@ fn classify_invoke_status(status: &Status) -> CourierCallError {
 async fn trusted_channel(
     policy: TrustedUdsPolicy,
     connect_timeout: Duration,
+    #[cfg(test)] reconnect_attempts: Option<Arc<std::sync::atomic::AtomicUsize>>,
 ) -> Result<Channel, CourierConnectError> {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (policy, connect_timeout);
+        #[cfg(test)]
+        let _ = reconnect_attempts;
         Err(TrustedUdsError::UnsupportedPlatform.into())
     }
 
@@ -378,10 +452,28 @@ async fn trusted_channel(
         let endpoint = Endpoint::try_from("http://[::]:50051")
             .map_err(|_| CourierConnectError::Endpoint)?
             .connect_timeout(connect_timeout);
+        let connector_used = Arc::new(AtomicBool::new(false));
         let channel = endpoint
             .connect_with_connector(service_fn(move |_: Uri| {
                 let policy = policy.clone();
-                async move { connect_verified(&policy).await.map(TokioIo::new) }
+                let connector_used = Arc::clone(&connector_used);
+                #[cfg(test)]
+                let reconnect_attempts = reconnect_attempts.clone();
+                async move {
+                    if connector_used.swap(true, Ordering::AcqRel) {
+                        #[cfg(test)]
+                        if let Some(reconnect_attempts) = reconnect_attempts {
+                            reconnect_attempts.fetch_add(1, Ordering::SeqCst);
+                        }
+                        return Err(std::io::Error::other(
+                            "courier channel reconnect requires a fresh capability check",
+                        ));
+                    }
+                    connect_verified(&policy)
+                        .await
+                        .map(TokioIo::new)
+                        .map_err(std::io::Error::other)
+                }
             }))
             .await
             .map_err(|_| CourierConnectError::Endpoint)?;
@@ -594,7 +686,7 @@ impl NodeIdentity {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::indexing_slicing, clippy::unwrap_used)]
+    #![allow(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
     use super::*;
 
@@ -616,9 +708,67 @@ mod tests {
     #[cfg(target_os = "linux")]
     use tokio::net::UnixListener;
     #[cfg(target_os = "linux")]
+    use tokio_stream::StreamExt as _;
+    #[cfg(target_os = "linux")]
     use tokio_stream::wrappers::UnixListenerStream;
     #[cfg(target_os = "linux")]
     use tonic::{Request, Response};
+
+    const TEST_WAIT: Duration = Duration::from_secs(2);
+
+    struct TestTask<T> {
+        handle: Option<tokio::task::JoinHandle<T>>,
+    }
+
+    impl<T> TestTask<T> {
+        fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+            Self {
+                handle: Some(handle),
+            }
+        }
+
+        #[allow(clippy::panic)]
+        async fn join(mut self) -> T {
+            let result = tokio::time::timeout(TEST_WAIT, self.handle.as_mut().unwrap()).await;
+            if let Ok(result) = result {
+                self.handle.take();
+                return result.expect("test task panicked");
+            }
+
+            let _aborted = self.abort_and_reap().await;
+            panic!("test task join timed out");
+        }
+
+        async fn abort_and_join(mut self) {
+            let result = self.abort_and_reap().await;
+            if let Err(error) = result {
+                assert!(error.is_cancelled(), "test task panicked: {error}");
+            }
+        }
+
+        async fn abort_and_reap(&mut self) -> Result<T, tokio::task::JoinError> {
+            let handle = self.handle.as_mut().unwrap();
+            handle.abort();
+            let result = tokio::time::timeout(TEST_WAIT, &mut *handle).await;
+            if let Ok(result) = result {
+                self.handle.take();
+                return result;
+            }
+
+            // All guarded tasks are cooperative async futures. If an aborted
+            // task cannot be reaped, terminating the test process is the only
+            // way to guarantee it is not detached.
+            std::process::abort();
+        }
+    }
+
+    impl<T> Drop for TestTask<T> {
+        fn drop(&mut self) {
+            if let Some(handle) = &self.handle {
+                handle.abort();
+            }
+        }
+    }
 
     #[test]
     fn rejects_non_normal_socket_paths() {
@@ -853,7 +1003,7 @@ mod tests {
         let mut fixture = SocketFixture::bind();
         let policy = fixture.policy();
         let server = fixture.serve(service);
-        let mut client = InvocationCourierClient::connect(
+        let client = InvocationCourierClient::connect(
             policy,
             Duration::from_secs(2),
             Duration::from_secs(2),
@@ -879,13 +1029,140 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn replacement_after_capability_cannot_receive_operation_on_reconnect() {
+        let service = TestInvocation::new(ListenerProfile::Courier as i32, true, 1);
+        let capability_calls = Arc::clone(&service.capability_calls);
+        let mut fixture = SocketFixture::bind();
+        let policy = fixture.policy();
+        let (server, mut connections) = fixture.serve_with_connection_controls(service);
+        let server = TestTask::new(server);
+        let mut client = InvocationCourierClient::connect(
+            policy,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        drop(
+            tokio::time::timeout(TEST_WAIT, connections.recv())
+                .await
+                .expect("startup connection observation timed out")
+                .expect("startup connection observation channel closed"),
+        );
+
+        let barrier = Arc::new(TestForwardBarrier {
+            capability_complete: tokio::sync::Notify::new(),
+            operation_release: tokio::sync::Notify::new(),
+            reconnect_attempts: Arc::new(AtomicUsize::new(0)),
+        });
+        client.forward_barrier = Some(Arc::clone(&barrier));
+        let operation = TestTask::new(tokio::spawn(async move {
+            client
+                .invoke(SealedRequest {
+                    message: b"opaque".to_vec(),
+                })
+                .await
+        }));
+
+        tokio::time::timeout(TEST_WAIT, barrier.capability_complete.notified())
+            .await
+            .expect("capability barrier timed out");
+        assert_eq!(capability_calls.load(Ordering::SeqCst), 2);
+        let operation_connection = tokio::time::timeout(TEST_WAIT, connections.recv())
+            .await
+            .expect("operation connection observation timed out")
+            .expect("operation connection observation channel closed");
+        operation_connection
+            .shutdown(std::net::Shutdown::Both)
+            .unwrap();
+        server.abort_and_join().await;
+
+        let replacement = TestInvocation::new(ListenerProfile::Host as i32, false, 0);
+        let replacement_invokes = Arc::clone(&replacement.invoke_calls);
+        let replacement_server = TestTask::new(fixture.replace_and_serve(replacement));
+        barrier.operation_release.notify_one();
+        let error = operation.join().await.unwrap_err();
+        assert_eq!(error, CourierCallError::UnavailableAfterForward);
+        assert_eq!(barrier.reconnect_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(replacement_invokes.load(Ordering::SeqCst), 0);
+        replacement_server.abort_and_join().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn capability_and_operation_share_one_end_to_end_budget() {
+        let service = TestInvocation::new(ListenerProfile::Courier as i32, true, 1);
+        let capability_delay_ms = Arc::clone(&service.capability_delay_ms);
+        let invoke_delay_ms = Arc::clone(&service.invoke_delay_ms);
+        let mut fixture = SocketFixture::bind();
+        let policy = fixture.policy();
+        let server = fixture.serve(service);
+        let client = InvocationCourierClient::connect(
+            policy,
+            Duration::from_secs(2),
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
+
+        capability_delay_ms.store(60, Ordering::SeqCst);
+        invoke_delay_ms.store(60, Ordering::SeqCst);
+        let started = tokio::time::Instant::now();
+        let error = client
+            .invoke(SealedRequest {
+                message: b"opaque".to_vec(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error, CourierCallError::DeadlineAfterForward);
+        assert!(started.elapsed() < Duration::from_millis(140));
+        server.abort();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn exact_raw_message_limit_succeeds_and_next_byte_is_not_forwarded() {
+        let service = TestInvocation::new(ListenerProfile::Courier as i32, true, 1);
+        let invokes = Arc::clone(&service.invoke_calls);
+        let mut fixture = SocketFixture::bind();
+        let policy = fixture.policy();
+        let server = fixture.serve(service);
+        let client = InvocationCourierClient::connect(
+            policy,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+
+        let exact = vec![9; MAX_RAW_INVOCATION_BYTES];
+        let response = client
+            .invoke(SealedRequest {
+                message: exact.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.message, exact);
+        let error = client
+            .invoke(SealedRequest {
+                message: vec![9; MAX_RAW_INVOCATION_BYTES + 1],
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error, CourierCallError::BrokerRejected);
+        assert_eq!(invokes.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn invocation_only_client_accepts_host_and_container_profiles() {
         for profile in [ListenerProfile::Host, ListenerProfile::Container] {
             let service = TestInvocation::new(profile as i32, false, 0);
             let mut fixture = SocketFixture::bind();
             let policy = fixture.policy();
             let server = fixture.serve(service);
-            let mut client = InvocationOnlyClient::connect(
+            let client = InvocationOnlyClient::connect(
                 policy,
                 Duration::from_secs(2),
                 Duration::from_secs(2),
@@ -984,10 +1261,54 @@ mod tests {
             let listener = self.listener.take().unwrap();
             tokio::spawn(async move {
                 let _ = tonic::transport::Server::builder()
-                    .add_service(InvocationServiceServer::new(service))
+                    .add_service(
+                        InvocationServiceServer::new(service)
+                            .max_decoding_message_size(MAX_COURIER_GRPC_MESSAGE_BYTES)
+                            .max_encoding_message_size(MAX_COURIER_GRPC_MESSAGE_BYTES),
+                    )
                     .serve_with_incoming(UnixListenerStream::new(listener))
                     .await;
             })
+        }
+
+        fn serve_with_connection_controls(
+            &mut self,
+            service: TestInvocation,
+        ) -> (
+            tokio::task::JoinHandle<()>,
+            tokio::sync::mpsc::UnboundedReceiver<std::os::unix::net::UnixStream>,
+        ) {
+            let listener = self.listener.take().unwrap();
+            let (controls_tx, controls_rx) = tokio::sync::mpsc::unbounded_channel();
+            let incoming = UnixListenerStream::new(listener).map(move |accepted| {
+                let stream = accepted?;
+                let control = rustix::io::dup(&stream).map_err(std::io::Error::other)?;
+                let control = std::os::unix::net::UnixStream::from(control);
+                controls_tx
+                    .send(control)
+                    .map_err(|_| std::io::Error::other("connection control receiver closed"))?;
+                Ok::<_, std::io::Error>(stream)
+            });
+            let server = tokio::spawn(async move {
+                let _ = tonic::transport::Server::builder()
+                    .add_service(
+                        InvocationServiceServer::new(service)
+                            .max_decoding_message_size(MAX_COURIER_GRPC_MESSAGE_BYTES)
+                            .max_encoding_message_size(MAX_COURIER_GRPC_MESSAGE_BYTES),
+                    )
+                    .serve_with_incoming(incoming)
+                    .await;
+            });
+            (server, controls_rx)
+        }
+
+        fn replace_and_serve(&mut self, service: TestInvocation) -> tokio::task::JoinHandle<()> {
+            let socket = self.root.join("d/broker.sock");
+            fs::remove_file(&socket).unwrap();
+            let listener = UnixListener::bind(&socket).unwrap();
+            fs::set_permissions(&socket, fs::Permissions::from_mode(0o660)).unwrap();
+            self.listener = Some(listener);
+            self.serve(service)
         }
     }
 
@@ -1007,6 +1328,10 @@ mod tests {
         require_challenge: bool,
         version: u32,
         challenge_calls: Arc<AtomicUsize>,
+        invoke_calls: Arc<AtomicUsize>,
+        capability_calls: Arc<AtomicUsize>,
+        capability_delay_ms: Arc<AtomicUsize>,
+        invoke_delay_ms: Arc<AtomicUsize>,
     }
 
     #[cfg(target_os = "linux")]
@@ -1017,6 +1342,10 @@ mod tests {
                 require_challenge,
                 version,
                 challenge_calls: Arc::new(AtomicUsize::new(0)),
+                invoke_calls: Arc::new(AtomicUsize::new(0)),
+                capability_calls: Arc::new(AtomicUsize::new(0)),
+                capability_delay_ms: Arc::new(AtomicUsize::new(0)),
+                invoke_delay_ms: Arc::new(AtomicUsize::new(0)),
             }
         }
     }
@@ -1028,6 +1357,11 @@ mod tests {
             &self,
             request: Request<SealedRequest>,
         ) -> Result<Response<SealedResponse>, Status> {
+            self.invoke_calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(
+                u64::try_from(self.invoke_delay_ms.load(Ordering::SeqCst)).unwrap(),
+            ))
+            .await;
             Ok(Response::new(SealedResponse {
                 message: request.into_inner().message,
                 response_subject: None,
@@ -1054,6 +1388,11 @@ mod tests {
             &self,
             _request: Request<GetInvocationCapabilitiesRequest>,
         ) -> Result<Response<GetInvocationCapabilitiesResponse>, Status> {
+            self.capability_calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(
+                u64::try_from(self.capability_delay_ms.load(Ordering::SeqCst)).unwrap(),
+            ))
+            .await;
             Ok(Response::new(GetInvocationCapabilitiesResponse {
                 listener_profile: self.profile.load(Ordering::SeqCst),
                 require_challenge: self.require_challenge,

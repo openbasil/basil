@@ -1019,6 +1019,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "basil-https-courier"
+version = "0.8.0-pre.1"
+dependencies = [
+ "anyhow",
+ "basil-courier",
+ "basil-proto",
+ "bytes",
+ "clap",
+ "http-body-util",
+ "httparse",
+ "hyper 1.11.0",
+ "mimalloc",
+ "prost 0.14.4",
+ "rustix 1.1.4",
+ "rustls 0.23.42",
+ "rustls-pemfile",
+ "serde",
+ "subtle",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-rustls 0.26.4",
+ "tokio-stream",
+ "toml 1.1.4+spec-1.1.0",
+ "tonic 0.14.6",
+ "tracing",
+ "tracing-subscriber",
+ "zeroize",
+]
+
+[[package]]
 name = "basil-keystore-backend"
 version = "0.8.0-pre.1"
 dependencies = [

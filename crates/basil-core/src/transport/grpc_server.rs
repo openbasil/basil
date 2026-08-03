@@ -46,6 +46,9 @@ pub const DEFAULT_SOCKET_MODE: u32 = 0o600;
 /// Maximum number of named Unix listeners accepted from one agent config.
 pub const MAX_LISTENERS: usize = 32;
 
+const COURIER_RAW_INVOCATION_BYTES: usize = 4 * 1024 * 1024;
+const COURIER_GRPC_MESSAGE_BYTES: usize = COURIER_RAW_INVOCATION_BYTES + 5;
+
 /// Closed listener types compiled into the broker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -772,11 +775,16 @@ async fn serve_bound(
     );
 
     let server = Server::builder()
-        .add_optional_service(
-            listener_type
-                .exposes(GrpcService::Invocation)
-                .then(|| InvocationServiceServer::new(broker.clone())),
-        )
+        .add_optional_service(listener_type.exposes(GrpcService::Invocation).then(|| {
+            let service = InvocationServiceServer::new(broker.clone());
+            if listener_type == ListenerType::Courier {
+                service
+                    .max_decoding_message_size(COURIER_GRPC_MESSAGE_BYTES)
+                    .max_encoding_message_size(COURIER_GRPC_MESSAGE_BYTES)
+            } else {
+                service
+            }
+        }))
         .add_optional_service(
             listener_type
                 .exposes(GrpcService::Signing)
@@ -928,6 +936,7 @@ mod tests {
     use basil_proto::spiffe::X509BundlesRequest;
     use basil_proto::spiffe::spiffe_workload_api_client::SpiffeWorkloadApiClient;
     use hyper_util::rt::TokioIo;
+    use prost::Message as _;
     use tokio::net::UnixStream;
     use tokio::sync::oneshot;
     use tonic::Code;
@@ -941,6 +950,18 @@ mod tests {
     use crate::catalog::load;
     use crate::manager::BackendManager;
     use crate::transport::listener::{LegacyListenerConfig, ListenerConfigInput};
+
+    #[test]
+    fn courier_grpc_ceiling_includes_exact_protobuf_envelope() {
+        let exact = SealedRequest {
+            message: vec![0; COURIER_RAW_INVOCATION_BYTES],
+        };
+        assert_eq!(exact.encoded_len(), COURIER_GRPC_MESSAGE_BYTES);
+        let oversized = SealedRequest {
+            message: vec![0; COURIER_RAW_INVOCATION_BYTES + 1],
+        };
+        assert!(oversized.encoded_len() > COURIER_GRPC_MESSAGE_BYTES);
+    }
 
     #[test]
     fn listener_service_registry_is_closed_and_admin_is_host_only() {
@@ -1474,6 +1495,32 @@ mod tests {
                 .code(),
             Code::Unimplemented
         );
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn courier_listener_accepts_exact_raw_limit_and_rejects_next_byte() {
+        let socket = socket_path("courier-message-bound");
+        let shutdown = spawn_server_with_type(socket.clone(), ListenerType::Courier).await;
+        let mut client = InvocationServiceClient::new(uds_channel(&socket).await)
+            .max_encoding_message_size(COURIER_GRPC_MESSAGE_BYTES + 1);
+
+        let exact = client
+            .invoke(SealedRequest {
+                message: vec![0; COURIER_RAW_INVOCATION_BYTES],
+            })
+            .await
+            .expect_err("opaque invalid bytes reach the invocation decoder");
+        assert_ne!(exact.code(), Code::ResourceExhausted);
+
+        let oversized = client
+            .invoke(SealedRequest {
+                message: vec![0; COURIER_RAW_INVOCATION_BYTES + 1],
+            })
+            .await
+            .expect_err("protobuf envelope above the raw limit is rejected");
+        assert_eq!(oversized.code(), Code::OutOfRange);
 
         let _ = shutdown.send(());
     }
