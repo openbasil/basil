@@ -23,19 +23,19 @@ or operations, though: any process's access is still limited by the active [poli
 
 Online docs: **[CLI overview](https://docs.openbasil.org/cli/overview/)** and **[command reference](https://docs.openbasil.org/cli/command-reference/)**
 
-| Command           | Role                                                                                                                                                                                                                                                                   |
-| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `basil init`      | Scaffold a first-run starter set: config, catalog, policy.                                                                                                                                                                                                             |
-| `basil agent`     | Run the broker daemon.                                                                                                                                                                                                                                                 |
-| `basil compose …` | Project a selected frontend's effective Compose model into bounded, secret-discarding JSON.                                                                                                                                                                            |
-| `basil bundle …`  | Create and manage the sealed credential bundle (seal, verify, `set-backend`, …).                                                                                                                                                                                       |
-| `basil nix key …` | Enroll or inspect a Nix binary-cache signing key held in backend custody. The commands return public material only.                                                                                                                                                     |
-| `basil nix signer serve` | Serve one backend-custodied Nix cache key through the purpose-specific local external-signer protocol.                                                                                                                                                        |
-| `basil nix cache …` | Add, replace, or remove signatures in a local binary-cache directory with byte-preserving, atomic-per-record updates.                                                                                                                                            |
-| `basil explain`   | Explain a policy decision offline from the catalog + policy files; `--live` asks the running broker instead.                                                                                                                                                           |
-| `basil doctor`    | Preflight environment and deployment checks.                                                                                                                                                                                                                           |
-| `basil cache …`   | Inspect the private OCI evidence cache or preview and confirm exact-ID/reference pruning.                                                                                                                                                                              |
-| client commands   | `new-key`, `import`, `import-set`, `sign`, `verify`, `encrypt`, `decrypt`, `get`, `set`, `rotate`, `list`, `mint-jwt`, `mint-nats-user`, `sign-nats-jwt`, `issue-nats-creds`, `issue-cert`, `status`, `health`, `ready`, `reload`, `revoke`, `invocation-challenge`, … |
+| Command                  | Role                                                                                                                                                                                                                                                                   |
+| ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `basil init`             | Scaffold a first-run starter set: config, catalog, policy.                                                                                                                                                                                                             |
+| `basil agent`            | Run the broker daemon.                                                                                                                                                                                                                                                 |
+| `basil compose …`        | Project a selected frontend's effective Compose model into bounded, secret-discarding JSON.                                                                                                                                                                            |
+| `basil bundle …`         | Create and manage the sealed credential bundle (seal, verify, `set-backend`, …).                                                                                                                                                                                       |
+| `basil nix key …`        | Enroll or inspect a Nix binary-cache signing key held in backend custody. The commands return public material only.                                                                                                                                                    |
+| `basil nix signer serve` | Serve one backend-custodied Nix cache key through the purpose-specific local external-signer protocol.                                                                                                                                                                 |
+| `basil nix cache …`      | Add, replace, or remove signatures in a local binary-cache directory with byte-preserving, atomic-per-record updates.                                                                                                                                                  |
+| `basil explain`          | Explain a policy decision offline from the catalog + policy files; `--live` asks the running broker instead.                                                                                                                                                           |
+| `basil doctor`           | Preflight environment and deployment checks.                                                                                                                                                                                                                           |
+| `basil cache …`          | Inspect the private OCI evidence cache or preview and confirm exact-ID/reference pruning.                                                                                                                                                                              |
+| client commands          | `new-key`, `import`, `import-set`, `sign`, `verify`, `encrypt`, `decrypt`, `get`, `set`, `rotate`, `list`, `mint-jwt`, `mint-nats-user`, `sign-nats-jwt`, `issue-nats-creds`, `issue-cert`, `status`, `health`, `ready`, `reload`, `revoke`, `invocation-challenge`, … |
 
 `basil cache --check` is an integrity check as well as an inventory: it removes
 safely identified corrupt regular entries as cache misses. Use `basil doctor`
@@ -67,6 +67,34 @@ key before any record changes.
 Cache mutation supports local directories only, preserves unrecognized
 `.narinfo` fields byte for byte, and commits each record atomically so a failed
 batch can be rerun safely.
+
+### Nix cache mutation audit events
+
+Each cache mutation writes best-effort JSON Lines records to standard error for
+capture by journald or a CI log sink. The `basil.audit.nix_cache_mutation` v1
+schema has `batch_start`, `path_commit`, `batch_failure`, `batch_cancellation`,
+and `batch_completion` phases. Every record identifies the operation, selection
+mode, dry-run policy, and the batch's raw 16-byte correlation ID rendered as 32
+lowercase hexadecimal characters. A signing `path_commit` also has the raw sign
+request ID in the same form, which joins the CLI record to the broker sign audit.
+
+A `path_commit` appears only after the `.narinfo` rename and directory flush
+succeed. Directory-flush uncertainty produces a batch failure without a path
+commit. The record separates `signature_source` (`produced`, `reused`, or
+`not_applicable`) from the installed or removed mutation, while terminal counts
+also report unchanged and dry-run preview outcomes. Store paths and fingerprints
+are represented only by SHA-256 digests rendered as 64 lowercase hexadecimal
+characters. The schema excludes cache paths, payloads, signatures, fingerprints,
+and private material.
+
+Emission is not atomic with cache mutation and does not create an audit database.
+An absent record proves nothing, including that no mutation committed. Operators
+retain standard error in durable journald or CI storage according to their own
+retention policy and rescan the cache after a failed or cancelled batch. Catchable
+`SIGINT` and `SIGTERM` signals identify the cancellation; dropped asynchronous work
+uses `task_cancelled`. Cancellation is observed while connecting to Basil, while
+waiting for the cache lock, and between selected records. No new record begins after
+the cancellation is observed. Forced termination can leave no terminal record.
 
 ## basil-measure-helper
 

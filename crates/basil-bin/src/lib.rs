@@ -13,6 +13,7 @@
 
 pub mod client_cli;
 pub mod nix_cache_cli;
+mod nix_cache_mutation_audit;
 pub mod nix_cli;
 pub mod nix_provider;
 
