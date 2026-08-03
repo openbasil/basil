@@ -68,6 +68,7 @@ hyper-util = { workspace = true }
 jsonwebtoken = { workspace = true }
 minicbor = { workspace = true, features = ["alloc", "std"] }
 pkcs8 = { workspace = true }
+prost = { workspace = true }
 # `rand`/`rsa`/`url`: deterministic runtime-generated RSA trust material and the
 # provider document-fetcher seam for `ci_trust_reload_matrix` (no key blobs in
 # source; `url` must be the workspace version so the fetcher trait types unify).
@@ -196,6 +197,11 @@ required-features = ["live-e2e", "unlock-bip39"]
 [[test]]
 name = "nats_bridge_cose_e2e"
 path = "tests/nats_bridge_cose_e2e.rs"
+required-features = ["live-e2e"]
+
+[[test]]
+name = "nats_courier_qualification"
+path = "tests/nats_courier_qualification.rs"
 required-features = ["live-e2e"]
 
 [[bin]]
