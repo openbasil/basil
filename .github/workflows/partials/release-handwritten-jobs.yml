@@ -145,6 +145,7 @@ jobs:
     needs:
       - plan
       - host
+      - debian-packages
     if: ${{ needs.plan.outputs.publishing == 'true' }}
     strategy:
       fail-fast: false
