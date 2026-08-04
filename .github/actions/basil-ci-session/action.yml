@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+name: Basil CI session
+description: Start one job-scoped Basil identity session from a reviewed executable
+
+inputs:
+  basil-executable:
+    description: Absolute path to the reviewed Basil executable
+    required: true
+  basil-executable-sha256:
+    description: Exact lowercase SHA-256 digest of the reviewed Basil executable
+    required: true
+  rule-max-token-age-seconds:
+    description: Maximum token age configured by the matching federation rule
+    required: true
+
+outputs:
+  session-control-socket:
+    description: Job-local lifecycle control socket
+  adapter-sockets:
+    description: JSON object of registered typed-adapter sockets
+  proof-jkt:
+    description: Proof-key thumbprint
+  proof-audience:
+    description: Key-bound provider-token audience
+
+runs:
+  using: node20
+  main: main.mjs
+  post: post.mjs
+  post-if: always()

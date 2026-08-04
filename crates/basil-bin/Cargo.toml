@@ -67,10 +67,10 @@ ed25519-dalek = { workspace = true }
 getrandom = { workspace = true }
 hex = { workspace = true }
 mimalloc = { workspace = true }
+reqwest = { workspace = true }
 # `basil-attestor` entrypoint: effective-UID default for the runtime-directory
 # owner check.
 rustix = { workspace = true }
-reqwest = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true, features = ["std"] }
 serde_json = { workspace = true, features = ["std"] }
