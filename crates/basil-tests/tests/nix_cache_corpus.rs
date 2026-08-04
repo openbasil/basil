@@ -9,14 +9,14 @@ const PATH_INFO_V1: &[u8] = include_bytes!(concat!(
     "/fixtures/nix-cache-signing/path-info-v1.json"
 ));
 const PATH_INFO_V1_SHA256: &str =
-    "b1de9eac413f548934b0aeee5a56f8a566616bf9590ad55a2ebca8094170e49b";
+    "c4d31875e779e11d2a8b9dcd071e34fc832f545dca5784f0c72540dff8ee3823";
 
 const NARINFO_FIDELITY: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/fixtures/nix-cache-signing/narinfo-fidelity.json"
 ));
 const NARINFO_FIDELITY_SHA256: &str =
-    "c7d4588ffd21025b00a8609b17183aede72bc63cf788aec2bac490559c6a7542";
+    "fef4433a5fdfab4220f795ce8e85c092d2cb472d676645cef8cc7b59a3212548";
 
 #[test]
 fn corpus_digests_match() {
