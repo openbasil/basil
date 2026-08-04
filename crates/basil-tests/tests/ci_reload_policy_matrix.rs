@@ -123,6 +123,9 @@ fn reload_pinning_kill_switch_and_policy_separation_over_the_real_rpc() {
         subject_signature_key: URL_SAFE_NO_PAD.encode(subject_a.public_key_bytes()),
         second_subject_signature_key: None,
         response_public: response_recipient.public().public,
+        request_private: None,
+        operation_signing_key_id: None,
+        courier_listener: false,
         // The race and kill-switch rows both reserve challenge batches for
         // subject A's jkt in quick succession; the SPEC-default per-jkt rate
         // (burst 8, integer-second refill 4/s) would make the second batch

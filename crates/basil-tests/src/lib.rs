@@ -35,6 +35,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// The trust domain the prefill fixtures configure the SPIFFE issuers for.
@@ -452,6 +453,7 @@ fn prefill_with_retry(
 /// Drops regardless of assertion outcome so we never leak processes/sockets.
 pub struct Harness {
     workdir: PathBuf,
+    socket_path: Option<PathBuf>,
     agent: Option<Child>,
     server_pidfile: PathBuf,
     backend_addr: String,
@@ -470,7 +472,9 @@ impl Harness {
     }
     #[must_use]
     pub fn socket(&self) -> PathBuf {
-        self.workdir.join("agent.sock")
+        self.socket_path
+            .clone()
+            .unwrap_or_else(|| self.workdir.join("agent.sock"))
     }
     /// The standard SPIFFE endpoint string a workload puts in
     /// `SPIFFE_ENDPOINT_SOCKET`; pass it to `connect_to` directly.
@@ -674,6 +678,9 @@ impl Drop for Harness {
             #[cfg(unix)]
             reap_dev_server(pid);
         }
+        if let Some(socket_path) = &self.socket_path {
+            let _ = std::fs::remove_file(socket_path);
+        }
         let _ = std::fs::remove_dir_all(&self.workdir);
     }
 }
@@ -839,6 +846,7 @@ pub fn boot_basil_bip39(tag: &str, engine: Engine, addr: &str) -> Harness {
 
     let mut harness = Harness {
         workdir: workdir.clone(),
+        socket_path: None,
         agent: None,
         server_pidfile: workdir.join("server.pid"),
         backend_addr: addr.clone(),
@@ -1002,6 +1010,7 @@ fn boot_basil_inner(tag: &str, engine: Engine, addr: &str, svid_ttl_secs: Option
 
     let mut harness = Harness {
         workdir: workdir.clone(),
+        socket_path: None,
         agent: None,
         server_pidfile: workdir.join("server.pid"),
         backend_addr: addr.clone(),
@@ -1141,6 +1150,7 @@ pub fn boot_basil_spiffe(
 
     let mut harness = Harness {
         workdir: workdir.clone(),
+        socket_path: None,
         agent: None,
         server_pidfile: workdir.join("server.pid"),
         backend_addr: addr.clone(),
@@ -1516,6 +1526,14 @@ pub struct InvocationBootSpec {
     /// X25519 public key provisioned out of band at the response key's
     /// `publicPath`, so the broker can seal a response the caller can open.
     pub response_public: [u8; 32],
+    /// Optional X25519 private request key provisioned for tests that must
+    /// reach an invocation operation. `None` keeps the broker unable to open
+    /// request bodies.
+    pub request_private: Option<[u8; 32]>,
+    /// Optional catalog key granted to the invocation subject for signing.
+    pub operation_signing_key_id: Option<String>,
+    /// Serve the invocation RPCs on a courier-profile listener.
+    pub courier_listener: bool,
     /// Optional `[invocation.challenge]` table shape. `None` keeps the SPEC
     /// defaults (global capacity 16384, per-`jkt` rate `8/4`).
     pub challenge: Option<ChallengeTableBoot>,
@@ -1574,6 +1592,7 @@ pub fn boot_basil_invocation(
 
     let mut harness = Harness {
         workdir: workdir.clone(),
+        socket_path: spec.courier_listener.then(trusted_courier_socket_path),
         agent: None,
         server_pidfile: workdir.join("server.pid"),
         backend_addr: addr.clone(),
@@ -1586,6 +1605,7 @@ pub fn boot_basil_invocation(
         &harness.policy_path(),
         &spec.subject_signature_key,
         spec.second_subject_signature_key.as_deref(),
+        spec.operation_signing_key_id.as_deref(),
     );
 
     let fixtures = harness.fixtures();
@@ -1615,6 +1635,16 @@ pub fn boot_basil_invocation(
     harness
 }
 
+fn trusted_courier_socket_path() -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let uid = rustix::process::geteuid().as_raw();
+    PathBuf::from(format!(
+        "/run/user/{uid}/basil-live-courier-{}-{}.sock",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
 /// Render the agent config for an invocation boot.
 fn invocation_agent_config(
     harness: &Harness,
@@ -1623,13 +1653,23 @@ fn invocation_agent_config(
     pass: &Path,
     spec: &InvocationBootSpec,
 ) -> String {
+    let listener = if spec.courier_listener {
+        format!(
+            "[listeners.host]\ntype = \"host\"\npath = \"{}\"\n\n\
+             [listeners.courier]\ntype = \"courier\"\npath = \"{}\"\n",
+            harness.workdir.join("agent-host.sock").display(),
+            harness.socket().display()
+        )
+    } else {
+        format!("socket = \"{}\"\n", harness.socket().display())
+    };
     format!(
         r#"schema = "agent"
 schemaVersion = 3
 capability-policy = "strict"
 audit-log = "{audit}"
-socket = "{socket}"
 vault-addr = "{addr}"
+{listener}
 
 [import]
 catalog = "{catalog}"
@@ -1654,7 +1694,7 @@ request-encryption-key-id = "{request}"
 require-challenge = {require_challenge}
 {challenge}{federation}"#,
         audit = harness.audit_log_path().display(),
-        socket = harness.socket().display(),
+        listener = listener,
         catalog = harness.catalog_path().display(),
         policy = harness.policy_path().display(),
         bundle = bundle.display(),
@@ -1719,8 +1759,13 @@ fn provision_invocation_material(engine: Engine, addr: &str, spec: &InvocationBo
             &format!("value={response_public}"),
         ],
     );
-    // The request key's public half is never read by this lane (callers seal to
-    // a key they generate), but the sealing reconcile probe expects a value.
+    let request_public = spec
+        .request_private
+        .map_or(spec.response_public, |private| {
+            basil_core::x25519_seal::public_from_private(&zeroize::Zeroizing::new(private))
+        });
+    let request_public =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, request_public);
     engine_write(
         engine,
         addr,
@@ -1728,9 +1773,23 @@ fn provision_invocation_material(engine: Engine, addr: &str, spec: &InvocationBo
             "kv",
             "put",
             "secret/ci/request-seal-public",
-            &format!("value={response_public}"),
+            &format!("value={request_public}"),
         ],
     );
+    if let Some(private) = spec.request_private {
+        let request_private =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, private);
+        engine_write(
+            engine,
+            addr,
+            &[
+                "kv",
+                "put",
+                "secret/ci/request-seal",
+                &format!("value={request_private}"),
+            ],
+        );
+    }
 }
 
 /// Run one `bao`/`vault` CLI command against the dev engine with the prefill's
@@ -1812,6 +1871,7 @@ fn extend_invocation_policy(
     policy_path: &Path,
     subject_signature_key: &str,
     second_subject_signature_key: Option<&str>,
+    operation_signing_key_id: Option<&str>,
 ) {
     let mut policy: serde_json::Value =
         serde_json::from_slice(&std::fs::read(policy_path).expect("read prefill policy"))
@@ -1850,6 +1910,18 @@ fn extend_invocation_policy(
                 "subjects": [subject],
                 "action": ["op:decrypt"],
                 "target": [INVOCATION_REQUEST_KEY_ID]
+            }));
+    }
+    if let Some(key_id) = operation_signing_key_id {
+        policy
+            .get_mut("rules")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("policy carries a rules array")
+            .push(serde_json::json!({
+                "id": "ci-invoker-sign",
+                "subjects": [INVOCATION_SUBJECT],
+                "action": ["op:sign"],
+                "target": [key_id]
             }));
     }
     std::fs::write(

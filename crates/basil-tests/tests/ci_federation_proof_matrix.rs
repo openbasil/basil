@@ -123,6 +123,9 @@ fn run_arm(arm: ProviderArm, tag: &str) {
         ),
         second_subject_signature_key: None,
         response_public: RESPONSE_PUBLIC,
+        request_private: None,
+        operation_signing_key_id: None,
+        courier_listener: false,
         challenge: None,
     };
     let harness = boot_basil_invocation(tag, Engine::OpenBao, &addr, &spec);

@@ -362,7 +362,7 @@ async fn inflight_and_connection_saturation_fail_without_queueing() {
 }
 
 #[tokio::test]
-async fn duplicate_mutation_replay_and_reorder_preserve_the_broker_oracle() {
+async fn duplicate_mutation_replay_and_reorder_preserve_transport_bytes() {
     let mut fixture = Fixture::new();
     let (service, oracle, reorder_entered, reorder_release) = AtomicBroker::new();
     let server = TestTask::new(fixture.serve_with(service));
@@ -411,6 +411,56 @@ async fn duplicate_mutation_replay_and_reorder_preserve_the_broker_oracle() {
         );
         drop(state);
     }
+
+    courier.abort_and_join().await;
+    server.abort_and_join().await;
+}
+
+#[tokio::test]
+async fn invocation_response_above_the_configured_limit_is_rejected() {
+    let mut fixture = Fixture::new();
+    let server = TestTask::new(fixture.serve_with(OversizedInvocationResponse));
+    let address = unused_loopback_address();
+    let mut config = fixture.config(address);
+    config.limits.invocation_response_bytes = 8;
+    let courier = TestTask::new(tokio::spawn(run(config)));
+    assert!(wait_for_listener(address).await);
+
+    let response = invoke_body(address, b"sealed").await;
+    assert_problem(&response, 413, "MESSAGE_TOO_LARGE", false);
+
+    courier.abort_and_join().await;
+    server.abort_and_join().await;
+}
+
+#[tokio::test]
+async fn challenge_response_above_the_configured_limit_is_rejected() {
+    let mut fixture = Fixture::new();
+    let server = TestTask::new(fixture.serve_with(OversizedChallengeResponse));
+    let address = unused_loopback_address();
+    let mut config = fixture.config(address);
+    config.limits.challenge_body_bytes = 40;
+    let courier = TestTask::new(tokio::spawn(run(config)));
+    assert!(wait_for_listener(address).await);
+
+    let body = GetInvocationChallengeRequest {
+        jkt: vec![4; 32],
+        courier_observed_source: None,
+    }
+    .encode_to_vec();
+    assert!(body.len() <= 40, "request must fit the shared body limit");
+    let response = request(
+        address,
+        "/v1/challenge",
+        "application/protobuf",
+        &body,
+        &[
+            "Authorization: Bearer test-courier-secret",
+            "X-Forwarded-For: 192.0.2.9",
+        ],
+    )
+    .await;
+    assert_problem(&response, 500, "INTERNAL", false);
 
     courier.abort_and_join().await;
     server.abort_and_join().await;
@@ -1377,6 +1427,67 @@ impl InvocationService for AtomicBroker {
 struct CountingInvocation {
     forwards: Arc<AtomicUsize>,
     profile: ListenerProfile,
+}
+
+#[derive(Clone, Copy)]
+struct OversizedInvocationResponse;
+
+#[tonic::async_trait]
+impl InvocationService for OversizedInvocationResponse {
+    async fn invoke(
+        &self,
+        _request: Request<SealedRequest>,
+    ) -> Result<Response<SealedResponse>, Status> {
+        Ok(Response::new(SealedResponse {
+            message: vec![0x5a; 9],
+            response_subject: None,
+        }))
+    }
+
+    async fn get_invocation_challenge(
+        &self,
+        request: Request<GetInvocationChallengeRequest>,
+    ) -> Result<Response<GetInvocationChallengeResponse>, Status> {
+        TestInvocation.get_invocation_challenge(request).await
+    }
+
+    async fn get_invocation_capabilities(
+        &self,
+        request: Request<GetInvocationCapabilitiesRequest>,
+    ) -> Result<Response<GetInvocationCapabilitiesResponse>, Status> {
+        TestInvocation.get_invocation_capabilities(request).await
+    }
+}
+
+#[derive(Clone, Copy)]
+struct OversizedChallengeResponse;
+
+#[tonic::async_trait]
+impl InvocationService for OversizedChallengeResponse {
+    async fn invoke(
+        &self,
+        request: Request<SealedRequest>,
+    ) -> Result<Response<SealedResponse>, Status> {
+        TestInvocation.invoke(request).await
+    }
+
+    async fn get_invocation_challenge(
+        &self,
+        _request: Request<GetInvocationChallengeRequest>,
+    ) -> Result<Response<GetInvocationChallengeResponse>, Status> {
+        Ok(Response::new(GetInvocationChallengeResponse {
+            challenge: vec![0x5a; 64],
+            generation: 2,
+            expires_at_unix: 60,
+        }))
+    }
+
+    async fn get_invocation_capabilities(
+        &self,
+        request: Request<GetInvocationCapabilitiesRequest>,
+    ) -> Result<Response<GetInvocationCapabilitiesResponse>, Status> {
+        TestInvocation.get_invocation_capabilities(request).await
+    }
 }
 
 impl CountingInvocation {

@@ -144,6 +144,9 @@ fn challenge_lifecycle_and_capacity_over_the_real_rpc() {
         subject_signature_key: URL_SAFE_NO_PAD.encode(subject_a.public_key_bytes()),
         second_subject_signature_key: Some(URL_SAFE_NO_PAD.encode(subject_b.public_key_bytes())),
         response_public: response_recipient.public().public,
+        request_private: None,
+        operation_signing_key_id: None,
+        courier_listener: false,
         challenge: Some(CHALLENGE_SHAPE),
     };
     let mut harness = boot_basil_invocation("jjgi-challenge", Engine::OpenBao, &addr, &spec);

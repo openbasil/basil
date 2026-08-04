@@ -1144,6 +1144,7 @@ dependencies = [
  "basil",
  "basil-core",
  "basil-cose",
+ "basil-https-courier",
  "basil-nats-bridge",
  "basil-proto",
  "bytes",

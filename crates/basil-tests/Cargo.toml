@@ -56,6 +56,7 @@ zeroize = { workspace = true }
 [dev-dependencies]
 basil = { workspace = true }
 basil-cose = { workspace = true }
+basil-https-courier = { workspace = true }
 basil-nats-bridge = { workspace = true }
 basil-proto = { workspace = true }
 
@@ -92,6 +93,11 @@ required-features = ["live-e2e"]
 [[test]]
 name = "ci_challenge_lifecycle_matrix"
 path = "tests/ci_challenge_lifecycle_matrix.rs"
+required-features = ["live-e2e"]
+
+[[test]]
+name = "https_courier_challenge_atomicity"
+path = "tests/https_courier_challenge_atomicity.rs"
 required-features = ["live-e2e"]
 
 [[test]]
