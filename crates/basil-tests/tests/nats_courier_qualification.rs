@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 
-use async_nats::jetstream::kv;
+use async_nats::jetstream::kv::{self, Operation};
 use async_nats::jetstream::stream::StorageType;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -72,6 +72,8 @@ const DEADLINE_REQUEST: &[u8] = b"force-deadline";
 const REJECTED_REQUEST: &[u8] = b"force-broker-rejection";
 const BOUNDARY_RESPONSE: &[u8] = b"exact-boundary-response";
 
+static QUALIFICATION_SERIAL: Mutex<()> = Mutex::const_new(());
+
 struct NatsServer {
     child: Child,
     storage: PathBuf,
@@ -118,6 +120,17 @@ impl<T> TaskGuard<T> {
             self.abort_and_reap().await;
             panic!("{context} exceeded its bounded join deadline");
         }
+    }
+
+    async fn result_before(
+        &mut self,
+        deadline: tokio::time::Instant,
+        context: &str,
+    ) -> Result<T, tokio::task::JoinError> {
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .unwrap_or(Duration::ZERO);
+        self.result_bounded(remaining, context).await
     }
 
     async fn abort_and_reap(&mut self) {
@@ -369,6 +382,7 @@ const fn federation_capabilities() -> GetInvocationCapabilitiesResponse {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn federation_qualifies_freshness_fidelity_replay_reorder_and_failures() {
+    let _serial_guard = QUALIFICATION_SERIAL.lock().await;
     require_nats_server_2_14_3();
 
     let port = port_from(&alloc_addr());
@@ -633,6 +647,7 @@ async fn federation_qualifies_freshness_fidelity_replay_reorder_and_failures() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn jetstream_lease_is_exclusive_renewed_before_forward_and_stops_intake_on_loss() {
+    let _serial_guard = QUALIFICATION_SERIAL.lock().await;
     require_nats_server_2_14_3();
 
     let port = port_from(&alloc_addr());
@@ -736,8 +751,227 @@ async fn jetstream_lease_is_exclusive_renewed_before_forward_and_stops_intake_on
     nats_server.stop_bounded();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn jetstream_graceful_shutdown_deletes_only_the_owned_revision() {
+    let _serial_guard = QUALIFICATION_SERIAL.lock().await;
+    require_nats_server_2_14_3();
+
+    let port = port_from(&alloc_addr());
+    let (mut nats_server, nats_url) = start_nats_server(port).await;
+    let nats = tokio::time::timeout(ASYNC_BOUND, async_nats::connect(&nats_url))
+        .await
+        .expect("shutdown NATS connection completed within its deadline")
+        .expect("connect shutdown qualification NATS client");
+    let bucket = format!("BASILQ{port}");
+    let store = create_lease_bucket(&nats, &bucket).await;
+    let service = QualificationService::default();
+    let (socket_guard, listener, server_uid) = bind_test_socket(port, "shutdown");
+    let mut server = spawn_service(listener, service);
+
+    let owned_request = "basil.qualify.shutdown.owned.invoke";
+    let owned_challenge = "basil.qualify.shutdown.owned.challenge";
+    let owned_config = federation_config_for_subjects(
+        &nats_url,
+        &socket_guard.socket,
+        server_uid,
+        &bucket,
+        owned_request,
+        owned_challenge,
+    );
+    let owned_heartbeat_deadline = tokio::time::Instant::now() + HEARTBEAT_EXCLUSION_BOUND;
+    let mut owned_bridge = TaskGuard::new(tokio::spawn(basil_nats_bridge::run(owned_config)));
+    request_until_ready(
+        &nats,
+        owned_challenge,
+        valid_challenge_request().encode_to_vec(),
+    )
+    .await;
+    let owned_key = lease_key(owned_challenge, owned_request);
+    let owned = tokio::time::timeout_at(owned_heartbeat_deadline, store.entry(&owned_key))
+        .await
+        .expect("owned lease read completed before the heartbeat exclusion deadline")
+        .expect("read owned shutdown lease")
+        .expect("owned lease exists before graceful shutdown");
+    assert_eq!(owned.operation, Operation::Put);
+
+    signal_graceful_shutdown();
+    let owned_result = owned_bridge
+        .result_before(owned_heartbeat_deadline, "owned graceful-shutdown bridge")
+        .await
+        .expect("owned graceful-shutdown bridge task joined");
+    assert!(tokio::time::Instant::now() < owned_heartbeat_deadline);
+    assert!(owned_result.is_ok(), "owned lease shutdown succeeds");
+    let deleted = bounded_entry(&store, &owned_key, "deleted shutdown lease")
+        .await
+        .expect("graceful shutdown leaves a JetStream delete marker");
+    assert_eq!(deleted.operation, Operation::Delete);
+    assert_eq!(
+        deleted.revision,
+        owned.revision + 1,
+        "expected-revision deletion is the next write for the owned lease"
+    );
+
+    let stale_request = "basil.qualify.shutdown.stale.invoke";
+    let stale_challenge = "basil.qualify.shutdown.stale.challenge";
+    let stale_config = federation_config_for_subjects(
+        &nats_url,
+        &socket_guard.socket,
+        server_uid,
+        &bucket,
+        stale_request,
+        stale_challenge,
+    );
+    let stale_heartbeat_deadline = tokio::time::Instant::now() + HEARTBEAT_EXCLUSION_BOUND;
+    let mut stale_bridge = TaskGuard::new(tokio::spawn(basil_nats_bridge::run(stale_config)));
+    request_until_ready(
+        &nats,
+        stale_challenge,
+        valid_challenge_request().encode_to_vec(),
+    )
+    .await;
+    let stale_key = lease_key(stale_challenge, stale_request);
+    let stale_owned = tokio::time::timeout_at(stale_heartbeat_deadline, store.entry(&stale_key))
+        .await
+        .expect("stale lease read completed before the heartbeat exclusion deadline")
+        .expect("read stale shutdown lease")
+        .expect("stale bridge owns a lease before replacement");
+    let replacement = Bytes::from_static(b"replacement-owner-instance");
+    let replacement_revision = tokio::time::timeout_at(
+        stale_heartbeat_deadline,
+        store.update(&stale_key, replacement.clone(), stale_owned.revision),
+    )
+    .await
+    .expect("replacement CAS completed before the heartbeat exclusion deadline")
+    .expect("replace the stale bridge lease revision");
+    assert!(tokio::time::Instant::now() < stale_heartbeat_deadline);
+
+    signal_graceful_shutdown();
+    let stale_result = stale_bridge
+        .result_before(stale_heartbeat_deadline, "stale graceful-shutdown bridge")
+        .await
+        .expect("stale graceful-shutdown bridge task joined");
+    assert!(tokio::time::Instant::now() < stale_heartbeat_deadline);
+    assert!(matches!(stale_result, Err(RuntimeError::LeaseLost)));
+    let preserved = bounded_entry(&store, &stale_key, "preserved replacement lease")
+        .await
+        .expect("replacement lease remains after stale shutdown");
+    assert_eq!(preserved.operation, Operation::Put);
+    assert_eq!(preserved.revision, replacement_revision);
+    assert_eq!(preserved.value, replacement);
+
+    server.abort_and_reap().await;
+    drop(nats);
+    nats_server.stop_bounded();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn jetstream_real_bucket_bounds_expiry_and_distinct_subject_pairs() {
+    let _serial_guard = QUALIFICATION_SERIAL.lock().await;
+    require_nats_server_2_14_3();
+
+    let port = port_from(&alloc_addr());
+    let (mut nats_server, nats_url) = start_nats_server(port).await;
+    let nats = tokio::time::timeout(ASYNC_BOUND, async_nats::connect(&nats_url))
+        .await
+        .expect("bucket-matrix NATS connection completed within its deadline")
+        .expect("connect bucket-matrix NATS client");
+    let qualified_bucket = format!("BASILQ{port}");
+    let store = create_lease_bucket(&nats, &qualified_bucket).await;
+    let wrong_history = format!("BASILH{port}");
+    create_bucket(&nats, &wrong_history, 2, Duration::from_secs(15)).await;
+    let wrong_age = format!("BASILA{port}");
+    create_bucket(&nats, &wrong_age, 1, Duration::from_secs(14)).await;
+    let missing_bucket = format!("BASILM{port}");
+
+    let service = QualificationService::default();
+    let (socket_guard, listener, server_uid) = bind_test_socket(port, "bucket-matrix");
+    let mut server = spawn_service(listener, service);
+    for (bucket, context) in [
+        (wrong_history.as_str(), "wrong-history bucket"),
+        (wrong_age.as_str(), "wrong-max-age bucket"),
+        (missing_bucket.as_str(), "unavailable bucket"),
+    ] {
+        let config = federation_config(&nats_url, &socket_guard.socket, server_uid, bucket);
+        assert_lease_setup_failure(config, context).await;
+    }
+
+    let request_a = "basil.qualify.distinct.a.invoke";
+    let challenge_a = "basil.qualify.distinct.a.challenge";
+    let request_b = "basil.qualify.distinct.b.invoke";
+    let challenge_b = "basil.qualify.distinct.b.challenge";
+    let config_a = federation_config_for_subjects(
+        &nats_url,
+        &socket_guard.socket,
+        server_uid,
+        &qualified_bucket,
+        request_a,
+        challenge_a,
+    );
+    let config_b = federation_config_for_subjects(
+        &nats_url,
+        &socket_guard.socket,
+        server_uid,
+        &qualified_bucket,
+        request_b,
+        challenge_b,
+    );
+    let mut bridge_a = TaskGuard::new(tokio::spawn(basil_nats_bridge::run(config_a.clone())));
+    let mut bridge_b = TaskGuard::new(tokio::spawn(basil_nats_bridge::run(config_b)));
+    request_until_ready(
+        &nats,
+        challenge_a,
+        valid_challenge_request().encode_to_vec(),
+    )
+    .await;
+    request_until_ready(
+        &nats,
+        challenge_b,
+        valid_challenge_request().encode_to_vec(),
+    )
+    .await;
+    let key_a = lease_key(challenge_a, request_a);
+    let key_b = lease_key(challenge_b, request_b);
+    assert_ne!(key_a, key_b);
+    let lease_a = bounded_entry(&store, &key_a, "distinct lease A")
+        .await
+        .expect("first subject pair has an independent lease");
+    let lease_b = bounded_entry(&store, &key_b, "distinct lease B")
+        .await
+        .expect("second subject pair has an independent lease");
+    assert_eq!(lease_a.operation, Operation::Put);
+    assert_eq!(lease_b.operation, Operation::Put);
+
+    bridge_a.abort_and_reap().await;
+    bridge_b.abort_and_reap().await;
+    wait_for_key_expiry(&store, &key_a).await;
+    assert!(
+        bounded_entry(&store, &key_a, "expired lease A")
+            .await
+            .is_none(),
+        "an ungracefully abandoned real lease expires from JetStream"
+    );
+
+    let mut reacquired = TaskGuard::new(tokio::spawn(basil_nats_bridge::run(config_a)));
+    request_until_ready(
+        &nats,
+        challenge_a,
+        valid_challenge_request().encode_to_vec(),
+    )
+    .await;
+    let lease_a_reacquired = bounded_entry(&store, &key_a, "reacquired lease A")
+        .await
+        .expect("expired subject-pair lease can be acquired again");
+    assert_eq!(lease_a_reacquired.operation, Operation::Put);
+
+    reacquired.abort_and_reap().await;
+    server.abort_and_reap().await;
+    drop(nats);
+    nats_server.stop_bounded();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn legacy_mode_rejects_a_listener_that_claims_remote_freshness() {
+    let _serial_guard = QUALIFICATION_SERIAL.lock().await;
     require_nats_server_2_14_3();
 
     let port = port_from(&alloc_addr());
@@ -803,13 +1037,22 @@ async fn start_nats_server(port: u16) -> (NatsServer, String) {
 }
 
 async fn create_lease_bucket(nats: &async_nats::Client, bucket: &str) -> kv::Store {
+    create_bucket(nats, bucket, 1, Duration::from_secs(15)).await
+}
+
+async fn create_bucket(
+    nats: &async_nats::Client,
+    bucket: &str,
+    history: i64,
+    max_age: Duration,
+) -> kv::Store {
     let context = async_nats::jetstream::new(nats.clone());
     tokio::time::timeout(
         ASYNC_BOUND,
         context.create_key_value(kv::Config {
             bucket: bucket.to_string(),
-            history: 1,
-            max_age: Duration::from_secs(15),
+            history,
+            max_age,
             storage: StorageType::Memory,
             ..Default::default()
         }),
@@ -953,6 +1196,24 @@ where
 }
 
 fn federation_config(nats_url: &str, socket: &Path, uid: u32, bucket: &str) -> Config {
+    federation_config_for_subjects(
+        nats_url,
+        socket,
+        uid,
+        bucket,
+        REQUEST_SUBJECT,
+        CHALLENGE_SUBJECT,
+    )
+}
+
+fn federation_config_for_subjects(
+    nats_url: &str,
+    socket: &Path,
+    uid: u32,
+    bucket: &str,
+    request_subject: &str,
+    challenge_subject: &str,
+) -> Config {
     Config {
         nats: NatsConfig {
             url: nats_url.to_string(),
@@ -960,8 +1221,8 @@ fn federation_config(nats_url: &str, socket: &Path, uid: u32, bucket: &str) -> C
         },
         basil: basil_config(socket, uid),
         bridge: BridgeConfig {
-            request_subject: REQUEST_SUBJECT.to_string(),
-            challenge_subject: Some(CHALLENGE_SUBJECT.to_string()),
+            request_subject: request_subject.to_string(),
+            challenge_subject: Some(challenge_subject.to_string()),
             source_partition: Some(SOURCE_PARTITION.to_string()),
             lease_bucket: Some(bucket.to_string()),
             queue_group: None,
@@ -980,6 +1241,55 @@ fn basil_config(socket: &Path, uid: u32) -> BasilConfig {
         server_uid: uid,
         socket_mode: 0o660,
     }
+}
+
+fn valid_challenge_request() -> GetInvocationChallengeRequest {
+    GetInvocationChallengeRequest {
+        jkt: JKT.to_vec(),
+        courier_observed_source: None,
+    }
+}
+
+async fn assert_lease_setup_failure(config: Config, context: &str) {
+    let mut bridge = TaskGuard::new(tokio::spawn(basil_nats_bridge::run(config)));
+    let result = bridge
+        .result_bounded(ASYNC_BOUND, context)
+        .await
+        .expect("lease setup bridge task joined");
+    assert!(matches!(result, Err(RuntimeError::LeaseSetup)));
+}
+
+async fn bounded_entry(store: &kv::Store, key: &str, context: &str) -> Option<kv::Entry> {
+    tokio::time::timeout(ASYNC_BOUND, store.entry(key))
+        .await
+        .unwrap_or_else(|_| panic!("{context} read exceeded its deadline"))
+        .unwrap_or_else(|error| panic!("{context} read failed: {error}"))
+}
+
+async fn wait_for_key_expiry(store: &kv::Store, key: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut poll = tokio::time::interval(Duration::from_millis(100));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::time::timeout_at(deadline, poll.tick())
+            .await
+            .expect("real JetStream lease expired within its deadline");
+        if tokio::time::timeout_at(deadline, store.entry(key))
+            .await
+            .expect("expiry observation completed within its deadline")
+            .expect("read expiring lease")
+            .is_none()
+        {
+            return;
+        }
+    }
+}
+
+fn signal_graceful_shutdown() {
+    let raw_pid = i32::try_from(std::process::id()).expect("test process ID fits i32");
+    let pid = rustix::process::Pid::from_raw(raw_pid).expect("test process ID is nonzero");
+    rustix::process::kill_process(pid, rustix::process::Signal::INT)
+        .expect("send SIGINT to the production bridge shutdown path");
 }
 
 async fn request_until_ready(

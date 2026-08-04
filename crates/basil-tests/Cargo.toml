@@ -15,7 +15,7 @@ description = "Basil live and interop integration tests."
 
 [features]
 default = ["compose-phase1-probe"]
-live-e2e = []
+live-e2e = ["dep:rustix"]
 # Test-only native host/guest feasibility probe for Compose Phase 1 evidence.
 compose-phase1-probe = [
   "dep:basil-proto",
