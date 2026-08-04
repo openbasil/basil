@@ -527,7 +527,7 @@ jobs:
             -w /pkg \
             ${{ matrix.image }} \
             bash -euo pipefail -c '
-              pacman -Syu --noconfirm --needed base-devel git pacman-contrib sudo
+              pacman -Syu --noconfirm --needed base-devel dpkg git pacman-contrib sudo
               useradd -m builder
               chown -R builder:builder /pkg
               sed -i "s/^pkgver=.*/pkgver=${PKGVER}/" PKGBUILD

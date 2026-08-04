@@ -22,8 +22,11 @@ url="https://github.com/openbasil/basil"
 license=('Apache-2.0')
 provides=('basil')
 conflicts=('basil')
+makedepends=('dpkg')
 # The payloads are already-built, already-stripped binaries; do not re-strip them.
 options=('!strip' '!debug')
+source=("extract-man-pages.sh")
+sha256sums=('08bf37009d401e36d5ab41c1bdf2097260424b5e9fddd9369fed0524e94b84d2')
 # Per-architecture release archives produced by dist. `makepkg` selects the
 # `source_<CARCH>` / `sha256sums_<CARCH>` arrays for the building host's arch, so
 # x86_64 and aarch64 packages each pull only their own tarballs. cargo-dist emits
@@ -96,8 +99,7 @@ package() {
   esac
   man_deb="${srcdir}/basil-${pkgver}-${deb_arch}.deb"
   man_root="$(mktemp -d "${srcdir}/basil-man-pages.XXXXXX")"
-  if ! ar p "${man_deb}" data.tar.zst > "${man_root}/data.tar.zst" \
-    || ! tar --zstd -xf "${man_root}/data.tar.zst" -C "${man_root}" ./usr/share/man/man1; then
+  if ! "${srcdir}/extract-man-pages.sh" "${man_deb}" "${man_root}"; then
     echo "could not extract generated man pages from ${man_deb}" >&2
     return 1
   fi

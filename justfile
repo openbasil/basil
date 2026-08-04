@@ -30,16 +30,42 @@ gen-release-workflow:
       echo "error: line ${header_lines} of ${fragment} is not 'jobs:' -- update header_lines" >&2
       exit 1
     fi
-    # Use a pinned `dist` if installed; otherwise fetch the matching version.
-    if command -v dist >/dev/null 2>&1; then
-      dist_cmd=(dist)
+    cfg=dist-workspace.toml
+    # The selected executable must exactly match the one pinned in the dist
+    # configuration. Reject duplicate or malformed pins before any mutation.
+    mapfile -t dist_pins < <(grep -n '^[[:space:]]*cargo-dist-version[[:space:]]*=' "$cfg" || true)
+    if [ "${#dist_pins[@]}" -ne 1 ]; then
+      echo "error: expected exactly one cargo-dist-version pin in $cfg" >&2
+      exit 1
+    fi
+    if [[ "${dist_pins[0]}" =~ ^[0-9]+:cargo-dist-version[[:space:]]*=[[:space:]]*\"([0-9]+\.[0-9]+\.[0-9]+)\"[[:space:]]*$ ]]; then
+      expected_dist_version="${BASH_REMATCH[1]}"
     else
-      dist_cmd=(nix run nixpkgs#cargo-dist --)
+      echo "error: malformed cargo-dist-version pin in $cfg" >&2
+      exit 1
+    fi
+    # Resolve cargo-dist from the exact nixpkgs revision in this flake lock,
+    # rather than accepting PATH or a mutable registry reference.
+    nixpkgs_rev="$(jq -er '
+      .nodes.root.inputs.nixpkgs as $node
+      | if ($node | type) != "string" then error("root nixpkgs input is not a node name") else . end
+      | .nodes[$node].locked
+      | select(.type == "github" and .owner == "NixOS" and .repo == "nixpkgs")
+      | .rev
+      | select(test("^[0-9a-f]{40}$"))
+    ' flake.lock)" || {
+      echo "error: flake.lock must pin root nixpkgs to a 40-character NixOS/nixpkgs Git revision" >&2
+      exit 1
+    }
+    dist_cmd=(nix run "github:NixOS/nixpkgs/${nixpkgs_rev}#cargo-dist" --)
+    actual_dist_version="$("${dist_cmd[@]}" --version)"
+    if [ "$actual_dist_version" != "cargo-dist ${expected_dist_version}" ]; then
+      echo "error: selected cargo-dist is '${actual_dist_version}', expected 'cargo-dist ${expected_dist_version}'" >&2
+      exit 1
     fi
     # dist-workspace.toml pins `allow-dirty = ["ci"]`, which makes `dist generate`
     # SKIP release.yml entirely. Strip that key for a single run so dist actually
     # rewrites the file, then always restore the real config.
-    cfg=dist-workspace.toml
     cfg_backup="$(mktemp)"
     cp "$cfg" "$cfg_backup"
     trap 'cp "$cfg_backup" "$cfg"; rm -f "$cfg_backup"' EXIT
@@ -73,22 +99,26 @@ gen-release-workflow:
         exit 1
         ;;
     esac
-    # dist 0.32.0 emits this exact strict `v{semver}` tag block. Accept its
-    # double-quoted form and the one legacy single-quoted output, then
-    # normalize to the formatter-compliant double-quoted form.
+    # dist 0.32.0 emits this exact loose tag block. Accept it and the two
+    # established strict forms, then normalize to strict double quotes.
+    raw_tag_line="      - '**[0-9]+.[0-9]+.[0-9]+*'"
     canonical_tag_line='      - "v[0-9]+.[0-9]+.[0-9]+*"'
     legacy_tag_line="      - 'v[0-9]+.[0-9]+.[0-9]+*'"
     tag_block="$(sed -n '/^    tags:$/,/^$/p' "$workflow")"
+    raw_tag_block="$(printf '%s\n%s' '    tags:' "$raw_tag_line")"
     canonical_tag_block="$(printf '%s\n%s' '    tags:' "$canonical_tag_line")"
     legacy_tag_block="$(printf '%s\n%s' '    tags:' "$legacy_tag_line")"
     case "$tag_block" in
-      "$canonical_tag_block"|"$legacy_tag_block") ;;
+      "$raw_tag_block"|"$canonical_tag_block"|"$legacy_tag_block") ;;
       *)
         echo "error: unexpected cargo-dist 0.32.0 tag block in $workflow; update gen-release-workflow" >&2
         exit 1
         ;;
     esac
-    sed -i 's|^      - '\''v\[0-9\]+\.\[0-9\]+\.\[0-9\]+\*'\''$|      - "v[0-9]+.[0-9]+.[0-9]+*"|' "$workflow"
+    sed -i \
+      -e 's|^      - '\''\*\*\[0-9\]+\.\[0-9\]+\.\[0-9\]+\*'\''$|      - "v[0-9]+.[0-9]+.[0-9]+*"|' \
+      -e 's|^      - '\''v\[0-9\]+\.\[0-9\]+\.\[0-9\]+\*'\''$|      - "v[0-9]+.[0-9]+.[0-9]+*"|' \
+      "$workflow"
     # ... then re-append the hand-written jobs, minus the anchor header.
     tail -n +"$((header_lines + 1))" "$fragment" >> "$workflow"
     # dist emits actions pinned to moving tags (`@v4`); dist 0.32 has no config
@@ -96,6 +126,25 @@ gen-release-workflow:
     # the re-appended hand-written ones) to commit SHAs. Needs gh auth / GH_TOKEN.
     scripts/pin-github-actions.sh "$workflow"
     echo "regenerated $workflow, re-appended hand-written jobs, and pinned actions to SHAs"
+
+# Verify that the version guard rejects a selected cargo-dist before either
+# generator input can be rewritten. The fake `nix` exists only for this test.
+test-release-generator-version-guard:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    test_root="$(mktemp -d)"
+    trap 'rm -rf "$test_root"' EXIT
+    cp .github/workflows/release.yml "$test_root/release.yml"
+    cp dist-workspace.toml "$test_root/dist-workspace.toml"
+    mkdir "$test_root/bin"
+    printf '%s\n' '#!/usr/bin/env bash' "printf '%s\\n' 'cargo-dist 99.99.99'" >"$test_root/bin/nix"
+    chmod +x "$test_root/bin/nix"
+    if PATH="$test_root/bin:$PATH" just gen-release-workflow; then
+      echo "error: wrong cargo-dist version was accepted" >&2
+      exit 1
+    fi
+    cmp "$test_root/release.yml" .github/workflows/release.yml
+    cmp "$test_root/dist-workspace.toml" dist-workspace.toml
 
 # Pin every third-party GitHub Action referenced in .github/workflows/*.yml to a
 # full commit SHA (the moving tag is kept as a trailing comment). Idempotent.
