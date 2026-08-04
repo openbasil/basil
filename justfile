@@ -14,8 +14,7 @@ man-pages out="target/man":
 
 # Regenerate .github/workflows/release.yml from the cargo-dist config, then
 # re-append the hand-written jobs (debian-packages + arch-package) that dist
-# 0.32.0 cannot emit. `dist generate` OWNS release.yml and would otherwise wipe
-# them. The jobs live in .github/workflows/partials/release-handwritten-jobs.yml
+# 0.32.0 cannot emit. The jobs live in .github/workflows/partials/release-handwritten-jobs.yml
 # under a `jobs:` indentation anchor (a subdir, so GitHub Actions ignores it).
 # Run this after bumping cargo-dist-version or editing the hand-written jobs.
 gen-release-workflow:
@@ -45,18 +44,51 @@ gen-release-workflow:
     cp "$cfg" "$cfg_backup"
     trap 'cp "$cfg_backup" "$cfg"; rm -f "$cfg_backup"' EXIT
     grep -vF 'allow-dirty = ["ci"]' "$cfg_backup" > "$cfg"
-    # Regenerate the dist-owned portion (this DROPS the hand-written jobs) ...
+    # Regenerate the dist-owned portion. cargo-dist 0.32.0 may preserve the
+    # previous hand-written suffix, which is delimited by the canonical
+    # fragment. Migrate the one pre-delimiter fragment shape once; anything
+    # else is ambiguous and fails closed.
     "${dist_cmd[@]}" generate --mode ci
-    # dist 0.32.0 hardcodes a loose tag trigger ('**[0-9]+.[0-9]+.[0-9]+*') that
-    # also matches package-prefixed tags like `basil-v0.6.1`, which dist parses
-    # as a package tag for a binary-less crate (empty release matrix). Tighten
-    # it to the repo-wide tag convention shared with ci.yml and build.yml:
-    # strict `v{semver}` tags only (prerelease suffixes still match).
-    if ! grep -qF -- "- '**[0-9]+.[0-9]+.[0-9]+*'" "$workflow"; then
-      echo "error: dist tag-trigger glob not found in $workflow; dist changed its template -- update gen-release-workflow" >&2
-      exit 1
-    fi
-    sed -i "s/- '\*\*\[0-9\]+\.\[0-9\]+\.\[0-9\]+\*'/- 'v[0-9]+.[0-9]+.[0-9]+*'/" "$workflow"
+    fragment_begin='  # BEGIN HAND-WRITTEN RELEASE JOBS: managed by just gen-release-workflow'
+    fragment_end='  # END HAND-WRITTEN RELEASE JOBS: managed by just gen-release-workflow'
+    legacy_marker='  # HAND-WRITTEN JOBS (not managed by dist). Regenerate release.yml with'
+    begin_count="$(grep -cFx -- "$fragment_begin" "$workflow" || true)"
+    end_count="$(grep -cFx -- "$fragment_end" "$workflow" || true)"
+    legacy_count="$(grep -cFx -- "$legacy_marker" "$workflow" || true)"
+    case "$begin_count:$end_count:$legacy_count" in
+      0:0:0) ;;
+      1:1:1) sed -i "/^${fragment_begin}$/,/^${fragment_end}$/d" "$workflow" ;;
+      0:0:1)
+        legacy_line="$(grep -nFx -- "$legacy_marker" "$workflow" | cut -d: -f1)"
+        legacy_start="$((legacy_line - 1))"
+        if [ "$legacy_start" -lt 1 ] \
+          || [ "$(sed -n "${legacy_start}p" "$workflow")" != '  # ===========================================================================' ]; then
+          echo "error: legacy hand-written fragment has an unexpected boundary in $workflow" >&2
+          exit 1
+        fi
+        sed -i "${legacy_start},\$d" "$workflow"
+        ;;
+      *)
+        echo "error: unexpected hand-written fragment delimiters in $workflow; refusing to choose one" >&2
+        exit 1
+        ;;
+    esac
+    # dist 0.32.0 emits this exact strict `v{semver}` tag block. A subsequent
+    # generation preserves the canonical quote style below. Accept only those
+    # two complete blocks, then normalize to the repository's canonical form.
+    dist_tag_line='      - "v[0-9]+.[0-9]+.[0-9]+*"'
+    strict_tag_line="      - 'v[0-9]+.[0-9]+.[0-9]+*'"
+    tag_block="$(sed -n '/^    tags:$/,/^$/p' "$workflow")"
+    dist_tag_block="$(printf '%s\n%s' '    tags:' "$dist_tag_line")"
+    strict_tag_block="$(printf '%s\n%s' '    tags:' "$strict_tag_line")"
+    case "$tag_block" in
+      "$dist_tag_block"|"$strict_tag_block") ;;
+      *)
+        echo "error: unexpected cargo-dist 0.32.0 tag block in $workflow; update gen-release-workflow" >&2
+        exit 1
+        ;;
+    esac
+    sed -i 's|^      - "v\[0-9\]+\.\[0-9\]+\.\[0-9\]+\*"$|      - '\''v[0-9]+.[0-9]+.[0-9]+*'\''|' "$workflow"
     # ... then re-append the hand-written jobs, minus the anchor header.
     tail -n +"$((header_lines + 1))" "$fragment" >> "$workflow"
     # dist emits actions pinned to moving tags (`@v4`); dist 0.32 has no config

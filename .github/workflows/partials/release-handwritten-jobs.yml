@@ -14,7 +14,7 @@
 # flushing it to column 0. `just gen-release-workflow` skips this 16-line header
 # (through `jobs:`) and appends only the job definitions that follow.
 jobs:
-
+  # BEGIN HAND-WRITTEN RELEASE JOBS: managed by just gen-release-workflow
   # ===========================================================================
   # HAND-WRITTEN JOBS (not managed by dist). Regenerate release.yml with
   # `just gen-release-workflow` -- do not hand-edit the copy inside release.yml.
@@ -214,3 +214,4 @@ jobs:
           subject-path: ${{ steps.pkg.outputs.path }}
       - name: Attach the Arch package to the GitHub Release
         run: gh release upload "${{ needs.plan.outputs.tag }}" "${{ steps.pkg.outputs.path }}" --clobber
+  # END HAND-WRITTEN RELEASE JOBS: managed by just gen-release-workflow
