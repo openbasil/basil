@@ -73,22 +73,22 @@ gen-release-workflow:
         exit 1
         ;;
     esac
-    # dist 0.32.0 emits this exact strict `v{semver}` tag block. A subsequent
-    # generation preserves the canonical quote style below. Accept only those
-    # two complete blocks, then normalize to the repository's canonical form.
-    dist_tag_line='      - "v[0-9]+.[0-9]+.[0-9]+*"'
-    strict_tag_line="      - 'v[0-9]+.[0-9]+.[0-9]+*'"
+    # dist 0.32.0 emits this exact strict `v{semver}` tag block. Accept its
+    # double-quoted form and the one legacy single-quoted output, then
+    # normalize to the formatter-compliant double-quoted form.
+    canonical_tag_line='      - "v[0-9]+.[0-9]+.[0-9]+*"'
+    legacy_tag_line="      - 'v[0-9]+.[0-9]+.[0-9]+*'"
     tag_block="$(sed -n '/^    tags:$/,/^$/p' "$workflow")"
-    dist_tag_block="$(printf '%s\n%s' '    tags:' "$dist_tag_line")"
-    strict_tag_block="$(printf '%s\n%s' '    tags:' "$strict_tag_line")"
+    canonical_tag_block="$(printf '%s\n%s' '    tags:' "$canonical_tag_line")"
+    legacy_tag_block="$(printf '%s\n%s' '    tags:' "$legacy_tag_line")"
     case "$tag_block" in
-      "$dist_tag_block"|"$strict_tag_block") ;;
+      "$canonical_tag_block"|"$legacy_tag_block") ;;
       *)
         echo "error: unexpected cargo-dist 0.32.0 tag block in $workflow; update gen-release-workflow" >&2
         exit 1
         ;;
     esac
-    sed -i 's|^      - "v\[0-9\]+\.\[0-9\]+\.\[0-9\]+\*"$|      - '\''v[0-9]+.[0-9]+.[0-9]+*'\''|' "$workflow"
+    sed -i 's|^      - '\''v\[0-9\]+\.\[0-9\]+\.\[0-9\]+\*'\''$|      - "v[0-9]+.[0-9]+.[0-9]+*"|' "$workflow"
     # ... then re-append the hand-written jobs, minus the anchor header.
     tail -n +"$((header_lines + 1))" "$fragment" >> "$workflow"
     # dist emits actions pinned to moving tags (`@v4`); dist 0.32 has no config
