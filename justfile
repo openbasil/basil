@@ -152,11 +152,45 @@ test-release-generator-version-guard:
 pin-actions:
     scripts/pin-github-actions.sh
 
-check:
+# Rust gates: build, lint, test, and format-check.
+check-rust:
     cargo build  --workspace --all-features
     cargo clippy --workspace --all-targets --all-features -- -D warnings
     cargo test   --workspace
-    fd -e rs -x rustfmt --edition 2024
+    cargo fmt --all -- --check
+
+# Go gates: module hygiene, build, vet, test, and format-check.
+check-go:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    go_modules=(
+      clients/go
+      crates/basil-tests/tests/cose_go_interop
+      crates/basil-tests/tests/oidc_verifier_go
+      interop-tests/go-spiffe
+    )
+    for module in "${go_modules[@]}"; do
+      echo "== Go gates: ${module}"
+      (
+        cd "$module"
+        go mod tidy -diff
+        go build ./...
+        go vet ./...
+        go test -count=1 ./...
+      )
+    done
+    unformatted="$(fd -e go -E vendor -x gofmt -l)"
+    if [[ -n "$unformatted" ]]; then
+      echo "Go files require formatting:"
+      printf '%s\n' "$unformatted"
+      exit 1
+    fi
+
+# Shell gates.
+check-sh:
+    fd -e sh -0 | xargs -0 shellcheck
+
+check: (check-rust) (check-go) (check-sh)
     typos
 
 # Validate the pinned source, patch, corpora, version, and platform manifest

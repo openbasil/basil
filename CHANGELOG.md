@@ -36,6 +36,11 @@ SPDX-License-Identifier: Apache-2.0
   work from Jujutsu workspaces while keeping the sandbox sealed from unrelated
   host paths.
 
+### Release scope
+
+- Keeps Docker and Podman runtime integration, container-only image packaging,
+  and rootless-container qualification outside the 0.7.2 maintenance line.
+
 ## 0.7.1 2026-07-08
 
 ### `basil demo`: a zero-dependency guided tour

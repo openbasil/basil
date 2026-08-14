@@ -9,9 +9,6 @@
 extend-exclude = [
   "docs/archive",
   "**/vendor/github.com/**",
-  "interop-tests/compose-phase1/guest/wrapper-feasibility.sh",
-  "interop-tests/compose-phase1/guest/capacity-ladder.sh",
-  "scripts/compose-phase1-artifacts.ubuntu-24.04-docker-packages-x86_64.packages.tsv", # fpr
 ]
 
 [default]

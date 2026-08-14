@@ -20,9 +20,9 @@ with `UnsupportedPlatform`.
 
 `InvocationCourierClient` exposes only challenge issuance and sealed
 invocation. It verifies the local listener's capability response at startup and
-immediately before each forwarded call. A host, container, unknown, optional-
-freshness, or wrong-version listener is rejected.
+immediately before each forwarded call. A host, unknown, optional-freshness, or
+wrong-version listener is rejected.
 
 `InvocationOnlyClient` preserves local invocation-only NATS compatibility over
-the same trusted connector. It accepts only a Host or Container listener with
-optional freshness and exposes only sealed invocation.
+the same trusted connector. It accepts only a Host listener with optional
+freshness and exposes only sealed invocation.

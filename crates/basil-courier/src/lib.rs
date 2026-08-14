@@ -179,7 +179,7 @@ struct TestForwardBarrier {
     reconnect_attempts: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-/// Typed invocation-only client for a local Host or Container listener.
+/// Typed invocation-only client for a local Host listener.
 ///
 /// This compatibility surface uses the same hardened Unix connector as a
 /// courier, but rejects courier listeners and mandatory-freshness profiles. It

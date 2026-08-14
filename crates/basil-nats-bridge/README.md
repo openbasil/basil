@@ -43,9 +43,9 @@ max-message-bytes = 1048576
 
 `creds`, `queue-group`, and `max-message-bytes` may be omitted.
 
-This invocation-only form is the local legacy mode. It accepts a Host or
-Container Basil listener only when that listener reports optional freshness. It
-rejects Courier, unknown, or mandatory-freshness profiles, does not transport
+This invocation-only form is the local legacy mode. It accepts a Host Basil
+listener only when that listener reports optional freshness. It rejects
+Courier, unknown, or mandatory-freshness profiles, does not transport
 freshness challenges, and makes no federation guarantee.
 
 Federation mode adds one distinct challenge subject and one operator-selected

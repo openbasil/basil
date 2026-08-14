@@ -78,8 +78,7 @@ verify a download with `gh attestation verify <file> --repo openbasil/basil`.
 The release archives, deb, Arch, and Nix packages ship `basil`,
 `basil-nats-bridge`, and `basil-https-courier`; packages also ship their man
 pages and bash/zsh/fish completions (`basil completions <shell>` generates them
-anywhere else). A NixOS module is included under `nix/`, and `nix build .#basil-oci-thin` builds a
-`docker load`-ready container image.
+anywhere else). A NixOS module is included under `nix/`.
 
 The [Cachix external-custody proposal](packaging/cachix/README.md) is a pinned,
 opt-in Cachix `1.11.1` package for self-managed cache uploads. It signs through

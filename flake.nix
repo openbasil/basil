@@ -50,13 +50,9 @@
           };
           workspace_version = (fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
 
-          # Docker/OCI architecture name for the single-arch image tag. Basil
-          # publishes one image per build platform (no multi-arch manifest list
-          # yet), so the arch is pinned into the tag to keep `basil:<version>-amd64`
-          # and `basil:<version>-arm64` from colliding on load. Drop the suffix
-          # once a multi-arch manifest is published. Only forced under the
-          # linux-gated image output, so darwin eval never hits the missing key.
-          dockerArch =
+          # Debian architecture name for packages built on each Linux platform.
+          # This value is forced only by the Linux-gated package output.
+          debArch =
             {
               "x86_64-linux" = "amd64";
               "aarch64-linux" = "arm64";
@@ -68,7 +64,7 @@
             # To refresh after editing rust-toolchain.toml: set sha256 = "" (or
             # lib.fakeHash), run `nix build` (or `nix develop`), and paste the
             # `got:` sha256 the hash-mismatch error prints into this field.
-            sha256 = "sha256-h+t2xTBz5yt2YIO+1VMIIGlCU7gyp2LYOFvaV1nwOXU=";
+            sha256 = "sha256-OATSZm98Es5kIFuqaba+UvkQtFsVgJEBMmS+t6od5/U=";
           };
           toolchainNightly = inputs.fenix.packages.${system}.latest.toolchain;
           shellTools = with pkgs; [
@@ -126,8 +122,12 @@
                   ;
                 postInstall = lib.optionalString installManPages manPagesPostInstall + postInstall;
                 version = workspace_version;
-                cargoLock.lockFile = ./Cargo.lock;
-                cargoHash = pkgs.lib.fakeSha256;
+                cargoLock = {
+                  lockFile = ./Cargo.lock;
+                  outputHashes = {
+                    "age-0.12.1" = "sha256-CNYGypRocOTPj454fLOr0xGA2zFj54PKPEC6opGE9f4=";
+                  };
+                };
                 src = ./.;
                 nativeBuildInputs = [ buildProtobuf ];
                 PROTOC = "${buildProtobuf}/bin/protoc";
@@ -187,9 +187,6 @@
           tpm-unlock-test = import ./nix/tests/tpm-unlock-test.nix {
             inherit pkgs basilTpm;
           };
-          rootless-keyring-quota-test = import ./nix/tests/rootless-keyring-quota-test.nix {
-            inherit pkgs basil;
-          };
           basil-agent-schema3-test = import ./nix/tests/basil-agent-schema3-test.nix {
             inherit pkgs basil;
             nixosSystem = inputs.nixpkgs.lib.nixosSystem;
@@ -242,92 +239,6 @@
             basil-tpm-aarch64-linux = basilTpmAarch64Linux;
           }
           // lib.optionalAttrs (lib.hasSuffix "linux" system) {
-            # A `docker load`- and `podman load`-ready image archive built with
-            # `buildLayeredImage`. Both runtimes accept this format directly, so
-            # there is no skopeo/`oci-archive` conversion step:
-            #   nix build .#basil-oci-thin
-            #   docker load < result        # or: podman load < result
-            #   docker run --rm basil:<version>-<arch> --help   # e.g. -amd64
-            # LOAD it, never `docker import`/`podman import`, which build an image
-            # from a bare rootfs and discard the entrypoint/config, leaving an image
-            # that runs nothing. To publish it as OCI on the wire, push the same
-            # artifact with `skopeo copy docker-archive:result docker://<registry>`.
-            basil-oci-thin = pkgs.dockerTools.buildLayeredImage {
-              name = "basil";
-              tag = "${workspace_version}-${dockerArch}";
-              contents = pkgs.buildEnv {
-                name = "basil-thin-root";
-                paths = [ basil ];
-                pathsToLink = [ "/bin" ];
-              };
-              config = {
-                Entrypoint = [ "/bin/basil" ];
-                WorkingDir = "/";
-                Labels = {
-                  "org.opencontainers.image.description" = "Basil broker and client CLI";
-                  "org.opencontainers.image.source" = "https://github.com/openbasil/basil";
-                  "org.opencontainers.image.title" = "basil";
-                  "org.opencontainers.image.version" = workspace_version;
-                };
-              };
-            };
-
-            # The interactive trial image: `docker run -it basil-playground:<tag>`
-            # runs the self-contained `basil demo` (built-in db-keystore backend,
-            # no external services), restarts the demo broker, and drops into a
-            # shell with BASIL_SOCKET set so the visitor can try commands
-            # immediately. This is the zero-install trial path for people who
-            # won't install anything; load it like basil-oci-thin above.
-            #   nix build .#basil-playground-oci
-            #   docker load < result
-            #   docker run --rm -it basil-playground:<version>-<arch>
-            basil-playground-oci =
-              let
-                entry = pkgs.writeShellApplication {
-                  name = "basil-playground";
-                  text = ''
-                    basil demo --dir /tmp/basil-demo --force "$@"
-                    export BASIL_SOCKET=/tmp/basil-demo/basil.sock
-                    basil agent --config /tmp/basil-demo/basil-agent.toml \
-                      > /tmp/basil-demo/agent.log 2>&1 &
-                    for _ in $(seq 1 100); do
-                      [ -S "$BASIL_SOCKET" ] && break
-                      sleep 0.1
-                    done
-                    echo
-                    echo "The demo broker is running again and BASIL_SOCKET is set."
-                    echo "Try: basil status | basil list | basil sign --key-id demo.signing_key 'hi'"
-                    exec bash -i
-                  '';
-                };
-              in
-              pkgs.dockerTools.buildLayeredImage {
-                name = "basil-playground";
-                tag = "${workspace_version}-${dockerArch}";
-                contents = pkgs.buildEnv {
-                  name = "basil-playground-root";
-                  paths = [
-                    basil
-                    entry
-                    pkgs.bashInteractive
-                    pkgs.coreutils
-                  ];
-                  pathsToLink = [ "/bin" ];
-                };
-                config = {
-                  Entrypoint = [ "/bin/basil-playground" ];
-                  WorkingDir = "/";
-                  Env = [ "PATH=/bin" ];
-                  Labels = {
-                    "org.opencontainers.image.description" =
-                      "Basil guided-tour playground: basil demo plus an interactive shell";
-                    "org.opencontainers.image.source" = "https://github.com/openbasil/basil";
-                    "org.opencontainers.image.title" = "basil-playground";
-                    "org.opencontainers.image.version" = workspace_version;
-                  };
-                };
-              };
-
             # A Debian package assembled with `dpkg-deb` (no ruby/fpm): the three
             # binaries under `/usr/bin` and the gzipped man pages under
             # `/usr/share/man/man1`, from the single `basilDist` build. The arch
@@ -338,11 +249,11 @@
             #   nix build .#basil-deb
             #   dpkg-deb --contents result/*.deb
             basil-deb =
-              pkgs.runCommand "basil-deb-${workspace_version}-${dockerArch}"
+              pkgs.runCommand "basil-deb-${workspace_version}-${debArch}"
                 {
                   nativeBuildInputs = [ pkgs.dpkg ];
                   meta = {
-                    description = "Debian package for the Basil broker and couriers (${dockerArch}).";
+                    description = "Debian package for the Basil broker and couriers (${debArch}).";
                   };
                 }
                 ''
@@ -359,7 +270,7 @@
                     echo "Version: ${workspace_version}"
                     echo "Section: utils"
                     echo "Priority: optional"
-                    echo "Architecture: ${dockerArch}"
+                    echo "Architecture: ${debArch}"
                     echo "Maintainer: Basil maintainers <info@openbasil.org>"
                     echo "Homepage: https://github.com/openbasil/basil"
                     echo "Depends: libc6"
@@ -372,7 +283,7 @@
 
                   mkdir -p "$out"
                   dpkg-deb --root-owner-group --build "$root" \
-                    "$out/basil_${workspace_version}_${dockerArch}.deb"
+                    "$out/basil_${workspace_version}_${debArch}.deb"
                 '';
           };
           devShells.default = pkgs.mkShell {
@@ -389,14 +300,10 @@
         }
         # Linux-only: nixosTest builds NixOS guest VMs, which only make sense on
         # Linux systems. Keep them outside `checks` so `nix flake check` remains
-        # lightweight. The rootless-keyring-quota lane is x86_64-only; build it as
-        # `nix build .#tests.x86_64-linux.rootless-keyring-quota`.
+        # lightweight.
         // lib.optionalAttrs (lib.hasSuffix "linux" system) {
           tests = {
             tpm-unlock = tpm-unlock-test;
-          }
-          // lib.optionalAttrs (system == "x86_64-linux") {
-            rootless-keyring-quota = rootless-keyring-quota-test;
           };
         }
       );
