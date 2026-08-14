@@ -9,6 +9,9 @@
 extend-exclude = [
   "docs/archive",
   "**/vendor/github.com/**",
+  "interop-tests/compose-phase1/guest/wrapper-feasibility.sh",
+  "interop-tests/compose-phase1/guest/capacity-ladder.sh",
+  "scripts/compose-phase1-artifacts.ubuntu-24.04-docker-packages-x86_64.packages.tsv", # fpr
 ]
 
 [default]
@@ -16,14 +19,17 @@ extend-ignore-identifiers-re = [
   ".*(cose|Cose|COSE).*",
   ".*Encrypter.*",
   "Tpm.*",
+  # br ticket-id suffixes (e.g. `basil-1som`): the hyphen splits the id, so
+  # typos sees a digit-prefixed identifier like `1som` and flags `som`.
+  "^[0-9]+[a-z]{1,4}$",
 ]
 
 [default.extend-identifiers]
 # overrides: if right side of equals is same as left side, no change is made
 AOTHER = "AOTHER"
+WRONLY = "WRONLY" # rustix::fs::OFlags::WRONLY (POSIX O_WRONLY)
 HashiCorp = "HashiCorp"
 PNGs = "PNGs"
-WRONLY = "WRONLY"
 encrypter = "encrypter"
 fals = "fals"
 keyedhash_parms = "keyedhash_parms"

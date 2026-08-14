@@ -318,8 +318,8 @@ fn assert_mode_0600(path: &Path, engine: Engine) {
 #[cfg(not(unix))]
 fn assert_mode_0600(_path: &Path, _engine: Engine) {}
 
-/// Spawn `basil agent -c <config> --socket <socket> --vault-addr <addr>`,
-/// logging to `<dir>/broker.log`.
+/// Spawn `basil agent -c <config> --socket <socket>`, logging to
+/// `<dir>/broker.log`. The scaffolded catalog already contains `addr`.
 fn spawn_run(config: &Path, socket: &Path, addr: &str) -> std::process::Child {
     let dir = config.parent().expect("config has a parent dir");
     let log = std::fs::File::create(dir.join("broker.log")).expect("create broker log");
@@ -329,7 +329,6 @@ fn spawn_run(config: &Path, socket: &Path, addr: &str) -> std::process::Child {
         .arg(config)
         .arg("--socket")
         .arg(socket)
-        .args(["--vault-addr", addr])
         .env("VAULT_ADDR", addr)
         .stdout(log.try_clone().expect("clone log handle"))
         .stderr(log)

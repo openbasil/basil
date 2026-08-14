@@ -10,7 +10,12 @@
 
 #![allow(clippy::result_large_err)]
 
+pub mod connection;
 pub mod grpc_server;
+pub mod listener;
+pub mod listener_manager;
+pub mod rewire;
+pub mod rpc_registry;
 
 use prost::Message;
 use tonic::codegen::Bytes;
@@ -20,9 +25,11 @@ use tonic::{Code, Request, Status};
 
 use crate::actor::{AuthenticatedActor, SubjectResolutionError};
 use crate::catalog::policy::Op;
+use crate::catalog::{Decision, DenyReason};
 use crate::decision::{DecisionRecord, op_token};
 use crate::peer::PeerInfo;
 use crate::state::{BrokerState, Generation};
+use connection::{ConnectionRegistryError, ConnectionStreamLease, ListenerConnectInfo};
 
 /// Resolve the attested peer from a tonic request.
 #[must_use]
@@ -66,11 +73,98 @@ pub fn authorize_in_generation<T>(
     authorize_extensions_in_generation(state, generation, request.extensions(), op, key)
 }
 
+/// An authorization failure retaining the resolved actor for denial auditing.
+#[derive(Debug)]
+pub struct AuthorizationFailure {
+    actor: Option<AuthenticatedActor>,
+    status: Status,
+}
+
+impl AuthorizationFailure {
+    /// Resolved authenticated actor, absent only when subject resolution failed.
+    #[must_use]
+    pub const fn actor(&self) -> Option<&AuthenticatedActor> {
+        self.actor.as_ref()
+    }
+
+    /// Consume the detailed failure and return its wire status.
+    #[must_use]
+    pub fn into_status(self) -> Status {
+        self.status
+    }
+}
+
+/// Authorize against one pinned generation while retaining a denied actor.
+///
+/// This is used by services whose dedicated audit event must attribute policy
+/// denial to the authenticated transport subject. Resolution failures have no
+/// authenticated subject and therefore return `actor = None`.
+pub fn authorize_in_generation_detailed<T>(
+    state: &BrokerState,
+    generation: &Generation,
+    request: &Request<T>,
+    op: Op,
+    key: &str,
+) -> Result<AuthenticatedActor, AuthorizationFailure> {
+    authorize_extensions_in_generation_detailed(state, generation, request.extensions(), op, key)
+}
+
+fn authorize_extensions_in_generation_detailed(
+    state: &BrokerState,
+    generation: &Generation,
+    extensions: &Extensions,
+    op: Op,
+    key: &str,
+) -> Result<AuthenticatedActor, AuthorizationFailure> {
+    let peer = peer_from_extensions(extensions);
+    let actor = generation
+        .pdp()
+        .resolve_local_actor(&peer)
+        .map_err(|error| {
+            record_resolution_error(state, generation.id(), &peer, op, key, &error);
+            AuthorizationFailure {
+                actor: None,
+                status: resolution_status(op, &error),
+            }
+        })?;
+    if let Err(status) =
+        enforce_listener_domain_extensions(state, generation.id(), extensions, &actor, op, key)
+    {
+        return Err(AuthorizationFailure {
+            actor: Some(actor),
+            status,
+        });
+    }
+
+    let decision = generation.pdp().decide(&actor, op, key);
+    state.record_decision(&DecisionRecord::from_actor_decision(
+        generation.id(),
+        &actor,
+        op,
+        key,
+        &decision,
+    ));
+    if decision.is_deny() {
+        return Err(AuthorizationFailure {
+            actor: Some(actor),
+            status: broker_status(
+                Code::PermissionDenied,
+                "UNAUTHORIZED",
+                op_token(op),
+                "not authorized",
+            ),
+        });
+    }
+    Ok(actor)
+}
+
 fn peer_from_extensions(extensions: &Extensions) -> PeerInfo {
     if let Some(peer) = extensions.get::<PeerInfo>() {
         return peer.clone();
     }
-
+    if let Some(info) = extensions.get::<ListenerConnectInfo>() {
+        return info.peer().clone();
+    }
     extensions
         .get::<UdsConnectInfo>()
         .and_then(|info| info.peer_cred.as_ref())
@@ -86,30 +180,140 @@ fn authorize_extensions_in_generation(
     op: Op,
     key: &str,
 ) -> Result<AuthenticatedActor, Status> {
-    let peer = peer_from_extensions(extensions);
-    let actor = generation.pdp().resolve_local_actor(&peer).map_err(|err| {
-        record_resolution_error(state, generation.id(), &peer, op, key, &err);
-        resolution_status(op, &err)
-    })?;
+    authorize_extensions_in_generation_detailed(state, generation, extensions, op, key)
+        .map_err(AuthorizationFailure::into_status)
+}
 
-    let decision = generation.pdp().decide(&actor, op, key);
-    state.record_decision(&DecisionRecord::from_actor_decision(
-        generation.id(),
-        &actor,
-        op,
-        key,
-        &decision,
-    ));
-    if decision.is_deny() {
-        return Err(broker_status(
-            Code::PermissionDenied,
-            "UNAUTHORIZED",
+/// Enforce typed-listener domain admission for a previously resolved actor.
+///
+/// Services with custom authorization flows use this before their first policy
+/// decision.
+pub(crate) fn enforce_listener_domain<T>(
+    state: &BrokerState,
+    generation: u64,
+    request: &Request<T>,
+    actor: &AuthenticatedActor,
+    op: Op,
+    key: &str,
+) -> Result<(), Status> {
+    enforce_listener_domain_extensions(state, generation, request.extensions(), actor, op, key)
+}
+
+/// Return the immutable accepted-transport context for a request.
+///
+/// # Errors
+///
+/// Returns a typed unavailable status when the server did not attach listener
+/// context.
+pub(crate) fn listener_context<T>(
+    request: &Request<T>,
+    op: Op,
+) -> Result<ListenerConnectInfo, Status> {
+    request
+        .extensions()
+        .get::<ListenerConnectInfo>()
+        .cloned()
+        .ok_or_else(|| {
+            broker_status(
+                Code::Unavailable,
+                "LISTENER_CONTEXT_UNAVAILABLE",
+                op_token(op),
+                "listener context unavailable",
+            )
+        })
+}
+
+/// Register a long-lived stream against its owning accepted connection.
+///
+/// A missing registry entry means the transport concurrently closed. Its
+/// response stream can no longer reach a client, so no lease is necessary.
+///
+/// # Errors
+///
+/// Returns a typed unavailable status if the stream counter is exhausted.
+pub(crate) fn begin_long_lived_stream(
+    state: &BrokerState,
+    listener: &ListenerConnectInfo,
+    op: Op,
+) -> Result<Option<ConnectionStreamLease>, Status> {
+    match state.connections().begin_stream(listener.connection_id()) {
+        Ok(lease) => Ok(Some(lease)),
+        Err(ConnectionRegistryError::ConnectionUnavailable) => Ok(None),
+        Err(error) => Err(broker_status(
+            Code::Unavailable,
+            "STREAM_REGISTRATION_UNAVAILABLE",
             op_token(op),
-            "not authorized",
-        ));
+            error.to_string(),
+        )),
+    }
+}
+
+/// Enforce typed-listener admission using retained immutable connection context.
+pub(crate) fn enforce_listener_domain_info(
+    state: &BrokerState,
+    generation: u64,
+    listener: &ListenerConnectInfo,
+    actor: &AuthenticatedActor,
+    op: Op,
+    key: &str,
+) -> Result<(), Status> {
+    state
+        .connections()
+        .record_actor(listener.connection_id(), actor);
+    let admitted = match listener.listener_type() {
+        grpc_server::ListenerType::Host => true,
+        // Courier RPCs resolve their gateway and remote evidence inside the
+        // sealed-invocation service. No ordinary authorization domain is
+        // admitted on this closed listener surface.
+        grpc_server::ListenerType::Courier => false,
+    };
+    if admitted {
+        return Ok(());
     }
 
-    Ok(actor)
+    state.record_decision(&DecisionRecord::from_actor_decision(
+        generation,
+        actor,
+        op,
+        key,
+        &Decision::Deny {
+            reason: DenyReason::NotPermitted,
+        },
+    ));
+    Err(broker_status(
+        Code::PermissionDenied,
+        "LISTENER_DOMAIN_MISMATCH",
+        op_token(op),
+        "listener does not admit resolved workload domain",
+    ))
+}
+
+fn enforce_listener_domain_extensions(
+    state: &BrokerState,
+    generation: u64,
+    extensions: &Extensions,
+    actor: &AuthenticatedActor,
+    op: Op,
+    key: &str,
+) -> Result<(), Status> {
+    let Some(listener) = extensions.get::<ListenerConnectInfo>() else {
+        state.record_decision(&DecisionRecord::from_actor_decision(
+            generation,
+            actor,
+            op,
+            key,
+            &Decision::Deny {
+                reason: DenyReason::NotPermitted,
+            },
+        ));
+        return Err(broker_status(
+            Code::Unavailable,
+            "LISTENER_CONTEXT_UNAVAILABLE",
+            op_token(op),
+            "listener context unavailable",
+        ));
+    };
+    enforce_listener_domain_info(state, generation, listener, actor, op, key)
 }
 
 fn record_resolution_error(
@@ -121,19 +325,16 @@ fn record_resolution_error(
     err: &SubjectResolutionError,
 ) {
     let reason = match err {
-        SubjectResolutionError::MissingPeerCredentials => "no_actor_subject".to_string(),
-        SubjectResolutionError::NoSubject { uid } => {
-            format!("no_actor_subject:{uid}")
-        }
-        SubjectResolutionError::AmbiguousSubject { uid, .. } => {
-            format!("ambiguous_actor_subject:{uid}")
-        }
-        SubjectResolutionError::InvalidUnauthenticatedSubject { subject } => {
-            format!("invalid_unauthenticated_subject:{subject}")
+        SubjectResolutionError::MissingPeerCredentials
+        | SubjectResolutionError::NoSubject { .. } => "no_actor_subject".to_string(),
+        SubjectResolutionError::DomainUnavailable => "actor_domain_unavailable".to_string(),
+        SubjectResolutionError::AmbiguousSubject { .. } => "ambiguous_actor_subject".to_string(),
+        SubjectResolutionError::EvidenceUnavailable { .. } => {
+            "actor_evidence_unavailable".to_string()
         }
     };
-    state.record_decision(&DecisionRecord::from_resolution_error(
-        generation, peer, op, key, reason,
+    state.record_decision(&DecisionRecord::from_subject_resolution_error(
+        generation, peer, op, key, err, &reason,
     ));
 }
 
@@ -147,7 +348,8 @@ fn resolution_status(op: Op, err: &SubjectResolutionError) -> Status {
         ),
         SubjectResolutionError::NoSubject { .. }
         | SubjectResolutionError::AmbiguousSubject { .. }
-        | SubjectResolutionError::InvalidUnauthenticatedSubject { .. } => broker_status(
+        | SubjectResolutionError::DomainUnavailable
+        | SubjectResolutionError::EvidenceUnavailable { .. } => broker_status(
             Code::PermissionDenied,
             "UNAUTHORIZED",
             op_token(op),
@@ -164,6 +366,16 @@ pub fn broker_status(
     op: &'static str,
     message: impl Into<String>,
 ) -> Status {
+    broker_status_with_details(code, reason, op, message, Vec::new())
+}
+
+fn broker_status_with_details(
+    code: Code,
+    reason: &str,
+    op: &str,
+    message: impl Into<String>,
+    mut extra_details: Vec<prost_types::Any>,
+) -> Status {
     let info = basil_proto::broker::v1::BrokerErrorInfo {
         reason: reason.to_string(),
         op: op.to_string(),
@@ -172,10 +384,12 @@ pub fn broker_status(
         type_url: "type.googleapis.com/basil.broker.v1.BrokerErrorInfo".to_string(),
         value: info.encode_to_vec(),
     };
+    let mut details = vec![detail];
+    details.append(&mut extra_details);
     let status = basil_proto::google::rpc::Status {
         code: code as i32,
         message: message.into(),
-        details: vec![detail],
+        details,
     };
     Status::with_details(
         code,
@@ -216,7 +430,7 @@ mod tests {
     const POLICY: &str = r#"{
       "schema": "policy",
       "subjects": {
-        "svc.app": { "allOf": [ { "kind": "unix", "uid": 42 } ] }
+        "svc.app": { "domain": "host-process", "match": { "all": [ { "process.uid": 42 } ] } }
       },
       "roles": { "reader": ["get"] },
       "rules": [
@@ -231,7 +445,7 @@ mod tests {
     const DENY_POLICY: &str = r#"{
       "schema": "policy",
       "subjects": {
-        "svc.app": { "allOf": [ { "kind": "unix", "uid": 42 } ] }
+        "svc.app": { "domain": "host-process", "match": { "all": [ { "process.uid": 42 } ] } }
       },
       "roles": {},
       "rules": [],
@@ -286,10 +500,16 @@ mod tests {
 
     fn request_with_uid(uid: u32) -> Request<()> {
         let mut request = Request::new(());
-        request.extensions_mut().insert(PeerInfo {
-            uid: Some(uid),
-            ..PeerInfo::default()
-        });
+        request
+            .extensions_mut()
+            .insert(ListenerConnectInfo::for_test(
+                "host",
+                grpc_server::ListenerType::Host,
+                PeerInfo {
+                    uid: Some(uid),
+                    ..PeerInfo::default()
+                },
+            ));
         request
     }
 
@@ -336,6 +556,23 @@ mod tests {
         let request = Request::new(());
         let status = authorize(&state, &request, Op::Get, "app.secret").expect_err("no uid");
         assert_eq!(status.code(), Code::Unauthenticated);
+    }
+
+    #[test]
+    fn authorize_fails_closed_when_listener_context_is_missing() {
+        let state = state();
+        let mut request = Request::new(());
+        request.extensions_mut().insert(PeerInfo {
+            uid: Some(42),
+            ..PeerInfo::default()
+        });
+        let status = authorize(&state, &request, Op::Get, "app.secret")
+            .expect_err("missing listener context must fail closed");
+        assert_eq!(status.code(), Code::Unavailable);
+        let rpc = RpcStatus::decode(status.details()).expect("details decode");
+        let detail = rpc.details.first().expect("detail present");
+        let info = BrokerErrorInfo::decode(detail.value.as_slice()).expect("info decodes");
+        assert_eq!(info.reason, "LISTENER_CONTEXT_UNAVAILABLE");
     }
 
     #[test]

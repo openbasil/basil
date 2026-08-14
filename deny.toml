@@ -1,0 +1,100 @@
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Workspace supply-chain gate (cargo-deny), adopted per basil-0npm.
+#
+# Decision record: docs/reviews/0npm-supply-chain-gate-decision.md
+# Run: `cargo deny check` (advisories need network to refresh the DB;
+# `cargo deny check bans licenses sources` runs fully offline).
+#
+# The [bans].deny ceilings below are the mechanical half of the review
+# conditions from docs/R1-20260718 (basil-zy3d): the dependency that entered
+# the security core in that round is held at its reviewed version. Bumping it
+# REQUIRES editing this file in the same change, which triggers the recorded
+# dependency-diff review.
+
+[graph]
+# The broker is Linux-only (SO_PEERCRED / unix sockets); evaluate the
+# dependency graph for the shipped targets rather than every possible cfg.
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+]
+all-features = true
+
+[advisories]
+# Defaults (v2 schema): vulnerabilities, unmaintained (workspace-reachable),
+# unsound, and yanked crates all error.
+yanked = "deny"
+# Accepted-finding ledger, recorded at gate adoption (2026-07-21). Every
+# entry needs a reason and a tracking ticket; burn-down is basil-0niq.
+# None of these is fixable by a lockfile-only `cargo update` — each needs an
+# upstream stack move in basil-core.
+ignore = [
+  # rsa 0.9 Marvin timing sidechannel; no fixed release upstream yet. Used
+  # by the RSA JWT-SVID issuer path and jsonwebtoken. Broker RSA private-key
+  # ops on attacker-timed oracles are not exposed: signing runs in-process
+  # over broker-authorized requests, not as a decryption oracle.
+  { id = "RUSTSEC-2023-0071", reason = "no upstream fix released; broker exposes no RSA decryption timing oracle; tracked basil-0niq" },
+  # rustls-webpki 0.101.7 via aws-smithy-http-client's legacy hyper-rustls
+  # 0.24 stack (AWS KMS backend only; fix requires webpki 0.103, i.e. a
+  # rustls 0.23 http client in the aws-smithy stack).
+  { id = "RUSTSEC-2026-0098", reason = "legacy rustls stack pinned by aws-smithy-http-client; affects AWS KMS backend TLS only; tracked basil-0niq" },
+  { id = "RUSTSEC-2026-0099", reason = "legacy rustls stack pinned by aws-smithy-http-client; affects AWS KMS backend TLS only; tracked basil-0niq" },
+  { id = "RUSTSEC-2026-0104", reason = "legacy rustls stack pinned by aws-smithy-http-client; affects AWS KMS backend TLS only; tracked basil-0niq" },
+  # Unmaintained (no vulnerability): rustls-pemfile via google-cloud-* tonic
+  # 0.12.
+  { id = "RUSTSEC-2025-0134", reason = "unmaintained PEM parser via google-cloud KMS tonic 0.12 pin; tracked basil-0niq" },
+]
+
+[licenses]
+# The workspace itself is Apache-2.0; allow the permissive licenses observed
+# in the dependency tree. Extending this list is a reviewed change.
+allow = [
+  "Apache-2.0",
+  "MIT",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "CDLA-Permissive-2.0",
+  # CC0-1.0: bip39/bitcoin_hashes/hex-conservative (basil-core NKey/mnemonic
+  # path). Public-domain dedication; no patent grant, acceptable for use.
+  "CC0-1.0",
+  # BlueOak-1.0.0: minicbor-derive (COSE codec). Permissive, OSI approved.
+  "BlueOak-1.0.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Duplicate versions are common in a tree this size; surface them without
+# failing the gate.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+# Reviewed-version ceilings: security-core dependencies adopted in the
+# R1-20260718 round under pin + one-module containment + re-verify-on-bump
+# conditions. A version above the ceiling fails `cargo deny check bans`
+# until the ceiling is raised here alongside the dependency-diff review.
+#
+# Req shape: cargo-deny matches `>x` inclusively (it bans x itself), so each
+# ceiling is spelled `>=<next possible version>` — verified against
+# cargo-deny 0.20.2. Caveat: a semver req without a pre-release tag never
+# matches a pre-release version, so a future `X-pre.N` adoption would slip
+# past its ceiling — but cargo never auto-selects pre-releases, so that bump
+# requires a Cargo.toml edit, which is itself the review trigger.
+deny = [
+  # basil-iry5: keystore-backend store adapter; requalified at 0.5.0.
+  { crate = "db-keystore@>=0.5.1", reason = "supply-chain ceiling: re-review the dependency diff and raise this ceiling in the same change (basil-0npm; requalification basil-iry5)" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# Temporary, revision-pinned upstream dependency for basil-ik7x. Revert this
+# allowlist together with the `age` Git pin when the successor release lands.
+required-git-spec = "rev"
+allow-git = ["https://github.com/str4d/rage"]

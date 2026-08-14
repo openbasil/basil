@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: 2026 OpenBasil Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+name: Qualify protected Basil CI session
+
+on:
+  push:
+
+jobs:
+  session:
+    runs-on: basil-ci
+    enable-openid-connect: true
+    steps:
+      - name: Start Basil CI session
+        id: session
+        uses: https://github.com/openbasil/basil/.github/actions/basil-ci-session@ccb3705a950cb85b84ff152b73936195ad739c1a
+        with:
+          basil-executable: /usr/local/bin/basil
+          basil-executable-sha256: ${{ secrets.BASIL_CI_EXECUTABLE_SHA256 }}
+          provider-kind: forgejoActions
+          expected-token-request-origin: ${{ github.server_url }}
+          rule-max-token-age-seconds: "300"

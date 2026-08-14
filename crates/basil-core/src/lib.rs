@@ -49,6 +49,8 @@ pub mod core;
 pub mod demo;
 pub mod doctor;
 pub mod init;
+#[cfg(feature = "db-keystore")]
+pub mod keystore_cli;
 pub mod service;
 pub mod transport;
 pub mod unlock;
@@ -57,9 +59,9 @@ pub mod unlock;
 pub use core::identity;
 pub use core::ml_dsa_sign;
 pub use core::{
-    actor, audit, backend, capability, catalog, configuration, decision, ed25519_sign, event,
-    manager, minter, ml_kem_envelope, peer, reconcile, reload, revocation, seal, state,
-    x25519_seal,
+    actor, audit, backend, capability, catalog, ci_federation, configuration, decision,
+    ed25519_sign, event, manager, minter, ml_kem_envelope, nix_cache_audit, nix_cache_fingerprint,
+    peer, reconcile, reload, revocation, seal, state, x25519_seal,
 };
 pub use service::broker as grpc;
 #[cfg(feature = "http")]
@@ -73,7 +75,7 @@ pub use audit::{AuditLog, ReloadActor};
 pub use backend::keystore::KeystoreBackend;
 pub use backend::spiffe::{SpiffeConfig, SpiffeVaultBackend};
 pub use backend::vault::VaultBackend;
-pub use backend::{Backend, BackendError, NewKey};
+pub use backend::{Backend, BackendError, NewKey, NixCacheBackendSignature, NixCacheKeyPosture};
 pub use capability::{
     CapabilityError, CapabilityGap, CapabilityPolicy, CapabilitySummary, enforce_capabilities,
 };
@@ -89,11 +91,19 @@ pub use configuration::{
 };
 pub use decision::{DecisionRecord, Outcome};
 pub use event::{BrokerEvent, BrokerEventKind, EventSource};
-pub use grpc_server::{DEFAULT_SOCKET_MODE, ServerConfig, run as run_grpc};
-pub use manager::{BackendManager, ManagerError};
+pub use grpc_server::{
+    DEFAULT_SOCKET_MODE, ServerConfig, run as run_grpc, run_many as run_grpc_many,
+};
+pub use manager::{
+    BackendManager, ManagerError, NixCacheDescription, NixCacheEnrollment,
+    NixCacheEnrollmentDisposition, NixCacheSignature,
+};
 pub use peer::PeerInfo;
 pub use reconcile::{CheckReport, KeyCheck, KeyStatus, ReconcileError, ReconcileSummary};
-pub use reload::{ReloadError, ReloadInputs, ReloadOutcome, check_reload, reload_generation};
+pub use reload::{
+    ReloadError, ReloadInputs, ReloadOutcome, check_reload, reload_generation,
+    reload_generation_live,
+};
 pub use revocation::JwtRevocationStore;
 pub use seal::{
     BackendCred, CredBundle, MasterKek, MethodKind, MethodRegistry, ParsedBundle, SealError,

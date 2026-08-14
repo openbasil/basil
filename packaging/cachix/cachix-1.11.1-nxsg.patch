@@ -1,0 +1,1392 @@
+--- a/cachix.cabal
++++ b/cachix.cabal
+@@ -69,6 +69,7 @@
+     Cachix.Client.Config.Orphans
+     Cachix.Client.Env
+     Cachix.Client.Exception
++    Cachix.Client.ExternalSigner
+     Cachix.Client.HumanSize
+     Cachix.Client.InstallationMode
+     Cachix.Client.NetRc
+@@ -135,6 +136,7 @@
+     , async
+     , attoparsec
+     , base64-bytestring
++    , binary
+     , bytestring
+     , cachix-api
+     , concurrent-extra
+@@ -256,6 +258,8 @@
+     Daemon.TaskQueueSpec
+     Daemon.TTLCacheSpec
+     DeploySpec
++    ExternalSignerConformanceSpec
++    ExternalSignerSpec
+     InstallationModeSpec
+     NetRcSpec
+     NixConfSpec
+@@ -266,26 +270,36 @@
+   build-depends:
+     , aeson
+     , async
++    , base64-bytestring
+     , bytestring
++    , binary
+     , cachix
+     , cachix-api
+     , containers
+     , dhall
+     , directory
++    , ed25519
+     , extra
+     , filepath
+     , hercules-ci-cnix-store
+     , here
+     , hspec
+     , katip
++    , network
++    , optparse-applicative
+     , protolude
+     , retry
++    , safe-exceptions
+     , servant-auth-client
++    , servant-client
+     , servant-client-core
+     , stm
+     , temporary
++    , text
+     , time
+     , unliftio
++    , unix
++    , uuid
+     , versions
+ 
+   build-tool-depends: hspec-discover:hspec-discover
+--- a/src/Cachix/Client/Command/Import.hs
++++ b/src/Cachix/Client/Command/Import.hs
+@@ -71,6 +71,7 @@
+ {- ORMOLU_DISABLE -}
+ import' :: Env -> PushOptions -> Text -> URI -> IO ()
+ import' env pushOptions name s3uri = do
++  rejectExternalSignerImport pushOptions
+   awsEnv <- discoverAwsEnv (URI.getQueryParam s3uri "endpoint") (URI.getQueryParam s3uri "region")
+   putErrText $ "Importing narinfos/nars using " <> show (numJobs pushOptions) <> " workers from " <> URI.serialize s3uri <> " to " <> name
+   putErrText ""
+@@ -167,3 +168,10 @@
+                 | otherwise -> putErrText $ show err
+ 
+ {- ORMOLU_ENABLE -}
++
++rejectExternalSignerImport :: PushOptions -> IO ()
++rejectExternalSignerImport pushOptions =
++  when (isJust $ signerSocket pushOptions) $
++    throwM $
++      ExternalSignerError
++        "--signer-socket is not supported by cachix import because import cannot pin one signer identity for the whole command"
+--- a/src/Cachix/Client/Command/Push.hs
++++ b/src/Cachix/Client/Command/Push.hs
+@@ -6,6 +6,7 @@
+     withPushParams,
+     withPushParams',
+     handleCacheResponse,
++    validateExternalSignerCache,
+     getPushSecret,
+     getPushSecretRequired,
+   )
+@@ -16,6 +17,7 @@
+ import Cachix.Client.Config qualified as Config
+ import Cachix.Client.Env (Env (..))
+ import Cachix.Client.Exception (CachixException (..))
++import Cachix.Client.ExternalSigner qualified as ExternalSigner
+ import Cachix.Client.HumanSize (humanSize)
+ import Cachix.Client.OptionsParser as Options (PushOptions (..))
+ import Cachix.Client.Push as Push
+@@ -127,7 +129,7 @@
+ 
+ withPushParams :: Env -> PushOptions -> BinaryCacheName -> (PushParams IO () -> IO ()) -> IO ()
+ withPushParams env pushOpts name m = do
+-  pushSecret <- getPushSecretRequired (config env) name
++  pushSecret <- getPushSecretRequired (config env) name (Options.signerSocket pushOpts)
+   withPushParams' env pushOpts name pushSecret m
+ 
+ withPushParams' :: Env -> PushOptions -> BinaryCacheName -> PushSecret -> (PushParams IO () -> IO ()) -> IO ()
+@@ -136,6 +138,14 @@
+ 
+   compressionMethodBackend <- case pushSecret of
+     PushSigningKey {} -> pure Nothing
++    PushExternalSigner _ signer -> do
++      let token = fromMaybe (Token "") authToken
++      res <- retryClientM (clientenv env) $ API.getCache cachixClient token name
++      case res of
++        Left err -> handleCacheResponse name authToken err
++        Right binaryCache -> do
++          validateExternalSignerCache signer binaryCache
++          pure (Just $ BinaryCache.preferredCompressionMethod binaryCache)
+     PushToken token -> do
+       res <- retryClientM (clientenv env) $ API.getCache cachixClient token name
+       case res of
+@@ -183,24 +193,39 @@
+     context Nothing = ""
+     context (Just body) = " Error: " <> toS body
+ 
++validateExternalSignerCache :: ExternalSigner.ExternalSigner -> BinaryCache.BinaryCache -> IO ()
++validateExternalSignerCache signer binaryCache =
++  unless
++    (ExternalSigner.externalSignerPublicKey signer `elem` BinaryCache.publicSigningKeys binaryCache)
++    (throwIO $ ExternalSignerError "NXSG key identity is not configured for this cache")
++
+ -- | Fetch the push credentials from the environment or config.
+ getPushSecret ::
+   Config.Config ->
+   -- | Cache name
+   Text ->
++  -- | Purpose-specific external signer socket
++  Maybe FilePath ->
+   IO (Either Text PushSecret)
+-getPushSecret config name = do
++getPushSecret config name signerSocket = do
+   maybeAuthToken <- Config.getAuthTokenMaybe config
+ 
+   maybeSigningKeyEnv <- toS <<$>> lookupEnv "CACHIX_SIGNING_KEY"
+   let maybeSigningKeyConfig = Config.secretKey <$> head (getBinaryCache config)
+ 
+-  case maybeSigningKeyEnv <|> maybeSigningKeyConfig of
+-    Just signingKey ->
+-      return $ PushSigningKey (fromMaybe (Token "") maybeAuthToken) <$> parseSigningKeyLenient signingKey
+-    Nothing -> case maybeAuthToken of
+-      Just authToken -> return $ Right $ PushToken authToken
+-      Nothing -> return $ Left msg
++  case signerSocket of
++    Just path
++      | isJust maybeSigningKeyEnv || isJust maybeSigningKeyConfig ->
++          pure $ Left "--signer-socket is mutually exclusive with every private signing-key source"
++      | otherwise ->
++          Right . PushExternalSigner (fromMaybe (Token "") maybeAuthToken)
++            <$> ExternalSigner.connectExternalSigner path
++    Nothing -> case maybeSigningKeyEnv <|> maybeSigningKeyConfig of
++      Just signingKey ->
++        return $ PushSigningKey (fromMaybe (Token "") maybeAuthToken) <$> parseSigningKeyLenient signingKey
++      Nothing -> case maybeAuthToken of
++        Just authToken -> return $ Right $ PushToken authToken
++        Nothing -> return $ Left msg
+   where
+     -- we reverse list of caches to prioritize keys added as last
+     getBinaryCache c =
+@@ -223,10 +248,12 @@
+   Config.Config ->
+   -- | Cache name
+   Text ->
++  -- | Purpose-specific external signer socket
++  Maybe FilePath ->
+   -- | Secret key or exception
+   IO PushSecret
+-getPushSecretRequired config name = do
+-  epushSecret <- getPushSecret config name
++getPushSecretRequired config name signerSocket = do
++  epushSecret <- getPushSecret config name signerSocket
+   case epushSecret of
+     -- TODO: technically, we're missing any credentials, not just the signing key
+     Left err -> throwIO $ NoSigningKey err
+--- a/src/Cachix/Client/Exception.hs
++++ b/src/Cachix/Client/Exception.hs
+@@ -23,6 +23,7 @@
+   | ImportUnsupportedHash Text
+   | RemoveCacheUnsupported Text
+   | InvalidStorePath Text
++  | ExternalSignerError Text
+   deriving (Show, Typeable)
+ 
+ instance Exception CachixException where
+@@ -46,3 +47,4 @@
+   displayException (ImportUnsupportedHash s) = toS s
+   displayException (RemoveCacheUnsupported s) = toS s
+   displayException (InvalidStorePath s) = toS s
++  displayException (ExternalSignerError s) = toS s
+--- /dev/null
++++ b/src/Cachix/Client/ExternalSigner.hs
+@@ -0,0 +1,268 @@
++module Cachix.Client.ExternalSigner
++  ( ExternalSigner,
++    connectExternalSigner,
++    externalSignerPublicKey,
++    signFingerprint,
++  )
++where
++
++import Cachix.Client.Exception (CachixException (ExternalSignerError))
++import Control.Exception.Safe (bracket, throwIO)
++import Control.Monad.Fail qualified as MonadFail
++import Crypto.Random (getRandomBytes)
++import Crypto.Sign.Ed25519 (PublicKey (PublicKey), Signature (Signature), dverify)
++import Data.Binary.Get hiding (label, remaining)
++import Data.Binary.Put
++import Data.ByteString qualified as BS
++import Data.ByteString.Base64 qualified as B64
++import Data.ByteString.Lazy qualified as LBS
++import Data.Text qualified as Text
++import Data.Text.Encoding qualified as T
++import Network.Socket
++import Network.Socket.ByteString qualified as Socket
++import Protolude hiding (bracket, putByteString, throwIO, toS)
++import System.Directory (canonicalizePath)
++import System.FilePath (isAbsolute, takeDirectory, takeFileName, (</>))
++import System.Posix.Files (getSymbolicLinkStatus, isSocket, isSymbolicLink)
++import System.Posix.User (getEffectiveUserID)
++import System.Timeout (timeout)
++
++data ExternalSigner = ExternalSigner
++  { signerPath :: FilePath,
++    signerBatchId :: ByteString,
++    signerKeyName :: ByteString,
++    signerPublicKey :: ByteString,
++    signerEndpointId :: ByteString
++  }
++
++headerLength :: Int
++headerLength = 48
++
++operationTimeoutMicros :: Int
++operationTimeoutMicros = 5 * 1000 * 1000
++
++maxFingerprintLength :: Int
++maxFingerprintLength = 524626
++
++connectExternalSigner :: FilePath -> IO ExternalSigner
++connectExternalSigner path = do
++  safePath <- validateSocketPath path
++  batchId <- randomIdentifier
++  requestId <- randomIdentifier
++  body <- exchange safePath 0x01 0x81 batchId requestId mempty
++  (keyName, publicKey, endpointId) <- parseBody "DescribeKey" describeBody body
++  pure
++    ExternalSigner
++      { signerPath = safePath,
++        signerBatchId = batchId,
++        signerKeyName = keyName,
++        signerPublicKey = publicKey,
++        signerEndpointId = endpointId
++      }
++
++externalSignerPublicKey :: ExternalSigner -> Text
++externalSignerPublicKey ExternalSigner {..} =
++  T.decodeUtf8 signerKeyName <> ":" <> T.decodeUtf8 (B64.encode signerPublicKey)
++
++signFingerprint :: ExternalSigner -> ByteString -> IO ByteString
++signFingerprint ExternalSigner {..} fingerprintBytes = do
++  when (BS.null fingerprintBytes || BS.length fingerprintBytes > maxFingerprintLength) $
++    externalFailure "fingerprint is outside the NXSG PATH_INFO_V1 bound"
++  requestId <- randomIdentifier
++  let body = LBS.toStrict $ runPut $ do
++        putWord16be $ fromIntegral $ BS.length signerKeyName
++        putByteString signerKeyName
++        putByteString signerPublicKey
++        putByteString signerEndpointId
++        putWord32be $ fromIntegral $ BS.length fingerprintBytes
++        putByteString fingerprintBytes
++  response <- exchange signerPath 0x02 0x82 signerBatchId requestId body
++  (responseKeyName, responsePublicKey, responseEndpointId, signature) <-
++    parseBody "SignPathInfoV1" signBody response
++  unless (responseKeyName == signerKeyName && responsePublicKey == signerPublicKey) $
++    externalFailure "NXSG signing key identity changed during the command"
++  unless (responseEndpointId == signerEndpointId) $
++    externalFailure "NXSG signer endpoint changed during the command"
++  unless
++    (dverify (PublicKey signerPublicKey) fingerprintBytes (Signature signature))
++    (externalFailure "NXSG provider returned an invalid signature")
++  pure signature
++
++validateSocketPath :: FilePath -> IO FilePath
++validateSocketPath path = do
++  unless (isAbsolute path) $ externalFailure "NXSG signer socket path must be absolute"
++  status <- getSymbolicLinkStatus path
++  when (isSymbolicLink status) $ externalFailure "NXSG signer socket must not be a symlink"
++  unless (isSocket status) $ externalFailure "NXSG signer path is not a Unix socket"
++  parent <- canonicalizePath $ takeDirectory path
++  pure $ parent </> takeFileName path
++
++randomIdentifier :: IO ByteString
++randomIdentifier = go (8 :: Int)
++  where
++    go 0 = externalFailure "could not generate a nonzero NXSG correlation identifier"
++    go attempts = do
++      value <- getRandomBytes 16
++      if BS.any (/= 0) value then pure value else go (attempts - 1)
++
++exchange :: FilePath -> Word8 -> Word8 -> ByteString -> ByteString -> ByteString -> IO ByteString
++exchange path requestType responseType batchId requestId body = do
++  let operation = bracket (socket AF_UNIX Stream defaultProtocol) close $ \sock -> do
++        connect sock $ SockAddrUnix path
++        requireSameUser sock
++        Socket.sendAll sock $ encodeRequest requestType batchId requestId body
++        shutdown sock ShutdownSend
++        header <- receiveExactly sock headerLength
++        encodedBodyLength <- parseResponseHeader responseType batchId requestId header
++        bodyLength <-
++          maybe
++            (externalFailure "NXSG response body length cannot be represented on this platform")
++            pure
++            (toIntegralSized encodedBodyLength)
++        response <- receiveExactly sock bodyLength
++        trailing <- Socket.recv sock 1
++        unless (BS.null trailing) $ externalFailure "NXSG response has trailing bytes"
++        let status = BS.index header 7
++        if status == 0 then pure response else decodeFailure status response
++  timeout operationTimeoutMicros operation >>= \case
++    Nothing -> externalFailure "NXSG operation exceeded the five-second deadline"
++    Just response -> pure response
++
++requireSameUser :: Socket -> IO ()
++requireSameUser sock = do
++  peer <- getPeerCredential sock
++  effective <- getEffectiveUserID
++  case peer of
++    (_, Just peerUid, _)
++      | fromIntegral peerUid == (fromIntegral effective :: Integer) -> pure ()
++    _ -> externalFailure "NXSG provider peer UID does not match the Cachix process"
++
++encodeRequest :: Word8 -> ByteString -> ByteString -> ByteString -> ByteString
++encodeRequest requestType batchId requestId body =
++  LBS.toStrict $ runPut $ do
++    putByteString "NXSG"
++    putWord8 1
++    putWord8 0
++    putWord8 requestType
++    putWord8 0
++    putWord32be 0
++    putWord32be $ fromIntegral $ BS.length body
++    putByteString batchId
++    putByteString requestId
++    putByteString body
++
++parseResponseHeader :: Word8 -> ByteString -> ByteString -> ByteString -> IO Word32
++parseResponseHeader responseType batchId requestId encoded = do
++  (magic, major, minor, actualType, status, flags, bodyLength, actualBatch, actualRequest) <-
++    parseBody "response header" responseHeader encoded
++  unless (magic == "NXSG" && major == 1 && minor == 0) $
++    externalFailure "NXSG response version or magic does not match"
++  unless (actualType == responseType) $ externalFailure "NXSG response type does not match request"
++  unless (status <= 9 && flags == 0) $ externalFailure "NXSG response status or flags are invalid"
++  unless (actualBatch == batchId && actualRequest == requestId) $
++    externalFailure "NXSG response correlation identifiers do not match"
++  let bound :: Word32
++      bound
++        | status /= 0 = 1026
++        | responseType == 0x81 = 179
++        | responseType == 0x82 = 242
++        | otherwise = 0
++  when (bodyLength > bound) $ externalFailure "NXSG response body exceeds its message bound"
++  pure bodyLength
++
++responseHeader :: Get (ByteString, Word8, Word8, Word8, Word8, Word32, Word32, ByteString, ByteString)
++responseHeader = do
++  magic <- getByteString 4
++  major <- getWord8
++  minor <- getWord8
++  messageType <- getWord8
++  status <- getWord8
++  flags <- getWord32be
++  bodyLength <- getWord32be
++  batchId <- getByteString 16
++  requestId <- getByteString 16
++  pure (magic, major, minor, messageType, status, flags, bodyLength, batchId, requestId)
++
++describeBody :: Get (ByteString, ByteString, ByteString)
++describeBody = do
++  keyName <- getKeyName
++  algorithm <- getWord8
++  unless (algorithm == 1) $ MonadFail.fail "unsupported signing algorithm"
++  publicKey <- getByteString 32
++  endpointId <- getByteString 16
++  when (BS.all (== 0) endpointId) $ MonadFail.fail "zero endpoint identifier"
++  pure (keyName, publicKey, endpointId)
++
++signBody :: Get (ByteString, ByteString, ByteString, ByteString)
++signBody = do
++  keyName <- getKeyName
++  publicKey <- getByteString 32
++  endpointId <- getByteString 16
++  signature <- getByteString 64
++  pure (keyName, publicKey, endpointId, signature)
++
++getKeyName :: Get ByteString
++getKeyName = do
++  length' <- fromIntegral <$> getWord16be
++  unless (length' >= 1 && length' <= 128) $ MonadFail.fail "key name length"
++  keyName <- getByteString length'
++  unless (validKeyName keyName) $ MonadFail.fail "key name syntax"
++  pure keyName
++
++validKeyName :: ByteString -> Bool
++validKeyName name =
++  maybe False isAlphaNumeric (fst <$> BS.uncons name)
++    && BS.all (\byte -> isAlphaNumeric byte || byte `elem` [46, 95, 45]) name
++  where
++    isAlphaNumeric byte =
++      (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
++
++decodeFailure :: Word8 -> ByteString -> IO a
++decodeFailure status encoded = do
++  diagnostic <- parseBody "error response" errorBody encoded
++  externalFailure $ "NXSG " <> statusName status <> ": " <> diagnostic
++
++errorBody :: Get Text
++errorBody = do
++  length' <- fromIntegral <$> getWord16be
++  unless (length' <= 1024) $ MonadFail.fail "diagnostic length"
++  bytes <- getByteString length'
++  diagnostic <- either (const $ MonadFail.fail "diagnostic UTF-8") pure $ T.decodeUtf8' bytes
++  when (Text.any isControl diagnostic) $ MonadFail.fail "diagnostic control character"
++  pure diagnostic
++
++statusName :: Word8 -> Text
++statusName = \case
++  1 -> "Malformed"
++  2 -> "UnsupportedVersion"
++  3 -> "Unauthorized"
++  4 -> "KeyMismatch"
++  5 -> "InvalidFingerprint"
++  6 -> "Unavailable"
++  7 -> "DeadlineExceeded"
++  8 -> "Internal"
++  9 -> "Overloaded"
++  _ -> "Unknown"
++
++receiveExactly :: Socket -> Int -> IO ByteString
++receiveExactly sock expected = go expected []
++  where
++    go 0 chunks = pure $ BS.concat $ reverse chunks
++    go remaining chunks = do
++      chunk <- Socket.recv sock remaining
++      if BS.null chunk
++        then externalFailure "NXSG response ended before its declared length"
++        else go (remaining - BS.length chunk) (chunk : chunks)
++
++parseBody :: Text -> Get a -> ByteString -> IO a
++parseBody label parser encoded =
++  case runGetOrFail (parser <* ensureEmpty) $ LBS.fromStrict encoded of
++    Left _ -> externalFailure $ "invalid NXSG " <> label
++    Right (_, _, value) -> pure value
++  where
++    ensureEmpty = do
++      remaining <- getRemainingLazyByteString
++      unless (LBS.null remaining) $ MonadFail.fail "trailing bytes"
++
++externalFailure :: Text -> IO a
++externalFailure = throwIO . ExternalSignerError
+--- a/src/Cachix/Client/OptionsParser.hs
++++ b/src/Cachix/Client/OptionsParser.hs
+@@ -34,6 +34,7 @@
+     -- * Misc
+     BinaryCacheName,
+     getOpts,
++    optsInfo,
+   )
+ where
+ 
+@@ -130,7 +131,9 @@
+     -- | The number of store paths to process concurrently.
+     numJobs :: Int,
+     -- | Omit the derivation from the store path metadata.
+-    omitDeriver :: Bool
++    omitDeriver :: Bool,
++    -- | Purpose-specific external signer socket.
++    signerSocket :: Maybe FilePath
+   }
+   deriving (Show)
+ 
+@@ -172,7 +175,8 @@
+       chunkSize = defaultChunkSize,
+       numConcurrentChunks = defaultNumConcurrentChunks,
+       numJobs = defaultNumJobs,
+-      omitDeriver = defaultOmitDeriver
++      omitDeriver = defaultOmitDeriver,
++      signerSocket = Nothing
+     }
+ 
+ data DaemonCommand
+@@ -355,6 +359,7 @@
+     <*> numConcurrentChunks
+     <*> numJobs
+     <*> omitDeriver
++    <*> signerSocket
+   where
+     compressionLevel =
+       option (auto >>= validateCompressionLevel) $
+@@ -429,6 +434,12 @@
+         long "omit-deriver"
+           <> help "Do not publish which derivations built the store paths."
+ 
++    signerSocket =
++      optional . strOption $
++        long "signer-socket"
++          <> metavar "PATH"
++          <> help "Sign through an NXSG 1.0 Unix socket; never accepts or returns private key material."
++
+ pushCommand :: Parser CachixCommand
+ pushCommand = toPushCommand <$> pushOptionsParser <*> cacheNameParser <*> pushArgumentsParser
+   where
+--- a/src/Cachix/Client/Push.hs
++++ b/src/Cachix/Client/Push.hs
+@@ -48,6 +48,7 @@
+ import Cachix.API.Signing (fingerprint, passthroughHashSink, passthroughHashSinkB16, passthroughSizeSink)
+ import Cachix.Client.CNix (formatStorePathWarning, validateStorePath)
+ import Cachix.Client.Exception (CachixException (..))
++import Cachix.Client.ExternalSigner qualified as ExternalSigner
+ import Cachix.Client.Push.S3 qualified as Push.S3
+ import Cachix.Client.Retry (retryAll, retryClientM, retryHttp)
+ import Cachix.Client.Secrets
+@@ -95,11 +96,14 @@
+     PushToken Token
+   | -- | An auth token with a signing key for pushing to self-signed caches.
+     PushSigningKey Token SigningKey
++  | -- | An auth token with a purpose-specific external signer.
++    PushExternalSigner Token ExternalSigner.ExternalSigner
+ 
+ getAuthTokenFromPushSecret :: PushSecret -> Maybe Token
+ getAuthTokenFromPushSecret = \case
+   PushToken token -> nullTokenToMaybe token
+   PushSigningKey token _ -> nullTokenToMaybe token
++  PushExternalSigner token _ -> nullTokenToMaybe token
+   where
+     nullTokenToMaybe (Token "") = Nothing
+     nullTokenToMaybe token = Just token
+@@ -198,6 +202,7 @@
+ getCacheAuthToken :: PushSecret -> Token
+ getCacheAuthToken (PushToken token) = token
+ getCacheAuthToken (PushSigningKey token _) = token
++getCacheAuthToken (PushExternalSigner token _) = token
+ 
+ uploadStorePath ::
+   (MonadUnliftIO m, MonadCatch m) =>
+@@ -476,9 +481,12 @@
+ 
+   let (storeHash, storeSuffix) = splitStorePath storePathText
+   let fp = fingerprint storePathText undNarHash undNarSize fpReferences
+-      sig = case pushParamsSecret pushParams of
+-        PushToken _ -> Nothing
+-        PushSigningKey _ signKey -> Just $ toS $ B64.encode $ unSignature $ dsign (signingSecretKey signKey) fp
++  sig <- liftIO $ case pushParamsSecret pushParams of
++    PushToken _ -> pure Nothing
++    PushSigningKey _ signKey ->
++      pure $ Just $ toS $ B64.encode $ unSignature $ dsign (signingSecretKey signKey) fp
++    PushExternalSigner _ signer ->
++      Just . toS . B64.encode <$> ExternalSigner.signFingerprint signer fp
+ 
+   let nic =
+         Api.NarInfoCreate
+--- a/src/Cachix/Daemon.hs
++++ b/src/Cachix/Daemon.hs
+@@ -86,7 +86,11 @@
+   daemonSocketThread <- newEmptyMVar
+   daemonClients <- SocketStore.newSocketStore
+ 
+-  daemonPushSecret <- Command.Push.getPushSecretRequired (config daemonEnv) daemonCacheName
++  daemonPushSecret <-
++    Command.Push.getPushSecretRequired
++      (config daemonEnv)
++      daemonCacheName
++      (Options.signerSocket daemonPushOptions)
+   let authToken = getAuthTokenFromPushSecret daemonPushSecret
+   daemonBinaryCache <- Push.getBinaryCache daemonLogger daemonEnv authToken daemonCacheName
+ 
+@@ -183,6 +187,7 @@
+               pushSecret = pushParamsSecret pushParams
+               hasSigningKey = case pushSecret of
+                 PushSigningKey {} -> True
++                PushExternalSigner {} -> True
+                 PushToken {} -> False
+               maybeToken = getAuthTokenFromPushSecret pushSecret
+           -- Verify auth by making an API call
+--- /dev/null
++++ b/test/ExternalSignerConformanceSpec.hs
+@@ -0,0 +1,497 @@
++module ExternalSignerConformanceSpec where
++
++import Cachix.Client.Command.Import qualified as Import
++import Cachix.Client.Command.Push (getPushSecret, validateExternalSignerCache)
++import Cachix.Client.Config qualified as Config
++import Cachix.Client.Env (Env (..))
++import Cachix.Client.Exception (CachixException (ExternalSignerError))
++import Cachix.Client.ExternalSigner
++import Cachix.Client.OptionsParser
++import Cachix.Client.URI qualified as URI
++import Cachix.Client.Push (PushSecret)
++import Cachix.Types.BinaryCache qualified as BinaryCache
++import Cachix.Types.Permission qualified as Permission
++import Control.Concurrent.Async qualified as Async
++import Control.Concurrent.MVar qualified as MVar
++import Control.Exception.Safe (bracket)
++import Crypto.Sign.Ed25519 (PublicKey (PublicKey), SecretKey, Signature (Signature), createKeypair, dsign)
++import Data.Binary.Get hiding (remaining)
++import Data.Binary.Put
++import Data.ByteString qualified as BS
++import Data.ByteString.Base64 qualified as B64
++import Data.ByteString.Lazy qualified as LBS
++import Data.Text qualified as Text
++import Network.Socket
++import Network.Socket.ByteString qualified as Socket
++import Options.Applicative (ParserResult (Success), defaultPrefs, execParserPure)
++import Protolude hiding (bracket, putByteString)
++import Prelude qualified
++import Servant.Auth.Client (Token (Token))
++import System.Environment (lookupEnv, setEnv, unsetEnv)
++import System.Directory (removeFile)
++import System.IO.Temp (withSystemTempDirectory)
++import System.Posix.Files (createSymbolicLink)
++import System.Timeout qualified as Timeout
++import Test.Hspec
++
++data Scenario
++  = Normal
++  | DescribeOnly
++  | BadMagic
++  | WrongMajor
++  | WrongMinor
++  | WrongBatch
++  | WrongRequest
++  | WrongType
++  | InvalidStatus
++  | ProviderStatus
++  | NonzeroFlags
++  | MaxBodyLength
++  | TruncatedBody
++  | TrailingBody
++  | Deadline
++  | MalformedDiagnostic
++  | InvalidAlgorithm
++  | ZeroEndpoint
++  | ChangedName
++  | ChangedPublicKey
++  | ChangedEndpoint
++  | MalformedSignature
++  deriving stock (Eq, Show)
++
++spec :: Spec
++spec = do
++  describe "CLI and credential selection" $ do
++    it "parses --signer-socket on push" $
++      case parseCommand ["push", "--signer-socket", "/run/cachix/nxsg.sock", "example", "/nix/store/example"] of
++        Success (_, Push (PushPaths options "example" ["/nix/store/example"])) ->
++          signerSocket options `shouldBe` Just "/run/cachix/nxsg.sock"
++        _ -> expectationFailure "expected a push command carrying the external signer socket"
++
++    it "rejects --signer-socket on import before AWS discovery or traversal" $
++      case parseCommand ["import", "--signer-socket", "/run/cachix/nxsg.sock", "example", "s3://bucket"] of
++        Success (_, Import options "example" _) ->
++          let poisonedEnv =
++                Env
++                  { cachixoptions = Prelude.error "import evaluated Cachix options before the signer guard",
++                    clientenv = Prelude.error "import evaluated the client environment before the signer guard",
++                    config = Prelude.error "import evaluated config before the signer guard"
++                  }
++              poisonedAwsInput = Prelude.error "import evaluated the AWS discovery input before the signer guard"
++           in Import.import' poisonedEnv options "example" poisonedAwsInput
++                `shouldThrow` isExternalFailure
++        _ -> expectationFailure "expected an import command carrying the external signer socket"
++
++    it "rejects an environment private key before connecting to the signer" $
++      withEnvironment "CACHIX_SIGNING_KEY" (Just "private") $ do
++        result <- getPushSecret emptyConfig "example" (Just "/does/not/exist")
++        isCredentialConflict result `shouldBe` True
++
++    it "rejects a configured private key before connecting to the signer" $
++      withEnvironment "CACHIX_SIGNING_KEY" Nothing $ do
++        let configured =
++              emptyConfig
++                { Config.binaryCaches = [Config.BinaryCacheConfig "example" "private"]
++                }
++        result <- getPushSecret configured "example" (Just "/does/not/exist")
++        isCredentialConflict result `shouldBe` True
++
++  describe "cache identity enrollment" $ do
++    it "accepts only the advertised name and public key" $
++      withScenario DescribeOnly $ \socketPath server keyName publicKey _ -> do
++        signer <- connectExternalSigner socketPath
++        validateExternalSignerCache signer (cacheWithKeys [externalIdentity keyName publicKey])
++        validateExternalSignerCache signer (cacheWithKeys ["other:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="])
++          `shouldThrow` isExternalFailure
++        Async.wait server
++
++  describe "NXSG response validation" $ do
++    forM_
++      [ WrongBatch,
++        BadMagic,
++        WrongMajor,
++        WrongMinor,
++        WrongRequest,
++        WrongType,
++        InvalidStatus,
++        ProviderStatus,
++        NonzeroFlags,
++        MaxBodyLength,
++        TruncatedBody,
++        TrailingBody,
++        Deadline,
++        MalformedDiagnostic,
++        InvalidAlgorithm,
++        ZeroEndpoint
++      ] $ \scenario ->
++        it ("rejects DescribeKey scenario " <> show scenario) $
++          withScenario scenario $ \socketPath server _ _ _ -> do
++            connectExternalSigner socketPath `shouldThrow` isExternalFailure
++            Async.wait server
++
++    forM_
++      [ChangedName, ChangedPublicKey, ChangedEndpoint, MalformedSignature] $ \scenario ->
++        it ("rejects SignPathInfoV1 scenario " <> show scenario) $
++          withScenario scenario $ \socketPath server _ _ _ -> do
++            signer <- connectExternalSigner socketPath
++            signFingerprint signer "1;/nix/store/example;sha256:0000;1;"
++              `shouldThrow` isExternalFailure
++            Async.wait server
++
++    it "rejects a replacement socket after receiving its complete signing request" $
++      withReplacementScenario $ \socketPath server replacementReady requestObserved -> do
++        signer <- connectExternalSigner socketPath
++        awaitSignal "replacement signer did not become ready" replacementReady
++        signFingerprint signer "1;/nix/store/example;sha256:0000;1;"
++          `shouldThrow` isEndpointChanged
++        awaitSignal "replacement signer did not receive the signing request" requestObserved
++        awaitServer server
++
++    it "rejects an oversized fingerprint before sending it" $
++      withScenario DescribeOnly $ \socketPath server _ _ _ -> do
++        signer <- connectExternalSigner socketPath
++        signFingerprint signer (BS.replicate 524627 1) `shouldThrow` isExternalFailure
++        Async.wait server
++
++  describe "signer path validation" $ do
++    it "rejects a relative signer path" $
++      connectExternalSigner "signer.sock" `shouldThrow` isExternalFailure
++
++    it "rejects a regular file" $
++      withSystemTempDirectory "cachix-nxsg-file" $ \directory -> do
++        let path = directory <> "/not-a-socket"
++        BS.writeFile path "not a socket"
++        connectExternalSigner path `shouldThrow` isExternalFailure
++
++    it "rejects a symlink to a signer socket" $
++      withSystemTempDirectory "cachix-nxsg-link" $ \directory -> do
++        let socketPath = directory <> "/signer.sock"
++            linkPath = directory <> "/signer-link.sock"
++        bracket (boundListener socketPath) close $ \_ -> do
++          createSymbolicLink socketPath linkPath
++          connectExternalSigner linkPath `shouldThrow` isExternalFailure
++
++parseCommand :: [Prelude.String] -> ParserResult (Flags, CachixCommand)
++parseCommand = execParserPure defaultPrefs (optsInfo "/tmp/cachix-test.dhall")
++
++emptyConfig :: Config.Config
++emptyConfig =
++  Config.Config
++    { Config.authToken = Token "",
++      Config.hostname = URI.defaultCachixURI,
++      Config.binaryCaches = []
++    }
++
++isCredentialConflict :: Either Text PushSecret -> Bool
++isCredentialConflict = \case
++  Left message -> "mutually exclusive" `Text.isInfixOf` message
++  Right _ -> False
++
++withEnvironment :: Prelude.String -> Maybe Prelude.String -> IO a -> IO a
++withEnvironment name value = bracket (lookupEnv name <* install value) install . const
++  where
++    install = maybe (unsetEnv name) (setEnv name)
++
++cacheWithKeys :: [Text] -> BinaryCache.BinaryCache
++cacheWithKeys keys =
++  BinaryCache.BinaryCache
++    { BinaryCache.name = "example",
++      BinaryCache.uri = "https://example.cachix.org",
++      BinaryCache.isPublic = False,
++      BinaryCache.publicSigningKeys = keys,
++      BinaryCache.githubUsername = "",
++      BinaryCache.permission = Permission.Write,
++      BinaryCache.preferredCompressionMethod = BinaryCache.ZSTD
++    }
++
++externalIdentity :: ByteString -> ByteString -> Text
++externalIdentity keyName publicKey = decodeUtf8 keyName <> ":" <> decodeUtf8 (B64.encode publicKey)
++
++isExternalFailure :: CachixException -> Bool
++isExternalFailure (ExternalSignerError _) = True
++isExternalFailure _ = False
++
++isEndpointChanged :: CachixException -> Bool
++isEndpointChanged (ExternalSignerError message) =
++  message == "NXSG signer endpoint changed during the command"
++isEndpointChanged _ = False
++
++withScenario ::
++  Scenario ->
++  (FilePath -> Async.Async () -> ByteString -> ByteString -> ByteString -> IO a) ->
++  IO a
++withScenario scenario action =
++  withSystemTempDirectory "cachix-nxsg-conformance" $ \directory -> do
++    let socketPath = directory <> "/signer.sock"
++        keyName = "cache.example-1"
++        endpointId = BS.replicate 16 3
++    (PublicKey publicKey, secretKey) <- createKeypair
++    server <- startScenarioServer socketPath scenario keyName publicKey endpointId secretKey
++    action socketPath server keyName publicKey endpointId
++
++startScenarioServer ::
++  FilePath ->
++  Scenario ->
++  ByteString ->
++  ByteString ->
++  ByteString ->
++  SecretKey ->
++  IO (Async.Async ())
++startScenarioServer socketPath scenario keyName publicKey endpointId secretKey = do
++  listener <- boundListener socketPath
++  Async.async $ do
++    (describeSocket, _) <- accept listener
++    (_, describeBatch, describeRequest, describeRequestBody) <- receiveRequest describeSocket
++    unless (BS.null describeRequestBody) $ expectationFailure "DescribeKey request body was not empty"
++    let validDescribeBody = describeBody keyName publicKey endpointId
++        wrongBatch = corruptIdentifier describeBatch
++        wrongRequest = corruptIdentifier describeRequest
++    case scenario of
++      BadMagic -> sendResponsePreamble describeSocket "NOPE" 1 0 0x81 0 0 Nothing describeBatch describeRequest validDescribeBody mempty
++      WrongMajor -> sendResponsePreamble describeSocket "NXSG" 2 0 0x81 0 0 Nothing describeBatch describeRequest validDescribeBody mempty
++      WrongMinor -> sendResponsePreamble describeSocket "NXSG" 1 1 0x81 0 0 Nothing describeBatch describeRequest validDescribeBody mempty
++      WrongBatch -> sendResponse describeSocket 0x81 0 0 Nothing wrongBatch describeRequest validDescribeBody mempty
++      WrongRequest -> sendResponse describeSocket 0x81 0 0 Nothing describeBatch wrongRequest validDescribeBody mempty
++      WrongType -> sendResponse describeSocket 0x82 0 0 Nothing describeBatch describeRequest validDescribeBody mempty
++      InvalidStatus -> sendResponse describeSocket 0x81 10 0 Nothing describeBatch describeRequest mempty mempty
++      ProviderStatus -> sendResponse describeSocket 0x81 9 0 Nothing describeBatch describeRequest (diagnosticBody "busy") mempty
++      NonzeroFlags -> sendResponse describeSocket 0x81 0 1 Nothing describeBatch describeRequest validDescribeBody mempty
++      MaxBodyLength -> sendResponse describeSocket 0x81 0 0 (Just maxBound) describeBatch describeRequest mempty mempty
++      TruncatedBody ->
++        sendResponse
++          describeSocket
++          0x81
++          0
++          0
++          (Just $ fromIntegral $ BS.length validDescribeBody + 1)
++          describeBatch
++          describeRequest
++          validDescribeBody
++          mempty
++      TrailingBody -> sendResponse describeSocket 0x81 0 0 Nothing describeBatch describeRequest validDescribeBody "x"
++      Deadline -> threadDelay 6000000
++      MalformedDiagnostic -> sendResponse describeSocket 0x81 8 0 Nothing describeBatch describeRequest "\NUL\SOH\255" mempty
++      InvalidAlgorithm -> sendResponse describeSocket 0x81 0 0 Nothing describeBatch describeRequest (describeBodyWith 2 keyName publicKey endpointId) mempty
++      ZeroEndpoint -> sendResponse describeSocket 0x81 0 0 Nothing describeBatch describeRequest (describeBody keyName publicKey $ BS.replicate 16 0) mempty
++      _ -> sendResponse describeSocket 0x81 0 0 Nothing describeBatch describeRequest validDescribeBody mempty
++    close describeSocket
++
++    unless (isDescribeFailure scenario || scenario == DescribeOnly) $ do
++      (signSocket, _) <- accept listener
++      (_, signBatch, signRequest, signRequestBody) <- receiveRequest signSocket
++      fingerprint <- parseFingerprint signRequestBody
++      let responseName = if scenario == ChangedName then keyName <> "-rotated" else keyName
++          responsePublicKey = if scenario == ChangedPublicKey then BS.replicate 32 4 else publicKey
++          responseEndpoint = if scenario == ChangedEndpoint then BS.replicate 16 4 else endpointId
++          Signature validSignature = dsign secretKey fingerprint
++          signature = if scenario == MalformedSignature then BS.take 63 validSignature else validSignature
++          responseBody = signBody responseName responsePublicKey responseEndpoint signature
++      sendResponse signSocket 0x82 0 0 Nothing signBatch signRequest responseBody mempty
++      close signSocket
++    close listener
++
++withReplacementScenario ::
++  (FilePath -> Async.Async () -> MVar.MVar () -> MVar.MVar () -> IO a) ->
++  IO a
++withReplacementScenario action =
++  withSystemTempDirectory "cachix-nxsg-replacement" $ \directory -> do
++    let socketPath = directory <> "/signer.sock"
++        keyName = "cache.example-1"
++        endpointId = BS.replicate 16 3
++    (PublicKey publicKey, secretKey) <- createKeypair
++    replacementReady <- MVar.newEmptyMVar
++    requestObserved <- MVar.newEmptyMVar
++    bracket
++      (startReplacementServer socketPath keyName publicKey endpointId secretKey replacementReady requestObserved)
++      Async.cancel
++      (\server -> action socketPath server replacementReady requestObserved)
++
++startReplacementServer ::
++  FilePath ->
++  ByteString ->
++  ByteString ->
++  ByteString ->
++  SecretKey ->
++  MVar.MVar () ->
++  MVar.MVar () ->
++  IO (Async.Async ())
++startReplacementServer socketPath keyName publicKey endpointId secretKey replacementReady requestObserved = do
++  originalListener <- boundListener socketPath
++  Async.async $
++    bracket (pure originalListener) close $ \listener -> do
++      bracket (accept listener) (close . fst) $ \(describeSocket, _) -> do
++        (requestType, describeBatch, describeRequest, describeRequestBody) <- receiveRequest describeSocket
++        requestType `shouldBe` 0x01
++        describeRequestBody `shouldBe` mempty
++        sendResponse describeSocket 0x81 0 0 Nothing describeBatch describeRequest (describeBody keyName publicKey endpointId) mempty
++
++      removeFile socketPath
++      bracket (boundListener socketPath) close $ \replacementListener -> do
++        MVar.putMVar replacementReady ()
++        bracket (accept replacementListener) (close . fst) $ \(signSocket, _) -> do
++          (requestType, signBatch, signRequest, signRequestBody) <- receiveRequest signSocket
++          requestType `shouldBe` 0x02
++          fingerprint <- parseFingerprint signRequestBody
++          MVar.putMVar requestObserved ()
++          let replacementEndpoint = BS.replicate 16 4
++              Signature signature = dsign secretKey fingerprint
++              responseBody = signBody keyName publicKey replacementEndpoint signature
++          sendResponse signSocket 0x82 0 0 Nothing signBatch signRequest responseBody mempty
++
++awaitSignal :: Prelude.String -> MVar.MVar () -> IO ()
++awaitSignal failureMessage signal =
++  Timeout.timeout 2000000 (MVar.takeMVar signal) >>= \case
++    Nothing -> expectationFailure failureMessage
++    Just () -> pure ()
++
++awaitServer :: Async.Async () -> IO ()
++awaitServer server =
++  Timeout.timeout 2000000 (Async.waitCatch server) >>= \case
++    Nothing -> expectationFailure "replacement signer did not complete"
++    Just (Left exception) -> throwIO exception
++    Just (Right ()) -> pure ()
++
++isDescribeFailure :: Scenario -> Bool
++isDescribeFailure scenario =
++  scenario
++    `elem` [ BadMagic,
++             WrongMajor,
++             WrongMinor,
++             WrongBatch,
++             WrongRequest,
++             WrongType,
++             InvalidStatus,
++             ProviderStatus,
++             NonzeroFlags,
++             MaxBodyLength,
++             TruncatedBody,
++             TrailingBody,
++             Deadline,
++             MalformedDiagnostic,
++             InvalidAlgorithm,
++             ZeroEndpoint
++           ]
++
++boundListener :: FilePath -> IO Socket
++boundListener socketPath = do
++  listener <- socket AF_UNIX Stream defaultProtocol
++  bind listener $ SockAddrUnix socketPath
++  listen listener 2
++  pure listener
++
++describeBody :: ByteString -> ByteString -> ByteString -> ByteString
++describeBody keyName publicKey endpointId =
++  describeBodyWith 1 keyName publicKey endpointId
++
++describeBodyWith :: Word8 -> ByteString -> ByteString -> ByteString -> ByteString
++describeBodyWith algorithm keyName publicKey endpointId =
++  LBS.toStrict $ runPut $ do
++    putWord16be $ fromIntegral $ BS.length keyName
++    putByteString keyName
++    putWord8 algorithm
++    putByteString publicKey
++    putByteString endpointId
++
++signBody :: ByteString -> ByteString -> ByteString -> ByteString -> ByteString
++signBody keyName publicKey endpointId signature =
++  LBS.toStrict $ runPut $ do
++    putWord16be $ fromIntegral $ BS.length keyName
++    putByteString keyName
++    putByteString publicKey
++    putByteString endpointId
++    putByteString signature
++
++diagnosticBody :: ByteString -> ByteString
++diagnosticBody diagnostic =
++  LBS.toStrict $ runPut $ do
++    putWord16be $ fromIntegral $ BS.length diagnostic
++    putByteString diagnostic
++
++sendResponse ::
++  Socket ->
++  Word8 ->
++  Word8 ->
++  Word32 ->
++  Maybe Word32 ->
++  ByteString ->
++  ByteString ->
++  ByteString ->
++  ByteString ->
++  IO ()
++sendResponse sock responseType status flags declaredLength batchId requestId body trailing =
++  sendResponsePreamble sock "NXSG" 1 0 responseType status flags declaredLength batchId requestId body trailing
++
++sendResponsePreamble ::
++  Socket ->
++  ByteString ->
++  Word8 ->
++  Word8 ->
++  Word8 ->
++  Word8 ->
++  Word32 ->
++  Maybe Word32 ->
++  ByteString ->
++  ByteString ->
++  ByteString ->
++  ByteString ->
++  IO ()
++sendResponsePreamble sock magic major minor responseType status flags declaredLength batchId requestId body trailing =
++  Socket.sendAll sock $
++    LBS.toStrict (runPut header)
++      <> body
++      <> trailing
++  where
++    header = do
++      putByteString magic
++      putWord8 major
++      putWord8 minor
++      putWord8 responseType
++      putWord8 status
++      putWord32be flags
++      putWord32be $ fromMaybe (fromIntegral $ BS.length body) declaredLength
++      putByteString batchId
++      putByteString requestId
++
++receiveRequest :: Socket -> IO (Word8, ByteString, ByteString, ByteString)
++receiveRequest sock = do
++  header <- receiveExactly sock 48
++  let requestType = BS.index header 6
++      bodyLength = fromIntegral $ runGet getWord32be $ LBS.fromStrict $ BS.take 4 $ BS.drop 12 header
++      batchId = BS.take 16 $ BS.drop 16 header
++      requestId = BS.take 16 $ BS.drop 32 header
++  body <- receiveExactly sock bodyLength
++  trailing <- Socket.recv sock 1
++  unless (BS.null trailing) $ expectationFailure "request contained trailing bytes"
++  pure (requestType, batchId, requestId, body)
++
++parseFingerprint :: ByteString -> IO ByteString
++parseFingerprint encoded =
++  case runGetOrFail parser $ LBS.fromStrict encoded of
++    Left (_, _, reason) -> expectationFailure reason >> pure mempty
++    Right (remaining, _, fingerprint) -> do
++      unless (LBS.null remaining) $ expectationFailure "SignPathInfoV1 request contained trailing bytes"
++      pure fingerprint
++  where
++    parser = do
++      keyNameLength <- fromIntegral <$> getWord16be
++      skip keyNameLength
++      skip 32
++      skip 16
++      fingerprintLength <- fromIntegral <$> getWord32be
++      getByteString fingerprintLength
++
++receiveExactly :: Socket -> Int -> IO ByteString
++receiveExactly sock expected = go expected []
++  where
++    go 0 chunks = pure $ BS.concat $ reverse chunks
++    go remaining chunks = do
++      chunk <- Socket.recv sock remaining
++      if BS.null chunk
++        then expectationFailure "truncated NXSG request" >> pure mempty
++        else go (remaining - BS.length chunk) (chunk : chunks)
++
++corruptIdentifier :: ByteString -> ByteString
++corruptIdentifier identifier =
++  case BS.uncons identifier of
++    Nothing -> identifier
++    Just (firstByte, rest) -> BS.cons (if firstByte == 0 then 1 else 0) rest
+--- /dev/null
++++ b/test/ExternalSignerSpec.hs
+@@ -0,0 +1,290 @@
++module ExternalSignerSpec where
++
++import Cachix.Client.ExternalSigner
++import Cachix.Client.Exception (CachixException (ExternalSignerError))
++import Cachix.Client.Config qualified as Config
++import Cachix.Client.Env qualified as Env
++import Cachix.Client.Push
++import Cachix.Client.URI qualified as URI
++import Cachix.Types.BinaryCache qualified as BinaryCache
++import Cachix.Types.NarInfoCreate qualified as Api
++import Control.Concurrent.Async qualified as Async
++import Crypto.Sign.Ed25519 (PublicKey (PublicKey), SecretKey, Signature (Signature), createKeypair, dsign)
++import Data.Binary.Get hiding (remaining)
++import Data.Binary.Put
++import Data.ByteString qualified as BS
++import Data.ByteString.Base64 qualified as B64
++import Data.ByteString.Char8 qualified as Char8
++import Data.ByteString.Lazy qualified as LBS
++import Data.IORef
++import Data.Set qualified as Set
++import Data.UUID qualified as UUID
++import Hercules.CNix qualified as CNix
++import Hercules.CNix.Store qualified as Store
++import Network.Socket
++import Network.Socket.ByteString qualified as Socket
++import Protolude hiding (putByteString, toS)
++import Protolude.Conv (toS)
++import Servant.Auth.Client (Token (Token))
++import Servant.Client.Streaming qualified as Servant
++import System.IO.Temp (withSystemTempDirectory)
++import Test.Hspec
++
++spec :: Spec
++spec =
++  describe "NXSG self-managed cache signing" $ do
++    it "constructs the Cachix narinfo signature without private-key input" $
++      withSystemTempDirectory "cachix-nxsg" $ \directory -> do
++        let socketPath = directory <> "/signer.sock"
++            keyName = "cache.example-1"
++            endpointId = BS.replicate 16 3
++        (PublicKey publicKey, secretKey) <- createKeypair
++        observed <- newIORef []
++        server <- startServer socketPath keyName publicKey endpointId secretKey ValidSignature observed
++        signer <- connectExternalSigner socketPath
++        (uploadServer, clientEnv, uploadedRequest) <- startUploadServer
++
++        CNix.init
++        Store.withStore $ \store -> do
++          storePath <-
++            Store.parseStorePath store "/nix/store/00000000000000000000000000000000-package"
++          let strategy :: PushStrategy IO ()
++              strategy =
++                PushStrategy
++                  { onAlreadyPresent = pure (),
++                    onAttempt = \_ _ -> pure (),
++                    onUncompressedNARStream = panic "unused NAR stream hook",
++                    on401 = panic "unused authentication hook",
++                    onError = panic "unused error hook",
++                    onDone = pure (),
++                    compressionMethod = BinaryCache.ZSTD,
++                    compressionLevel = 1,
++                    chunkSize = 5242880,
++                    numConcurrentChunks = 1,
++                    omitDeriver = False
++                  }
++              params =
++                PushParams
++                  { pushParamsName = "example",
++                    pushParamsSecret = PushExternalSigner (Token "") signer,
++                    pushOnClosureAttempt = panic "unused closure hook",
++                    pushParamsStrategy = const strategy,
++                    pushParamsClientEnv = clientEnv,
++                    pushParamsStore = store
++                  }
++              pathInfo =
++                PathInfo
++                  { piPath = "/nix/store/00000000000000000000000000000000-package",
++                    piNarHash = "sha256:0000000000000000000000000000000000000000000000000000",
++                    piNarSize = 1,
++                    piDeriver = Nothing,
++                    piReferences = Set.empty
++                  }
++              upload =
++                UploadNarDetails
++                  { undNarSize = 1,
++                    undNarHash = "sha256:0000000000000000000000000000000000000000000000000000",
++                    undFileSize = 1,
++                    undFileHash = "00"
++                  }
++          narinfo <- newNarInfoCreate params storePath pathInfo upload
++          requests <- readIORef observed
++          case requests of
++            [(describeBatch, describeRequest, _), (signBatch, signRequest, fingerprint)] -> do
++              describeBatch `shouldBe` signBatch
++              describeRequest `shouldNotBe` signRequest
++              BS.all (== 0) describeBatch `shouldBe` False
++              BS.all (== 0) describeRequest `shouldBe` False
++              BS.all (== 0) signRequest `shouldBe` False
++              fingerprint
++                `shouldBe` "1;/nix/store/00000000000000000000000000000000-package;sha256:0000000000000000000000000000000000000000000000000000;1;"
++              let Signature signature = dsign secretKey fingerprint
++              Api.cSig narinfo `shouldBe` Just (toS $ B64.encode signature)
++              completeNarUpload
++                params
++                UploadMultipartResult
++                  { urNarId = UUID.nil,
++                    urUploadId = "upload-1",
++                    urParts = Nothing
++                  }
++                narinfo
++              Async.wait uploadServer
++              request <- readIORef uploadedRequest
++              request `shouldSatisfy` BS.isInfixOf (B64.encode signature)
++            _ -> expectationFailure "expected exactly one DescribeKey and one SignPathInfoV1 request"
++
++        Async.wait server
++
++    it "fails closed when the provider returns an invalid signature" $
++      withSystemTempDirectory "cachix-nxsg-invalid" $ \directory -> do
++        let socketPath = directory <> "/signer.sock"
++            keyName = "cache.example-1"
++            endpointId = BS.replicate 16 3
++            fingerprint = "1;/nix/store/00000000000000000000000000000000-package;sha256:0000;1;"
++        (PublicKey publicKey, secretKey) <- createKeypair
++        observed <- newIORef []
++        server <- startServer socketPath keyName publicKey endpointId secretKey InvalidSignature observed
++        signer <- connectExternalSigner socketPath
++        signFingerprint signer fingerprint `shouldThrow` \case
++          ExternalSignerError message -> message == "NXSG provider returned an invalid signature"
++          _ -> False
++        Async.wait server
++
++data SignatureMode = ValidSignature | InvalidSignature
++
++startUploadServer :: IO (Async.Async (), Servant.ClientEnv, IORef ByteString)
++startUploadServer = do
++  listener <- socket AF_INET Stream defaultProtocol
++  bind listener $ SockAddrInet 0 $ tupleToHostAddress (127, 0, 0, 1)
++  listen listener 1
++  port <- getSocketName listener >>= \case
++    SockAddrInet value _ -> pure value
++    _ -> expectationFailure "expected an IPv4 upload listener" >> pure 0
++  let uriText = Char8.pack $ "http://127.0.0.1:" <> show port
++      uri = either (panic . show) identity $ URI.parseURI uriText
++      options =
++        Config.CachixOptions
++          { Config.host = uri,
++            Config.configPath = "/tmp/cachix-test.dhall",
++            Config.verbose = False
++          }
++  clientEnv <- Env.createClientEnv options
++  observed <- newIORef mempty
++  server <- Async.async $ do
++    (connection, _) <- accept listener
++    request <- receiveHttpRequest connection
++    writeIORef observed request
++    Socket.sendAll connection "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
++    close connection
++    close listener
++  pure (server, clientEnv, observed)
++
++receiveHttpRequest :: Socket -> IO ByteString
++receiveHttpRequest sock = do
++  initial <- receiveHeaders mempty
++  let (headers, encodedBody) = BS.breakSubstring "\r\n\r\n" initial
++      body = BS.drop 4 encodedBody
++      bodyLength =
++        fromMaybe 0 $
++          head $
++            mapMaybe parseContentLength $
++              Char8.lines headers
++  remainder <- receiveExactly sock $ bodyLength - BS.length body
++  pure $ headers <> "\r\n\r\n" <> body <> remainder
++  where
++    receiveHeaders accumulated
++      | "\r\n\r\n" `BS.isInfixOf` accumulated = pure accumulated
++      | otherwise = do
++          chunk <- Socket.recv sock 4096
++          if BS.null chunk
++            then expectationFailure "truncated HTTP upload request" >> pure accumulated
++            else receiveHeaders $ accumulated <> chunk
++
++    parseContentLength line =
++      let lowered = Char8.map toLower line
++       in if "content-length:" `BS.isPrefixOf` lowered
++            then readMaybe $ Char8.unpack $ Char8.dropWhile (== ' ') $ BS.drop 15 lowered
++            else Nothing
++
++startServer ::
++  FilePath ->
++  ByteString ->
++  ByteString ->
++  ByteString ->
++  SecretKey ->
++  SignatureMode ->
++  IORef [(ByteString, ByteString, ByteString)] ->
++  IO (Async.Async ())
++startServer socketPath keyName publicKey endpointId secretKey signatureMode observed = do
++  listener <- socket AF_UNIX Stream defaultProtocol
++  bind listener $ SockAddrUnix socketPath
++  listen listener 2
++  Async.async $ do
++    (describeSocket, _) <- accept listener
++    (describeType, describeBatch, describeRequest, describeBody) <- receiveRequest describeSocket
++    describeType `shouldBe` 0x01
++    describeBody `shouldBe` mempty
++    sendResponse describeSocket 0x81 describeBatch describeRequest $
++      LBS.toStrict $ runPut $ do
++        putWord16be $ fromIntegral $ BS.length keyName
++        putByteString keyName
++        putWord8 1
++        putByteString publicKey
++        putByteString endpointId
++    modifyIORef' observed (<> [(describeBatch, describeRequest, mempty)])
++    close describeSocket
++
++    (sign, _) <- accept listener
++    (signType, signBatch, signRequest, signBody) <- receiveRequest sign
++    signType `shouldBe` 0x02
++    fingerprint <- parseSignBody keyName publicKey endpointId signBody
++    let Signature validSignature = dsign secretKey fingerprint
++        signature = case signatureMode of
++          ValidSignature -> validSignature
++          InvalidSignature -> BS.replicate 64 0
++    sendResponse sign 0x82 signBatch signRequest $
++      LBS.toStrict $ runPut $ do
++        putWord16be $ fromIntegral $ BS.length keyName
++        putByteString keyName
++        putByteString publicKey
++        putByteString endpointId
++        putByteString signature
++    modifyIORef' observed (<> [(signBatch, signRequest, fingerprint)])
++    close sign
++    close listener
++
++receiveRequest :: Socket -> IO (Word8, ByteString, ByteString, ByteString)
++receiveRequest sock = do
++  header <- receiveExactly sock 48
++  let requestType = BS.index header 6
++      bodyLength = fromIntegral $ runGet getWord32be $ LBS.fromStrict $ BS.take 4 $ BS.drop 12 header
++      batchId = BS.take 16 $ BS.drop 16 header
++      requestId = BS.take 16 $ BS.drop 32 header
++  body <- receiveExactly sock bodyLength
++  trailing <- Socket.recv sock 1
++  trailing `shouldBe` mempty
++  pure (requestType, batchId, requestId, body)
++
++parseSignBody :: ByteString -> ByteString -> ByteString -> ByteString -> IO ByteString
++parseSignBody keyName publicKey endpointId encoded =
++  case runGetOrFail parser $ LBS.fromStrict encoded of
++    Left (_, _, reason) -> expectationFailure reason >> pure mempty
++    Right (remaining, _, (actualName, actualPublicKey, actualEndpointId, fingerprint)) -> do
++      remaining `shouldBe` mempty
++      actualName `shouldBe` keyName
++      actualPublicKey `shouldBe` publicKey
++      actualEndpointId `shouldBe` endpointId
++      pure fingerprint
++  where
++    parser = do
++      nameLength <- fromIntegral <$> getWord16be
++      actualName <- getByteString nameLength
++      actualPublicKey <- getByteString 32
++      actualEndpointId <- getByteString 16
++      fingerprintLength <- fromIntegral <$> getWord32be
++      fingerprint <- getByteString fingerprintLength
++      pure (actualName, actualPublicKey, actualEndpointId, fingerprint)
++
++sendResponse :: Socket -> Word8 -> ByteString -> ByteString -> ByteString -> IO ()
++sendResponse sock responseType batchId requestId body =
++  Socket.sendAll sock $ LBS.toStrict $ runPut $ do
++    putByteString "NXSG"
++    putWord8 1
++    putWord8 0
++    putWord8 responseType
++    putWord8 0
++    putWord32be 0
++    putWord32be $ fromIntegral $ BS.length body
++    putByteString batchId
++    putByteString requestId
++    putByteString body
++
++receiveExactly :: Socket -> Int -> IO ByteString
++receiveExactly sock expected = go expected []
++  where
++    go 0 chunks = pure $ BS.concat $ reverse chunks
++    go remaining chunks = do
++      chunk <- Socket.recv sock remaining
++      if BS.null chunk
++        then expectationFailure "truncated NXSG request" >> pure mempty
++        else go (remaining - BS.length chunk) (chunk : chunks)

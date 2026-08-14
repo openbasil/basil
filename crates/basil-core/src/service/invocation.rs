@@ -4,9 +4,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::BTreeSet;
 use std::fmt;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -26,19 +26,30 @@ use basil_proto::invocation::{
 use tonic::{Code, Request, Response, Status};
 use zeroize::Zeroizing;
 
-use crate::actor::{AuthenticatedActor, PresenterInfo, ProofKind, ProofSummary, TransportInfo};
+use crate::actor::{AuthenticatedActor, host_process_snapshot, resolve_evidence_actor};
+use crate::actor::{PresenterInfo, ProofKind, ProofSummary, TransportInfo};
 use crate::catalog::Class;
-use crate::catalog::policy::{
-    Op, PrincipalSpec, ResolvedPolicy, SignatureKeyAlgorithm, SubjectMatch,
+use crate::catalog::evidence::{
+    EvidencePredicate, EvidenceState, EvidenceValue, SignatureKeyEvidence,
+};
+use crate::catalog::policy::{Op, ResolvedPolicy, SignatureKeyAlgorithm};
+use crate::core::ci_federation_audit::{
+    CiInvocationAudit, CiQuotaState, CiTerminalOutcome, CiTerminalReason, CiTerminalStage,
 };
 use crate::decision::DecisionRecord;
 use crate::service::broker::{BrokerGrpc, GrpcResult};
 use crate::service::shared::{invalid_request, manager_status};
+use crate::transport::connection::ListenerConnectInfo;
 use crate::transport::{broker_status, peer_from_request};
 
 const BROKER_KEY_USE_LABEL: &str = "broker_key_use";
 const BROKER_RESPONSE_ENCRYPTION_USE: &str = "response-encryption";
 const INVOKE_OP: &str = "invoke";
+const CHALLENGE_OP: &str = "get_invocation_challenge";
+/// Frozen local courier contract version from SPEC revision 4.2.
+const COURIER_PROTOCOL_VERSION: u32 = 1;
+/// Wire bound on `courier_observed_source`: a rate-limit partition key only.
+const MAX_COURIER_SOURCE_BYTES: usize = 128;
 
 #[tonic::async_trait]
 impl InvocationService for BrokerGrpc {
@@ -51,20 +62,102 @@ impl InvocationService for BrokerGrpc {
                 "InvocationService is disabled; set invocation.enable=true to accept sealed invocations",
             ));
         }
-        let prepared = self.prepare_invocation(&request).await?;
-        tracing::debug!(
-            sender_subject = %prepared.actor.subject,
-            recipient_key_id = %prepared.recipient_key_id,
-            plaintext_len = prepared.body.len(),
-            "sealed invocation preflight accepted",
-        );
-        self.execute_invocation(prepared)
-            .await
-            .map(Response::new)
-            .map_err(|error| {
-                tracing::warn!(%error, "sealed invocation response protection failed");
-                response_protection_failed()
-            })
+        match self.prepare_invocation(&request).await? {
+            PreparedRequest::Proceed(prepared) => {
+                tracing::debug!(
+                    sender_subject = %prepared.actor.subject,
+                    recipient_key_id = %prepared.recipient_key_id,
+                    response_key_id = %prepared.response_recipient.key_id(),
+                    plaintext_len = prepared.body.len(),
+                    "sealed invocation preflight accepted",
+                );
+                self.execute_invocation(*prepared)
+                    .await
+                    .map(Response::new)
+                    .map_err(|error| {
+                        tracing::warn!(%error, "sealed invocation response protection failed");
+                        response_protection_failed()
+                    })
+            }
+            PreparedRequest::Denied(denied) => self
+                .protect_denied_invocation(*denied)
+                .await
+                .map(Response::new)
+                .map_err(|error| {
+                    tracing::warn!(%error, "sealed invocation response protection failed");
+                    response_protection_failed()
+                }),
+        }
+    }
+
+    /// Issue a single-use freshness challenge (SPEC rev 4 Freshness).
+    ///
+    /// Reachable without authentication: the requested `jkt` is self-asserted
+    /// and grants nothing; it only binds the issued challenge to one proof
+    /// key and partitions issuance rate limits. Declined issuance under
+    /// capacity or rate-limit pressure is `RESOURCE_EXHAUSTED` with the
+    /// stable reason `CHALLENGE_ISSUANCE_DECLINED`, retryable with the same
+    /// request after backoff.
+    async fn get_invocation_challenge(
+        &self,
+        request: Request<pb::GetInvocationChallengeRequest>,
+    ) -> GrpcResult<pb::GetInvocationChallengeResponse> {
+        if !self.invocation.enabled {
+            return Err(broker_status(
+                Code::FailedPrecondition,
+                "INVOCATION_DISABLED",
+                CHALLENGE_OP,
+                "InvocationService is disabled; set invocation.enable=true to issue challenges",
+            ));
+        }
+        let body = request.get_ref();
+        let Ok(jkt) = <[u8; 32]>::try_from(body.jkt.as_slice()) else {
+            return Err(invalid_request(
+                CHALLENGE_OP,
+                "jkt must be exactly 32 bytes",
+            ));
+        };
+        let source = self.challenge_source_partition(&request)?;
+        let generation = self.state.load_generation().id();
+        let now = i64::from(self.invocation_now_unix());
+        let _issuance = match self.challenge_issuance_gate.try_lock() {
+            Ok(gate) => gate,
+            Err(TryLockError::WouldBlock) => return Err(challenge_issuance_declined()),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(challenge_table_unavailable(CHALLENGE_OP));
+            }
+        };
+        let Ok(mut table) = self.challenge_table.try_lock() else {
+            return Err(challenge_issuance_declined());
+        };
+        let issued = table.issue(jkt, source, generation, now);
+        drop(table);
+        match issued {
+            Ok(issued) => Ok(Response::new(pb::GetInvocationChallengeResponse {
+                challenge: issued.challenge.to_vec(),
+                generation,
+                expires_at_unix: issued.expires_at_unix,
+            })),
+            Err(decline) => {
+                tracing::debug!(reason = %decline, "invocation challenge issuance declined");
+                Err(challenge_issuance_declined())
+            }
+        }
+    }
+
+    async fn get_invocation_capabilities(
+        &self,
+        _request: Request<pb::GetInvocationCapabilitiesRequest>,
+    ) -> GrpcResult<pb::GetInvocationCapabilitiesResponse> {
+        let listener_profile = match self.listener_type {
+            crate::transport::grpc_server::ListenerType::Host => pb::ListenerProfile::Host,
+            crate::transport::grpc_server::ListenerType::Courier => pb::ListenerProfile::Courier,
+        };
+        Ok(Response::new(pb::GetInvocationCapabilitiesResponse {
+            listener_profile: listener_profile.into(),
+            require_challenge: self.invocation.require_challenge,
+            courier_protocol_version: COURIER_PROTOCOL_VERSION,
+        }))
     }
 }
 
@@ -90,19 +183,236 @@ impl fmt::Debug for DecryptedInvocationBody {
     }
 }
 
+/// Outcome of the invocation preflight: proceed to the typed operation, or
+/// answer a sealed denial — a freshness denial (`CHALLENGE_UNKNOWN`, before
+/// authorization, quota, or the backend) or a per-run quota denial
+/// (retryable-never `PER_RUN_QUOTA_EXCEEDED` on exhaustion, retryable
+/// `RUN_QUOTA_UNTRACKED` on bucket-table pressure; both after subject
+/// resolution and before authorization or the backend).
+#[derive(Debug)]
+enum PreparedRequest {
+    Proceed(Box<PreparedInvocation>),
+    Denied(Box<DeniedInvocation>),
+}
+
 #[derive(Debug)]
 struct PreparedInvocation {
+    generation: std::sync::Arc<crate::state::Generation>,
     actor: AuthenticatedActor,
+    provider_operation_target: Option<String>,
     recipient_key_id: String,
-    response_key_id: String,
+    response_recipient: ResponseRecipient,
     response_subject: Option<String>,
     content_type: String,
     claims: Claims,
     request_message: Vec<u8>,
     body: DecryptedInvocationBody,
+    audit: Option<CiInvocationAudit>,
+}
+
+impl PreparedInvocation {
+    fn envelope(&self) -> ResponseEnvelope<'_> {
+        ResponseEnvelope {
+            response_recipient: &self.response_recipient,
+            response_subject: self.response_subject.as_deref(),
+            request_message: &self.request_message,
+            request_message_id: &self.claims.message_id,
+        }
+    }
+}
+
+/// The sealed status a denied preflight answers with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SealedDenial {
+    /// The freshness challenge did not consume; the client fetches a fresh
+    /// challenge and rebuilds. Not retryable with the same message.
+    ChallengeUnknown,
+    /// The rule's per-run operation quota is exhausted for this
+    /// `(rule, run_id, run_attempt)`; never retryable within the run.
+    PerRunQuotaExceeded,
+    /// Quota configuration or table state was unavailable; fail closed with
+    /// the same sealed status as exhaustion.
+    RunQuotaUnavailable,
+    /// The rule's bounded run-bucket allowance cannot track this run yet
+    /// (table pressure, not exhaustion); retryable after expired buckets
+    /// are reclaimed.
+    RunQuotaUntracked,
+}
+
+impl SealedDenial {
+    fn status(self) -> InvocationStatus {
+        match self {
+            Self::ChallengeUnknown => InvocationStatus::challenge_unknown(),
+            Self::PerRunQuotaExceeded | Self::RunQuotaUnavailable => {
+                InvocationStatus::per_run_quota_exceeded()
+            }
+            Self::RunQuotaUntracked => InvocationStatus::run_quota_untracked(),
+        }
+    }
+}
+
+/// A request denied at the freshness-challenge or per-run quota step.
+/// Carries exactly what is needed to protect the sealed denial response;
+/// the request body is never decrypted.
+#[derive(Debug)]
+struct DeniedInvocation {
+    generation: std::sync::Arc<crate::state::Generation>,
+    denial: SealedDenial,
+    response_recipient: ResponseRecipient,
+    response_subject: Option<String>,
+    request_message_id: MessageId,
+    request_message: Vec<u8>,
+    audit: Option<CiInvocationAudit>,
+}
+
+impl DeniedInvocation {
+    fn envelope(&self) -> ResponseEnvelope<'_> {
+        ResponseEnvelope {
+            response_recipient: &self.response_recipient,
+            response_subject: self.response_subject.as_deref(),
+            request_message: &self.request_message,
+            request_message_id: &self.request_message_id,
+        }
+    }
+}
+
+/// The request-derived inputs of response protection, shared by success,
+/// operation-status, and challenge-denial responses.
+struct ResponseEnvelope<'a> {
+    response_recipient: &'a ResponseRecipient,
+    response_subject: Option<&'a str>,
+    request_message: &'a [u8],
+    request_message_id: &'a MessageId,
+}
+
+fn finish_ci_audit(
+    audit: &mut Option<CiInvocationAudit>,
+    stage: CiTerminalStage,
+    outcome: CiTerminalOutcome,
+    reason: CiTerminalReason,
+) {
+    if let Some(audit) = audit {
+        audit.finish(stage, outcome, reason);
+    }
+}
+
+fn finalize_response_audit<T, E>(
+    audit: &mut Option<CiInvocationAudit>,
+    result: &Result<T, E>,
+    success_stage: CiTerminalStage,
+    success_outcome: CiTerminalOutcome,
+    success_reason: CiTerminalReason,
+) {
+    let (stage, outcome, reason, succeeded) = if result.is_ok() {
+        (success_stage, success_outcome, success_reason, true)
+    } else {
+        (
+            CiTerminalStage::ResponseDelivery,
+            CiTerminalOutcome::Failure,
+            CiTerminalReason::ResponseFailed,
+            false,
+        )
+    };
+    if let Some(audit) = audit {
+        audit.response_delivered(succeeded);
+        audit.finish(stage, outcome, reason);
+    }
+}
+
+/// The response-encryption recipient resolved once during preflight.
+///
+/// Catalog recipients retain the existing local subject-key behavior.
+/// Ephemeral recipients are supplied by a successfully verified provider
+/// proof and carry the already validated public half directly; response
+/// protection never consults a catalog entry with the same key ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResponseRecipient {
+    Catalog { key_id: String },
+    Ephemeral { key_id: String, public: [u8; 32] },
+}
+
+impl ResponseRecipient {
+    fn key_id(&self) -> &str {
+        match self {
+            Self::Catalog { key_id } | Self::Ephemeral { key_id, .. } => key_id,
+        }
+    }
+
+    const fn is_catalog(&self) -> bool {
+        matches!(self, Self::Catalog { .. })
+    }
+}
+
+/// Why the freshness-challenge step denied the request. Every variant maps
+/// to the sealed `CHALLENGE_UNKNOWN` (`retryable = false`); the client
+/// obtains a fresh challenge and rebuilds with a fresh message ID.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+enum ChallengeDenial {
+    #[error("missing required freshness challenge")]
+    Missing,
+    #[error("{0}")]
+    Denied(crate::core::challenge::ConsumeDenied),
 }
 
 impl BrokerGrpc {
+    fn challenge_source_partition(
+        &self,
+        request: &Request<pb::GetInvocationChallengeRequest>,
+    ) -> Result<crate::core::challenge::ChallengeSourcePartition, Status> {
+        let context = request
+            .extensions()
+            .get::<ListenerConnectInfo>()
+            .ok_or_else(challenge_source_context_unavailable)?;
+        if context.listener_type() != self.listener_type
+            || context.listener_name() != self.listener_name.as_ref()
+        {
+            return Err(challenge_source_context_unavailable());
+        }
+        let Some(uid) = context.peer().uid else {
+            return Err(challenge_source_context_unavailable());
+        };
+        if peer_from_request(request).uid != Some(uid) {
+            return Err(challenge_source_context_unavailable());
+        }
+        let source = request.get_ref().courier_observed_source.as_deref();
+        match self.listener_type {
+            crate::transport::grpc_server::ListenerType::Host => {
+                if source.is_some() {
+                    return Err(invalid_request(
+                        CHALLENGE_OP,
+                        "courier_observed_source is forbidden on host listeners",
+                    ));
+                }
+                Ok(crate::core::challenge::ChallengeSourcePartition::host(
+                    context.listener_name(),
+                    uid,
+                ))
+            }
+            crate::transport::grpc_server::ListenerType::Courier => {
+                let Some(source) = source else {
+                    return Err(invalid_request(
+                        CHALLENGE_OP,
+                        "courier_observed_source is required on courier listeners",
+                    ));
+                };
+                if source.is_empty()
+                    || source.len() > MAX_COURIER_SOURCE_BYTES
+                    || source.chars().any(char::is_control)
+                {
+                    return Err(invalid_request(
+                        CHALLENGE_OP,
+                        "courier_observed_source must be 1..=128 control-free bytes",
+                    ));
+                }
+                Ok(crate::core::challenge::ChallengeSourcePartition::courier(
+                    context.listener_name(),
+                    uid,
+                    source,
+                ))
+            }
+        }
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "ordered security preflight is kept linear"
@@ -110,20 +420,20 @@ impl BrokerGrpc {
     async fn prepare_invocation(
         &self,
         request: &Request<pb::SealedRequest>,
-    ) -> Result<PreparedInvocation, Status> {
+    ) -> Result<PreparedRequest, Status> {
         let message = request.get_ref();
         if message.message.is_empty() {
             return Err(invalid_request(INVOKE_OP, "missing sealed COSE message"));
         }
 
         let peer = peer_from_request(request);
-        let generation = self.state.load_generation();
+        let generation = self.state.load_generation().to_owned();
         let generation_id = generation.id();
         let policy = generation.policy().clone();
-        drop(generation);
+        let config = generation.config().clone();
 
         let policy_verifier = PolicyVerifier::new(&policy);
-        let validation = self.request_validation_params()?;
+        let validation = self.request_validation_params(generation.federation().is_some())?;
         let sealed = match verify_sealed(
             &message.message,
             &policy_verifier,
@@ -142,41 +452,426 @@ impl BrokerGrpc {
                         &peer,
                         Op::Decrypt,
                         "unknown",
-                        format!("invalid_actor_proof: {error}"),
+                        None,
+                        EvidenceState::NoMatch,
+                        &format!("invalid_actor_proof: {error}"),
                     ));
                 return Err(verify_status(&error));
             }
         };
 
-        let actor = match resolve_signature_actor(
-            &policy_verifier.verified_subjects()?,
-            sealed.claims.issuer.as_ref().map(Subject::as_str),
-            PresenterInfo::from(&peer),
-        ) {
-            Ok(actor) => actor,
-            Err(status) => {
+        let provider_proof_presented = !sealed.protected_headers.signer_certificates_jwt.is_empty()
+            || sealed.protected_headers.signer_public_key_cose.is_some();
+        let mut ci_audit = provider_proof_presented.then(|| {
+            CiInvocationAudit::presented(
+                Arc::clone(&self.state),
+                generation_id,
+                request_hash(&message.message).0,
+                Some(sealed.claims.message_id.as_bytes()),
+            )
+        });
+        let provider_token = if sealed.protected_headers.signer_certificates_jwt.is_empty() {
+            None
+        } else {
+            let token = crate::ci_federation::exactly_one_bounded_token(
+                &sealed.protected_headers.signer_certificates_jwt,
+            )
+            .map_err(|error| {
+                finish_ci_audit(
+                    &mut ci_audit,
+                    CiTerminalStage::IdentityVerification,
+                    CiTerminalOutcome::Denied,
+                    CiTerminalReason::IdentityRejected,
+                );
+                invalid_request(INVOKE_OP, error.to_string())
+            })?;
+            if let (Some(audit), Ok(correlation)) = (&mut ci_audit, token_correlation_key())
+                && let Ok(digest) = correlation.token_digest(token.as_bytes())
+            {
+                audit.presented_token(&digest);
+            }
+            Some(token)
+        };
+        let proof_public = if let Some(proof_key) = &sealed.protected_headers.signer_public_key_cose
+        {
+            let public = crate::ci_federation::decode_proof_key_cose(proof_key).map_err(|_| {
+                finish_ci_audit(
+                    &mut ci_audit,
+                    CiTerminalStage::IdentityVerification,
+                    CiTerminalOutcome::Denied,
+                    CiTerminalReason::IdentityRejected,
+                );
+                invalid_request(INVOKE_OP, "malformed proof key")
+            })?;
+            if let Some(audit) = &mut ci_audit {
+                audit.proof_key(&crate::ci_federation::proof_key_thumbprint(&public));
+            }
+            if provider_token.is_none() {
+                finish_ci_audit(
+                    &mut ci_audit,
+                    CiTerminalStage::IdentityVerification,
+                    CiTerminalOutcome::Denied,
+                    CiTerminalReason::IdentityRejected,
+                );
+                return Err(invalid_request(INVOKE_OP, "missing signer certificate"));
+            }
+            Some(public)
+        } else {
+            None
+        };
+        let provider_evidence = if let Some(token) = provider_token {
+            let Some(public) = proof_public.as_ref() else {
+                finish_ci_audit(
+                    &mut ci_audit,
+                    CiTerminalStage::IdentityVerification,
+                    CiTerminalOutcome::Denied,
+                    CiTerminalReason::IdentityRejected,
+                );
+                return Err(invalid_request(INVOKE_OP, "missing proof key"));
+            };
+            let evidence = self
+                .verify_provider_evidence(&generation, token, public)
+                .await
+                .inspect_err(|_| {
+                    finish_ci_audit(
+                        &mut ci_audit,
+                        CiTerminalStage::IdentityVerification,
+                        CiTerminalOutcome::Denied,
+                        CiTerminalReason::IdentityRejected,
+                    );
+                })?;
+            if let Some(audit) = &mut ci_audit {
+                audit.verified(&evidence);
+            }
+            Some(evidence)
+        } else {
+            None
+        };
+        let provider_operation_target = if let Some(provider) = &provider_evidence {
+            let target = validate_provider_envelope_authority(
+                &provider.broker_audience,
+                &provider.operation_profiles,
+                &provider.artifact_sign_key_ids,
+                sealed.claims.audience.as_ref(),
+                sealed.content_type.as_str(),
+                sealed.protected_headers.operation_target_key_id.as_ref(),
+                &self.invocation.audiences,
+            )
+            .inspect_err(|_| {
+                finish_ci_audit(
+                    &mut ci_audit,
+                    CiTerminalStage::EnvelopeAuthority,
+                    CiTerminalOutcome::Denied,
+                    CiTerminalReason::EnvelopeRejected,
+                );
+            })?;
+            if let Some(audit) = &mut ci_audit {
+                audit.accepted_operation(target.clone());
+            }
+            Some(target)
+        } else {
+            if sealed.protected_headers.operation_target_key_id.is_some() {
+                return Err(invalid_request(
+                    INVOKE_OP,
+                    "operation target requires provider proof",
+                ));
+            }
+            None
+        };
+        if provider_evidence.is_none()
+            && !self.invocation.audiences.is_empty()
+            && !sealed.claims.audience.as_ref().is_some_and(|audience| {
+                self.invocation
+                    .audiences
+                    .iter()
+                    .any(|allowed| allowed == audience.as_str())
+            })
+        {
+            return Err(invalid_request(INVOKE_OP, "invocation audience rejected"));
+        }
+        // SPEC revision 4.2 step 3: resolve the one response recipient after
+        // provider verification and before peer admission, challenge
+        // consumption, policy, or backend use. The provider-proof and local
+        // subject-key shapes are disjoint and never fall back into one
+        // another, even when an ephemeral thumbprint collides with a catalog
+        // key name.
+        let response_recipient = Self::resolve_response_recipient(
+            &generation,
+            &sealed.claims,
+            provider_evidence.is_some(),
+        )
+        .inspect_err(|_| {
+            finish_ci_audit(
+                &mut ci_audit,
+                CiTerminalStage::EnvelopeAuthority,
+                CiTerminalOutcome::Denied,
+                CiTerminalReason::EnvelopeRejected,
+            );
+        })?;
+
+        let Some(uid) = peer.uid else {
+            self.state
+                .record_decision(&DecisionRecord::from_resolution_error(
+                    generation_id,
+                    &peer,
+                    Op::Decrypt,
+                    key_id_for_audit(&sealed.recipient_key_id),
+                    None,
+                    EvidenceState::Unavailable,
+                    "invalid_actor_proof",
+                ));
+            finish_ci_audit(
+                &mut ci_audit,
+                CiTerminalStage::SubjectResolution,
+                CiTerminalOutcome::Denied,
+                CiTerminalReason::SubjectRejected,
+            );
+            return Err(unauthorized_invocation());
+        };
+
+        // Freshness (SPEC rev 4, step 4): consume the single-use challenge
+        // after the outer signature verified and the thumbprint is known,
+        // and before subject resolution, the per-run quota hook
+        // (basil-jjgi.3.4 slots in after subject resolution below),
+        // authorization, or any backend use of the requested operation. A
+        // denial is answered as a sealed non-retryable `CHALLENGE_UNKNOWN`
+        // without decrypting the request body.
+        let freshness = self
+            .consume_freshness_challenge(
+                generation_id,
+                &sealed.claims,
+                proof_public.as_ref(),
+                &policy_verifier,
+            )
+            .await
+            .inspect_err(|_| {
+                if let Some(audit) = &mut ci_audit {
+                    audit.freshness_unavailable();
+                }
+                finish_ci_audit(
+                    &mut ci_audit,
+                    CiTerminalStage::Freshness,
+                    CiTerminalOutcome::Failure,
+                    CiTerminalReason::FreshnessUnavailable,
+                );
+            })?;
+        if let Err(denial) = freshness {
+            if let Some(audit) = &mut ci_audit {
+                audit.freshness_denied();
+            }
+            tracing::debug!(reason = %denial, "sealed invocation freshness challenge denied");
+            self.state
+                .record_decision(&DecisionRecord::from_resolution_error(
+                    generation_id,
+                    &peer,
+                    Op::Decrypt,
+                    key_id_for_audit(&sealed.recipient_key_id),
+                    None,
+                    EvidenceState::NoMatch,
+                    &format!("freshness_challenge_denied: {denial}"),
+                ));
+            let response_subject = sealed
+                .claims
+                .response_subject
+                .as_ref()
+                .map(ResponseSubject::as_str)
+                .map(str::to_string);
+            return Ok(PreparedRequest::Denied(Box::new(DeniedInvocation {
+                generation,
+                denial: SealedDenial::ChallengeUnknown,
+                response_recipient,
+                response_subject,
+                request_message_id: sealed.claims.message_id.clone(),
+                request_message: message.message.clone(),
+                audit: ci_audit,
+            })));
+        }
+        if let Some(audit) = &mut ci_audit {
+            audit.freshness_accepted();
+        }
+
+        // Captured before the evidence moves into the actor below; charged
+        // at the quota step (SPEC rev 4, step 6) after subject resolution.
+        let run_quota_charge = provider_evidence.as_ref().map(|provider| RunQuotaCharge {
+            key: crate::ci_federation::RunQuotaKey {
+                rule_id: provider.rule_id.clone(),
+                run_id: provider.claims.run_id(),
+                run_attempt: provider.claims.run_attempt(),
+            },
+            limit: provider.max_operations_per_run,
+            retention_secs: provider.run_bucket_retention_secs,
+        });
+
+        let actor = if let Some(provider) = &provider_evidence {
+            let Some(mut actor) = generation.pdp().resolve_subject_actor(&provider.subject) else {
+                finish_ci_audit(
+                    &mut ci_audit,
+                    CiTerminalStage::SubjectResolution,
+                    CiTerminalOutcome::Denied,
+                    CiTerminalReason::SubjectRejected,
+                );
+                return Err(unauthorized_invocation());
+            };
+            actor.authenticated_by.push(ProofSummary {
+                kind: ProofKind::ProviderJwt,
+                subject: provider.subject.clone(),
+                fingerprint: Some(encode_id(provider.claims.token_digest())),
+            });
+            actor.presenter = PresenterInfo::from(&peer);
+            actor.transport = TransportInfo::default();
+            actor
+        } else {
+            let mut evidence = host_process_snapshot(&config, &peer, uid);
+            evidence.invocation_signature_key =
+                EvidenceValue::Available(policy_verifier.verified_key()?);
+            resolve_evidence_actor(&policy, &evidence, &peer).map_err(|error| {
                 self.state
-                    .record_decision(&DecisionRecord::from_resolution_error(
+                    .record_decision(&DecisionRecord::from_subject_resolution_error(
                         generation_id,
                         &peer,
                         Op::Decrypt,
                         key_id_for_audit(&sealed.recipient_key_id),
-                        "invalid_actor_proof".to_string(),
+                        &error,
+                        "invalid_actor_proof",
                     ));
-                return Err(status);
-            }
+                unauthorized_invocation()
+            })?
         };
-
-        let recipient_key_id = catalog_key_id(&sealed.recipient_key_id, "recipient key id")?;
-        self.validate_request_recipient_key(recipient_key_id)?;
-        let response_key_id = sealed
+        if sealed
             .claims
-            .response_key_id
+            .issuer
             .as_ref()
-            .ok_or_else(|| invalid_request(INVOKE_OP, "missing response encryption key"))?;
-        let response_key_id = catalog_key_id(response_key_id, "response encryption key")?;
+            .is_some_and(|issuer| issuer.as_str() != actor.subject)
+        {
+            self.state
+                .record_decision(&DecisionRecord::from_actor_evidence_denial(
+                    generation_id,
+                    &actor,
+                    Op::Decrypt,
+                    key_id_for_audit(&sealed.recipient_key_id),
+                    EvidenceState::NoMatch,
+                    "actor_claim_mismatch",
+                ));
+            finish_ci_audit(
+                &mut ci_audit,
+                CiTerminalStage::SubjectResolution,
+                CiTerminalOutcome::Denied,
+                CiTerminalReason::SubjectRejected,
+            );
+            return Err(unauthorized_invocation());
+        }
+        if let Some(audit) = &mut ci_audit {
+            audit.subject_resolved();
+        }
 
-        let generation = self.state.load_generation();
+        // Per-run quota (SPEC rev 4, step 6): charge one typed operation
+        // against `(rule, run_id, run_attempt)` after subject resolution and
+        // before authorization or any backend use. Genuine exhaustion (and
+        // the fail-closed missing-limit case) is answered as the sealed
+        // retryable-never `PER_RUN_QUOTA_EXCEEDED`; bucket-table pressure
+        // (`Untracked`) as the sealed retryable `RUN_QUOTA_UNTRACKED` —
+        // both without decrypting the request body. The counter is
+        // in-memory and generation-scoped, so restart or reload resets it
+        // (stated behavior), and a denied charge consumes no quota.
+        if let Some(charge) = run_quota_charge {
+            let mut run_quota = self.run_quota.lock().map_err(|_| {
+                if let Some(audit) = &mut ci_audit {
+                    audit.quota_denied(CiQuotaState::Unavailable);
+                }
+                finish_ci_audit(
+                    &mut ci_audit,
+                    CiTerminalStage::Quota,
+                    CiTerminalOutcome::Failure,
+                    CiTerminalReason::QuotaUnavailable,
+                );
+                run_quota_table_unavailable()
+            })?;
+            let outcome = run_quota.charge_with_receipt(
+                generation_id,
+                &charge.key,
+                charge.limit,
+                charge.retention_secs,
+                i64::from(self.invocation_now_unix()),
+            );
+            drop(run_quota);
+            match outcome {
+                Ok(receipt) => {
+                    if let Some(audit) = &mut ci_audit {
+                        audit.quota_charged(receipt);
+                    }
+                }
+                Err(denied) => {
+                    tracing::debug!(
+                        reason = %denied,
+                        rule = %charge.key.rule_id,
+                        "sealed invocation per-run quota denied",
+                    );
+                    self.state
+                        .record_decision(&DecisionRecord::from_actor_evidence_denial(
+                            generation_id,
+                            &actor,
+                            Op::Decrypt,
+                            key_id_for_audit(&sealed.recipient_key_id),
+                            EvidenceState::Match,
+                            &format!("per_run_quota_denied: {denied}"),
+                        ));
+                    let response_subject = sealed
+                        .claims
+                        .response_subject
+                        .as_ref()
+                        .map(ResponseSubject::as_str)
+                        .map(str::to_string);
+                    let denial = match denied {
+                        crate::ci_federation::RunQuotaDenied::Untracked => {
+                            if let Some(audit) = &mut ci_audit {
+                                audit.quota_denied(CiQuotaState::Untracked);
+                            }
+                            SealedDenial::RunQuotaUntracked
+                        }
+                        crate::ci_federation::RunQuotaDenied::Exhausted => {
+                            if let Some(audit) = &mut ci_audit {
+                                audit.quota_denied(CiQuotaState::Exhausted);
+                            }
+                            SealedDenial::PerRunQuotaExceeded
+                        }
+                        crate::ci_federation::RunQuotaDenied::QuotaUnavailable => {
+                            if let Some(audit) = &mut ci_audit {
+                                audit.quota_denied(CiQuotaState::Unavailable);
+                            }
+                            SealedDenial::RunQuotaUnavailable
+                        }
+                    };
+                    return Ok(PreparedRequest::Denied(Box::new(DeniedInvocation {
+                        generation,
+                        denial,
+                        response_recipient,
+                        response_subject,
+                        request_message_id: sealed.claims.message_id.clone(),
+                        request_message: message.message.clone(),
+                        audit: ci_audit,
+                    })));
+                }
+            }
+        }
+
+        let recipient_key_id = catalog_key_id(&sealed.recipient_key_id, "recipient key id")
+            .inspect_err(|_| {
+                finish_ci_audit(
+                    &mut ci_audit,
+                    CiTerminalStage::RecipientValidation,
+                    CiTerminalOutcome::Denied,
+                    CiTerminalReason::RecipientRejected,
+                );
+            })?;
+        self.validate_request_recipient_key(recipient_key_id)
+            .inspect_err(|_| {
+                finish_ci_audit(
+                    &mut ci_audit,
+                    CiTerminalStage::RecipientValidation,
+                    CiTerminalOutcome::Denied,
+                    CiTerminalReason::RecipientRejected,
+                );
+            })?;
         let decision = generation
             .pdp()
             .decide(&actor, Op::Decrypt, recipient_key_id);
@@ -189,17 +884,33 @@ impl BrokerGrpc {
                 &decision,
             ));
         if decision.is_deny() {
+            if let Some(audit) = &mut ci_audit {
+                audit.decrypt_authorized(false);
+            }
+            finish_ci_audit(
+                &mut ci_audit,
+                CiTerminalStage::DecryptAuthorization,
+                CiTerminalOutcome::Denied,
+                CiTerminalReason::DecryptDenied,
+            );
             return Err(unauthorized_invocation());
         }
-        drop(generation);
+        if let Some(audit) = &mut ci_audit {
+            audit.decrypt_authorized(true);
+        }
 
-        self.validate_response_encryption_key(response_key_id)
-            .await?;
-        self.check_replay(
-            &sealed.signer_key_id,
-            &sealed.claims.message_id,
-            effective_expires_at_unix(&sealed.claims)?,
-        )?;
+        if response_recipient.is_catalog() {
+            self.validate_catalog_response_encryption_key_material(response_recipient.key_id())
+                .await
+                .inspect_err(|_| {
+                    finish_ci_audit(
+                        &mut ci_audit,
+                        CiTerminalStage::ResponseDelivery,
+                        CiTerminalOutcome::Failure,
+                        CiTerminalReason::ResponseFailed,
+                    );
+                })?;
+        }
 
         let opened = sealed
             .open(
@@ -211,9 +922,26 @@ impl BrokerGrpc {
                 Some(&KdfParties::anonymous()),
             )
             .await
-            .map_err(|e| open_status(&e))?;
+            .map_err(|error| {
+                finish_ci_audit(
+                    &mut ci_audit,
+                    CiTerminalStage::RequestDecryption,
+                    CiTerminalOutcome::Failure,
+                    CiTerminalReason::DecryptFailed,
+                );
+                open_status(&error)
+            })?;
         if opened.content_type != sealed.content_type {
+            finish_ci_audit(
+                &mut ci_audit,
+                CiTerminalStage::RequestDecryption,
+                CiTerminalOutcome::Failure,
+                CiTerminalReason::DecryptFailed,
+            );
             return Err(invalid_request(INVOKE_OP, "opened content type mismatch"));
+        }
+        if let Some(audit) = &mut ci_audit {
+            audit.request_decrypted();
         }
 
         let response_subject = sealed
@@ -222,107 +950,236 @@ impl BrokerGrpc {
             .as_ref()
             .map(ResponseSubject::as_str)
             .map(str::to_string);
-        Ok(PreparedInvocation {
+        Ok(PreparedRequest::Proceed(Box::new(PreparedInvocation {
+            generation,
             actor,
+            provider_operation_target,
             recipient_key_id: recipient_key_id.to_string(),
-            response_key_id: response_key_id.to_string(),
+            response_recipient,
             response_subject,
             content_type: sealed.content_type.as_str().to_string(),
             claims: sealed.claims,
             request_message: message.message.clone(),
             body: DecryptedInvocationBody::new(opened.plaintext),
-        })
+            audit: ci_audit,
+        })))
+    }
+
+    /// Consume the request's single-use freshness challenge.
+    ///
+    /// Proof-bound requests (an ephemeral proof key in the signer headers)
+    /// must present a challenge. Subject-key requests may — and must when the
+    /// broker is configured with `invocation.require-challenge` (courier
+    /// deployments); when present it is enforced identically, bound to the
+    /// verified Ed25519 subject key's RFC 7638 thumbprint. `Ok(Err(_))` is a
+    /// freshness denial that surfaces as the sealed non-retryable
+    /// `CHALLENGE_UNKNOWN`; `Err(_)` is an envelope error.
+    async fn consume_freshness_challenge(
+        &self,
+        generation_id: u64,
+        claims: &Claims,
+        proof_public: Option<&[u8; 32]>,
+        verifier: &PolicyVerifier<'_>,
+    ) -> Result<Result<(), ChallengeDenial>, Status> {
+        let Some(challenge) = claims.freshness_challenge else {
+            if proof_public.is_some() || self.invocation.require_challenge {
+                return Ok(Err(ChallengeDenial::Missing));
+            }
+            return Ok(Ok(()));
+        };
+        let jkt = if let Some(public) = proof_public {
+            crate::ci_federation::proof_key_thumbprint(public)
+        } else {
+            let evidence = verifier.verified_key()?;
+            if evidence.algorithm != SignatureKeyAlgorithm::Ed25519 {
+                return Err(invalid_request(
+                    INVOKE_OP,
+                    "freshness challenge requires an Ed25519 invocation signature key",
+                ));
+            }
+            let public = decode_ed25519_public(&evidence.public)
+                .ok_or_else(|| invalid_request(INVOKE_OP, "verified signature key is malformed"))?;
+            crate::ci_federation::proof_key_thumbprint(&public)
+        };
+        let now = i64::from(self.invocation_now_unix());
+        let outcome = self.challenge_table.lock().await.consume(
+            challenge.as_bytes(),
+            &jkt,
+            generation_id,
+            now,
+        );
+        Ok(outcome.map_err(ChallengeDenial::Denied))
+    }
+
+    /// Protect the sealed non-retryable denial (`CHALLENGE_UNKNOWN` or
+    /// `PER_RUN_QUOTA_EXCEEDED`) for a request rejected in preflight.
+    async fn protect_denied_invocation(
+        &self,
+        mut denied: DeniedInvocation,
+    ) -> Result<pb::SealedResponse, ResponseProtectionError> {
+        let body = SignInvocationResponse {
+            status: denied.denial.status(),
+            policy_generation: denied.generation.id(),
+            signature: None,
+        };
+        if let Some(audit) = &mut denied.audit {
+            audit.response_started();
+        }
+        let result = self
+            .protect_response(
+                &denied.envelope(),
+                CONTENT_TYPE_SIGN_RESPONSE,
+                &body.to_cbor_bytes(),
+            )
+            .await;
+        let reason = match denied.denial {
+            SealedDenial::ChallengeUnknown => CiTerminalReason::FreshnessDenied,
+            SealedDenial::PerRunQuotaExceeded => CiTerminalReason::QuotaExhausted,
+            SealedDenial::RunQuotaUnavailable => CiTerminalReason::QuotaUnavailable,
+            SealedDenial::RunQuotaUntracked => CiTerminalReason::QuotaUntracked,
+        };
+        finalize_response_audit(
+            &mut denied.audit,
+            &result,
+            match denied.denial {
+                SealedDenial::ChallengeUnknown => CiTerminalStage::Freshness,
+                SealedDenial::PerRunQuotaExceeded
+                | SealedDenial::RunQuotaUnavailable
+                | SealedDenial::RunQuotaUntracked => CiTerminalStage::Quota,
+            },
+            CiTerminalOutcome::Denied,
+            reason,
+        );
+        result
     }
 
     async fn execute_invocation(
         &self,
-        prepared: PreparedInvocation,
+        mut prepared: PreparedInvocation,
     ) -> Result<pb::SealedResponse, ResponseProtectionError> {
         if prepared_content_type(&prepared) == CONTENT_TYPE_SIGN_REQUEST {
             self.execute_sign_invocation(prepared).await
         } else {
             let body = SignInvocationResponse {
                 status: InvocationStatus::invalid_request("UNSUPPORTED_CONTENT_TYPE"),
-                policy_generation: self.state.load_generation().id(),
+                policy_generation: prepared.generation.id(),
                 signature: None,
             };
-            self.protect_response(&prepared, CONTENT_TYPE_SIGN_RESPONSE, &body.to_cbor_bytes())
-                .await
+            self.protect_prepared_response(
+                &mut prepared,
+                &body.to_cbor_bytes(),
+                CiTerminalStage::OperationValidation,
+                CiTerminalOutcome::Denied,
+                CiTerminalReason::OperationRejected,
+            )
+            .await
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "ordered operation and terminal audit transitions stay linear"
+    )]
     async fn execute_sign_invocation(
         &self,
-        prepared: PreparedInvocation,
+        mut prepared: PreparedInvocation,
     ) -> Result<pb::SealedResponse, ResponseProtectionError> {
         let request_body = match SignInvocationRequest::from_cbor_bytes(prepared.body.0.as_slice())
         {
             Ok(body) => body,
             Err(error) => {
-                let policy_generation = self.state.load_generation().id();
+                let policy_generation = prepared.generation.id();
                 tracing::debug!(%error, "sealed sign invocation body rejected");
                 return self
                     .protect_sign_status_response(
-                        &prepared,
+                        &mut prepared,
                         InvocationStatus::invalid_request("INVALID_REQUEST_BODY"),
                         policy_generation,
+                        CiTerminalStage::OperationValidation,
+                        CiTerminalOutcome::Denied,
+                        CiTerminalReason::OperationRejected,
                     )
                     .await;
             }
         };
+        let operation_target = prepared
+            .provider_operation_target
+            .clone()
+            .unwrap_or_else(|| request_body.key_id.clone());
         if let Err(error) = crate::service::shared::ensure_supported_signing_algorithm(
             request_body.algorithm,
             INVOKE_OP,
         ) {
-            let policy_generation = self.state.load_generation().id();
+            let policy_generation = prepared.generation.id();
             tracing::debug!(%error, "sealed sign invocation algorithm rejected");
             return self
                 .protect_sign_status_response(
-                    &prepared,
+                    &mut prepared,
                     InvocationStatus::invalid_request("UNSUPPORTED_SIGNING_ALGORITHM"),
                     policy_generation,
+                    CiTerminalStage::OperationValidation,
+                    CiTerminalOutcome::Denied,
+                    CiTerminalReason::OperationRejected,
                 )
                 .await;
         }
-        let generation = self.state.load_generation();
+        let generation = &prepared.generation;
         let policy_generation = generation.id();
         let decision = generation
             .pdp()
-            .decide(&prepared.actor, Op::Sign, &request_body.key_id);
+            .decide(&prepared.actor, Op::Sign, &operation_target);
         self.state
             .record_decision(&DecisionRecord::from_actor_decision(
                 policy_generation,
                 &prepared.actor,
                 Op::Sign,
-                &request_body.key_id,
+                &operation_target,
                 &decision,
             ));
         if decision.is_deny() {
-            drop(generation);
+            if let Some(audit) = &mut prepared.audit {
+                audit.sign_authorized(false);
+            }
             return self
                 .protect_sign_status_response(
-                    &prepared,
+                    &mut prepared,
                     InvocationStatus::denied(),
                     policy_generation,
+                    CiTerminalStage::SignAuthorization,
+                    CiTerminalOutcome::Denied,
+                    CiTerminalReason::SignDenied,
                 )
                 .await;
         }
-        drop(generation);
-
+        if let Some(audit) = &mut prepared.audit {
+            audit.sign_authorized(true);
+            audit.backend_started();
+        }
         let signature = match self
             .state
             .manager()
-            .sign(&request_body.key_id, &request_body.message)
+            .sign(&operation_target, &request_body.message)
             .await
         {
-            Ok(signature) => signature,
+            Ok(signature) => {
+                if let Some(audit) = &mut prepared.audit {
+                    audit.backend_executed(true);
+                }
+                signature
+            }
             Err(error) => {
+                if let Some(audit) = &mut prepared.audit {
+                    audit.backend_executed(false);
+                }
                 tracing::warn!(%error, "sealed sign invocation operation failed");
                 return self
                     .protect_sign_status_response(
-                        &prepared,
+                        &mut prepared,
                         InvocationStatus::internal_error(),
                         policy_generation,
+                        CiTerminalStage::BackendExecution,
+                        CiTerminalOutcome::Failure,
+                        CiTerminalReason::BackendFailed,
                     )
                     .await;
             }
@@ -332,23 +1189,50 @@ impl BrokerGrpc {
             policy_generation,
             signature: Some(signature),
         };
-        self.protect_response(&prepared, CONTENT_TYPE_SIGN_RESPONSE, &body.to_cbor_bytes())
-            .await
+        self.protect_prepared_response(
+            &mut prepared,
+            &body.to_cbor_bytes(),
+            CiTerminalStage::Complete,
+            CiTerminalOutcome::Success,
+            CiTerminalReason::Completed,
+        )
+        .await
     }
 
     async fn protect_sign_status_response(
         &self,
-        prepared: &PreparedInvocation,
+        prepared: &mut PreparedInvocation,
         status: InvocationStatus,
         policy_generation: u64,
+        stage: CiTerminalStage,
+        outcome: CiTerminalOutcome,
+        reason: CiTerminalReason,
     ) -> Result<pb::SealedResponse, ResponseProtectionError> {
         let body = SignInvocationResponse {
             status,
             policy_generation,
             signature: None,
         };
-        self.protect_response(prepared, CONTENT_TYPE_SIGN_RESPONSE, &body.to_cbor_bytes())
+        self.protect_prepared_response(prepared, &body.to_cbor_bytes(), stage, outcome, reason)
             .await
+    }
+
+    async fn protect_prepared_response(
+        &self,
+        prepared: &mut PreparedInvocation,
+        body: &[u8],
+        stage: CiTerminalStage,
+        outcome: CiTerminalOutcome,
+        reason: CiTerminalReason,
+    ) -> Result<pb::SealedResponse, ResponseProtectionError> {
+        if let Some(audit) = &mut prepared.audit {
+            audit.response_started();
+        }
+        let result = self
+            .protect_response(&prepared.envelope(), CONTENT_TYPE_SIGN_RESPONSE, body)
+            .await;
+        finalize_response_audit(&mut prepared.audit, &result, stage, outcome, reason);
+        result
     }
 
     fn validate_request_recipient_key(&self, recipient_key_id: &str) -> Result<(), Status> {
@@ -368,8 +1252,50 @@ impl BrokerGrpc {
         }
     }
 
-    async fn validate_response_encryption_key(&self, key_id: &str) -> Result<(), Status> {
-        let generation = self.state.load_generation();
+    fn resolve_response_recipient(
+        generation: &crate::state::Generation,
+        claims: &Claims,
+        provider_verified: bool,
+    ) -> Result<ResponseRecipient, Status> {
+        let key_id = required_response_key_id(claims)?;
+        match (provider_verified, claims.response_public_key_cose) {
+            (true, Some(public)) => {
+                // The COSE profile already enforces this relation while
+                // decoding. Recheck at the trust-boundary selection seam so
+                // this function remains correct for typed callers and future
+                // construction paths too.
+                if key_id.as_bytes() != public.thumbprint().as_bytes() {
+                    return Err(invalid_request(
+                        INVOKE_OP,
+                        "response key id does not match ephemeral response public key",
+                    ));
+                }
+                Ok(ResponseRecipient::Ephemeral {
+                    key_id: key_id.to_string(),
+                    public: *public.as_public_bytes(),
+                })
+            }
+            (true, None) => Err(invalid_request(
+                INVOKE_OP,
+                "provider-proof request is missing an ephemeral response public key",
+            )),
+            (false, Some(_)) => Err(invalid_request(
+                INVOKE_OP,
+                "ephemeral response public key requires verified provider proof",
+            )),
+            (false, None) => {
+                Self::validate_catalog_response_encryption_key(generation, key_id)?;
+                Ok(ResponseRecipient::Catalog {
+                    key_id: key_id.to_string(),
+                })
+            }
+        }
+    }
+
+    fn validate_catalog_response_encryption_key(
+        generation: &crate::state::Generation,
+        key_id: &str,
+    ) -> Result<(), Status> {
         let Some(key) = generation.catalog().keys.get(key_id) else {
             return Err(invalid_request(
                 INVOKE_OP,
@@ -391,7 +1317,13 @@ impl BrokerGrpc {
                 ));
             }
         }
-        drop(generation);
+        Ok(())
+    }
+
+    async fn validate_catalog_response_encryption_key_material(
+        &self,
+        key_id: &str,
+    ) -> Result<(), Status> {
         self.state
             .manager()
             .sealing_public_key(key_id)
@@ -402,7 +1334,7 @@ impl BrokerGrpc {
 
     async fn protect_response(
         &self,
-        prepared: &PreparedInvocation,
+        envelope: &ResponseEnvelope<'_>,
         content_type: &str,
         plaintext_body: &[u8],
     ) -> Result<pb::SealedResponse, ResponseProtectionError> {
@@ -411,12 +1343,15 @@ impl BrokerGrpc {
             .broker_identity
             .as_ref()
             .ok_or(ResponseProtectionError::MissingBrokerIdentity)?;
-        let recipient_public = self
-            .state
-            .manager()
-            .sealing_public_key(&prepared.response_key_id)
-            .await
-            .map_err(ResponseProtectionError::Manager)?;
+        let recipient_public = match envelope.response_recipient {
+            ResponseRecipient::Catalog { key_id } => self
+                .state
+                .manager()
+                .sealing_public_key(key_id)
+                .await
+                .map_err(ResponseProtectionError::Manager)?,
+            ResponseRecipient::Ephemeral { public, .. } => *public,
+        };
         let now = self.invocation_now_unix();
         let response_message_id = MessageId::from_bytes(uuid::Uuid::new_v4().as_bytes().to_vec())?;
         let signer_key_id = KeyId::from_text(&identity.response_signing_key_id)?;
@@ -431,8 +1366,10 @@ impl BrokerGrpc {
             sender_key_id: Some(signer_key_id.clone()),
             response_key_id: None,
             response_subject: None,
-            in_reply_to: Some(prepared.claims.message_id.clone()),
-            request_hash: Some(request_hash(&prepared.request_message)),
+            in_reply_to: Some(envelope.request_message_id.clone()),
+            request_hash: Some(request_hash(envelope.request_message)),
+            freshness_challenge: None,
+            response_public_key_cose: None,
         };
         let message = build_sealed(
             &SealParams {
@@ -441,7 +1378,7 @@ impl BrokerGrpc {
                 claims,
                 role: MessageRole::Response,
                 recipient: X25519RecipientPublic {
-                    key_id: KeyId::from_text(&prepared.response_key_id)?,
+                    key_id: KeyId::from_text(envelope.response_recipient.key_id())?,
                     public: recipient_public,
                 },
                 content_algorithm: ContentAlgorithm::A256Gcm,
@@ -456,17 +1393,23 @@ impl BrokerGrpc {
         .await?;
         Ok(pb::SealedResponse {
             message: message.into_vec(),
-            response_subject: prepared.response_subject.clone(),
+            response_subject: envelope.response_subject.map(str::to_string),
         })
     }
 
-    fn request_validation_params(&self) -> Result<ValidationParams, Status> {
+    fn request_validation_params(
+        &self,
+        allow_provider_audience: bool,
+    ) -> Result<ValidationParams, Status> {
         let mut allowed_audiences = BTreeSet::new();
         for audience in &self.invocation.audiences {
             allowed_audiences.insert(
                 Subject::new(audience.clone())
                     .map_err(|e| invalid_request(INVOKE_OP, e.to_string()))?,
             );
+        }
+        if allow_provider_audience {
+            allowed_audiences.clear();
         }
         Ok(ValidationParams {
             now: UnixTime(i64::from(self.invocation_now_unix())),
@@ -478,28 +1421,258 @@ impl BrokerGrpc {
         })
     }
 
-    fn check_replay(
+    /// Resolve the JWKS to verify against for one federation rule.
+    ///
+    /// Classifies the presented key ID under one cache lock (fresh hit,
+    /// positive-TTL expiry needing revalidation, or unknown key ID), then
+    /// performs at most one bounded fetch per cooldown window; any admitted
+    /// refresh attempt is recorded before the fetch so a failed fetch still
+    /// consumes it. Past `max_age`, a cached key ID serves the stale set only
+    /// within `stale_if_error`, after which the rule fails closed until a
+    /// fetch succeeds — so a provider-side key rotation (its only revocation
+    /// mechanism) takes effect boundedly instead of persisting for the
+    /// generation lifetime. `Ok(None)` means this rule cannot serve the key
+    /// ID right now: no generation cache entry (never fetches, fails closed),
+    /// cooldown-gated, fetch failed, or staleness bound exceeded.
+    async fn resolve_rule_jwks(
         &self,
-        sender_sign_id: &KeyId,
-        message_id: &MessageId,
-        expires_at_unix: u32,
-    ) -> Result<(), Status> {
-        let sender = encode_id(sender_sign_id.as_bytes());
-        let message = encode_id(message_id.as_bytes());
-        let mut cache = self
-            .invocation_replay_cache
-            .lock()
-            .map_err(|_| invalid_request(INVOKE_OP, "invocation replay cache unavailable"))?;
-        cache
-            .check_and_insert(
-                &sender,
-                &message,
-                expires_at_unix,
-                self.invocation.clock_skew_secs,
-                self.invocation_now_unix(),
-            )
-            .map_err(|e| invalid_request(INVOKE_OP, e.to_string()))
+        generation: &std::sync::Arc<crate::state::Generation>,
+        rule_id: &str,
+        provider: &crate::core::ci_federation::ProviderConfig,
+        token_kid: &str,
+        now: std::time::SystemTime,
+    ) -> Result<Option<crate::core::ci_federation::GenerationJwks>, Status> {
+        let Some(client) = generation.provider_client(rule_id).cloned() else {
+            return Ok(None);
+        };
+        let generation_id = generation.id();
+        resolve_rule_jwks_via(generation, rule_id, token_kid, now, &mut || {
+            let client = client.clone();
+            let provider = provider.clone();
+            async move {
+                crate::ci_federation::fetch_generation_jwks(&client, generation_id, &provider).await
+            }
+        })
+        .await
     }
+
+    async fn verify_provider_evidence(
+        &self,
+        generation: &std::sync::Arc<crate::state::Generation>,
+        token: &str,
+        public: &[u8; 32],
+    ) -> Result<crate::core::ci_federation::VerifiedProviderEvidence, Status> {
+        let catalog = generation
+            .federation()
+            .ok_or_else(unauthorized_invocation)?;
+        let now = std::time::UNIX_EPOCH
+            .checked_add(Duration::from_secs(u64::from(self.invocation_now_unix())))
+            .ok_or_else(unauthorized_invocation)?;
+        let token_kid = jsonwebtoken::decode_header(token)
+            .ok()
+            .and_then(|header| header.kid)
+            .ok_or_else(unauthorized_invocation)?;
+        let correlation = token_correlation_key()?;
+        for rule in catalog.rules() {
+            let Some(keys) = self
+                .resolve_rule_jwks(generation, &rule.id, &rule.provider, &token_kid, now)
+                .await?
+            else {
+                continue;
+            };
+            let verified = match &rule.provider {
+                crate::core::ci_federation::ProviderConfig::GithubActions(github) => {
+                    crate::core::ci_federation::verify_github(
+                        github,
+                        &keys,
+                        token,
+                        public,
+                        correlation,
+                        now,
+                    )
+                    .map(crate::core::ci_federation::ProviderClaimEvidence::GithubActions)
+                }
+                crate::core::ci_federation::ProviderConfig::ForgejoActions(forgejo) => {
+                    crate::core::ci_federation::verify_forgejo(
+                        forgejo,
+                        &keys,
+                        token,
+                        public,
+                        correlation,
+                        now,
+                    )
+                    .map(crate::core::ci_federation::ProviderClaimEvidence::ForgejoActions)
+                }
+            };
+            if let Ok(claims) = verified {
+                return Ok(crate::core::ci_federation::VerifiedProviderEvidence {
+                    provider: rule.provider.kind(),
+                    issuer: rule.provider.issuer().to_string(),
+                    rule_id: rule.id.clone(),
+                    subject: rule.subject.clone(),
+                    broker_audience: rule.audience.clone(),
+                    operation_profiles: rule.operation_profiles.clone(),
+                    artifact_sign_key_ids: rule.artifact_sign_key_ids.clone(),
+                    max_operations_per_run: rule.max_operations_per_run,
+                    run_bucket_retention_secs: rule
+                        .max_token_age_secs
+                        .saturating_add(rule.clock_skew_secs),
+                    claims,
+                });
+            }
+        }
+        Err(unauthorized_invocation())
+    }
+}
+
+fn validate_provider_envelope_authority(
+    broker_audience: &str,
+    operation_profiles: &[crate::core::ci_federation::ProviderOperationProfile],
+    artifact_sign_key_ids: &[String],
+    claims_audience: Option<&Subject>,
+    content_type: &str,
+    operation_target_key_id: Option<&KeyId>,
+    invocation_audiences: &[String],
+) -> Result<String, Status> {
+    if claims_audience.map(Subject::as_str) != Some(broker_audience)
+        || !invocation_audiences
+            .iter()
+            .any(|audience| audience == broker_audience)
+    {
+        return Err(invalid_request(
+            INVOKE_OP,
+            "provider broker audience rejected",
+        ));
+    }
+    if content_type != CONTENT_TYPE_SIGN_REQUEST
+        || !operation_profiles
+            .contains(&crate::core::ci_federation::ProviderOperationProfile::ArtifactSign)
+    {
+        return Err(invalid_request(
+            INVOKE_OP,
+            "provider operation profile rejected",
+        ));
+    }
+    let operation_target = operation_target_key_id
+        .and_then(KeyId::as_catalog_name)
+        .ok_or_else(|| {
+            invalid_request(INVOKE_OP, "provider operation target missing or invalid")
+        })?;
+    if !artifact_sign_key_ids
+        .iter()
+        .any(|target| target == operation_target)
+    {
+        return Err(invalid_request(
+            INVOKE_OP,
+            "provider operation target rejected",
+        ));
+    }
+    Ok(operation_target.to_string())
+}
+
+/// Serving-path JWKS resolution for one federation rule (the body of
+/// [`BrokerGrpc::resolve_rule_jwks`], which documents the contract).
+///
+/// Generic over the fetch so the wiring is testable with a stub: `fetch` is
+/// invoked only after the cache decision admits a refresh (fresh hits never
+/// fetch, a missing generation cache entry never fetches and fails closed,
+/// and the cooldown gate records the attempt before the fetch so a failed
+/// fetch still consumes it). Production supplies the bounded HTTPS
+/// discovery + JWKS fetch.
+async fn resolve_rule_jwks_via<F, Fut>(
+    generation: &std::sync::Arc<crate::state::Generation>,
+    rule_id: &str,
+    token_kid: &str,
+    now: std::time::SystemTime,
+    fetch: &mut F,
+) -> Result<Option<crate::core::ci_federation::GenerationJwks>, Status>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<
+            Output = Result<
+                crate::core::ci_federation::GenerationJwks,
+                crate::core::ci_federation::FederationError,
+            >,
+        >,
+{
+    use crate::core::ci_federation::ServeDecision;
+    let decision = generation
+        .jwks_caches()
+        .lock()
+        .map_err(|_| unauthorized_invocation())?
+        .get_mut(rule_id)
+        .map(|cache| cache.serve_or_revalidate(token_kid, now));
+    let Some(decision) = decision else {
+        return Ok(None);
+    };
+    match decision {
+        ServeDecision::Fresh(keys) => Ok(Some(keys)),
+        ServeDecision::Revalidate {
+            refresh_allowed,
+            stale,
+        } => {
+            let fetched = if refresh_allowed {
+                fetch().await.ok()
+            } else {
+                None
+            };
+            match fetched {
+                Some(keys) => {
+                    install_generation_jwks(generation, rule_id, &keys, now)?;
+                    Ok(Some(keys))
+                }
+                None => Ok(stale),
+            }
+        }
+        ServeDecision::UnknownKid { refresh_allowed } => {
+            if !refresh_allowed {
+                return Ok(None);
+            }
+            let Ok(keys) = fetch().await else {
+                return Ok(None);
+            };
+            install_generation_jwks(generation, rule_id, &keys, now)?;
+            Ok(Some(keys))
+        }
+    }
+}
+
+/// Install a freshly fetched JWKS into the generation's cache for one rule.
+fn install_generation_jwks(
+    generation: &std::sync::Arc<crate::state::Generation>,
+    rule_id: &str,
+    keys: &crate::core::ci_federation::GenerationJwks,
+    now: std::time::SystemTime,
+) -> Result<(), Status> {
+    let mut cache_map = generation
+        .jwks_caches()
+        .lock()
+        .map_err(|_| unauthorized_invocation())?;
+    if let Some(cache) = cache_map.get_mut(rule_id) {
+        cache.install(keys.clone(), now);
+    }
+    drop(cache_map);
+    Ok(())
+}
+
+/// The broker-local key for CI token/`jti` correlation digests.
+///
+/// A fresh random key per broker process: correlation identity is only
+/// meaningful within one audit stream, and keeping the key ephemeral means a
+/// captured audit record can never be matched against a raw token offline
+/// after the process exits. Fails closed if entropy is unavailable.
+fn token_correlation_key()
+-> Result<&'static crate::core::ci_federation::TokenCorrelationKey, Status> {
+    static KEY: std::sync::OnceLock<crate::core::ci_federation::TokenCorrelationKey> =
+        std::sync::OnceLock::new();
+    if let Some(key) = KEY.get() {
+        return Ok(key);
+    }
+    // Zeroizing end-to-end: the generated bytes move into the key (or are
+    // scrubbed on the race-loser path) without leaving a plain stack copy.
+    let mut bytes = zeroize::Zeroizing::new([0_u8; 32]);
+    getrandom::fill(&mut *bytes).map_err(|_| unauthorized_invocation())?;
+    Ok(KEY.get_or_init(move || crate::core::ci_federation::TokenCorrelationKey::new(bytes)))
 }
 
 fn prepared_content_type(prepared: &PreparedInvocation) -> &str {
@@ -520,35 +1693,79 @@ fn encode_id(bytes: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
-fn effective_expires_at_unix(claims: &Claims) -> Result<u32, Status> {
-    let effective = match claims.expires_at {
-        Some(UnixTime(exp)) => exp,
-        None => claims
-            .issued_at
-            .0
-            .saturating_add(i64::from(DEFAULT_EXPIRES_AFTER_SECS)),
-    };
-    u32::try_from(effective).map_err(|_| invalid_request(INVOKE_OP, "claim expiry out of range"))
+/// Parse the required response-encryption key ID out of the request claims.
+fn required_response_key_id(claims: &Claims) -> Result<&str, Status> {
+    let response_key_id = claims
+        .response_key_id
+        .as_ref()
+        .ok_or_else(|| invalid_request(INVOKE_OP, "missing response encryption key"))?;
+    catalog_key_id(response_key_id, "response encryption key")
+}
+
+/// The stable, retryable decline for challenge issuance under capacity or
+/// rate-limit pressure. The same request may be retried after backoff.
+fn challenge_issuance_declined() -> Status {
+    broker_status(
+        Code::ResourceExhausted,
+        "CHALLENGE_ISSUANCE_DECLINED",
+        CHALLENGE_OP,
+        "challenge issuance declined; retry after backoff",
+    )
+}
+
+/// Internal broker fault: the challenge-table mutex is poisoned. Unreachable
+/// under the no-panic rule, and honestly labeled as a server error rather
+/// than a client error or a retryable decline (a poisoned mutex never
+/// recovers).
+fn challenge_table_unavailable(op: &'static str) -> Status {
+    broker_status(
+        Code::Internal,
+        "CHALLENGE_TABLE_UNAVAILABLE",
+        op,
+        "challenge table unavailable",
+    )
+}
+
+fn run_quota_table_unavailable() -> Status {
+    broker_status(
+        Code::Internal,
+        "RUN_QUOTA_TABLE_UNAVAILABLE",
+        INVOKE_OP,
+        "run quota table unavailable",
+    )
+}
+
+fn challenge_source_context_unavailable() -> Status {
+    broker_status(
+        Code::Unavailable,
+        "CHALLENGE_SOURCE_CONTEXT_UNAVAILABLE",
+        CHALLENGE_OP,
+        "challenge source context unavailable",
+    )
 }
 
 struct PolicyVerifier<'a> {
     policy: &'a ResolvedPolicy,
-    verified_subjects: Mutex<Vec<String>>,
+    verified_key: Mutex<Option<SignatureKeyEvidence>>,
 }
 
 impl<'a> PolicyVerifier<'a> {
     const fn new(policy: &'a ResolvedPolicy) -> Self {
         Self {
             policy,
-            verified_subjects: Mutex::new(Vec::new()),
+            verified_key: Mutex::new(None),
         }
     }
 
-    fn verified_subjects(&self) -> Result<Vec<String>, Status> {
-        self.verified_subjects
+    fn verified_key(&self) -> Result<SignatureKeyEvidence, Status> {
+        self.verified_key
             .lock()
-            .map(|subjects| subjects.clone())
             .map_err(|_| invalid_request(INVOKE_OP, "signature verifier state unavailable"))
+            .and_then(|verified| {
+                verified
+                    .clone()
+                    .ok_or_else(|| invalid_request(INVOKE_OP, "signature was not verified"))
+            })
     }
 }
 
@@ -557,31 +1774,58 @@ impl Verifier for PolicyVerifier<'_> {
         &self,
         key_id: &KeyId,
         algorithm: SignatureAlgorithm,
-        _protected_headers: &basil_cose::ProtectedHeaders,
+        protected_headers: &basil_cose::ProtectedHeaders,
         sig_structure: &[u8],
         signature: &Signature,
     ) -> Result<(), VerifyError> {
+        if let Some(proof_key) = &protected_headers.signer_public_key_cose {
+            let public = crate::ci_federation::decode_proof_key_cose(proof_key)
+                .map_err(|_| VerifyError::SignatureInvalid)?;
+            let expected_kid = crate::ci_federation::proof_key_kid(&public);
+            if key_id.as_bytes() != expected_kid.as_bytes()
+                || algorithm != SignatureAlgorithm::EdDsa
+                || !crate::ed25519_sign::verify(&public, sig_structure, signature.as_bytes())
+                    .unwrap_or(false)
+            {
+                return Err(VerifyError::SignatureInvalid);
+            }
+            let mut verified = self
+                .verified_key
+                .lock()
+                .map_err(|_| VerifyError::Provider {
+                    message: "signature verifier state unavailable".to_string(),
+                })?;
+            *verified = Some(SignatureKeyEvidence {
+                algorithm: SignatureKeyAlgorithm::Ed25519,
+                public: URL_SAFE_NO_PAD.encode(public),
+            });
+            drop(verified);
+            return Ok(());
+        }
         // The broker verifies invocation signatures against EdDSA subject keys
         // only; any other wire algorithm fails closed.
         if algorithm != SignatureAlgorithm::EdDsa {
             return Err(VerifyError::AlgorithmMismatch);
         }
-        let mut subjects = Vec::new();
-        for (name, definition) in &self.policy.subjects {
-            if subject_match_verifies(&definition.match_, key_id, sig_structure, signature) {
-                subjects.push(name.clone());
+        let mut verified_key = None;
+        for definition in self.policy.subjects.values() {
+            if let Some(key) =
+                expression_signature_verifies(&definition.match_, key_id, sig_structure, signature)
+            {
+                verified_key = Some(key);
+                break;
             }
         }
-        if subjects.is_empty() {
+        let Some(verified_key) = verified_key else {
             return Err(VerifyError::SignatureInvalid);
-        }
+        };
         let mut verified = self
-            .verified_subjects
+            .verified_key
             .lock()
             .map_err(|_| VerifyError::Provider {
                 message: "signature verifier state unavailable".to_string(),
             })?;
-        *verified = subjects;
+        *verified = Some(verified_key);
         drop(verified);
         Ok(())
     }
@@ -650,110 +1894,44 @@ impl Signer for ManagerSigner<'_> {
     }
 }
 
+/// One pending per-run quota charge, captured from verified provider
+/// evidence before it moves into the resolved actor.
 #[derive(Debug)]
-pub(super) struct InvocationReplayCache {
-    capacity: usize,
-    order: VecDeque<(String, String)>,
-    entries: HashMap<(String, String), u32>,
+struct RunQuotaCharge {
+    key: crate::ci_federation::RunQuotaKey,
+    /// The selected rule's `max_operations_per_run`; `None` (unreachable for
+    /// a loaded rule) fails closed at the charge.
+    limit: Option<u64>,
+    /// The rule's bucket retention window (`max_token_age_secs +
+    /// clock_skew_secs`), bounding how long an idle bucket stays tracked.
+    retention_secs: u64,
 }
 
-impl InvocationReplayCache {
-    pub(super) fn new(capacity: usize) -> Self {
-        Self {
-            capacity: capacity.max(1),
-            order: VecDeque::new(),
-            entries: HashMap::new(),
-        }
-    }
-
-    fn check_and_insert(
-        &mut self,
-        sender_sign_id: &str,
-        message_id: &str,
-        expires_at_unix: u32,
-        clock_skew_secs: u32,
-        now_unix: u32,
-    ) -> Result<(), ReplayError> {
-        self.evict_expired(now_unix);
-        let key = (sender_sign_id.to_string(), message_id.to_string());
-        if self.entries.contains_key(&key) {
-            return Err(ReplayError::ReplayedMessageId);
-        }
-        while self.entries.len() >= self.capacity {
-            if let Some(oldest) = self.order.pop_front() {
-                self.entries.remove(&oldest);
-            } else {
-                break;
-            }
-        }
-        self.order.push_back(key.clone());
-        self.entries
-            .insert(key, expires_at_unix.saturating_add(clock_skew_secs));
-        Ok(())
-    }
-
-    fn evict_expired(&mut self, now_unix: u32) {
-        self.entries.retain(|_, expires_at| *expires_at >= now_unix);
-        self.order.retain(|key| self.entries.contains_key(key));
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-enum ReplayError {
-    #[error("replayed `message_id`")]
-    ReplayedMessageId,
-}
-
-fn resolve_signature_actor(
-    subjects: &[String],
-    explicit_subject: Option<&str>,
-    presenter: PresenterInfo,
-) -> Result<AuthenticatedActor, Status> {
-    let subject = match explicit_subject {
-        Some(subject) if subjects.iter().any(|s| s == subject) => subject.to_string(),
-        Some(_) => return Err(unauthorized_invocation()),
-        None => match subjects {
-            [subject] => subject.clone(),
-            [] | [_, ..] => return Err(unauthorized_invocation()),
-        },
-    };
-    Ok(AuthenticatedActor {
-        subject: subject.clone(),
-        authenticated_by: vec![ProofSummary {
-            kind: ProofKind::SignatureKey,
-            subject,
-        }],
-        presenter,
-        transport: TransportInfo::default(),
-    })
-}
-
-fn subject_match_verifies(
-    match_: &SubjectMatch,
+fn expression_signature_verifies(
+    expression: &crate::catalog::EvidenceExpression,
     key_id: &KeyId,
     sig_structure: &[u8],
     signature: &Signature,
-) -> bool {
-    match match_ {
-        SubjectMatch::AllOf(specs) => specs
-            .iter()
-            .all(|spec| principal_verifies(spec, key_id, sig_structure, signature)),
-        SubjectMatch::AnyOf(specs) => specs
-            .iter()
-            .any(|spec| principal_verifies(spec, key_id, sig_structure, signature)),
-    }
+) -> Option<SignatureKeyEvidence> {
+    let mut verified = None;
+    expression.visit_leaves(&mut |predicate| {
+        if verified.is_none() {
+            verified = predicate_signature_verifies(predicate, key_id, sig_structure, signature);
+        }
+    });
+    verified
 }
 
-fn principal_verifies(
-    spec: &PrincipalSpec,
+fn predicate_signature_verifies(
+    predicate: &EvidencePredicate,
     key_id: &KeyId,
     sig_structure: &[u8],
     signature: &Signature,
-) -> bool {
-    let PrincipalSpec::SignatureKey { algorithm, public } = spec else {
-        return false;
+) -> Option<SignatureKeyEvidence> {
+    let EvidencePredicate::InvocationSignatureKey { algorithm, public } = predicate else {
+        return None;
     };
-    match algorithm {
+    let valid = match algorithm {
         SignatureKeyAlgorithm::Ed25519 => decode_ed25519_public(public).is_some_and(|public| {
             let _ = key_id;
             crate::ed25519_sign::verify(&public, sig_structure, signature.as_bytes())
@@ -764,7 +1942,11 @@ fn principal_verifies(
                 && basil_nats::verify_public_signature(public, sig_structure, signature.as_bytes())
                     .unwrap_or(false)
         }
-    }
+    };
+    valid.then(|| SignatureKeyEvidence {
+        algorithm: *algorithm,
+        public: public.clone(),
+    })
 }
 
 fn decode_ed25519_public(public: &str) -> Option<[u8; crate::ed25519_sign::PUBLIC_KEY_LEN]> {
@@ -831,13 +2013,15 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
+    use crate::audit::AuditLog;
     use crate::backend::{Backend, BackendError, KvValue, NewKey};
     use crate::catalog::loader::load;
     use crate::manager::BackendManager;
     use crate::service::broker::{BrokerIdentityRuntimeConfig, InvocationRuntimeConfig};
     use crate::state::BrokerState;
     use basil_cose::{
-        Ed25519Signer, Ed25519Verifier, SignParams, VerifiedSealed, X25519Recipient, build_signed,
+        Ed25519Signer, Ed25519Verifier, ProtectedHeaders, SignParams, VerifiedSealed,
+        X25519Recipient, X25519ResponsePublicKey, build_sealed_with_headers, build_signed,
     };
     use basil_proto::KeyType;
     use ed25519_dalek::{Signer as _, SigningKey};
@@ -967,6 +2151,10 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
+        fixture_with_audit(None)
+    }
+
+    fn fixture_with_audit(audit: Option<Arc<AuditLog>>) -> Fixture {
         let client_signer = signer(CLIENT_SIGNING_KEY, [7; 32]);
         let mallory_signer = signer(MALLORY_SIGNING_KEY, [8; 32]);
         let response_signer = signer(RESPONSE_SIGNING_KEY, [9; 32]);
@@ -1015,7 +2203,11 @@ mod tests {
             }),
         );
         let manager = BackendManager::new(catalog.clone(), backends).unwrap();
-        let state = Arc::new(BrokerState::new(catalog, resolved, config, manager, "test"));
+        let mut state = BrokerState::new(catalog, resolved, config, manager, "test");
+        if let Some(audit) = audit {
+            state = state.with_audit_log(audit);
+        }
+        let state = Arc::new(state);
         let service = BrokerGrpc::new_with_invocation_config(
             state,
             InvocationRuntimeConfig {
@@ -1028,7 +2220,12 @@ mod tests {
                 request_encryption_key_id: Some(REQUEST_SEALING_KEY.to_string()),
                 max_ttl_secs: DEFAULT_EXPIRES_AFTER_SECS,
                 clock_skew_secs: 5,
-                replay_cache_capacity: 16,
+                challenge_table: crate::core::challenge::ChallengeTableConfig {
+                    global_capacity: 16,
+                    ..Default::default()
+                },
+                run_quota_buckets_per_rule: 16,
+                require_challenge: false,
                 now_unix_override: Some(NOW),
             },
         );
@@ -1089,14 +2286,18 @@ mod tests {
               "schema": "policy",
               "subjects": {{
                 "{CLIENT_SUBJECT}": {{
-                  "allOf": [
-                    {{ "kind": "signature-key", "algorithm": "ed25519", "public": "{client_public}" }}
-                  ]
+                  "domain": "host-process",
+                  "match": {{ "all": [
+                    {{ "process.uid": 42 }},
+                    {{ "invocation.signature-key": {{ "algorithm": "ed25519", "public": "{client_public}" }} }}
+                  ] }}
                 }},
                 "mallory": {{
-                  "allOf": [
-                    {{ "kind": "signature-key", "algorithm": "ed25519", "public": "{mallory_public}" }}
-                  ]
+                  "domain": "host-process",
+                  "match": {{ "all": [
+                    {{ "process.uid": 42 }},
+                    {{ "invocation.signature-key": {{ "algorithm": "ed25519", "public": "{mallory_public}" }} }}
+                  ] }}
                 }}
               }},
               "roles": {{
@@ -1124,7 +2325,21 @@ mod tests {
             response_subject: Some(ResponseSubject::new("reply.client".to_string()).unwrap()),
             in_reply_to: None,
             request_hash: None,
+            freshness_challenge: None,
+            response_public_key_cose: None,
         }
+    }
+
+    fn ephemeral_response_recipient(seed: u8) -> (X25519Recipient, X25519ResponsePublicKey) {
+        let private = Zeroizing::new([seed; 32]);
+        let provisional = X25519Recipient::new(key_id("provisional"), private);
+        let public = X25519ResponsePublicKey::from_public_bytes(provisional.public().public)
+            .expect("contributory response public key");
+        let recipient = X25519Recipient::new(
+            KeyId::from_text(&public.thumbprint()).expect("thumbprint key id"),
+            Zeroizing::new([seed; 32]),
+        );
+        (recipient, public)
     }
 
     fn sign_body() -> Vec<u8> {
@@ -1177,6 +2392,48 @@ mod tests {
         .into_vec()
     }
 
+    fn proof_key_cose(public: &[u8; 32]) -> Vec<u8> {
+        let mut cose_key = Vec::new();
+        let mut encoder = Encoder::new(&mut cose_key);
+        encoder.map(3).unwrap();
+        encoder.i64(1).unwrap();
+        encoder.i64(1).unwrap();
+        encoder.i64(-1).unwrap();
+        encoder.i64(6).unwrap();
+        encoder.i64(-2).unwrap();
+        encoder.bytes(public).unwrap();
+        cose_key
+    }
+
+    async fn proof_key_only_request(fixture: &Fixture) -> Vec<u8> {
+        let public = fixture.client_signer.public_key_bytes();
+        let proof_signer = signer(&crate::ci_federation::proof_key_kid(&public), [7; 32]);
+        let headers = ProtectedHeaders {
+            signer_certificates_jwt: Vec::new(),
+            signer_public_key_cose: Some(proof_key_cose(&public)),
+            operation_target_key_id: None,
+        };
+        let mut claims = request_claims(b"proof-key-only");
+        claims.sender_key_id = Some(proof_signer.key_id().clone());
+        build_sealed_with_headers(
+            &SealParams {
+                content_type: self::content_type(CONTENT_TYPE_SIGN_REQUEST),
+                plaintext: &sign_body(),
+                claims,
+                role: MessageRole::Request,
+                recipient: fixture.request_public.clone(),
+                content_algorithm: ContentAlgorithm::A256Gcm,
+                aad: SealedAad::empty(),
+                kdf_parties: KdfParties::anonymous(),
+            },
+            &headers,
+            &proof_signer,
+        )
+        .await
+        .unwrap()
+        .into_vec()
+    }
+
     async fn sealed_request_to(
         fixture: &Fixture,
         claims: Claims,
@@ -1211,7 +2468,53 @@ mod tests {
     }
 
     fn request(message: Vec<u8>) -> Request<pb::SealedRequest> {
-        Request::new(pb::SealedRequest { message })
+        let mut request = Request::new(pb::SealedRequest { message });
+        request.extensions_mut().insert(crate::peer::PeerInfo {
+            uid: Some(42),
+            gid: Some(42),
+            ..crate::peer::PeerInfo::default()
+        });
+        request
+    }
+
+    fn challenge_request(
+        service: &BrokerGrpc,
+        jkt: impl Into<Vec<u8>>,
+        courier_observed_source: Option<String>,
+    ) -> Request<pb::GetInvocationChallengeRequest> {
+        let peer = crate::peer::PeerInfo {
+            uid: Some(42),
+            gid: Some(42),
+            ..crate::peer::PeerInfo::default()
+        };
+        challenge_request_with_context(
+            jkt,
+            courier_observed_source,
+            Arc::clone(&service.listener_name),
+            service.listener_type,
+            peer,
+        )
+    }
+
+    fn challenge_request_with_context(
+        jkt: impl Into<Vec<u8>>,
+        courier_observed_source: Option<String>,
+        listener_name: impl Into<Arc<str>>,
+        listener_type: crate::transport::grpc_server::ListenerType,
+        peer: crate::peer::PeerInfo,
+    ) -> Request<pb::GetInvocationChallengeRequest> {
+        let mut request = Request::new(pb::GetInvocationChallengeRequest {
+            jkt: jkt.into(),
+            courier_observed_source,
+        });
+        request
+            .extensions_mut()
+            .insert(ListenerConnectInfo::for_test(
+                listener_name,
+                listener_type,
+                peer,
+            ));
+        request
     }
 
     async fn prepare_err(fixture: &Fixture, message: Vec<u8>) -> Status {
@@ -1244,6 +2547,21 @@ mod tests {
         response: &pb::SealedResponse,
         original_request: &[u8],
     ) -> (VerifiedSealed, SignInvocationResponse) {
+        verify_response_with_recipient(
+            fixture,
+            response,
+            original_request,
+            &fixture.response_recipient,
+        )
+        .await
+    }
+
+    async fn verify_response_with_recipient(
+        fixture: &Fixture,
+        response: &pb::SealedResponse,
+        original_request: &[u8],
+        recipient: &X25519Recipient,
+    ) -> (VerifiedSealed, SignInvocationResponse) {
         let validation = response_validation();
         let verified = verify_sealed(
             &response.message,
@@ -1261,7 +2579,7 @@ mod tests {
         );
         let opened = verified
             .open(
-                &fixture.response_recipient,
+                recipient,
                 &ExternalAad::empty(),
                 Some(&KdfParties::anonymous()),
             )
@@ -1366,17 +2684,6 @@ mod tests {
     }
 
     #[test]
-    fn replay_cache_rejects_duplicate_sender_message_pair() {
-        let mut cache = InvocationReplayCache::new(8);
-        assert_eq!(cache.check_and_insert("s", "m", 20, 0, 10), Ok(()));
-        assert_eq!(
-            cache.check_and_insert("s", "m", 20, 0, 10),
-            Err(ReplayError::ReplayedMessageId)
-        );
-        assert_eq!(cache.check_and_insert("s", "other", 20, 0, 10), Ok(()));
-    }
-
-    #[test]
     fn request_hash_uses_complete_request_bytes() {
         let h1 = request_hash(b"request-a");
         let h2 = request_hash(b"request-b");
@@ -1403,16 +2710,984 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_is_rejected_before_second_open() {
+    async fn proof_key_without_certificate_emits_identity_rejection_once() {
+        let path = std::env::temp_dir().join(format!(
+            "basil-proof-key-only-audit-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let audit = Arc::new(AuditLog::open(&path).expect("open test audit log"));
+        let fixture = fixture_with_audit(Some(audit));
+        let message = proof_key_only_request(&fixture).await;
+
+        let status = prepare_err(&fixture, message).await;
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(status.message().contains("missing signer certificate"));
+        drop(fixture);
+
+        let contents = std::fs::read_to_string(&path).expect("read flushed audit log");
+        let events = contents
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("audit JSON"))
+            .filter(|value| value["event"]["kind"] == "basil.audit.ci_invocation")
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event["identity_state"], "presented_unverified");
+        assert_eq!(event["stage"], "identity_verification");
+        assert_eq!(event["outcome"], "denied");
+        assert_eq!(event["reason"], "identity_rejected");
+        assert!(event["correlation"].get("token_digest").is_none());
+        assert_eq!(
+            event["correlation"]["proof_jkt"].as_str().map(str::len),
+            Some(43)
+        );
+        assert_ne!(event["outcome"], "aborted");
+        std::fs::remove_file(path).expect("remove test audit log");
+    }
+
+    #[tokio::test]
+    async fn provider_dispatch_uses_authenticated_outer_target_as_sole_authority() {
         let fixture = fixture();
         let request_message = valid_request(&fixture).await;
-        fixture
+        let PreparedRequest::Proceed(mut prepared) = fixture
             .service
             .prepare_invocation(&request(request_message.clone()))
             .await
-            .unwrap();
-        let status = assert_prepare_code(&fixture, request_message, Code::InvalidArgument).await;
-        assert!(status.message().contains("replayed"));
+            .expect("local request prepares")
+        else {
+            panic!("local request unexpectedly denied");
+        };
+        prepared.provider_operation_target = Some(TARGET_SIGNING_KEY.to_string());
+        prepared.body = DecryptedInvocationBody::new(Zeroizing::new(
+            SignInvocationRequest {
+                key_id: RESPONSE_SIGNING_KEY.to_string(),
+                message: b"outer target is authoritative".to_vec(),
+                algorithm: pb::SigningAlgorithm::Ed25519 as i32,
+            }
+            .to_cbor_bytes(),
+        ));
+
+        let response = fixture
+            .service
+            .execute_sign_invocation(*prepared)
+            .await
+            .expect("response protects");
+        let (_, body) = verify_response(&fixture, &response, &request_message).await;
+        assert_eq!(
+            body.status,
+            InvocationStatus::ok(),
+            "the untrusted encrypted body target must not replace the authenticated outer target"
+        );
+    }
+
+    #[test]
+    fn response_recipient_admission_matrix_is_strict_and_disjoint() {
+        let fixture = fixture();
+        let generation = fixture.service.state.load_generation();
+
+        let missing = request_claims(b"provider-missing-response-key");
+        let status = BrokerGrpc::resolve_response_recipient(&generation, &missing, true)
+            .expect_err("verified provider proof requires an ephemeral response key");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(status.message().contains("missing an ephemeral response"));
+
+        let (_, public) = ephemeral_response_recipient(0x31);
+        let mut injected = request_claims(b"subject-key-injection");
+        injected.response_key_id = Some(key_id(&public.thumbprint()));
+        injected.response_public_key_cose = Some(public);
+        let status = BrokerGrpc::resolve_response_recipient(&generation, &injected, false)
+            .expect_err("subject-key mode forbids an ephemeral response key");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(
+            status
+                .message()
+                .contains("requires verified provider proof")
+        );
+
+        let mut substituted = injected.clone();
+        substituted.response_key_id = Some(key_id(RESPONSE_SEALING_KEY));
+        let status = BrokerGrpc::resolve_response_recipient(&generation, &substituted, true)
+            .expect_err("provider response key substitution must fail closed");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(status.message().contains("does not match"));
+
+        let ephemeral = BrokerGrpc::resolve_response_recipient(&generation, &injected, true)
+            .expect("verified provider selects the request key");
+        assert_eq!(
+            ephemeral,
+            ResponseRecipient::Ephemeral {
+                key_id: public.thumbprint(),
+                public: *public.as_public_bytes(),
+            }
+        );
+
+        let catalog = BrokerGrpc::resolve_response_recipient(
+            &generation,
+            &request_claims(b"legacy-catalog"),
+            false,
+        )
+        .expect("subject-key mode retains the catalog response key");
+        assert_eq!(
+            catalog,
+            ResponseRecipient::Catalog {
+                key_id: RESPONSE_SEALING_KEY.to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn subject_key_request_cannot_inject_an_ephemeral_response_recipient() {
+        let fixture = fixture();
+        let (_, public) = ephemeral_response_recipient(0x37);
+        let mut claims = request_claims(b"subject-key-ephemeral-injection");
+        claims.response_key_id = Some(key_id(&public.thumbprint()));
+        claims.response_public_key_cose = Some(public);
+        let message =
+            sealed_request_with(&fixture, claims, CONTENT_TYPE_SIGN_REQUEST, &sign_body()).await;
+        let status = prepare_err(&fixture, message).await;
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(
+            status
+                .message()
+                .contains("requires verified provider proof")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_response_recipient_admission_does_not_consume_challenge() {
+        let fixture = fixture();
+        let generation = fixture.service.state.load_generation().to_owned();
+        let proof_public = fixture.client_signer.public_key_bytes();
+        let challenge = issue_challenge(&fixture, client_jkt(&fixture)).await;
+        let mut claims = request_claims(b"admission-before-challenge");
+        claims.freshness_challenge = Some(basil_cose::FreshnessChallenge::new(challenge));
+
+        BrokerGrpc::resolve_response_recipient(&generation, &claims, true)
+            .expect_err("missing provider response key is rejected");
+
+        let policy = generation.policy().clone();
+        let verifier = PolicyVerifier::new(&policy);
+        fixture
+            .service
+            .consume_freshness_challenge(generation.id(), &claims, Some(&proof_public), &verifier)
+            .await
+            .expect("no envelope error")
+            .expect("recipient admission failure must leave challenge unconsumed");
+    }
+
+    #[tokio::test]
+    async fn ephemeral_recipient_protects_success_and_denial_without_catalog_lookup() {
+        let fixture = fixture();
+        let (ephemeral_private, ephemeral_public) = ephemeral_response_recipient(0x41);
+        let recipient = ResponseRecipient::Ephemeral {
+            key_id: ephemeral_public.thumbprint(),
+            public: *ephemeral_public.as_public_bytes(),
+        };
+        let request_message = valid_request(&fixture).await;
+        let request_message_id = message_id(b"ephemeral-response");
+        let envelope = ResponseEnvelope {
+            response_recipient: &recipient,
+            response_subject: Some("reply.ephemeral"),
+            request_message: &request_message,
+            request_message_id: &request_message_id,
+        };
+        let success_body = SignInvocationResponse {
+            status: InvocationStatus::ok(),
+            policy_generation: fixture.service.state.load_generation().id(),
+            signature: Some(vec![0x5a; 64]),
+        };
+        let response = fixture
+            .service
+            .protect_response(
+                &envelope,
+                CONTENT_TYPE_SIGN_RESPONSE,
+                &success_body.to_cbor_bytes(),
+            )
+            .await
+            .expect("ephemeral response protection does not need a catalog entry");
+        let (_, opened) = verify_response_with_recipient(
+            &fixture,
+            &response,
+            &request_message,
+            &ephemeral_private,
+        )
+        .await;
+        assert_eq!(opened, success_body);
+
+        let validation = response_validation();
+        let verified = verify_sealed(
+            &response.message,
+            &fixture.broker_verifier,
+            &VerifySealedParams {
+                signature_aad: ExternalAad::empty(),
+                validation: &validation,
+            },
+        )
+        .await
+        .expect("broker signature remains independently pinned");
+        assert!(
+            verified
+                .open(
+                    &fixture.response_recipient,
+                    &ExternalAad::empty(),
+                    Some(&KdfParties::anonymous()),
+                )
+                .await
+                .is_err(),
+            "catalog private key must not open an ephemeral response",
+        );
+
+        let denied = DeniedInvocation {
+            generation: fixture.service.state.load_generation().to_owned(),
+            denial: SealedDenial::ChallengeUnknown,
+            response_recipient: recipient,
+            response_subject: Some("reply.ephemeral".to_string()),
+            request_message_id,
+            request_message: request_message.clone(),
+            audit: None,
+        };
+        let denial = fixture
+            .service
+            .protect_denied_invocation(denied)
+            .await
+            .expect("freshness denial uses the same ephemeral recipient");
+        let (_, opened) =
+            verify_response_with_recipient(&fixture, &denial, &request_message, &ephemeral_private)
+                .await;
+        assert_eq!(opened.status, InvocationStatus::challenge_unknown());
+        assert!(opened.signature.is_none());
+    }
+
+    fn client_jkt(fixture: &Fixture) -> [u8; 32] {
+        crate::ci_federation::proof_key_thumbprint(&fixture.client_signer.public_key_bytes())
+    }
+
+    async fn issue_challenge(fixture: &Fixture, jkt: [u8; 32]) -> [u8; 32] {
+        let issued = fixture
+            .service
+            .get_invocation_challenge(challenge_request(&fixture.service, jkt, None))
+            .await
+            .expect("challenge issues")
+            .into_inner();
+        assert_eq!(issued.expires_at_unix, i64::from(NOW) + 60);
+        issued.challenge.as_slice().try_into().expect("32 bytes")
+    }
+
+    async fn challenged_request(fixture: &Fixture, message_id: &[u8]) -> Vec<u8> {
+        let challenge = issue_challenge(fixture, client_jkt(fixture)).await;
+        let mut claims = request_claims(message_id);
+        claims.freshness_challenge = Some(basil_cose::FreshnessChallenge::new(challenge));
+        sealed_request_with(fixture, claims, CONTENT_TYPE_SIGN_REQUEST, &sign_body()).await
+    }
+
+    #[tokio::test]
+    async fn challenged_request_consumes_exactly_once_and_replay_is_sealed_unknown() {
+        let fixture = fixture();
+        let message = challenged_request(&fixture, b"challenged").await;
+        let first = fixture
+            .service
+            .invoke(request(message.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        let (_, body) = verify_response(&fixture, &first, &message).await;
+        assert_eq!(body.status, InvocationStatus::ok());
+
+        // The identical message replays as a sealed non-retryable
+        // CHALLENGE_UNKNOWN: the challenge was consumed exactly once.
+        let replayed = fixture
+            .service
+            .invoke(request(message.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        let (verified, body) = verify_response(&fixture, &replayed, &message).await;
+        assert_eq!(body.status, InvocationStatus::challenge_unknown());
+        assert!(body.signature.is_none());
+        assert_eq!(verified.claims.in_reply_to, Some(message_id(b"challenged")));
+    }
+
+    #[tokio::test]
+    async fn challenge_bound_to_another_key_is_denied_sealed() {
+        let fixture = fixture();
+        let mallory_jkt =
+            crate::ci_federation::proof_key_thumbprint(&fixture.mallory_signer.public_key_bytes());
+        let challenge = issue_challenge(&fixture, mallory_jkt).await;
+        let mut claims = request_claims(b"stolen-challenge");
+        claims.freshness_challenge = Some(basil_cose::FreshnessChallenge::new(challenge));
+        let message =
+            sealed_request_with(&fixture, claims, CONTENT_TYPE_SIGN_REQUEST, &sign_body()).await;
+        let response = fixture
+            .service
+            .invoke(request(message.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        let (_, body) = verify_response(&fixture, &response, &message).await;
+        assert_eq!(body.status, InvocationStatus::challenge_unknown());
+    }
+
+    #[tokio::test]
+    async fn foreign_instance_challenge_is_denied_sealed() {
+        let fixture = fixture();
+        // A challenge from a different agent instance (or a pre-restart one)
+        // has an unknown instance-ID prefix and denies without table state.
+        let mut claims = request_claims(b"foreign-instance");
+        claims.freshness_challenge = Some(basil_cose::FreshnessChallenge::new([0x5A; 32]));
+        let message =
+            sealed_request_with(&fixture, claims, CONTENT_TYPE_SIGN_REQUEST, &sign_body()).await;
+        let response = fixture
+            .service
+            .invoke(request(message.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        let (_, body) = verify_response(&fixture, &response, &message).await;
+        assert_eq!(body.status, InvocationStatus::challenge_unknown());
+    }
+
+    #[tokio::test]
+    async fn without_a_challenge_the_message_id_is_correlation_only() {
+        // SPEC rev 4 removed the message-ID replay table: a subject-key
+        // request that presents no challenge is accepted, and its message ID
+        // is correlation-only (a duplicate is not rejected on that basis).
+        let fixture = fixture();
+        let message = valid_request(&fixture).await;
+        for _ in 0..2 {
+            let response = fixture
+                .service
+                .invoke(request(message.clone()))
+                .await
+                .unwrap()
+                .into_inner();
+            let (_, body) = verify_response(&fixture, &response, &message).await;
+            assert_eq!(body.status, InvocationStatus::ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn courier_denies_challenge_less_subject_key_requests() {
+        // A Courier listener forces require-challenge even when the global
+        // compatibility setting is false. A bare subject-key request receives
+        // sealed CHALLENGE_UNKNOWN, while a challenged request still succeeds.
+        let fixture = fixture();
+        assert!(!fixture.service.invocation.require_challenge);
+        let strict = BrokerGrpc::new_with_invocation_config_for_named_listener(
+            Arc::clone(&fixture.service.state),
+            fixture.service.invocation.clone(),
+            "courier-test",
+            crate::transport::grpc_server::ListenerType::Courier,
+        );
+        assert!(strict.invocation.require_challenge);
+
+        let bare = valid_request(&fixture).await;
+        let response = strict
+            .invoke(request(bare.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        let (_, body) = verify_response(&fixture, &response, &bare).await;
+        assert_eq!(body.status, InvocationStatus::challenge_unknown());
+        assert!(body.signature.is_none());
+
+        // The challenge must come from the strict service instance: the
+        // table (and its instance ID) is per-BrokerGrpc.
+        let issued = strict
+            .get_invocation_challenge(challenge_request(
+                &strict,
+                client_jkt(&fixture),
+                Some("courier-source".to_string()),
+            ))
+            .await
+            .expect("challenge issues")
+            .into_inner();
+        let challenge: [u8; 32] = issued.challenge.as_slice().try_into().expect("32 bytes");
+        let mut claims = request_claims(b"strict-challenged");
+        claims.freshness_challenge = Some(basil_cose::FreshnessChallenge::new(challenge));
+        let challenged =
+            sealed_request_with(&fixture, claims, CONTENT_TYPE_SIGN_REQUEST, &sign_body()).await;
+        let response = strict
+            .invoke(request(challenged.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        let (_, body) = verify_response(&fixture, &response, &challenged).await;
+        assert_eq!(body.status, InvocationStatus::ok());
+    }
+
+    #[tokio::test]
+    async fn proof_bound_requests_must_present_a_challenge() {
+        let fixture = fixture();
+        let generation = fixture.service.state.load_generation().to_owned();
+        let policy = generation.policy().clone();
+        let verifier = PolicyVerifier::new(&policy);
+        let claims = request_claims(b"no-challenge");
+        let outcome = fixture
+            .service
+            .consume_freshness_challenge(generation.id(), &claims, Some(&[9; 32]), &verifier)
+            .await
+            .expect("no envelope error");
+        assert!(matches!(outcome, Err(ChallengeDenial::Missing)));
+    }
+
+    #[tokio::test]
+    async fn per_run_quota_denial_seals_the_retryable_never_status() {
+        // The quota denial rides the same sealed denial envelope as a
+        // freshness denial: status code 6 `PER_RUN_QUOTA_EXCEEDED`,
+        // `retryable = false`, no signature, correlated to the request.
+        let fixture = fixture();
+        let message = valid_request(&fixture).await;
+        let denied = DeniedInvocation {
+            generation: fixture.service.state.load_generation().to_owned(),
+            denial: SealedDenial::PerRunQuotaExceeded,
+            response_recipient: ResponseRecipient::Catalog {
+                key_id: RESPONSE_SEALING_KEY.to_string(),
+            },
+            response_subject: Some("reply.client".to_string()),
+            request_message_id: message_id(b"msg-1"),
+            request_message: message.clone(),
+            audit: None,
+        };
+        let response = fixture
+            .service
+            .protect_denied_invocation(denied)
+            .await
+            .expect("denial seals");
+        let (verified, body) = verify_response(&fixture, &response, &message).await;
+        assert_eq!(body.status, InvocationStatus::per_run_quota_exceeded());
+        assert!(!body.status.retryable);
+        assert!(body.signature.is_none());
+        assert_eq!(verified.claims.in_reply_to, Some(message_id(b"msg-1")));
+    }
+
+    #[tokio::test]
+    async fn run_quota_untracked_denial_seals_a_retryable_status() {
+        // Bucket-table pressure is not quota exhaustion: the sealed status
+        // must be retryable so a legitimate run denied by unrelated
+        // pressure retries after expired buckets are reclaimed, and the
+        // reason must be distinguishable from `PER_RUN_QUOTA_EXCEEDED`.
+        let fixture = fixture();
+        let message = valid_request(&fixture).await;
+        let denied = DeniedInvocation {
+            generation: fixture.service.state.load_generation().to_owned(),
+            denial: SealedDenial::RunQuotaUntracked,
+            response_recipient: ResponseRecipient::Catalog {
+                key_id: RESPONSE_SEALING_KEY.to_string(),
+            },
+            response_subject: Some("reply.client".to_string()),
+            request_message_id: message_id(b"msg-2"),
+            request_message: message.clone(),
+            audit: None,
+        };
+        let response = fixture
+            .service
+            .protect_denied_invocation(denied)
+            .await
+            .expect("denial seals");
+        let (verified, body) = verify_response(&fixture, &response, &message).await;
+        assert_eq!(body.status, InvocationStatus::run_quota_untracked());
+        assert!(body.status.retryable);
+        assert!(body.signature.is_none());
+        assert_eq!(verified.claims.in_reply_to, Some(message_id(b"msg-2")));
+    }
+
+    #[test]
+    fn broker_run_quota_table_is_generation_scoped() {
+        const RETENTION: u64 = 630;
+        const QUOTA_NOW: i64 = 1_700_000_000;
+        let mut cache = crate::ci_federation::RunQuotaTable::new(16);
+        let key = crate::ci_federation::RunQuotaKey {
+            rule_id: "release".to_string(),
+            run_id: 900,
+            run_attempt: 1,
+        };
+        cache
+            .charge_with_receipt(7, &key, Some(1), RETENTION, QUOTA_NOW)
+            .expect("admitted");
+        assert_eq!(
+            cache.charge_with_receipt(7, &key, Some(1), RETENTION, QUOTA_NOW),
+            Err(crate::ci_federation::RunQuotaDenied::Exhausted)
+        );
+        cache
+            .charge_with_receipt(8, &key, Some(1), RETENTION, QUOTA_NOW)
+            .expect("reload resets the counters");
+        // Fail closed when the rule somehow carries no quota value.
+        assert_eq!(
+            cache.charge_with_receipt(8, &key, None, RETENTION, QUOTA_NOW),
+            Err(crate::ci_federation::RunQuotaDenied::QuotaUnavailable)
+        );
+    }
+
+    /// One valid GitHub federation rule for serving-path JWKS tests.
+    fn federation_rule(id: &str) -> crate::core::ci_federation::ProviderRule {
+        use crate::core::ci_federation::{GithubActionsRule, ProviderConfig, ProviderRule};
+        const ISSUER: &str = "https://token.actions.githubusercontent.com";
+        ProviderRule {
+            id: id.to_string(),
+            subject: "ci/release".to_string(),
+            audience: BROKER_SUBJECT.to_string(),
+            operation_profiles: vec![
+                crate::core::ci_federation::ProviderOperationProfile::ArtifactSign,
+            ],
+            artifact_sign_key_ids: vec![TARGET_SIGNING_KEY.to_string()],
+            max_token_age_secs: 900,
+            clock_skew_secs: 30,
+            max_operations_per_run: Some(64),
+            provider: ProviderConfig::GithubActions(GithubActionsRule {
+                issuer: ISSUER.to_string(),
+                discovery_url: format!("{ISSUER}/.well-known/openid-configuration"),
+                jwks_url: format!("{ISSUER}/.well-known/jwks"),
+                ca_bundle_path: None,
+                audience_prefix: "urn:basil:ci:jkt:".to_string(),
+                repository_id: 42,
+                repository_owner_id: 7,
+                job_workflow_ref: "openbasil/basil/.github/workflows/release.yml@refs/heads/main"
+                    .to_string(),
+                job_workflow_sha: "a".repeat(40),
+                protected_refs: vec!["refs/heads/main".to_string()],
+                events: vec!["push".to_string()],
+                runner_environments: vec!["github-hosted".to_string()],
+                environment: None,
+                max_token_age_secs: 900,
+                clock_skew_secs: 30,
+            }),
+        }
+    }
+
+    #[test]
+    fn provider_authority_denies_custom_profile_and_target_confusion() {
+        use crate::core::ci_federation::ProviderOperationProfile;
+
+        let broker_audience = subject(BROKER_SUBJECT);
+        let invocation_audiences = vec![BROKER_SUBJECT.to_string()];
+        let profiles = vec![ProviderOperationProfile::ArtifactSign];
+        let targets = vec![TARGET_SIGNING_KEY.to_string()];
+        let target = key_id(TARGET_SIGNING_KEY);
+        assert_eq!(
+            validate_provider_envelope_authority(
+                BROKER_SUBJECT,
+                &profiles,
+                &targets,
+                Some(&broker_audience),
+                CONTENT_TYPE_SIGN_REQUEST,
+                Some(&target),
+                &invocation_audiences,
+            )
+            .expect("configured artifact-sign envelope is admitted"),
+            TARGET_SIGNING_KEY
+        );
+
+        let wrong_audience = subject("basil://attacker.invalid/broker");
+        let error = validate_provider_envelope_authority(
+            BROKER_SUBJECT,
+            &profiles,
+            &targets,
+            Some(&wrong_audience),
+            CONTENT_TYPE_SIGN_REQUEST,
+            Some(&target),
+            &invocation_audiences,
+        )
+        .expect_err("custom client cannot substitute the broker audience");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("broker audience rejected"));
+
+        let error = validate_provider_envelope_authority(
+            BROKER_SUBJECT,
+            &profiles,
+            &targets,
+            Some(&broker_audience),
+            "application/vnd.openbasil.invocation.raw-sign+cbor",
+            Some(&target),
+            &invocation_audiences,
+        )
+        .expect_err("custom content type has no operation profile");
+        assert!(error.message().contains("operation profile rejected"));
+
+        let error = validate_provider_envelope_authority(
+            BROKER_SUBJECT,
+            &[],
+            &targets,
+            Some(&broker_audience),
+            CONTENT_TYPE_SIGN_REQUEST,
+            Some(&target),
+            &invocation_audiences,
+        )
+        .expect_err("empty runtime mapping fails closed");
+        assert!(error.message().contains("operation profile rejected"));
+
+        let wrong_target = key_id(RESPONSE_SIGNING_KEY);
+        let error = validate_provider_envelope_authority(
+            BROKER_SUBJECT,
+            &profiles,
+            &targets,
+            Some(&broker_audience),
+            CONTENT_TYPE_SIGN_REQUEST,
+            Some(&wrong_target),
+            &invocation_audiences,
+        )
+        .expect_err("out-of-scope target fails before operation preparation");
+        assert!(error.message().contains("operation target rejected"));
+    }
+
+    /// A generation carrying one federation rule, so its constructor builds
+    /// the per-rule JWKS cache map the serving path resolves against.
+    fn federation_generation(id: u64) -> Arc<crate::state::Generation> {
+        let client_signer = signer(CLIENT_SIGNING_KEY, [7; 32]);
+        let mallory_signer = signer(MALLORY_SIGNING_KEY, [8; 32]);
+        let (catalog, resolved, config, warnings) = load(
+            &catalog_json(),
+            &policy_json(&client_signer, &mallory_signer),
+        )
+        .expect("fixture inputs load");
+        assert!(warnings.is_empty(), "fixture warnings: {warnings:?}");
+        let rules =
+            crate::core::ci_federation::ProviderCatalog::new(vec![federation_rule("release")])
+                .expect("rule validates");
+        Arc::new(
+            crate::state::Generation::new_with_overrides_listeners_and_federation(
+                id,
+                catalog,
+                resolved,
+                config,
+                Vec::new(),
+                crate::transport::listener::ListenerConfigSet::default(),
+                Some(Arc::new(rules)),
+            )
+            .expect("federation generation"),
+        )
+    }
+
+    fn parsed_jwks(generation: u64, kid: &str) -> crate::core::ci_federation::GenerationJwks {
+        let modulus = URL_SAFE_NO_PAD.encode([0x80; 256]);
+        let body = format!(
+            r#"{{"keys":[{{"kty":"RSA","kid":"{kid}","alg":"RS256","use":"sig","n":"{modulus}","e":"AQAB"}}]}}"#
+        );
+        crate::core::ci_federation::GenerationJwks::parse(generation, body.as_bytes())
+            .expect("test JWKS parses")
+    }
+
+    /// Pins the serving-path wiring of `resolve_rule_jwks_via` (the body of
+    /// `resolve_rule_jwks`) against a stub fetch: a rule without a generation
+    /// cache entry never fetches and fails closed; an unknown key ID admits
+    /// at most one fetch per cooldown window with a failed fetch consuming
+    /// the attempt; a fresh hit never fetches; past `max_age` the stale set
+    /// serves only within `stale_if_error` while revalidation fails; and a
+    /// successful revalidation reinstalls fresh serving.
+    #[tokio::test]
+    async fn resolve_rule_jwks_pins_refresh_gating_stale_service_and_fail_closed() {
+        use std::cell::{Cell, RefCell};
+        use std::collections::VecDeque;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        use crate::core::ci_federation::{FederationError, GenerationJwks};
+
+        // Default cache policy (what `Generation` installs): max_age 300s,
+        // stale_if_error 30s, refresh_cooldown 1s.
+        let generation = federation_generation(1);
+        let calls = Cell::new(0_u32);
+        let script: RefCell<VecDeque<Result<GenerationJwks, FederationError>>> =
+            RefCell::new(VecDeque::new());
+        let mut fetch = || {
+            calls.set(calls.get() + 1);
+            std::future::ready(
+                script
+                    .borrow_mut()
+                    .pop_front()
+                    .unwrap_or(Err(FederationError::FetchRejected)),
+            )
+        };
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_000_000);
+
+        // A rule with no generation cache entry fails closed without a fetch.
+        let absent = resolve_rule_jwks_via(&generation, "absent", "kid-a", t0, &mut fetch)
+            .await
+            .expect("no envelope error");
+        assert!(absent.is_none(), "unknown rule must fail closed");
+        assert_eq!(calls.get(), 0, "no cache entry must mean no fetch");
+
+        // Unknown key ID: the cooldown admits one fetch; the failure consumes
+        // the attempt, so an immediate retry does not fetch again.
+        let miss = resolve_rule_jwks_via(&generation, "release", "kid-a", t0, &mut fetch)
+            .await
+            .expect("no envelope error");
+        assert!(miss.is_none(), "failed refresh serves nothing");
+        assert_eq!(calls.get(), 1);
+        let gated = resolve_rule_jwks_via(&generation, "release", "kid-a", t0, &mut fetch)
+            .await
+            .expect("no envelope error");
+        assert!(gated.is_none());
+        assert_eq!(calls.get(), 1, "failed fetch must consume the attempt");
+
+        // Past the cooldown a successful fetch installs the key set.
+        let install_now = t0 + Duration::from_secs(2);
+        script.borrow_mut().push_back(Ok(parsed_jwks(1, "kid-a")));
+        let installed =
+            resolve_rule_jwks_via(&generation, "release", "kid-a", install_now, &mut fetch)
+                .await
+                .expect("no envelope error")
+                .expect("fetched set serves");
+        assert!(installed.key("kid-a").is_some());
+        assert_eq!(calls.get(), 2);
+
+        // A cached key ID inside max_age serves fresh with no fetch.
+        let fresh_now = install_now + Duration::from_secs(100);
+        let fresh = resolve_rule_jwks_via(&generation, "release", "kid-a", fresh_now, &mut fetch)
+            .await
+            .expect("no envelope error")
+            .expect("fresh hit serves");
+        assert!(fresh.key("kid-a").is_some());
+        assert_eq!(calls.get(), 2, "fresh hits must never fetch");
+
+        // Past max_age: revalidation is attempted; on failure the stale set
+        // still serves within stale_if_error, and the cooldown gates the
+        // second attempt without losing stale service.
+        let stale_now = install_now + Duration::from_secs(301);
+        let stale = resolve_rule_jwks_via(&generation, "release", "kid-a", stale_now, &mut fetch)
+            .await
+            .expect("no envelope error")
+            .expect("stale set serves inside the window");
+        assert!(stale.key("kid-a").is_some());
+        assert_eq!(calls.get(), 3);
+        let stale_gated =
+            resolve_rule_jwks_via(&generation, "release", "kid-a", stale_now, &mut fetch)
+                .await
+                .expect("no envelope error")
+                .expect("cooldown-gated revalidation still serves stale");
+        assert!(stale_gated.key("kid-a").is_some());
+        assert_eq!(calls.get(), 3, "cooldown must gate the second attempt");
+
+        // Beyond max_age + stale_if_error the rule fails closed while the
+        // fetch keeps failing.
+        let expired_now = install_now + Duration::from_secs(331);
+        let expired =
+            resolve_rule_jwks_via(&generation, "release", "kid-a", expired_now, &mut fetch)
+                .await
+                .expect("no envelope error");
+        assert!(expired.is_none(), "stale set must not outlive its window");
+        assert_eq!(calls.get(), 4);
+
+        // A successful revalidation restores fresh serving.
+        let recover_now = install_now + Duration::from_secs(333);
+        script.borrow_mut().push_back(Ok(parsed_jwks(1, "kid-a")));
+        let recovered =
+            resolve_rule_jwks_via(&generation, "release", "kid-a", recover_now, &mut fetch)
+                .await
+                .expect("no envelope error")
+                .expect("successful revalidation serves");
+        assert!(recovered.key("kid-a").is_some());
+        assert_eq!(calls.get(), 5);
+        let fresh_again = resolve_rule_jwks_via(
+            &generation,
+            "release",
+            "kid-a",
+            recover_now + Duration::from_secs(1),
+            &mut fetch,
+        )
+        .await
+        .expect("no envelope error")
+        .expect("reinstalled set serves fresh");
+        assert!(fresh_again.key("kid-a").is_some());
+        assert_eq!(calls.get(), 5, "reinstalled set must serve without a fetch");
+    }
+
+    #[tokio::test]
+    async fn challenge_issuance_validates_the_wire_shape() {
+        let fixture = fixture();
+        let bad_jkt = fixture
+            .service
+            .get_invocation_challenge(challenge_request(&fixture.service, vec![0x22; 31], None))
+            .await
+            .expect_err("31-byte jkt rejected");
+        assert_eq!(bad_jkt.code(), Code::InvalidArgument);
+
+        let disabled = BrokerGrpc::new_with_invocation_config(
+            Arc::clone(&fixture.service.state),
+            InvocationRuntimeConfig {
+                enabled: false,
+                ..fixture.service.invocation.clone()
+            },
+        );
+        let status = disabled
+            .get_invocation_challenge(challenge_request(&disabled, vec![0x22; 32], None))
+            .await
+            .expect_err("disabled service declines issuance");
+        assert_eq!(status.code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn challenge_source_shape_is_listener_closed_before_rate_mutation() {
+        let fixture = fixture();
+        let mut config = fixture.service.invocation.clone();
+        config.challenge_table.global_rate = crate::core::challenge::TokenBucketConfig {
+            burst: 1,
+            refill_per_sec: 0,
+        };
+        let host = BrokerGrpc::new_with_invocation_config_for_named_listener(
+            Arc::clone(&fixture.service.state),
+            config.clone(),
+            "host-test",
+            crate::transport::grpc_server::ListenerType::Host,
+        );
+        let courier = BrokerGrpc::new_with_invocation_config_for_named_listener(
+            Arc::clone(&fixture.service.state),
+            config,
+            "courier-test",
+            crate::transport::grpc_server::ListenerType::Courier,
+        );
+
+        let rejected = host
+            .get_invocation_challenge(challenge_request(
+                &host,
+                [0x31; 32],
+                Some("courier-source".to_string()),
+            ))
+            .await
+            .expect_err("host listener rejects courier source");
+        assert_eq!(rejected.code(), Code::InvalidArgument);
+        host.get_invocation_challenge(challenge_request(&host, [0x31; 32], None))
+            .await
+            .expect("rejected source consumed no global token");
+
+        for invalid_source in [
+            None,
+            Some(String::new()),
+            Some("line\nfeed".to_string()),
+            Some("s".repeat(MAX_COURIER_SOURCE_BYTES + 1)),
+        ] {
+            let rejected = courier
+                .get_invocation_challenge(challenge_request(&courier, [0x32; 32], invalid_source))
+                .await
+                .expect_err("courier source shape rejects");
+            assert_eq!(rejected.code(), Code::InvalidArgument);
+        }
+        courier
+            .get_invocation_challenge(challenge_request(
+                &courier,
+                [0x32; 32],
+                Some("courier-source".to_string()),
+            ))
+            .await
+            .expect("invalid courier sources consumed no global token");
+    }
+
+    #[tokio::test]
+    async fn challenge_source_context_must_match_listener_and_kernel_uid() {
+        let fixture = fixture();
+        let missing = fixture
+            .service
+            .get_invocation_challenge(Request::new(pb::GetInvocationChallengeRequest {
+                jkt: vec![0x41; 32],
+                courier_observed_source: None,
+            }))
+            .await
+            .expect_err("missing listener context rejects");
+        assert_eq!(missing.code(), Code::Unavailable);
+
+        let peer = crate::peer::PeerInfo {
+            uid: Some(42),
+            ..crate::peer::PeerInfo::default()
+        };
+        for request in [
+            challenge_request_with_context(
+                [0x41; 32],
+                None,
+                "wrong-name",
+                fixture.service.listener_type,
+                peer.clone(),
+            ),
+            challenge_request_with_context(
+                [0x41; 32],
+                None,
+                Arc::clone(&fixture.service.listener_name),
+                crate::transport::grpc_server::ListenerType::Courier,
+                peer.clone(),
+            ),
+            challenge_request_with_context(
+                [0x41; 32],
+                None,
+                Arc::clone(&fixture.service.listener_name),
+                fixture.service.listener_type,
+                crate::peer::PeerInfo::default(),
+            ),
+        ] {
+            let rejected = fixture
+                .service
+                .get_invocation_challenge(request)
+                .await
+                .expect_err("mismatched listener context rejects");
+            assert_eq!(rejected.code(), Code::Unavailable);
+        }
+
+        let mut mismatched_uid = challenge_request(&fixture.service, [0x41; 32], None);
+        mismatched_uid
+            .extensions_mut()
+            .insert(crate::peer::PeerInfo {
+                uid: Some(43),
+                ..crate::peer::PeerInfo::default()
+            });
+        let rejected = fixture
+            .service
+            .get_invocation_challenge(mismatched_uid)
+            .await
+            .expect_err("request peer must match immutable listener peer");
+        assert_eq!(rejected.code(), Code::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn challenge_issuance_pressure_is_resource_exhausted() {
+        let fixture = fixture();
+        let jkt = [0x33_u8; 32];
+        for _ in 0..8 {
+            issue_challenge(&fixture, jkt).await;
+        }
+        let status = fixture
+            .service
+            .get_invocation_challenge(challenge_request(&fixture.service, jkt, None))
+            .await
+            .expect_err("ninth outstanding challenge for one jkt declines");
+        assert_eq!(status.code(), Code::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn saturated_issuance_gate_does_not_block_invoke_consumption_or_quota() {
+        let fixture = fixture();
+        let challenge = issue_challenge(&fixture, client_jkt(&fixture)).await;
+        let mut claims = request_claims(b"gate-isolation");
+        claims.freshness_challenge = Some(basil_cose::FreshnessChallenge::new(challenge));
+        let challenged =
+            sealed_request_with(&fixture, claims, CONTENT_TYPE_SIGN_REQUEST, &sign_body()).await;
+
+        let gate = Arc::clone(&fixture.service.challenge_issuance_gate);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let holder = std::thread::spawn(move || {
+            let _guard = gate.lock().expect("issuance gate");
+            ready_tx.send(()).expect("announce held gate");
+            release_rx.recv().expect("release held gate");
+        });
+        ready_rx.recv().expect("gate held");
+
+        let declined = fixture
+            .service
+            .get_invocation_challenge(challenge_request(&fixture.service, [0x55; 32], None))
+            .await;
+        let quota_available = fixture.service.run_quota.try_lock().is_ok();
+        let response = fixture.service.invoke(request(challenged.clone())).await;
+
+        release_tx.send(()).expect("release issuance gate");
+        holder.join().expect("issuance gate holder exits");
+
+        let declined = declined.expect_err("concurrent issuance declines without queueing");
+        assert_eq!(declined.code(), Code::ResourceExhausted);
+        assert!(
+            quota_available,
+            "issuance gate is independent from run quota"
+        );
+        let response = response
+            .expect("challenge consumption proceeds while issuance is saturated")
+            .into_inner();
+        let (_, body) = verify_response(&fixture, &response, &challenged).await;
+        assert_eq!(body.status, InvocationStatus::ok());
     }
 
     #[tokio::test]
@@ -1527,7 +3802,7 @@ mod tests {
         unauthorized_unknown_response_key.issuer = Some(subject("mallory"));
         unauthorized_unknown_response_key.sender_key_id = Some(key_id(MALLORY_SIGNING_KEY));
         unauthorized_unknown_response_key.response_key_id = Some(key_id("unknown.response"));
-        assert_prepare_code(
+        let status = assert_prepare_code(
             &fixture,
             sealed_request_with_signer(
                 &fixture,
@@ -1537,9 +3812,10 @@ mod tests {
                 &fixture.mallory_signer,
             )
             .await,
-            Code::PermissionDenied,
+            Code::InvalidArgument,
         )
         .await;
+        assert!(status.message().contains("unknown response encryption key"));
 
         let mut forged_subject = request_claims(b"forged-subject");
         forged_subject.issuer = Some(subject("mallory"));

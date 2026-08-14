@@ -15,11 +15,12 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use basil_cose::{
-    BuildError, Claims, ContentAlgorithm, ContentType, Ed25519Verifier, ExternalAad, KdfParties,
-    KeyId, MessageId, MessageRole, OpenError, OpenRequest, Recipient, RequestHash, SealParams,
-    SealedAad, SignError, Signature, SignatureAlgorithm, Signer, Subject, UnixTime,
-    ValidationParams, VerifyError, VerifySealedParams, X25519Recipient, X25519RecipientPublic,
-    Zeroizing, build_sealed, request_hash, verify_sealed,
+    BuildError, Claims, ContentAlgorithm, ContentType, Ed25519Verifier, ExternalAad,
+    FreshnessChallenge, KdfParties, KeyId, MessageId, MessageRole, OpenError, OpenRequest,
+    ProtectedHeaders, Recipient, RequestHash, SealParams, SealedAad, SignError, Signature,
+    SignatureAlgorithm, Signer, Subject, UnixTime, ValidationParams, VerifyError,
+    VerifySealedParams, X25519Recipient, X25519RecipientPublic, X25519ResponsePublicKey, Zeroizing,
+    build_sealed, build_sealed_with_headers, request_hash, verify_sealed,
 };
 use basil_proto::broker::v1 as pb;
 use basil_proto::invocation::{
@@ -62,6 +63,43 @@ pub struct SealedInvocationOptions {
     pub recipient_subject: Option<String>,
     /// Caller-controlled response encryption key id.
     pub response_encryption_key_id: String,
+    /// Optional server-issued single-use freshness challenge (exactly 32
+    /// bytes), obtained from `InvocationService.GetInvocationChallenge` and
+    /// carried as encrypted-layer claim `-70008`. Remote CI invocations must
+    /// set it; local direct invocations leave it `None`.
+    pub freshness_challenge: Option<[u8; 32]>,
+}
+
+/// Request metadata for a provider-proof invocation with a fresh ephemeral
+/// response key.
+///
+/// Unlike [`SealedInvocationOptions`], this shape has no caller-selected
+/// response catalog id. [`prepare_ephemeral_sealed_invocation`] generates a
+/// new X25519 keypair and binds its RFC 7638 thumbprint automatically.
+/// `recipient_subject` is the broker audience for the COSE claims. The OIDC
+/// proof audience remains inside the provider token carried in the protected
+/// headers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EphemeralSealedInvocationOptions {
+    /// Caller-generated message id, unique inside the freshness window.
+    pub message_id: String,
+    /// Unix timestamp when the request is issued.
+    pub issued_at_unix: u32,
+    /// Optional Unix timestamp when the request expires.
+    pub expires_at_unix: Option<u32>,
+    /// Request proof-signing key id.
+    pub sender_sign_id: String,
+    /// Optional sender subject.
+    pub sender_subject: Option<String>,
+    /// Broker invocation-encryption key id.
+    pub recipient_key_id: String,
+    /// Configured broker audience encoded as the COSE `Claims::audience`.
+    ///
+    /// The provider OIDC audience is carried only by the signed provider token
+    /// in the protected proof headers.
+    pub recipient_subject: Option<String>,
+    /// Server-issued single-use freshness challenge.
+    pub freshness_challenge: [u8; 32],
 }
 
 /// A prepared raw COSE invocation request plus the client-side correlation
@@ -95,6 +133,68 @@ impl PreparedSealedInvocation {
         pb::SealedRequest {
             message: self.message.clone(),
         }
+    }
+}
+
+/// A prepared provider-proof invocation and its private response recipient.
+///
+/// This type intentionally implements neither `Clone` nor `Debug`: it owns
+/// the per-request X25519 private half, held by a zeroizing recipient. Use
+/// [`Self::to_sealed_request`] to send the request, then
+/// [`Self::verify_and_decrypt_sign_response`] to authenticate and open the
+/// broker response against pinned signing keys.
+///
+/// The private-owning handle cannot be cloned or debug-formatted:
+///
+/// ```compile_fail
+/// fn requires_clone<T: Clone>() {}
+/// requires_clone::<basil::PreparedEphemeralSealedInvocation>();
+/// ```
+///
+/// ```compile_fail
+/// fn requires_debug<T: core::fmt::Debug>() {}
+/// requires_debug::<basil::PreparedEphemeralSealedInvocation>();
+/// ```
+pub struct PreparedEphemeralSealedInvocation {
+    prepared: PreparedSealedInvocation,
+    response_recipient: X25519Recipient,
+}
+
+impl PreparedEphemeralSealedInvocation {
+    /// Borrow the prepared correlation metadata and exact request bytes.
+    #[must_use]
+    pub const fn prepared(&self) -> &PreparedSealedInvocation {
+        &self.prepared
+    }
+
+    /// Borrow this prepared request as the wire carrier.
+    #[must_use]
+    pub fn to_sealed_request(&self) -> pb::SealedRequest {
+        self.prepared.to_sealed_request()
+    }
+
+    /// Verify a broker-protected response with pinned Ed25519 keys and open
+    /// it with this request's private ephemeral recipient.
+    ///
+    /// # Errors
+    /// Returns [`SealedInvocationResponseError`] if signature verification,
+    /// correlation, response recipient selection, authenticated opening,
+    /// content type, or body decoding fails.
+    pub async fn verify_and_decrypt_sign_response(
+        &self,
+        response: &pb::SealedResponse,
+        broker_signing_keys: &BTreeMap<String, Vec<u8>>,
+        validation: &ValidationParams,
+    ) -> Result<SignInvocationResponse, SealedInvocationResponseError> {
+        let verifier = pinned_broker_verifier(broker_signing_keys)?;
+        verify_and_open_sign_response(
+            &self.prepared,
+            response,
+            &self.response_recipient,
+            &verifier,
+            validation,
+        )
+        .await
     }
 }
 
@@ -248,6 +348,10 @@ pub enum SealedInvocationError {
     /// The `basil-cose` sealed builder rejected the request.
     #[error("failed to build sealed invocation request: {0}")]
     Build(#[from] BuildError),
+    /// Provider-proof headers required by ephemeral response-key mode were
+    /// absent or empty.
+    #[error("ephemeral response-key requests require provider proof headers")]
+    MissingProviderProofHeaders,
 }
 
 /// Errors returned while verifying and decrypting a protected broker response.
@@ -318,9 +422,92 @@ pub async fn prepare_sealed_invocation<S: Signer>(
     body: &SignInvocationRequest,
     signer: &S,
 ) -> Result<PreparedSealedInvocation, SealedInvocationError> {
+    prepare_sealed_invocation_inner(options, recipient_public_key, body, signer, None, None).await
+}
+
+/// Prepare a provider-proof sealed `Sign` invocation with a fresh X25519
+/// response key.
+///
+/// The response keypair is generated from the system CSPRNG for this request
+/// only. The encrypted protected header receives critical label `-70009` and
+/// the matching RFC 7638 thumbprint in `response_key_id`. The supplied
+/// `proof_headers` are placed on the outer signature, which is produced only
+/// after both response-key fields are fixed. The broker audience comes from
+/// `options.recipient_subject`; provider-token audiences are left unchanged in
+/// `proof_headers`. Critical header `-70010` binds `body.key_id` as the sole
+/// provider operation target before the body is encrypted.
+///
+/// # Errors
+/// Returns [`SealedInvocationError`] for invalid profile values, malformed
+/// broker encryption public keys, unavailable randomness, or build/signing
+/// failures.
+#[allow(
+    clippy::future_not_send,
+    reason = "generic over basil-cose AFIT Signer; Send is a caller-side bound"
+)]
+pub async fn prepare_ephemeral_sealed_invocation<S: Signer>(
+    options: EphemeralSealedInvocationOptions,
+    recipient_public_key: &[u8],
+    body: &SignInvocationRequest,
+    proof_headers: &ProtectedHeaders,
+    signer: &S,
+) -> Result<PreparedEphemeralSealedInvocation, SealedInvocationError> {
+    if proof_headers.signer_certificates_jwt.is_empty()
+        || proof_headers
+            .signer_public_key_cose
+            .as_ref()
+            .is_none_or(Vec::is_empty)
+    {
+        return Err(SealedInvocationError::MissingProviderProofHeaders);
+    }
+    let (response_recipient, response_public_key) = X25519Recipient::generate_ephemeral_response()?;
+    let response_encryption_key_id = response_public_key.thumbprint();
+    let options = SealedInvocationOptions {
+        message_id: options.message_id,
+        issued_at_unix: options.issued_at_unix,
+        expires_at_unix: options.expires_at_unix,
+        sender_sign_id: options.sender_sign_id,
+        sender_subject: options.sender_subject,
+        recipient_key_id: options.recipient_key_id,
+        recipient_subject: options.recipient_subject,
+        response_encryption_key_id,
+        freshness_challenge: Some(options.freshness_challenge),
+    };
+    let prepared = prepare_sealed_invocation_inner(
+        options,
+        recipient_public_key,
+        body,
+        signer,
+        Some(response_public_key),
+        Some(proof_headers),
+    )
+    .await?;
+    Ok(PreparedEphemeralSealedInvocation {
+        prepared,
+        response_recipient,
+    })
+}
+
+#[allow(
+    clippy::future_not_send,
+    reason = "generic over basil-cose AFIT Signer; Send is a caller-side bound"
+)]
+async fn prepare_sealed_invocation_inner<S: Signer>(
+    options: SealedInvocationOptions,
+    recipient_public_key: &[u8],
+    body: &SignInvocationRequest,
+    signer: &S,
+    response_public_key_cose: Option<X25519ResponsePublicKey>,
+    protected_headers: Option<&ProtectedHeaders>,
+) -> Result<PreparedSealedInvocation, SealedInvocationError> {
     let sender_key_id = KeyId::from_text(&options.sender_sign_id)?;
     let response_key_id = KeyId::from_text(&options.response_encryption_key_id)?;
     let recipient_key_id = KeyId::from_text(&options.recipient_key_id)?;
+    let protected_headers = protected_headers.cloned().map(|mut headers| {
+        headers.operation_target_key_id = Some(KeyId::from_text(&body.key_id)?);
+        Ok::<_, SealedInvocationError>(headers)
+    });
+    let protected_headers = protected_headers.transpose()?;
     let public: [u8; 32] = recipient_public_key.try_into().map_err(|_| {
         SealedInvocationError::RecipientPublicKeyLength {
             actual: recipient_public_key.len(),
@@ -338,26 +525,28 @@ pub async fn prepare_sealed_invocation<S: Signer>(
         response_subject: None,
         in_reply_to: None,
         request_hash: None,
+        freshness_challenge: options.freshness_challenge.map(FreshnessChallenge::new),
+        response_public_key_cose,
     };
     let message_id = claims.message_id.as_bytes().to_vec();
 
-    let cose = build_sealed(
-        &SealParams {
-            content_type: ContentType::new(CONTENT_TYPE_SIGN_REQUEST.to_string())?,
-            plaintext: &body.to_cbor_bytes(),
-            claims,
-            role: MessageRole::Request,
-            recipient: X25519RecipientPublic {
-                key_id: recipient_key_id,
-                public,
-            },
-            content_algorithm: ContentAlgorithm::A256Gcm,
-            aad: SealedAad::empty(),
-            kdf_parties: KdfParties::anonymous(),
+    let params = SealParams {
+        content_type: ContentType::new(CONTENT_TYPE_SIGN_REQUEST.to_string())?,
+        plaintext: &body.to_cbor_bytes(),
+        claims,
+        role: MessageRole::Request,
+        recipient: X25519RecipientPublic {
+            key_id: recipient_key_id,
+            public,
         },
-        signer,
-    )
-    .await?;
+        content_algorithm: ContentAlgorithm::A256Gcm,
+        aad: SealedAad::empty(),
+        kdf_parties: KdfParties::anonymous(),
+    };
+    let cose = match protected_headers.as_ref() {
+        Some(headers) => build_sealed_with_headers(&params, headers, signer).await?,
+        None => build_sealed(&params, signer).await?,
+    };
     let message = cose.into_vec();
     let RequestHash(hash) = request_hash(&message);
 
@@ -656,6 +845,9 @@ where
             recipient_key_id: self.config.broker_request_key_id.clone(),
             recipient_subject: self.config.broker_request_subject.clone(),
             response_encryption_key_id: self.config.response_encryption_key_id.clone(),
+            // The carrier signer is a local trusted path, not a remote CI
+            // invocation; it presents no freshness challenge.
+            freshness_challenge: None,
         };
         let prepared = prepare_sealed_invocation(
             options,
@@ -774,6 +966,20 @@ mod tests {
             recipient_key_id: "broker-recipient".to_string(),
             recipient_subject: Some("broker".to_string()),
             response_encryption_key_id: "client-response".to_string(),
+            freshness_challenge: None,
+        }
+    }
+
+    fn ephemeral_options() -> EphemeralSealedInvocationOptions {
+        EphemeralSealedInvocationOptions {
+            message_id: "remote-request-1".to_string(),
+            issued_at_unix: 1_000,
+            expires_at_unix: Some(1_060),
+            sender_sign_id: "client-sign".to_string(),
+            sender_subject: Some("client".to_string()),
+            recipient_key_id: "broker-recipient".to_string(),
+            recipient_subject: Some("broker".to_string()),
+            freshness_challenge: [0x41; 32],
         }
     }
 
@@ -823,6 +1029,8 @@ mod tests {
                 MessageId::from_bytes(prepared.message_id.clone()).expect("message id"),
             ),
             request_hash: Some(RequestHash(prepared.request_hash)),
+            freshness_challenge: None,
+            response_public_key_cose: None,
         };
         let cose = build_sealed(
             &SealParams {
@@ -843,6 +1051,249 @@ mod tests {
         pb::SealedResponse {
             message: cose.into_vec(),
             response_subject: None,
+        }
+    }
+
+    async fn response_for_public(
+        prepared: &PreparedSealedInvocation,
+        response_public: X25519RecipientPublic,
+        broker_signer: &Ed25519Signer,
+    ) -> pb::SealedResponse {
+        let response_body = SignInvocationResponse {
+            status: InvocationStatus::ok(),
+            policy_generation: 42,
+            signature: Some(vec![1, 2, 3]),
+        };
+        let claims = Claims {
+            issuer: Some(Subject::new("broker".to_string()).expect("subject")),
+            audience: Some(Subject::new("client".to_string()).expect("subject")),
+            expires_at: Some(UnixTime(1_060)),
+            issued_at: UnixTime(1_000),
+            message_id: MessageId::from_bytes(b"response-ephemeral".to_vec()).expect("message id"),
+            sender_key_id: Some(broker_signer.key_id().clone()),
+            response_key_id: None,
+            response_subject: None,
+            in_reply_to: Some(
+                MessageId::from_bytes(prepared.message_id.clone()).expect("message id"),
+            ),
+            request_hash: Some(RequestHash(prepared.request_hash)),
+            freshness_challenge: None,
+            response_public_key_cose: None,
+        };
+        let cose = build_sealed(
+            &SealParams {
+                content_type: ContentType::new(CONTENT_TYPE_SIGN_RESPONSE.to_string())
+                    .expect("content type"),
+                plaintext: &response_body.to_cbor_bytes(),
+                claims,
+                role: MessageRole::Response,
+                recipient: response_public,
+                content_algorithm: ContentAlgorithm::A256Gcm,
+                aad: SealedAad::empty(),
+                kdf_parties: KdfParties::anonymous(),
+            },
+            broker_signer,
+        )
+        .await
+        .expect("response seals");
+        pb::SealedResponse {
+            message: cose.into_vec(),
+            response_subject: None,
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn ephemeral_preparation_binds_fresh_key_and_opens_with_pinned_broker_key() {
+        let client_signer = signer("client-sign", 7);
+        let client_verifier =
+            Ed25519Verifier::from_key(key_id("client-sign"), &client_signer.public_key_bytes())
+                .expect("verifier");
+        let broker_recipient = recipient("broker-recipient", 9);
+        let proof_headers = ProtectedHeaders {
+            signer_certificates_jwt: vec!["provider.jwt.signature".to_string()],
+            signer_public_key_cose: Some(vec![0xa3, 1, 1]),
+            operation_target_key_id: None,
+        };
+
+        let first = prepare_ephemeral_sealed_invocation(
+            ephemeral_options(),
+            &broker_recipient.public().public,
+            &sign_body(),
+            &proof_headers,
+            &client_signer,
+        )
+        .await
+        .expect("first request");
+        let mut second_options = ephemeral_options();
+        second_options.message_id = "remote-request-2".to_string();
+        let second = prepare_ephemeral_sealed_invocation(
+            second_options,
+            &broker_recipient.public().public,
+            &sign_body(),
+            &proof_headers,
+            &client_signer,
+        )
+        .await
+        .expect("second request");
+
+        let verified_first = verify_sealed(
+            &first.prepared().message,
+            &client_verifier,
+            &VerifySealedParams {
+                signature_aad: ExternalAad::empty(),
+                validation: &validation(MessageRole::Request),
+            },
+        )
+        .await
+        .expect("request verifies");
+        let verified_second = verify_sealed(
+            &second.prepared().message,
+            &client_verifier,
+            &VerifySealedParams {
+                signature_aad: ExternalAad::empty(),
+                validation: &validation(MessageRole::Request),
+            },
+        )
+        .await
+        .expect("request verifies");
+        let mut expected_headers = proof_headers;
+        expected_headers.operation_target_key_id = Some(key_id("target-sign"));
+        assert_eq!(verified_first.protected_headers, expected_headers);
+        let first_public = verified_first
+            .claims
+            .response_public_key_cose
+            .expect("response public key");
+        let second_public = verified_second
+            .claims
+            .response_public_key_cose
+            .expect("response public key");
+        assert_ne!(first_public, second_public);
+        assert_eq!(
+            verified_first
+                .claims
+                .response_key_id
+                .as_ref()
+                .map(KeyId::as_bytes),
+            Some(first_public.thumbprint().as_bytes())
+        );
+        assert_eq!(first_public.to_cose_key_bytes().len(), 40);
+
+        let broker_signer = signer("broker-sign", 13);
+        let response = response_for_public(
+            first.prepared(),
+            X25519RecipientPublic {
+                key_id: KeyId::from_text(&first_public.thumbprint()).expect("key id"),
+                public: *first_public.as_public_bytes(),
+            },
+            &broker_signer,
+        )
+        .await;
+        let pinned = BTreeMap::from([(
+            "broker-sign".to_string(),
+            broker_signer.public_key_bytes().to_vec(),
+        )]);
+        let opened = first
+            .verify_and_decrypt_sign_response(
+                &response,
+                &pinned,
+                &validation(MessageRole::Response),
+            )
+            .await
+            .expect("pinned response opens");
+        assert_eq!(opened.signature, Some(vec![1, 2, 3]));
+
+        let wrong_broker = signer("broker-sign", 14);
+        let wrong_pins = BTreeMap::from([(
+            "broker-sign".to_string(),
+            wrong_broker.public_key_bytes().to_vec(),
+        )]);
+        assert!(matches!(
+            first
+                .verify_and_decrypt_sign_response(
+                    &response,
+                    &wrong_pins,
+                    &validation(MessageRole::Response),
+                )
+                .await,
+            Err(SealedInvocationResponseError::Verify(
+                VerifyError::SignatureInvalid
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn ephemeral_preparation_separates_broker_audience_from_provider_proof() {
+        let client_signer = signer("client-sign", 7);
+        let client_verifier =
+            Ed25519Verifier::from_key(key_id("client-sign"), &client_signer.public_key_bytes())
+                .expect("verifier");
+        let broker_recipient = recipient("broker-recipient", 9);
+        let proof_headers = ProtectedHeaders {
+            signer_certificates_jwt: vec!["provider.jwt.with-oidc-audience".to_string()],
+            signer_public_key_cose: Some(vec![0xa3, 1, 1]),
+            operation_target_key_id: None,
+        };
+        let mut options = ephemeral_options();
+        options.recipient_subject = Some("basil://production.example/broker".to_string());
+
+        let prepared = prepare_ephemeral_sealed_invocation(
+            options,
+            &broker_recipient.public().public,
+            &sign_body(),
+            &proof_headers,
+            &client_signer,
+        )
+        .await
+        .expect("request seals");
+        let verified = verify_sealed(
+            &prepared.prepared().message,
+            &client_verifier,
+            &VerifySealedParams {
+                signature_aad: ExternalAad::empty(),
+                validation: &validation(MessageRole::Request),
+            },
+        )
+        .await
+        .expect("request verifies");
+
+        assert_eq!(
+            verified.claims.audience.as_ref().map(Subject::as_str),
+            Some("basil://production.example/broker")
+        );
+        let mut expected_headers = proof_headers;
+        expected_headers.operation_target_key_id = Some(key_id("target-sign"));
+        assert_eq!(verified.protected_headers, expected_headers);
+    }
+
+    #[tokio::test]
+    async fn ephemeral_preparation_requires_both_provider_proof_headers() {
+        let client_signer = signer("client-sign", 7);
+        let broker_recipient = recipient("broker-recipient", 9);
+        for headers in [
+            ProtectedHeaders::default(),
+            ProtectedHeaders {
+                signer_certificates_jwt: vec!["provider.jwt.signature".to_string()],
+                signer_public_key_cose: None,
+                operation_target_key_id: None,
+            },
+            ProtectedHeaders {
+                signer_certificates_jwt: Vec::new(),
+                signer_public_key_cose: Some(vec![0xa3, 1, 1]),
+                operation_target_key_id: None,
+            },
+        ] {
+            assert!(matches!(
+                prepare_ephemeral_sealed_invocation(
+                    ephemeral_options(),
+                    &broker_recipient.public().public,
+                    &sign_body(),
+                    &headers,
+                    &client_signer,
+                )
+                .await,
+                Err(SealedInvocationError::MissingProviderProofHeaders)
+            ));
         }
     }
 
@@ -902,6 +1353,8 @@ mod tests {
                 response_subject: None,
                 in_reply_to: Some(verified.claims.message_id.clone()),
                 request_hash: Some(RequestHash(hash)),
+                freshness_challenge: None,
+                response_public_key_cose: None,
             };
             let cose = build_sealed(
                 &SealParams {
@@ -937,6 +1390,65 @@ mod tests {
             default_ttl: Duration::from_secs(120),
             allowed_audiences: BTreeSet::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn prepared_invocation_carries_the_freshness_challenge_claim() {
+        let client_signer = signer("client-sign", 7);
+        let broker_recipient = recipient("broker-recipient", 9);
+        let mut challenge = [0x77_u8; 32];
+        challenge[..16].copy_from_slice(&[0x10; 16]);
+        let challenged_options = SealedInvocationOptions {
+            freshness_challenge: Some(challenge),
+            ..options()
+        };
+        let prepared = prepare_sealed_invocation(
+            challenged_options,
+            &broker_recipient.public().public,
+            &sign_body(),
+            &client_signer,
+        )
+        .await
+        .expect("request seals");
+
+        let verifier =
+            Ed25519Verifier::from_key(key_id("client-sign"), &client_signer.public_key_bytes())
+                .expect("verifier");
+        let checked = verify_sealed(
+            &prepared.message,
+            &verifier,
+            &VerifySealedParams {
+                signature_aad: ExternalAad::empty(),
+                validation: &validation(MessageRole::Request),
+            },
+        )
+        .await
+        .expect("request verifies");
+        assert_eq!(
+            checked.claims.freshness_challenge,
+            Some(FreshnessChallenge::new(challenge))
+        );
+
+        // Local requests without a challenge keep the claim absent.
+        let bare = prepare_sealed_invocation(
+            options(),
+            &broker_recipient.public().public,
+            &sign_body(),
+            &client_signer,
+        )
+        .await
+        .expect("request seals");
+        let checked = verify_sealed(
+            &bare.message,
+            &verifier,
+            &VerifySealedParams {
+                signature_aad: ExternalAad::empty(),
+                validation: &validation(MessageRole::Request),
+            },
+        )
+        .await
+        .expect("request verifies");
+        assert_eq!(checked.claims.freshness_challenge, None);
     }
 
     #[tokio::test]
@@ -1225,6 +1737,8 @@ mod tests {
                 MessageId::from_bytes(prepared.message_id.clone()).expect("message id"),
             ),
             request_hash: Some(RequestHash(prepared.request_hash)),
+            freshness_challenge: None,
+            response_public_key_cose: None,
         };
         let cose = build_sealed(
             &SealParams {

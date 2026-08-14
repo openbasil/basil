@@ -292,14 +292,26 @@ fn read_configuration_source_with_observer(
             "configuration source changed while being read",
         ));
     }
-    let (modified_unix_seconds, modified_nanoseconds) = system_time_parts(after.modified);
-    let digest = Sha256::digest(&bytes);
+    let trace = configuration_source_trace_from_bytes(slot, name, path, &bytes, after.modified);
+    Ok((bytes, trace))
+}
+
+pub(crate) fn configuration_source_trace_from_bytes(
+    slot: &str,
+    name: Option<&str>,
+    path: &Path,
+    bytes: &[u8],
+    modified: std::time::SystemTime,
+) -> ConfigurationSourceTrace {
+    let byte_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let (modified_unix_seconds, modified_nanoseconds) = system_time_parts(modified);
+    let digest = Sha256::digest(bytes);
     let mut sha256 = String::with_capacity(digest.len() * 2);
     for byte in digest {
         use std::fmt::Write as _;
         let _ = write!(sha256, "{byte:02x}");
     }
-    let trace = ConfigurationSourceTrace {
+    ConfigurationSourceTrace {
         slot: slot.to_string(),
         name: name.map(str::to_string),
         path: path.to_path_buf(),
@@ -307,8 +319,7 @@ fn read_configuration_source_with_observer(
         modified_nanoseconds,
         byte_size,
         sha256,
-    };
-    Ok((bytes, trace))
+    }
 }
 
 const fn source_byte_limit(slot: &str) -> u64 {
@@ -597,6 +608,7 @@ pub fn load_documents_with_overrides_and_context(
     result
 }
 
+#[allow(dead_code)]
 pub(crate) fn load_direct_documents_with_context(
     sources: &CorpusSources,
     context: ConfigurationTraceContext,
@@ -1386,7 +1398,9 @@ bundle = "bundle.age"
             &policy,
             r#"{
   "schema": "policy",
-  "subjects": {"svc.web": {"allOf": [{"kind": "unix", "uid": 1000}]}},
+  "subjects": {"svc.web": {
+    "domain": "host-process", "match": {"all": [{"process.uid": 1000}]}
+  }},
   "roles": {}, "rules": [], "config": {}
 }"#,
         );

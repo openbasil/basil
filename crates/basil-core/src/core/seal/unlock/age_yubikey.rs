@@ -54,12 +54,14 @@ impl AgeYubikeyMethod {
     /// for `age-plugin-yubikey` (the production path: needs the hardware token).
     ///
     /// # Errors
-    /// Returns [`UnlockError::Unavailable`] if the plugin binary is not on PATH.
+    /// Returns [`UnlockError::Unavailable`] if the plugin identity cannot be
+    /// resolved or the plugin binary is not on `PATH`.
     pub fn with_plugin(
         recipient: impl Into<String>,
         plugin_name: &str,
     ) -> Result<Self, UnlockError> {
-        let identity = age::plugin::Identity::default_for_plugin(plugin_name);
+        let identity = age::plugin::Identity::default_for_plugin(plugin_name)
+            .map_err(|e| UnlockError::Unavailable(format!("age plugin {plugin_name}: {e}")))?;
         let plugin = age::plugin::IdentityPluginV1::new(plugin_name, &[identity], NoCallbacks)
             .map_err(|e| UnlockError::Unavailable(format!("age plugin {plugin_name}: {e}")))?;
         Ok(Self {

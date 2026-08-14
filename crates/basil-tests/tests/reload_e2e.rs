@@ -83,7 +83,7 @@
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use basil_tests::{Engine, alloc_addr, boot_basil, on_path, repo_root};
+use basil_tests::{Engine, Harness, alloc_addr, boot_basil, on_path, repo_root};
 
 use basil::Client;
 
@@ -390,6 +390,9 @@ fn set_description(catalog_path: &std::path::Path, text: &str) {
 
 /// The parsed, non-secret outcome the `basil reload [--check] --json` CLI prints.
 /// Mirrors the wire `ReloadResponse` fields the CLI surfaces (`basil-atq`).
+/// `raw` keeps the whole printed object so newer fields (`listener_impacts`,
+/// `rewire_required`, `rejection.reason`) can be asserted without widening the
+/// struct per field.
 #[derive(Debug)]
 struct CliReload {
     exit_code: i32,
@@ -398,6 +401,7 @@ struct CliReload {
     previous_generation: u64,
     new_generation: u64,
     rejected: bool,
+    raw: serde_json::Value,
 }
 
 /// Shell the REAL `basil reload [--check] --json` CLI binary against the broker
@@ -440,6 +444,7 @@ fn basil_reload(socket: &str, check: bool) -> CliReload {
         // A missing `rejection` field (absent JSON) reads as "rejected": no JSON
         // means no successful apply was reported.
         rejected: v.get("rejection").is_none_or(|r| !r.is_null()),
+        raw: v,
     }
 }
 
@@ -669,6 +674,234 @@ async fn drive_rpc_engine(engine: Engine, tag: &str, addr: &str) {
 
     drop(client);
     drop(harness);
+}
+
+// ===========================================================================
+// Candidate-aware listener impact + persistent rewire diagnostics over a live
+// broker: `basil reload [--check]` reports listener adds/reconfigures with
+// exact active counts, an active listener BLOCKS the transition with the
+// structured `listener_transition_blocked` rejection, and an applied path
+// change is reported as a persistent `rewire_required` diagnostic on the gated
+// reload surface plus a COUNT on the ungated readiness probe (basil-9tj.15).
+// ===========================================================================
+
+/// One listener-impact JSON entry by name, or panic with the whole document.
+fn impact_by_name<'v>(v: &'v serde_json::Value, name: &str, ctx: &str) -> &'v serde_json::Value {
+    v["listener_impacts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{ctx}: listener_impacts is an array in {v:#}"))
+        .iter()
+        .find(|impact| impact["name"] == name)
+        .unwrap_or_else(|| panic!("{ctx}: listener `{name}` impact present in {v:#}"))
+}
+
+/// Rewrite the harness agent config from the legacy `socket = ...` form to the
+/// typed `[listeners]` form: the SAME `host` listener path plus an optional
+/// `aux` host listener at `aux_path`, with `host` optionally repathed.
+fn write_listener_config(
+    harness: &Harness,
+    original: &str,
+    host_path: &std::path::Path,
+    aux_path: Option<&std::path::Path>,
+) {
+    let legacy_line = format!("socket = \"{}\"\n", harness.socket().display());
+    let mut config = original.replace(&legacy_line, "");
+    assert_ne!(
+        config, original,
+        "legacy socket line present in the boot config"
+    );
+    {
+        use std::fmt::Write as _;
+        write!(
+            config,
+            "\n[listeners.host]\ntype = \"host\"\npath = {:?}\n",
+            host_path.display().to_string()
+        )
+        .expect("write host listener section");
+        if let Some(aux_path) = aux_path {
+            write!(
+                config,
+                "\n[listeners.aux]\ntype = \"host\"\npath = {:?}\n",
+                aux_path.display().to_string()
+            )
+            .expect("write aux listener section");
+        }
+    }
+    std::fs::write(harness.config_path(), config).expect("write typed listener config");
+}
+
+/// Drive one engine through the listener impact / rewire diagnostics legs.
+#[allow(clippy::too_many_lines)]
+async fn drive_listener_engine(engine: Engine, tag: &str, addr: &str) {
+    let name = engine.prefill_name();
+    let harness = boot_basil(tag, engine, addr);
+    let socket = harness.socket();
+    let socket_str = socket.to_str().expect("socket path is UTF-8").to_string();
+    let original_config = std::fs::read_to_string(harness.config_path()).expect("read boot config");
+    let parent = socket.parent().expect("socket parent").to_path_buf();
+    let aux = parent.join("aux.sock");
+    let aux2 = parent.join("aux2.sock");
+
+    let mut client = Client::connect(&socket_str)
+        .await
+        .expect("connect basil client to the broker socket");
+    assert_eq!(generation(&mut client).await, 1);
+    assert_eq!(
+        client
+            .readiness()
+            .await
+            .expect("readiness")
+            .listeners_rewire_required,
+        0,
+        "[{name}] no rewire diagnostics at boot"
+    );
+
+    // --- 1. dry-run of an added listener: the impact names the add with zero
+    //        active connections; nothing swaps, nothing binds.
+    write_listener_config(&harness, &original_config, &socket, Some(&aux));
+    let c = basil_reload(&socket_str, true);
+    assert_eq!(c.exit_code, 0, "[{name}] --check exits 0: {c:?}");
+    assert!(c.checked && !c.applied && !c.rejected, "{c:?}");
+    let add = impact_by_name(&c.raw, "aux", &format!("[{name}] dry-run add"));
+    assert_eq!(add["kind"], "add");
+    assert_eq!(add["active_connections"], 0);
+    assert_eq!(add["new_path"], aux.display().to_string());
+    assert!(!aux.exists(), "[{name}] a dry-run must not bind/publish");
+    assert_generation_stays(&mut client, 1, &format!("[{name}] dry-run no swap")).await;
+
+    // --- 2. apply the add: the socket is published and the impact reported.
+    let r = basil_reload(&socket_str, false);
+    assert_eq!(r.exit_code, 0, "[{name}] hot-add applies: {r:?}");
+    assert!(r.applied, "{r:?}");
+    let add = impact_by_name(&r.raw, "aux", &format!("[{name}] applied add"));
+    assert_eq!(add["kind"], "add");
+    wait_for_generation(&mut client, 2, &format!("[{name}] hot-add")).await;
+    assert!(aux.exists(), "[{name}] hot-added socket is published");
+
+    // --- 3. zero-connection same-name path change: applied, and a PERSISTENT
+    //        rewire diagnostic is recorded and surfaced (gated detail + ungated
+    //        readiness count).
+    write_listener_config(&harness, &original_config, &socket, Some(&aux2));
+    let r = basil_reload(&socket_str, false);
+    assert_eq!(r.exit_code, 0, "[{name}] repath applies: {r:?}");
+    let reconfigure = impact_by_name(&r.raw, "aux", &format!("[{name}] repath"));
+    assert_eq!(reconfigure["kind"], "reconfigure");
+    assert_eq!(reconfigure["previous_path"], aux.display().to_string());
+    assert_eq!(reconfigure["new_path"], aux2.display().to_string());
+    wait_for_generation(&mut client, 3, &format!("[{name}] repath")).await;
+    assert!(aux2.exists() && !aux.exists(), "[{name}] socket repathed");
+    let rewire = r.raw["rewire_required"]
+        .as_array()
+        .expect("rewire_required is an array");
+    assert_eq!(rewire.len(), 1, "{:#}", r.raw);
+    assert_eq!(rewire[0]["listener"], "aux");
+    assert_eq!(rewire[0]["previous_path"], aux.display().to_string());
+    assert_eq!(rewire[0]["new_path"], aux2.display().to_string());
+    assert_eq!(rewire[0]["applied_generation"], 3);
+    assert_eq!(
+        client
+            .readiness()
+            .await
+            .expect("readiness")
+            .listeners_rewire_required,
+        1,
+        "[{name}] readiness counts the pending rewire"
+    );
+    // The diagnostic PERSISTS across an unrelated applied reload.
+    set_description(&harness.catalog_path(), "rewire-persistence (basil-9tj.15)");
+    let r = basil_reload(&socket_str, false);
+    assert_eq!(r.exit_code, 0, "{r:?}");
+    wait_for_generation(&mut client, 4, &format!("[{name}] unrelated reload")).await;
+    assert_eq!(
+        r.raw["rewire_required"].as_array().map(Vec::len),
+        Some(1),
+        "[{name}] rewire diagnostic persists: {:#}",
+        r.raw
+    );
+
+    // --- 4. an ACTIVE listener blocks its own reconfiguration: the rejection
+    //        is the structured `listener_transition_blocked` with the exact
+    //        blocking impact, and nothing swaps (our own client holds a live
+    //        connection through the `host` listener).
+    write_listener_config(
+        &harness,
+        &original_config,
+        &parent.join("host-moved.sock"),
+        Some(&aux2),
+    );
+    let rej = basil_reload(&socket_str, false);
+    assert_ne!(rej.exit_code, 0, "[{name}] blocked reload exits nonzero");
+    assert!(rej.rejected && !rej.applied, "{rej:?}");
+    assert_eq!(
+        rej.raw["rejection"]["reason"], "listener_transition_blocked",
+        "{:#}",
+        rej.raw
+    );
+    let blocking = impact_by_name(&rej.raw, "host", &format!("[{name}] blocked"));
+    assert_eq!(blocking["kind"], "reconfigure");
+    assert!(
+        blocking["active_connections"].as_u64().unwrap_or(0) >= 1,
+        "[{name}] the blocking impact reports the live connection: {:#}",
+        rej.raw
+    );
+    assert_generation_stays(&mut client, 4, &format!("[{name}] blocked no swap")).await;
+    assert!(
+        socket.exists(),
+        "[{name}] the blocked host socket keeps serving"
+    );
+
+    // --- 5. returning `aux` to its recorded previous path RESOLVES the
+    //        diagnostic on both surfaces.
+    write_listener_config(&harness, &original_config, &socket, Some(&aux));
+    let r = basil_reload(&socket_str, false);
+    assert_eq!(r.exit_code, 0, "[{name}] revert applies: {r:?}");
+    wait_for_generation(&mut client, 5, &format!("[{name}] revert")).await;
+    assert_eq!(
+        r.raw["rewire_required"].as_array().map(Vec::len),
+        Some(0),
+        "[{name}] reverting the path resolves the diagnostic: {:#}",
+        r.raw
+    );
+    assert_eq!(
+        client
+            .readiness()
+            .await
+            .expect("readiness")
+            .listeners_rewire_required,
+        0,
+        "[{name}] readiness count returns to zero"
+    );
+    eprintln!(
+        "RELOAD-LISTENER[{name}]: add/apply/repath/rewire-persist/blocked/revert all verified"
+    );
+
+    drop(client);
+    drop(harness);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reload_listener_impact_and_rewire_cross_engine() {
+    let ran_bao = if on_path("bao") {
+        drive_listener_engine(Engine::OpenBao, "reload-lsn-bao", &alloc_addr()).await;
+        true
+    } else {
+        eprintln!("SKIP: bao not found on PATH; listener impact e2e needs a live OpenBao");
+        false
+    };
+
+    let ran_vault = if on_path("vault") {
+        drive_listener_engine(Engine::Vault, "reload-lsn-vault", &alloc_addr()).await;
+        true
+    } else {
+        eprintln!("SKIP: vault not found on PATH; listener impact e2e needs a live Vault");
+        false
+    };
+
+    assert!(
+        ran_bao || ran_vault,
+        "neither bao nor vault was on PATH; the listener impact live e2e ran no engine leg \
+         (this is a live cross-engine acceptance test; it must not pass vacuously)"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

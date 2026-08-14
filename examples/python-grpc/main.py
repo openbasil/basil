@@ -79,8 +79,7 @@ def main() -> None:
     admin = broker_pb2_grpc.AdminServiceStub(channel)
     status = admin.Status(broker_pb2.StatusRequest())
     print(
-        f"PASS status backend={status.backend} version={status.version} "
-        f"protocol={status.protocol}"
+        f"PASS status backend={status.backend} version={status.version} protocol={status.protocol}"
     )
 
     # 2. SigningService.Sign: the Ed25519 key signs IN PLACE in the backend;
@@ -93,9 +92,7 @@ def main() -> None:
 
     # 3. SigningService.Verify: the broker confirms the signature ...
     ok = signing.Verify(
-        broker_pb2.VerifyRequest(
-            key_id=KEY_ID, message=message, signature=sig.signature
-        )
+        broker_pb2.VerifyRequest(key_id=KEY_ID, message=message, signature=sig.signature)
     )
     assert ok.valid, "broker reported the signature as INVALID"
     print("PASS verify valid=true")
@@ -104,9 +101,7 @@ def main() -> None:
     # answer, not an error).
     tampered = bytes([message[0] ^ 1]) + message[1:]
     bad = signing.Verify(
-        broker_pb2.VerifyRequest(
-            key_id=KEY_ID, message=tampered, signature=sig.signature
-        )
+        broker_pb2.VerifyRequest(key_id=KEY_ID, message=tampered, signature=sig.signature)
     )
     assert not bad.valid, "tampered message unexpectedly verified"
     print("PASS verify tampered=rejected")

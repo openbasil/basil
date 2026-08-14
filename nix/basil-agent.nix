@@ -194,7 +194,11 @@ let
         "request-encryption-key-id" = settings.invocation.requestEncryptionKeyId;
         "max-ttl-secs" = settings.invocation.maxTtlSecs;
         "clock-skew-secs" = settings.invocation.clockSkewSecs;
-        "replay-cache-capacity" = settings.invocation.replayCacheCapacity;
+        # Freshness-challenge table shape ([invocation.challenge]); the
+        # remaining challenge knobs keep the binary's defaults.
+        challenge = {
+          capacity = settings.invocation.challenge.capacity;
+        };
       };
       # Opt-in JWKS HTTP surface ([jwks]). enable defaults to false: no HTTP port
       # is bound unless explicitly turned on. listen is parsed at startup but only

@@ -29,6 +29,11 @@ creds = "/run/basil/bridge.creds"
 
 [basil]
 socket = "/run/basil/basil.sock"
+service-owner-uid = 991
+directory-owner-uid = 0
+directory-mode = 0o755
+server-uid = 991
+socket-mode = 0o660
 
 [bridge]
 request-subject = "basil.invocation"
@@ -38,14 +43,53 @@ max-message-bytes = 1048576
 
 `creds`, `queue-group`, and `max-message-bytes` may be omitted.
 
+This invocation-only form is the local legacy mode. It accepts a Host or
+Container Basil listener only when that listener reports optional freshness. It
+rejects Courier, unknown, or mandatory-freshness profiles, does not transport
+freshness challenges, and makes no federation guarantee.
+
+Federation mode adds one distinct challenge subject and one operator-selected
+rate partition. It forbids a queue group so a challenge and its invocation
+cannot be split across agents:
+
+```toml
+[bridge]
+request-subject = "basil.agent-a.invocation"
+challenge-subject = "basil.agent-a.challenge"
+source-partition = "agent-a"
+lease-bucket = "BASIL_COURIER_LEASES"
+max-message-bytes = 1048576
+concurrency-limit = 32
+challenge-concurrency-limit = 8
+```
+
+Run one bridge per subject pair and Basil agent. Multi-agent deployments assign
+distinct subject pairs before challenge issuance. Incoming challenge requests
+are protobuf `GetInvocationChallengeRequest` messages and must omit
+`courier_observed_source`; the bridge inserts `source-partition`. Challenge
+responses are protobuf. Basil scopes this partition beneath the bridge's
+kernel-attested listener and UID. Invocation messages remain raw tagged COSE
+bytes.
+
+`concurrency-limit` reserves workers for invocations. The separate
+`challenge-concurrency-limit` bounds challenge workers, so challenge pressure
+cannot occupy the invocation pool. The challenge default is the smaller of `8`
+and `concurrency-limit`; both limits accept values from `1` through `256`.
+
+`lease-bucket` names a pre-created JetStream Key/Value bucket with history `1`
+and maximum age `15s`. The bridge never creates or reconfigures it. It acquires
+one atomic lease for the subject pair before subscribing, renews the lease every
+five seconds and before every forward, and stops serving immediately if compare-
+and-set ownership is lost.
+
 ## Policy
 
 The bridge process needs no policy grant of its own. There is no transport-level
 `op:invoke` action in the policy language (a policy naming one fails to load);
-the broker authorizes the *actor* inside the sealed message, never the process
-that delivered it:
+the broker authorizes the compound local ingress and verified signer:
 
-- the sealed request's actor proof (its `signature-key` subject) must verify;
+- the local bridge process must resolve in its observed workload domain;
+- the sealed request's `invocation.signature-key` evidence must verify;
 - the actor needs `op:decrypt` on the request-encryption key the message is
   sealed to;
 - the actor needs the operation-specific grant for the inner request (for
@@ -53,25 +97,30 @@ that delivered it:
 
 ```json
 {
-	"subjects": {
-		"content.publisher": {
-			"allOf": [
-				{
-					"kind": "signature-key",
-					"algorithm": "nats-nkey",
-					"public": "UANATS_PUBLIC_NKEY"
-				}
-			]
-		}
-	},
-	"rules": [
-		{
-			"id": "publisher-can-use-invocation-signing",
-			"subjects": ["content.publisher"],
-			"action": ["op:decrypt", "op:sign"],
-			"target": ["broker.request_encryption.2026q3", "publisher.signing.2026q3"]
-		}
-	]
+  "subjects": {
+    "content.publisher": {
+      "domain": "host-process",
+      "match": {
+        "all": [
+          { "process.uid": 991 },
+          {
+            "invocation.signature-key": {
+              "algorithm": "nats-nkey",
+              "public": "UANATS_PUBLIC_NKEY"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "rules": [
+    {
+      "id": "publisher-can-use-invocation-signing",
+      "subjects": ["content.publisher"],
+      "action": ["op:decrypt", "op:sign"],
+      "target": ["broker.request_encryption.2026q3", "publisher.signing.2026q3"]
+    }
+  ]
 }
 ```
 
@@ -120,11 +169,14 @@ subject:
 | Header                   | Meaning                                            |
 | ------------------------ | -------------------------------------------------- |
 | `Basil-Bridge-Error`     | Stable bridge-level token.                         |
-| `Basil-Bridge-Message`   | Operator-facing detail.                            |
 | `Basil-Bridge-Retryable` | `true` when retrying the same request may succeed. |
 
 Stable error tokens are `MALFORMED_REQUEST`, `MESSAGE_TOO_LARGE`,
-`BASIL_UNAVAILABLE`, `BASIL_REJECTED`, `TIMEOUT`, and `INTERNAL`.
+`BASIL_UNAVAILABLE`, `BASIL_REJECTED`, `CHALLENGE_ISSUANCE_DECLINED`,
+`CAPABILITY_MISMATCH`, `OVERLOADED`, `TIMEOUT`, and `INTERNAL`. Raw broker
+status text is never published. An invocation failure after forwarding is not
+retryable because Basil may already have consumed its challenge or completed
+the operation.
 
 ## Audit and boundaries
 

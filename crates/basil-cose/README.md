@@ -52,10 +52,17 @@ parameter of every encrypting entry point. ES256 signing is deterministic
 ## Claims
 
 Claims ride in the protected header as a CWT map (header 15) plus the basil
-private labels (`-70001..=-70005`, module `label`): in-reply-to, request
-hash (SHA3-256, helper `request_hash`), sender key id (must equal the outer
-`kid`), response key id, and response subject. `MessageRole`
-(request/response/peer) validators enforce claim shape;
+private labels (`-70001..=-70005` and `-70008..=-70010`, module `label`): in-reply-to,
+request hash (SHA3-256, helper `request_hash`), sender key id (must equal the
+outer `kid`), response key id, response subject, and the server-issued
+single-use freshness challenge (`-70008`, exactly 32 bytes, requests only,
+consumed by the broker before authorization), and the deterministic X25519
+response public `COSE_Key` (`-70009`, requests only). Its response key id is
+the exact RFC 7638 thumbprint; decoding rejects noncanonical, high-bit-alias,
+and non-contributory public keys. `MessageRole` (request/response/peer)
+validators enforce claim shape. Provider-proof requests bind their sole
+operation target in the critical, signed `-70010` protected header before body
+encryption.
 `ValidationParams` parameterizes clock skew, TTL bounds, and the audience
 allow-list (`now` is injected, never sampled: the crate is state-free and
 owns no time policy).

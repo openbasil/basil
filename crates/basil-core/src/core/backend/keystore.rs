@@ -204,6 +204,10 @@ fn store_error(err: StoreError) -> BackendError {
         StoreError::NotFound(key) => BackendError::KeyNotFound(key),
         StoreError::Backend(summary) => BackendError::Backend(summary),
         StoreError::NonUtf8Value => BackendError::Backend("non-utf8-secret-for-provider".into()),
+        // The rekey store-open fence: keep the full typed rendering so the
+        // operator-facing refusal still names the marker path and the
+        // `basil keystore rekey --resume` recovery command verbatim.
+        fence @ StoreError::RekeyInProgress { .. } => BackendError::Backend(fence.to_string()),
     }
 }
 
@@ -220,16 +224,56 @@ fn crypto_error(err: &CryptoError) -> BackendError {
     }
 }
 
+/// The typed rekey store-open fence must survive the `store_error` mapping
+/// with its refusal-text contract intact: the operator-facing text names the
+/// marker path and the `basil keystore rekey --resume` recovery command
+/// verbatim (no live store required: this exercises only the error mapping).
+#[cfg(test)]
+mod store_error_mapping {
+    #![allow(clippy::panic)]
+
+    use super::{BackendError, StoreError, store_error};
+
+    #[test]
+    fn rekey_fence_keeps_the_refusal_text_contract() {
+        let marker = "/var/lib/basil/keystore.db.rekey-intent";
+        let mapped = store_error(StoreError::RekeyInProgress {
+            marker: marker.to_owned(),
+        });
+        let BackendError::Backend(text) = mapped else {
+            panic!("the rekey fence must map to BackendError::Backend");
+        };
+        assert!(text.contains(marker), "must name the marker path: {text}");
+        assert!(
+            text.contains("basil keystore rekey --resume"),
+            "must name the recovery command verbatim: {text}"
+        );
+    }
+}
+
 /// A unique, absolute temp path so parallel tests never share a store file.
 #[cfg(all(test, feature = "db-keystore"))]
+#[allow(clippy::expect_used)]
 fn unique_temp_path(stem: &str, ext: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "basil-keystore-e2e-{stem}-{}-{n}.{ext}",
+    let directory = std::env::temp_dir().join(format!(
+        "basil-keystore-e2e-{stem}-{}-{n}",
         std::process::id()
-    ))
+    ));
+    std::fs::create_dir(&directory).expect("create private keystore test directory");
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+        .expect("protect keystore test directory");
+    directory.join(format!("keystore.{ext}"))
+}
+
+#[cfg(all(test, feature = "db-keystore"))]
+fn remove_temp_store(path: &std::path::Path) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::remove_dir_all(parent);
+    }
 }
 
 /// End-to-end: unlock a sealed `DbKeystoreDek` bundle credential and drive a
@@ -353,7 +397,7 @@ mod db_keystore_e2e {
         );
 
         drop(backend);
-        let _ = std::fs::remove_file(&path);
+        super::remove_temp_store(&path);
     }
 
     #[tokio::test]
@@ -390,7 +434,7 @@ mod db_keystore_e2e {
                 .await;
             assert!(err.is_err(), "wrong-DEK read must fail closed");
         }
-        let _ = std::fs::remove_file(&path);
+        super::remove_temp_store(&path);
     }
 }
 

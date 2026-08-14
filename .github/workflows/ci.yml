@@ -23,7 +23,7 @@ on:
     tags:
       # Strict v{semver} (prerelease suffixes match via the trailing `*`):
       # the same tag convention release.yml and build.yml trigger on.
-      - 'v[0-9]+.[0-9]+.[0-9]+*'
+      - "v[0-9]+.[0-9]+.[0-9]+*"
   workflow_dispatch:
     inputs:
       architecture:
@@ -91,9 +91,9 @@ jobs:
           ARCH: ${{ github.event_name == 'workflow_dispatch' && inputs.architecture || 'all' }}
         run: |
           all='[
-            {"arch":"x86_64-linux","runner":"ubuntu-latest","os":"linux","pkg_arch":"amd64"},
-            {"arch":"aarch64-linux","runner":"ubuntu-22.04-arm","os":"linux","pkg_arch":"arm64"},
-            {"arch":"aarch64-darwin","runner":"macos-14","os":"darwin","pkg_arch":""}
+            {"arch":"x86_64-linux","runner":"ubuntu-latest","os":"linux","pkg_arch":"amd64","nix_cache_tier":"production"},
+            {"arch":"aarch64-linux","runner":"ubuntu-22.04-arm","os":"linux","pkg_arch":"arm64","nix_cache_tier":"production"},
+            {"arch":"aarch64-darwin","runner":"macos-14","os":"darwin","pkg_arch":"","nix_cache_tier":"development-only"}
           ]'
           if [ "$ARCH" = "all" ]; then
             sel=$(jq -c . <<<"$all")
@@ -128,6 +128,17 @@ jobs:
 
       - name: Install just
         uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+
+      # The composite action uses Node 20. Pin the test runtime to the exact
+      # checked-in release; the tests use only Node's standard library.
+      - name: Install Node 20 for action qualification
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+
+      - name: Node action qualification
+        run: just test-node
 
       # basil-proto's build.rs drives `tonic-prost-build`, which shells out to
       # `protoc`. The Nix build (build.yml) gets it from the flake; these native
@@ -182,6 +193,15 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+      # This named qualification lane makes the support tier visible in the
+      # job log. It exercises real process signals and filesystem primitives on
+      # each native runner; macOS remains a development-only target. The matrix
+      # labels encode policy, while the completed native jobs provide evidence.
+      - name: Nix cache crash recovery (${{ matrix.nix_cache_tier }})
+        run: |
+          cargo test -p basil-core core::nix_cache_file::tests
+          cargo test -p basil-bin --test nix_cache_signals
 
       - name: Format check
         run: cargo fmt --all --check

@@ -9,7 +9,8 @@
 #
 # What dist owns here:
 #   * signed, attested `.tar.xz` archives for the three first-class targets
-#     below, covering the `basil` and `basil-nats-bridge` binaries;
+#     below, covering the `basil`, `basil-nats-bridge`, and
+#     `basil-https-courier` binaries;
 #   * a Homebrew formula (serves macOS arm64 AND Linux) published to the
 #     `openbasil/homebrew-tap` tap;
 #   * GitHub Artifact Attestations (build provenance) for every artifact.
@@ -29,12 +30,12 @@ cargo-dist-version = "0.32.0"
 ci = "github"
 hosting = "github"
 # The dist-able packages ship the unified `basil` binary and the companion
-# `basil-nats-bridge` courier. The `basil` binary is built with its DEFAULT
+# `basil-nats-bridge` and `basil-https-courier` couriers. The `basil` binary is built with its DEFAULT
 # features (db-keystore + onepassword + unlock-age-yubikey + unlock-bip39). PQC
 # and SPIFFE client dependencies are always compiled in. Optional HTTP server,
 # TPM, AWS KMS, GCP KMS, OTLP, and secure allocator surfaces are deliberately
 # outside the default release build.
-packages = ["basil-bin", "basil-nats-bridge"]
+packages = ["basil-bin", "basil-nats-bridge", "basil-https-courier"]
 installers = ["shell", "homebrew"]
 # First-class release targets.
 targets = [
@@ -69,7 +70,7 @@ github-attestations = true
 allow-dirty = ["ci"]
 
 # System build dependencies dist installs on the artifact-build runners before
-# `dist build`. basil-bin ships `basil-nats-bridge`, whose basil-proto dependency
+# `dist build`. The couriers depend on basil-proto, whose build script
 # runs `tonic-prost-build` in its build script -- that shells out to `protoc`.
 # `dist generate` turns these into the per-target "Install dependencies" step
 # (apt on Linux, Homebrew on macOS). Until release.yml is regenerated, the same

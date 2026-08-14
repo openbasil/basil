@@ -35,6 +35,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// The trust domain the prefill fixtures configure the SPIFFE issuers for.
@@ -115,7 +116,7 @@ const DEV_SEM_LOCK_PREFIX: &str = "basil-spiffe-test-devsem";
 /// process and is reclaimable, mirroring the `alloc_addr` stale-lock steal. The
 /// ceiling is generous: a dev server's whole boot→test→teardown lifetime fits
 /// well under it, so a live holder is never wrongly reclaimed.
-const DEV_SEM_STALE: Duration = Duration::from_secs(10 * 60);
+const DEV_SEM_STALE: Duration = Duration::from_mins(10);
 
 /// RAII: removes its lock file on drop so a panic in the critical section (or a
 /// held semaphore permit) still releases the cross-process lock; otherwise the
@@ -158,7 +159,7 @@ fn acquire_dev_server_permit() -> DevServerPermit {
     // Generous ceiling: a whole engine's boot+test+teardown can take many seconds
     // and up to `permits` of them serialize behind a saturated pool, so allow
     // minutes before declaring the pool wedged.
-    let deadline = Instant::now() + Duration::from_secs(5 * 60);
+    let deadline = Instant::now() + Duration::from_mins(5);
     loop {
         for i in 0..permits {
             let slot = dir.join(format!("{DEV_SEM_LOCK_PREFIX}.{i}.lock"));
@@ -452,6 +453,7 @@ fn prefill_with_retry(
 /// Drops regardless of assertion outcome so we never leak processes/sockets.
 pub struct Harness {
     workdir: PathBuf,
+    socket_path: Option<PathBuf>,
     agent: Option<Child>,
     server_pidfile: PathBuf,
     backend_addr: String,
@@ -470,7 +472,9 @@ impl Harness {
     }
     #[must_use]
     pub fn socket(&self) -> PathBuf {
-        self.workdir.join("agent.sock")
+        self.socket_path
+            .clone()
+            .unwrap_or_else(|| self.workdir.join("agent.sock"))
     }
     /// The standard SPIFFE endpoint string a workload puts in
     /// `SPIFFE_ENDPOINT_SOCKET`; pass it to `connect_to` directly.
@@ -569,6 +573,54 @@ impl Harness {
             .expect("dev backend pid available to kill");
         reap_dev_server(pid);
     }
+
+    /// Stop the running `basil-agent` and boot a fresh one from the SAME
+    /// on-disk config (`--config` [`Harness::config_path`]), leaving the dev
+    /// backend up. This is a real process restart: all in-memory broker state
+    /// (challenge table with its instance ID, per-run quota counters, serving
+    /// generation) is rebuilt from scratch, which is what the restart rows of
+    /// the challenge acceptance matrix (`basil-jjgi.3.3.2`) assert. Existing
+    /// gRPC channels to the old process are dead after this returns; callers
+    /// reconnect. Panics if the harness holds no agent child.
+    #[cfg(unix)]
+    pub fn restart_agent(&mut self) {
+        let mut child = self.agent.take().expect("agent is running for restart");
+        signal(child.id().cast_signed(), "-INT");
+        for _ in 0..100 {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if !matches!(child.try_wait(), Ok(Some(_))) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        // Remove the dead process's socket file: `wait_for_socket` keys on
+        // existence, so a stale file would report readiness early. Courier
+        // boots also expose a secondary Host listener from this private test
+        // directory; remove that socket before the same config binds again.
+        let socket = self.socket();
+        let _ = std::fs::remove_file(&socket);
+        let _ = std::fs::remove_file(self.workdir.join("agent-host.sock"));
+
+        let broker_log = self.workdir.join("broker.log");
+        let log = std::fs::File::options()
+            .append(true)
+            .create(true)
+            .open(&broker_log)
+            .expect("reopen broker log for the restarted agent");
+        let child = Command::new(repo_root().join("target/debug/basil"))
+            .arg("agent")
+            .arg("--config")
+            .arg(self.config_path())
+            .stdout(log.try_clone().expect("clone log handle"))
+            .stderr(log)
+            .spawn()
+            .expect("respawn basil agent");
+        self.agent = Some(child);
+        wait_for_socket(self, &socket, &broker_log);
+    }
 }
 
 #[cfg(unix)]
@@ -628,6 +680,9 @@ impl Drop for Harness {
         {
             #[cfg(unix)]
             reap_dev_server(pid);
+        }
+        if let Some(socket_path) = &self.socket_path {
+            let _ = std::fs::remove_file(socket_path);
         }
         let _ = std::fs::remove_dir_all(&self.workdir);
     }
@@ -794,6 +849,7 @@ pub fn boot_basil_bip39(tag: &str, engine: Engine, addr: &str) -> Harness {
 
     let mut harness = Harness {
         workdir: workdir.clone(),
+        socket_path: None,
         agent: None,
         server_pidfile: workdir.join("server.pid"),
         backend_addr: addr.clone(),
@@ -823,14 +879,22 @@ pub fn boot_basil_bip39(tag: &str, engine: Engine, addr: &str) -> Harness {
     std::fs::write(
         &config,
         format!(
-            r#"catalog = "{}"
+            r#"schema = "agent"
+schemaVersion = 3
+capability-policy = "strict"
+socket = "{}"
+vault-addr = "{}"
+
+[import]
+catalog = "{}"
 policy = "{}"
 bundle = "{}"
-capability-policy = "strict"
 
 [unlock]
 bip39-phrase-file = "{}"
 "#,
+            socket.display(),
+            addr,
             catalog.display(),
             policy.display(),
             bundle.display(),
@@ -842,9 +906,6 @@ bip39-phrase-file = "{}"
         .arg("agent")
         .arg("--config")
         .arg(&config)
-        .args(["--vault-addr", &addr])
-        .arg("--socket")
-        .arg(&socket)
         .stdout(log.try_clone().expect("clone log handle"))
         .stderr(log)
         .spawn()
@@ -952,6 +1013,7 @@ fn boot_basil_inner(tag: &str, engine: Engine, addr: &str, svid_ttl_secs: Option
 
     let mut harness = Harness {
         workdir: workdir.clone(),
+        socket_path: None,
         agent: None,
         server_pidfile: workdir.join("server.pid"),
         backend_addr: addr.clone(),
@@ -982,20 +1044,28 @@ fn boot_basil_inner(tag: &str, engine: Engine, addr: &str, svid_ttl_secs: Option
     std::fs::write(
         &config,
         format!(
-            r#"catalog = "{}"
-policy = "{}"
-bundle = "{}"
+            r#"schema = "agent"
+schemaVersion = 3
 capability-policy = "strict"
 audit-log = "{}"
+socket = "{}"
+vault-addr = "{}"
 {svid_ttl_line}
+
+[import]
+catalog = "{}"
+policy = "{}"
+bundle = "{}"
 
 [unlock]
 unlock-passphrase-file = "{}"
 "#,
+            audit_log.display(),
+            socket.display(),
+            addr,
             catalog.display(),
             policy.display(),
             bundle.display(),
-            audit_log.display(),
             pass.display()
         ),
     )
@@ -1004,9 +1074,6 @@ unlock-passphrase-file = "{}"
         .arg("agent")
         .arg("--config")
         .arg(&config)
-        .args(["--vault-addr", &addr])
-        .arg("--socket")
-        .arg(&socket)
         .stdout(log.try_clone().expect("clone log handle"))
         .stderr(log)
         .spawn()
@@ -1086,6 +1153,7 @@ pub fn boot_basil_spiffe(
 
     let mut harness = Harness {
         workdir: workdir.clone(),
+        socket_path: None,
         agent: None,
         server_pidfile: workdir.join("server.pid"),
         backend_addr: addr.clone(),
@@ -1125,22 +1193,30 @@ pub fn boot_basil_spiffe(
     std::fs::write(
         &config,
         format!(
-            r#"catalog = "{}"
-policy = "{}"
-bundle = "{}"
+            r#"schema = "agent"
+schemaVersion = 3
 capability-policy = "strict"
 jwt-auth-mount = "jwt"
 jwt-role = "basil-spiffe"
 jwt-audience = "{}"
 svid-ttl-secs = 300
+socket = "{}"
+vault-addr = "{}"
+
+[import]
+catalog = "{}"
+policy = "{}"
+bundle = "{}"
 
 [unlock]
 unlock-passphrase-file = "{}"
 {jwks_section}"#,
+            engine.prefill_name(),
+            socket.display(),
+            addr,
             catalog.display(),
             policy.display(),
             bundle.display(),
-            engine.prefill_name(),
             pass.display()
         ),
     )
@@ -1149,9 +1225,6 @@ unlock-passphrase-file = "{}"
         .arg("agent")
         .arg("--config")
         .arg(&config)
-        .args(["--vault-addr", &addr])
-        .arg("--socket")
-        .arg(&socket)
         .stdout(log.try_clone().expect("clone log handle"))
         .stderr(log)
         .spawn()
@@ -1305,4 +1378,560 @@ fn wait_for_socket(harness: &mut Harness, socket: &Path, broker_log: &Path) {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Proof-bound sealed-invocation harness (basil-jjgi.3.3.1)
+// ---------------------------------------------------------------------------
+
+/// Catalog key id the boot configures as `invocation.request-encryption-key-id`.
+pub const INVOCATION_REQUEST_KEY_ID: &str = "ci.request.seal";
+/// Catalog key id the boot configures as the broker response-encryption key.
+///
+/// This is the ONLY key id a sealed request may name in `response_key_id`;
+/// every other catalog key is a response-key substitution attempt.
+pub const INVOCATION_RESPONSE_KEY_ID: &str = "ci.response.seal";
+/// Catalog key id the broker signs sealed responses with.
+pub const INVOCATION_SIGNING_KEY_ID: &str = "ci.broker.signing";
+/// The single broker audience the boot accepts for subject-key invocations.
+pub const INVOCATION_AUDIENCE: &str = "basil://ci.test/invocation";
+/// Stable broker identity URI of an invocation boot.
+pub const INVOCATION_BROKER_ID: &str = "basil://ci.test/broker";
+/// Policy subject name bound to the caller-supplied invocation signature key.
+pub const INVOCATION_SUBJECT: &str = "ci.invoker";
+/// Second policy subject, admitted only when
+/// [`InvocationBootSpec::second_subject_signature_key`] is set. The challenge
+/// lifecycle matrix (`basil-jjgi.3.3.2`) uses it to prove a wrong-`jkt`
+/// consumption attempt does not burn the rightful holder's challenge.
+pub const INVOCATION_SUBJECT_2: &str = "ci.invoker2";
+
+/// Which CI provider arm of the proof-bound acceptance matrix a boot configures.
+///
+/// The matrix is parametrized over this enum so one corpus body runs against
+/// every provider family: the GitHub arm runs now, and the Forgejo arm ships
+/// gated (`#[ignore]`) until `basil-jjgi.3.5` activates it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderArm {
+    /// GitHub Actions OIDC (general tier).
+    GithubActions,
+    /// Forgejo Actions OIDC (experimental tier; needs the operator opt-in).
+    ForgejoActions,
+}
+
+impl ProviderArm {
+    /// The `ProviderKind` spelling the agent config uses.
+    #[must_use]
+    pub const fn config_name(self) -> &'static str {
+        match self {
+            Self::GithubActions => "githubActions",
+            Self::ForgejoActions => "forgejoActions",
+        }
+    }
+
+    /// Whether the arm is experimental-tier and needs
+    /// `federation.experimental-providers`.
+    #[must_use]
+    pub const fn is_experimental(self) -> bool {
+        match self {
+            Self::GithubActions => false,
+            Self::ForgejoActions => true,
+        }
+    }
+
+    /// The federation rule id this arm installs.
+    #[must_use]
+    pub const fn rule_id(self) -> &'static str {
+        match self {
+            Self::GithubActions => "github-release",
+            Self::ForgejoActions => "forgejo-release",
+        }
+    }
+
+    /// The `[federation]` section for this arm, including the opt-in line when
+    /// the arm is experimental-tier.
+    fn federation_toml(self) -> String {
+        let opt_in = if self.is_experimental() {
+            format!("experimental-providers = [\"{}\"]\n", self.config_name())
+        } else {
+            String::new()
+        };
+        let provider = match self {
+            Self::GithubActions => concat!(
+                "kind = \"githubActions\"\n",
+                "issuer = \"https://token.actions.githubusercontent.com\"\n",
+                "discoveryUrl = \"https://token.actions.githubusercontent.com/.well-known/openid-configuration\"\n",
+                "jwksUrl = \"https://token.actions.githubusercontent.com/.well-known/jwks\"\n",
+                "audiencePrefix = \"urn:basil:ci:jkt:\"\n",
+                "repositoryId = 4242\n",
+                "repositoryOwnerId = 77\n",
+                "jobWorkflowRef = \"openbasil/basil/.github/workflows/release.yml@refs/heads/main\"\n",
+                "jobWorkflowSha = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",
+                "protectedRefs = [\"refs/heads/main\"]\n",
+                "events = [\"push\"]\n",
+                "runnerEnvironments = [\"github-hosted\"]\n",
+                "maxTokenAgeSecs = 300\n",
+                "clockSkewSecs = 30\n",
+            )
+            .to_string(),
+            Self::ForgejoActions => concat!(
+                "kind = \"forgejoActions\"\n",
+                "issuer = \"https://forge.example.com/api/actions\"\n",
+                "discoveryUrl = \"https://forge.example.com/api/actions/.well-known/openid-configuration\"\n",
+                "jwksUrl = \"https://forge.example.com/api/actions/.well-known/jwks\"\n",
+                "audiencePrefix = \"urn:basil:ci:jkt:\"\n",
+                "repositoryId = 11\n",
+                "repositoryOwnerId = 3\n",
+                "workflowRef = \"forge/basil/.forgejo/workflows/release.yml@refs/heads/main\"\n",
+                "ref = \"refs/heads/main\"\n",
+                "refType = \"branch\"\n",
+                "sha = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"\n",
+                "runId = 900\n",
+                "runAttempt = 1\n",
+                "notBeforeUnix = 1700000000\n",
+                "expiresAtUnix = 1700000900\n",
+                "maxTokenAgeSecs = 300\n",
+                "clockSkewSecs = 30\n",
+            )
+            .to_string(),
+        };
+        format!(
+            "\n[federation]\nenable = true\n{opt_in}\n\
+             [[federation.providers]]\n\
+             id = \"{rule}\"\n\
+             subject = \"ci/release\"\n\
+             audience = \"{broker_audience}\"\n\
+             operationProfiles = [\"artifact-sign\"]\n\
+             artifactSignKeyIds = [\"ci.broker.signing\"]\n\
+             maxTokenAgeSecs = 300\n\
+             clockSkewSecs = 30\n\
+             maxOperationsPerRun = 64\n\
+             \n[federation.providers.provider]\n{provider}",
+            rule = self.rule_id(),
+            broker_audience = INVOCATION_AUDIENCE,
+        )
+    }
+}
+
+/// What an invocation boot must know that the prefill fixtures cannot supply.
+#[derive(Clone, Debug)]
+pub struct InvocationBootSpec {
+    /// The provider arm whose federation rule the broker loads.
+    pub provider: ProviderArm,
+    /// Value of `invocation.require-challenge`. Courier-style deployments set
+    /// this so a challenge-less subject-key request is denied.
+    pub require_challenge: bool,
+    /// Base64url (unpadded) Ed25519 public key admitted as the
+    /// [`INVOCATION_SUBJECT`] subject-key invocation signer.
+    pub subject_signature_key: String,
+    /// Optional base64url (unpadded) Ed25519 public key admitted as a second
+    /// subject-key signer, [`INVOCATION_SUBJECT_2`], with its own decrypt
+    /// grant. `None` leaves the boot single-subject (the `basil-jjgi.3.3.1`
+    /// shape).
+    pub second_subject_signature_key: Option<String>,
+    /// X25519 public key provisioned out of band at the response key's
+    /// `publicPath`, so the broker can seal a response the caller can open.
+    pub response_public: [u8; 32],
+    /// Optional X25519 private request key provisioned for tests that must
+    /// reach an invocation operation. `None` keeps the broker unable to open
+    /// request bodies.
+    pub request_private: Option<[u8; 32]>,
+    /// Optional catalog key granted to the invocation subject for signing.
+    pub operation_signing_key_id: Option<String>,
+    /// Serve the invocation RPCs on a courier-profile listener.
+    pub courier_listener: bool,
+    /// Optional `[invocation.challenge]` table shape. `None` keeps the SPEC
+    /// defaults (global capacity 16384, per-`jkt` rate `8/4`).
+    pub challenge: Option<ChallengeTableBoot>,
+}
+
+/// The `[invocation.challenge]` knobs an invocation boot may pin down.
+///
+/// Only the operator-configurable dimensions are here; the per-`jkt`
+/// outstanding cap (8) and the 60-second TTL are SPEC-fixed and deliberately
+/// not exposed (see `docs/ci-oidc-federation/SPEC.md`, Freshness). The
+/// challenge lifecycle matrix shrinks `capacity` to make global exhaustion
+/// reachable, raises the per-`jkt` rate burst above the outstanding cap so
+/// a per-`jkt` decline is attributable to the cap, and pins the per-source
+/// bucket burst-only (refill 0) so a per-source decline lands on a
+/// deterministic issuance count instead of racing wall-clock refills.
+#[derive(Clone, Copy, Debug)]
+pub struct ChallengeTableBoot {
+    /// Global maximum of outstanding challenges (`capacity`).
+    pub capacity: usize,
+    /// Per proof-key-thumbprint issuance token-bucket burst.
+    pub per_jkt_rate_burst: u32,
+    /// Per proof-key-thumbprint issuance token-bucket refill per second.
+    pub per_jkt_rate_refill_per_sec: u32,
+    /// Per courier-observed-source issuance token-bucket burst.
+    pub per_source_rate_burst: u32,
+    /// Per courier-observed-source issuance token-bucket refill per second.
+    /// Zero makes the bucket burst-only (the broker allows it; only a zero
+    /// burst is rejected).
+    pub per_source_rate_refill_per_sec: u32,
+}
+
+/// Boot a broker that accepts sealed invocations from proof-bound CI workloads.
+///
+/// Runs the standard prefill, then layers the sealed-invocation surface on top
+/// of its fixtures WITHOUT editing the prefill script: it provisions the two
+/// out-of-band public halves plus the broker response-signing transit key in
+/// the running dev engine, extends `catalog.json` with the three broker keys
+/// (each carrying the `broker_key_use` label its role requires), extends
+/// `policy.json` with a subject bound to `spec.subject_signature_key`, and
+/// writes an agent config carrying `[broker-identity]`, `[invocation]`, and the
+/// `[federation]` rule for `spec.provider`.
+///
+/// `tag`/`addr` follow the same uniqueness rules as [`boot_basil`].
+#[must_use]
+pub fn boot_basil_invocation(
+    tag: &str,
+    engine: Engine,
+    addr: &str,
+    spec: &InvocationBootSpec,
+) -> Harness {
+    ensure_crypto_provider();
+    let root = repo_root();
+    ensure_binaries_built(&root);
+    let dev_permit = acquire_dev_server_permit();
+    let (workdir, addr) = prefill_with_retry(&root, tag, engine, addr, PrefillMode::Standard);
+
+    let mut harness = Harness {
+        workdir: workdir.clone(),
+        socket_path: spec.courier_listener.then(trusted_courier_socket_path),
+        agent: None,
+        server_pidfile: workdir.join("server.pid"),
+        backend_addr: addr.clone(),
+        _dev_permit: dev_permit,
+    };
+
+    provision_invocation_material(engine, &addr, spec);
+    extend_invocation_catalog(&harness.catalog_path());
+    extend_invocation_policy(
+        &harness.policy_path(),
+        &spec.subject_signature_key,
+        spec.second_subject_signature_key.as_deref(),
+        spec.operation_signing_key_id.as_deref(),
+    );
+
+    let fixtures = harness.fixtures();
+    let bundle = fixtures.join("bundle.sealed");
+    let pass = fixtures.join("disk-pass.txt");
+    let config = workdir.join("basil-agent.toml");
+    std::fs::write(
+        &config,
+        invocation_agent_config(&harness, &addr, &bundle, &pass, spec),
+    )
+    .expect("write basil-agent invocation config");
+
+    let broker_log = workdir.join("broker.log");
+    let log = std::fs::File::create(&broker_log).expect("create broker log");
+    let socket = harness.socket();
+    let child = Command::new(root.join("target/debug/basil"))
+        .arg("agent")
+        .arg("--config")
+        .arg(&config)
+        .stdout(log.try_clone().expect("clone log handle"))
+        .stderr(log)
+        .spawn()
+        .expect("spawn basil agent (invocation boot)");
+
+    harness.agent = Some(child);
+    wait_for_socket(&mut harness, &socket, &broker_log);
+    harness
+}
+
+fn trusted_courier_socket_path() -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let uid = rustix::process::geteuid().as_raw();
+    PathBuf::from(format!(
+        "/run/user/{uid}/basil-live-courier-{}-{}.sock",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// Render the agent config for an invocation boot.
+fn invocation_agent_config(
+    harness: &Harness,
+    addr: &str,
+    bundle: &Path,
+    pass: &Path,
+    spec: &InvocationBootSpec,
+) -> String {
+    let listener = if spec.courier_listener {
+        format!(
+            "[listeners.host]\ntype = \"host\"\npath = \"{}\"\n\n\
+             [listeners.courier]\ntype = \"courier\"\npath = \"{}\"\n",
+            harness.workdir.join("agent-host.sock").display(),
+            harness.socket().display()
+        )
+    } else {
+        format!("socket = \"{}\"\n", harness.socket().display())
+    };
+    format!(
+        r#"schema = "agent"
+schemaVersion = 3
+capability-policy = "strict"
+audit-log = "{audit}"
+vault-addr = "{addr}"
+{listener}
+
+[import]
+catalog = "{catalog}"
+policy = "{policy}"
+bundle = "{bundle}"
+
+[unlock]
+unlock-passphrase-file = "{pass}"
+# Keep the passphrase file: the challenge-matrix restart row respawns the
+# agent from this same config ([`Harness::restart_agent`]), and the default
+# wipe-after-unlock would leave the restarted agent unable to unseal.
+unlock-passphrase-no-wipe = true
+
+[broker-identity]
+id = "{broker_id}"
+response-signing-key-id = "{signing}"
+
+[invocation]
+enable = true
+audience = ["{audience}"]
+request-encryption-key-id = "{request}"
+require-challenge = {require_challenge}
+{challenge}{federation}"#,
+        audit = harness.audit_log_path().display(),
+        listener = listener,
+        catalog = harness.catalog_path().display(),
+        policy = harness.policy_path().display(),
+        bundle = bundle.display(),
+        pass = pass.display(),
+        broker_id = INVOCATION_BROKER_ID,
+        signing = INVOCATION_SIGNING_KEY_ID,
+        audience = INVOCATION_AUDIENCE,
+        request = INVOCATION_REQUEST_KEY_ID,
+        require_challenge = spec.require_challenge,
+        challenge = challenge_table_toml(spec.challenge.as_ref()),
+        federation = spec.provider.federation_toml(),
+    )
+}
+
+/// Render the `[invocation.challenge]` section, empty when the boot keeps the
+/// SPEC defaults. Emitted before `[federation]` so it stays inside the
+/// `[invocation]` table tree.
+fn challenge_table_toml(challenge: Option<&ChallengeTableBoot>) -> String {
+    challenge.map_or_else(String::new, |shape| {
+        format!(
+            "\n[invocation.challenge]\ncapacity = {capacity}\n\
+             per-jkt-rate = {{ burst = {jkt_burst}, refill-per-sec = {jkt_refill} }}\n\
+             per-source-rate = {{ burst = {source_burst}, refill-per-sec = {source_refill} }}\n",
+            capacity = shape.capacity,
+            jkt_burst = shape.per_jkt_rate_burst,
+            jkt_refill = shape.per_jkt_rate_refill_per_sec,
+            source_burst = shape.per_source_rate_burst,
+            source_refill = shape.per_source_rate_refill_per_sec,
+        )
+    })
+}
+
+/// Provision the key material an invocation boot needs in the running dev
+/// engine: the broker response-signing transit key plus the out-of-band public
+/// halves the sealing keys' reconcile probe and `sealing_public_key` read.
+///
+/// The X25519 PRIVATE halves are deliberately absent: no test in this lane
+/// decrypts a request body, and leaving them out keeps a live broker unable to
+/// open anything even if a corpus case slipped past a denial.
+fn provision_invocation_material(engine: Engine, addr: &str, spec: &InvocationBootSpec) {
+    engine_write(
+        engine,
+        addr,
+        &[
+            "write",
+            "-f",
+            "transit/keys/ci-broker-signing",
+            "type=ed25519",
+        ],
+    );
+    let response_public = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        spec.response_public,
+    );
+    engine_write(
+        engine,
+        addr,
+        &[
+            "kv",
+            "put",
+            "secret/ci/response-seal-public",
+            &format!("value={response_public}"),
+        ],
+    );
+    let request_public = spec
+        .request_private
+        .map_or(spec.response_public, |private| {
+            basil_core::x25519_seal::public_from_private(&zeroize::Zeroizing::new(private))
+        });
+    let request_public =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, request_public);
+    engine_write(
+        engine,
+        addr,
+        &[
+            "kv",
+            "put",
+            "secret/ci/request-seal-public",
+            &format!("value={request_public}"),
+        ],
+    );
+    if let Some(private) = spec.request_private {
+        let request_private =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, private);
+        engine_write(
+            engine,
+            addr,
+            &[
+                "kv",
+                "put",
+                "secret/ci/request-seal",
+                &format!("value={request_private}"),
+            ],
+        );
+    }
+}
+
+/// Run one `bao`/`vault` CLI command against the dev engine with the prefill's
+/// dev root token, panicking with the argv on failure.
+fn engine_write(engine: Engine, addr: &str, args: &[&str]) {
+    let status = Command::new(engine.cli_bin())
+        .args(args)
+        .env("VAULT_ADDR", addr)
+        .env("VAULT_TOKEN", "root")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap_or_else(|e| panic!("spawn {} {args:?}: {e}", engine.cli_bin()));
+    assert!(
+        status.success(),
+        "{} {args:?} failed (addr {addr})",
+        engine.cli_bin()
+    );
+}
+
+/// Add the three broker invocation keys to the prefill catalog in place.
+fn extend_invocation_catalog(catalog_path: &Path) {
+    let mut catalog: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(catalog_path).expect("read prefill catalog"))
+            .expect("parse prefill catalog");
+    let keys = catalog
+        .get_mut("keys")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("catalog carries a keys object");
+    keys.insert(
+        INVOCATION_REQUEST_KEY_ID.to_string(),
+        sealing_key_entry("secret/data/ci/request-seal", "request-encryption"),
+    );
+    keys.insert(
+        INVOCATION_RESPONSE_KEY_ID.to_string(),
+        sealing_key_entry("secret/data/ci/response-seal", "response-encryption"),
+    );
+    keys.insert(
+        INVOCATION_SIGNING_KEY_ID.to_string(),
+        serde_json::json!({
+            "class": "asymmetric",
+            "keyType": "ed25519",
+            "backend": "bao",
+            "engine": "transit",
+            "path": "ci-broker-signing",
+            "writable": true,
+            "missing": "warn",
+            "labels": ["broker_key_use=response-signing"],
+            "description": "broker sealed-invocation response signing key (basil-jjgi.3.3.1)"
+        }),
+    );
+    std::fs::write(
+        catalog_path,
+        serde_json::to_vec_pretty(&catalog).expect("serialize extended catalog"),
+    )
+    .expect("write extended catalog");
+}
+
+/// One `sealing` X25519 catalog entry with its `broker_key_use` label. The
+/// private half is intentionally never provisioned, so `missing` is `warn`.
+fn sealing_key_entry(path: &str, key_use: &str) -> serde_json::Value {
+    serde_json::json!({
+        "class": "sealing",
+        "keyType": "x25519",
+        "backend": "bao",
+        "engine": "kv2",
+        "path": path,
+        "publicPath": format!("{path}-public"),
+        "writable": false,
+        "missing": "warn",
+        "labels": [format!("broker_key_use={key_use}")],
+        "description": "broker sealed-invocation key (basil-jjgi.3.3.1)"
+    })
+}
+
+/// Add the subject-key invocation subject(s) (and their decrypt grants) to
+/// the prefill policy in place.
+fn extend_invocation_policy(
+    policy_path: &Path,
+    subject_signature_key: &str,
+    second_subject_signature_key: Option<&str>,
+    operation_signing_key_id: Option<&str>,
+) {
+    let mut policy: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(policy_path).expect("read prefill policy"))
+            .expect("parse prefill policy");
+    let mut admitted = vec![(
+        INVOCATION_SUBJECT,
+        "ci-invoker-decrypt",
+        subject_signature_key,
+    )];
+    if let Some(second) = second_subject_signature_key {
+        admitted.push((INVOCATION_SUBJECT_2, "ci-invoker2-decrypt", second));
+    }
+    for (subject, rule_id, public) in admitted {
+        policy
+            .get_mut("subjects")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("policy carries a subjects object")
+            .insert(
+                subject.to_string(),
+                serde_json::json!({
+                    "domain": "host-process",
+                    "match": {
+                        "invocation.signature-key": {
+                            "algorithm": "ed25519",
+                            "public": public
+                        }
+                    }
+                }),
+            );
+        policy
+            .get_mut("rules")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("policy carries a rules array")
+            .push(serde_json::json!({
+                "id": rule_id,
+                "subjects": [subject],
+                "action": ["op:decrypt"],
+                "target": [INVOCATION_REQUEST_KEY_ID]
+            }));
+    }
+    if let Some(key_id) = operation_signing_key_id {
+        policy
+            .get_mut("rules")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("policy carries a rules array")
+            .push(serde_json::json!({
+                "id": "ci-invoker-sign",
+                "subjects": [INVOCATION_SUBJECT],
+                "action": ["op:sign"],
+                "target": [key_id]
+            }));
+    }
+    std::fs::write(
+        policy_path,
+        serde_json::to_vec_pretty(&policy).expect("serialize extended policy"),
+    )
+    .expect("write extended policy");
 }

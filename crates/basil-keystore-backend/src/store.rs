@@ -96,13 +96,34 @@ pub enum StoreError {
     /// The backend cannot store non-UTF-8 bytes.
     #[error("backend requires UTF-8 values")]
     NonUtf8Value,
+    /// A keystore rekey owns the store: the open was refused by the rekey
+    /// fence (an on-disk intent marker from a crashed rekey, or a live
+    /// rekey's exclusive advisory lock — `marker` then names the lock file).
+    /// Produced only by the `db-keystore` arm on Linux; the refusal text
+    /// names the marker path and the recovery command verbatim.
+    #[error(
+        "keystore rekey in progress: intent marker `{marker}` is present; run \
+         `basil keystore rekey --resume` to complete recovery"
+    )]
+    RekeyInProgress {
+        /// Path (or database-directory-relative name) of the fencing
+        /// marker/lock file.
+        marker: String,
+    },
 }
 
 enum StoreInner {
     #[cfg(not(any(feature = "db-keystore", feature = "onepassword")))]
     Unavailable,
     #[cfg(feature = "db-keystore")]
-    DbKeystore(Arc<CredentialStore>),
+    DbKeystore {
+        store: Arc<CredentialStore>,
+        /// Shared rekey advisory lock, held for the store's lifetime so an
+        /// offline `basil keystore rekey` cannot start while this store is
+        /// open (and vice versa). See `crate::rekey`.
+        #[cfg(target_os = "linux")]
+        _rekey_lock: std::os::fd::OwnedFd,
+    },
     #[cfg(feature = "onepassword")]
     OnePassword {
         provider: OnePasswordProvider,
@@ -119,6 +140,11 @@ pub struct SecretStore {
 impl SecretStore {
     /// Open a store from configuration.
     ///
+    /// On Linux, the `db-keystore` path must be absolute. The arm creates
+    /// missing database parent components with mode `0700`; its
+    /// descriptor-relative walk rejects symlinks and unsafe ancestor modes,
+    /// and requires the final database directory to be owner-only.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError::Backend`] if the configured backend cannot be opened.
@@ -134,22 +160,42 @@ impl SecretStore {
             }),
             #[cfg(feature = "db-keystore")]
             StoreConfig::DbKeystore { path, cipher, dek } => {
-                // A database/DEK mismatch may panic inside the database layer.
-                // Contain the complete open path so startup fails closed
-                // without unwinding through the broker. Moving the DEK into the
-                // closure also guarantees its zeroizing owner is dropped on
-                // both the error and panic paths.
+                // Rekey fence + shared advisory lock (Linux): refuse to open
+                // while a rekey intent marker exists or a rekey holds the
+                // exclusive lock; otherwise hold the lock shared for the
+                // store's lifetime. Fail-closed and typed: the fence itself
+                // surfaces as [`StoreError::RekeyInProgress`], every other
+                // guard failure as [`StoreError::Backend`].
+                #[cfg(target_os = "linux")]
+                let rekey_lock =
+                    crate::rekey::guard_store_open(&path).map_err(store_open_fence_error)?;
+                // Own the encoded DEK in zeroizing storage before writing its
+                // first byte, then lend it to db-keystore for decoding. The
+                // whole database-layer open runs inside `contained_open`:
+                // db-keystore 0.5.0 contains panics only in its rekey/verify
+                // entry points, and on a database/DEK mismatch turso may
+                // panic as well as return an error. An unwind here would
+                // crash the broker at startup, so it is converted into a
+                // fail-closed [`StoreError::Backend`] instead. Unwinding
+                // drops `hexkey` (and the moved `dek`), so the key material
+                // is zeroized on the panic path too.
                 let store = contained_open(move || {
                     let hexkey = hex_key(dek.expose_secret());
+                    let encryption_opts = EncryptionOpts::new(&cipher, hexkey.as_str())
+                        .map_err(|e| StoreError::Backend(keyring_error_summary(&e).to_owned()))?;
                     DbKeyStore::new(DbKeyStoreConfig {
                         path,
-                        encryption_opts: Some(EncryptionOpts::new(cipher, hexkey.as_str())),
+                        encryption_opts: Some(encryption_opts),
                         ..Default::default()
                     })
                     .map_err(|e| StoreError::Backend(keyring_error_summary(&e).to_owned()))
                 })?;
                 Ok(Self {
-                    inner: StoreInner::DbKeystore(store as Arc<CredentialStore>),
+                    inner: StoreInner::DbKeystore {
+                        store: store as Arc<CredentialStore>,
+                        #[cfg(target_os = "linux")]
+                        _rekey_lock: rekey_lock,
+                    },
                 })
             }
             #[cfg(feature = "onepassword")]
@@ -187,7 +233,7 @@ impl SecretStore {
                 Err(StoreError::Backend("no-keystore-backend-enabled".into()))
             }
             #[cfg(feature = "db-keystore")]
-            StoreInner::DbKeystore(store) => {
+            StoreInner::DbKeystore { store, .. } => {
                 let entry = store
                     .build(SERVICE, key, None)
                     .map_err(|e| StoreError::Backend(keyring_error_summary(&e).to_owned()))?;
@@ -225,7 +271,7 @@ impl SecretStore {
                 Err(StoreError::Backend("no-keystore-backend-enabled".into()))
             }
             #[cfg(feature = "db-keystore")]
-            StoreInner::DbKeystore(store) => {
+            StoreInner::DbKeystore { store, .. } => {
                 let entry = store
                     .build(SERVICE, key, None)
                     .map_err(|e| StoreError::Backend(keyring_error_summary(&e).to_owned()))?;
@@ -264,7 +310,7 @@ impl SecretStore {
                 Err(StoreError::Backend("no-keystore-backend-enabled".into()))
             }
             #[cfg(feature = "db-keystore")]
-            StoreInner::DbKeystore(store) => {
+            StoreInner::DbKeystore { store, .. } => {
                 let entry = store
                     .build(SERVICE, key, None)
                     .map_err(|e| StoreError::Backend(keyring_error_summary(&e).to_owned()))?;
@@ -282,20 +328,49 @@ impl SecretStore {
     }
 }
 
+/// Map a [`crate::rekey::guard_store_open`] refusal into the store's typed
+/// error. The rekey fence keeps its dedicated variant (preserving the
+/// refusal-text contract: the marker path and `basil keystore rekey --resume`
+/// verbatim); every other guard failure stays a fail-closed
+/// [`StoreError::Backend`] with the guard's secret-free rendering.
+#[cfg(all(feature = "db-keystore", target_os = "linux"))]
+fn store_open_fence_error(err: crate::rekey::KeystoreRekeyError) -> StoreError {
+    match err {
+        crate::rekey::KeystoreRekeyError::RekeyInProgress { marker } => {
+            StoreError::RekeyInProgress { marker }
+        }
+        other => StoreError::Backend(other.to_string()),
+    }
+}
+
 /// Stable summary for a contained database-layer panic during store open.
 #[cfg(feature = "db-keystore")]
 const CONTAINED_PANIC_SUMMARY: &str = "db-keystore-open-panic-contained";
 
-/// Run the db-keystore open path with panic containment.
+/// Run the db-keystore open path with panic containment, converting an
+/// escaped panic into a fail-closed [`StoreError::Backend`].
 ///
-/// The payload originates in the database layer and is discarded because it
-/// may contain buffer contents or key encodings. Only a stable, secret-free
-/// discriminator crosses the adapter boundary.
+/// db-keystore 0.5.0 wraps its `rekey_at`/`verify_at` entry points in
+/// `catch_unwind`, but **not** [`DbKeyStore::new`]; its own qualification
+/// wraps wrong-key `new` in `catch_unwind` because turso may panic (rather
+/// than error) on a database/DEK mismatch. The broker's no-panic invariant
+/// forbids letting that unwind cross this crate, so the runtime adapter
+/// carries the same containment here.
+///
+/// The panic payload is **discarded**, not reported: it originates in
+/// whatever database code panicked, so it is untrusted and could embed
+/// buffer contents or key encodings, and `StoreError::Backend` renders its
+/// summary via `Display`. The error carries only the stable
+/// [`CONTAINED_PANIC_SUMMARY`] discriminator (matching this crate's
+/// precedent that panic payloads never reach `Display`; see
+/// `rekey::AuditPayload`). Containment presumes `panic = "unwind"`; a
+/// `panic = "abort"` build aborts before this conversion can run.
 #[cfg(feature = "db-keystore")]
 fn contained_open<T>(f: impl FnOnce() -> Result<T, StoreError>) -> Result<T, StoreError> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(result) => result,
         Err(payload) => {
+            // Drop (and thereby discard) the untrusted payload explicitly.
             drop(payload);
             Err(StoreError::Backend(CONTAINED_PANIC_SUMMARY.to_owned()))
         }
@@ -304,12 +379,12 @@ fn contained_open<T>(f: impl FnOnce() -> Result<T, StoreError>) -> Result<T, Sto
 
 #[cfg(feature = "db-keystore")]
 fn hex_key(dek: &[u8]) -> Zeroizing<String> {
-    let mut out = String::with_capacity(64);
+    let mut out = Zeroizing::new(String::with_capacity(64));
     for b in dek {
         push_hex_nibble(&mut out, b >> 4);
         push_hex_nibble(&mut out, b & 0x0f);
     }
-    Zeroizing::new(out)
+    out
 }
 
 #[cfg(feature = "db-keystore")]
@@ -379,8 +454,31 @@ mod tests {
 
     #[cfg(feature = "db-keystore")]
     #[test]
+    fn db_keystore_rejects_invalid_encryption_options_without_exposing_the_dek() {
+        use zero_secrets::SecretArray;
+
+        let path = unique_temp_path("invalid-options", "db");
+        let result = super::SecretStore::open(super::StoreConfig::DbKeystore {
+            path: path.clone(),
+            cipher: String::new(),
+            dek: SecretArray::new([0xabu8; 32]),
+        });
+
+        match result {
+            Err(super::StoreError::Backend(summary)) => assert_eq!(summary, "invalid"),
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("invalid encryption options must fail"),
+        }
+        remove_temp_store(&path);
+    }
+
+    /// The containment boundary converts an escaped panic into the stable
+    /// fail-closed summary and never lets payload text reach the error.
+    #[cfg(feature = "db-keystore")]
+    #[test]
     fn contained_open_converts_panics_into_backend_errors() {
-        assert!(matches!(super::contained_open(|| Ok(7_u32)), Ok(7)));
+        // Success and error results pass through unchanged.
+        assert!(matches!(super::contained_open(|| Ok(7u32)), Ok(7)));
         let passthrough: Result<(), _> =
             super::contained_open(|| Err(super::StoreError::Backend("invalid".to_owned())));
         assert!(matches!(
@@ -388,6 +486,8 @@ mod tests {
             Err(super::StoreError::Backend(summary)) if summary == "invalid"
         ));
 
+        // A panic is contained; the untrusted payload is discarded, not
+        // echoed into the (Display-rendered) error summary.
         let contained: Result<(), super::StoreError> =
             super::contained_open(|| panic!("payload-with-material-abad1dea"));
         match contained {
@@ -400,18 +500,11 @@ mod tests {
         }
     }
 
-    /// A unique, absolute temp path so parallel tests never share a store file.
-    #[cfg(feature = "db-keystore")]
-    fn unique_temp_path(stem: &str, ext: &str) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "basil-keystore-{stem}-{}-{n}.{ext}",
-            std::process::id()
-        ))
-    }
-
+    /// Wrong-DEK startup qualification (runtime adapter): opening an existing
+    /// encrypted store with the wrong DEK must fail closed as an error and
+    /// must not unwind out of `SecretStore::open`, whether turso reports the
+    /// mismatch as an error or as a panic. The failed attempt must also
+    /// release the advisory lock so the correct DEK can still open.
     #[cfg(feature = "db-keystore")]
     #[test]
     fn wrong_dek_startup_is_contained_and_fails_closed() {
@@ -419,7 +512,7 @@ mod tests {
         use zero_secrets::SecretArray;
 
         let path = unique_temp_path("wrong-dek", "db");
-        let provisioning_dek = [0x11_u8; 32];
+        let provisioning_dek = [0x11u8; 32];
         {
             let store = super::SecretStore::open(super::StoreConfig::DbKeystore {
                 path: path.clone(),
@@ -432,16 +525,22 @@ mod tests {
                 .expect("store value");
         }
 
+        // Open (and, if open unexpectedly succeeds, read) with the wrong
+        // DEK. The outer `catch_unwind` proves no unwind path remains: the
+        // adapter itself must have already contained any database-layer
+        // panic and mapped it to a `StoreError`.
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             super::SecretStore::open(super::StoreConfig::DbKeystore {
                 path: path.clone(),
                 cipher: "aegis256".to_string(),
-                dek: SecretArray::new([0x22_u8; 32]),
+                dek: SecretArray::new([0x22u8; 32]),
             })
             .and_then(|store| store.get("kv2/qualification"))
         }));
         match outcome {
             Ok(Err(err)) => {
+                // Fail-closed, and the rendered error stays secret-free:
+                // neither DEK's hex encoding may appear.
                 let rendered = format!("{err}");
                 assert!(!rendered.contains(&"11".repeat(32)));
                 assert!(!rendered.contains(&"22".repeat(32)));
@@ -453,6 +552,8 @@ mod tests {
             }
         }
 
+        // The wrong-DEK attempt held nothing: the correct DEK still opens
+        // and reads.
         let store = super::SecretStore::open(super::StoreConfig::DbKeystore {
             path: path.clone(),
             cipher: "aegis256".to_string(),
@@ -464,7 +565,82 @@ mod tests {
             b"wrong-dek startup qualification"
         );
         drop(store);
-        let _ = std::fs::remove_file(path);
+        remove_temp_store(&path);
+    }
+
+    /// The rekey store-open fence surfaces as the dedicated typed variant,
+    /// and its rendering keeps the refusal-text contract: it names the
+    /// marker path and `basil keystore rekey --resume` verbatim.
+    #[cfg(all(feature = "db-keystore", target_os = "linux"))]
+    #[test]
+    fn store_open_fence_is_typed_rekey_in_progress() {
+        use zero_secrets::SecretArray;
+
+        let path = unique_temp_path("fence-typed", "db");
+        {
+            let store = super::SecretStore::open(super::StoreConfig::DbKeystore {
+                path: path.clone(),
+                cipher: "aegis256".to_string(),
+                dek: SecretArray::new([0x11u8; 32]),
+            })
+            .expect("provision the store");
+            drop(store);
+        }
+
+        // Plant the on-disk intent marker a crashed rekey would leave.
+        let marker_path = {
+            let mut name = path.file_name().expect("file name").to_os_string();
+            name.push(crate::rekey::MARKER_SUFFIX);
+            path.with_file_name(name)
+        };
+        std::fs::write(&marker_path, b"planted-by-test").expect("write marker");
+
+        let result = super::SecretStore::open(super::StoreConfig::DbKeystore {
+            path: path.clone(),
+            cipher: "aegis256".to_string(),
+            dek: SecretArray::new([0x11u8; 32]),
+        });
+        let Err(err) = result else {
+            panic!("the fence must refuse to open while the marker exists");
+        };
+        let text = err.to_string();
+        let super::StoreError::RekeyInProgress { marker } = err else {
+            panic!("expected RekeyInProgress, got: {text}");
+        };
+        assert!(
+            marker.ends_with(crate::rekey::MARKER_SUFFIX),
+            "marker must name the intent-marker path: {marker}"
+        );
+        assert!(text.contains("keystore rekey in progress"), "got: {text}");
+        assert!(text.contains(marker.as_str()), "got: {text}");
+        assert!(
+            text.contains("basil keystore rekey --resume"),
+            "refusal must name the recovery command verbatim: {text}"
+        );
+
+        remove_temp_store(&path);
+    }
+
+    /// A unique, absolute temp path so parallel tests never share a store file.
+    #[cfg(feature = "db-keystore")]
+    fn unique_temp_path(stem: &str, ext: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("basil-keystore-{stem}-{}-{n}", std::process::id()));
+        std::fs::create_dir(&directory).expect("create private store test directory");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+            .expect("protect store test directory");
+        directory.join(format!("keystore.{ext}"))
+    }
+
+    #[cfg(feature = "db-keystore")]
+    fn remove_temp_store(path: &std::path::Path) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
     }
 
     /// Functional coverage for the db-keystore materialize-to-use path over a
@@ -528,7 +704,7 @@ mod tests {
         ));
 
         drop(store);
-        let _ = std::fs::remove_file(&path);
+        remove_temp_store(&path);
     }
 
     /// The `1Password` provider-config path fails closed on a URI that is not a

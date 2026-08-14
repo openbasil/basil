@@ -17,7 +17,7 @@
 #   3. create a couple of PRE-FILLED test secrets (a transit ed25519 key + a
 #      kv-v2 value) out-of-band, so the broker starts from a known store state
 #   4. write a sample catalog.json + policy.json into a fixtures dir, with the
-#      policy principal templated to the *running uid* (the SO_PEERCRED uid the
+#      policy evidence templated to the *running uid* (the SO_PEERCRED uid the
 #      broker's PDP binds to; see the runbook §"two unlock layers" / authz)
 #   5. create a test AppRole and build the broker + create the 0600 sealed
 #      bundle (passphrase slot, --backend id=bao,type=openbao,role-id=...,
@@ -190,7 +190,7 @@ echo "  repo:     $REPO_ROOT"
 echo "  workdir:  $WORKDIR"
 echo "  engine:   $ENGINE  (cli: $CLI)"
 echo "  addr:     $ADDR  (listen $LISTEN)"
-echo "  uid:      $UID_NUM  (the SO_PEERCRED principal the policy will grant)"
+echo "  uid:      $UID_NUM  (the SO_PEERCRED evidence the policy will match)"
 echo
 
 require() { command -v "$1" >/dev/null 2>&1 || { echo "FATAL: '$1' not on PATH" >&2; exit 1; }; }
@@ -414,7 +414,7 @@ echo "-- step 4: writing fixtures (catalog.json, policy.json) to $FIXTURES"
 # one missing=generate signer left absent (reconcile must create it).
 cat >"$CATALOG" <<JSON
 {
-  "schemaVersion": 1,
+  "schema": "catalog",
   "backends": {
     "bao": {
       "kind": "vault", "addr": "$ADDR",
@@ -550,9 +550,9 @@ cat >"$CATALOG" <<JSON
 }
 JSON
 
-# Policy: roles = snake_case op lists; rules use prefix-form principal
+# Policy: roles = snake_case op lists; rules use prefix-form subject
 # user:<uid>/action role:|op:/target dotted-key; config.names + memberships carry
-# the export-resolved numeric principal. We grant the RUNNING uid signer+reader
+# the numeric process evidence. We grant the RUNNING uid signer+reader
 # over the test keys so basil (same uid) is authorized. operator is granted too
 # so a future write/rotate is possible. The RUNNING uid is ALSO granted the
 # dedicated `reload` admin op over the reserved target broker.reload (basil-mil0.5)
@@ -561,7 +561,7 @@ JSON
 # grants only the reload op and changes no other test's behavior.
 cat >"$POLICY" <<JSON
 {
-  "schemaVersion": 2,
+  "schema": "policy",
   "roles": {
     "signer":   ["sign", "verify", "get_public_key"],
     "reader":   ["get", "list", "get_public_key"],
@@ -571,7 +571,7 @@ cat >"$POLICY" <<JSON
     "validator": ["validate"]
   },
   "subjects": {
-    "test-runner": { "allOf": [ { "kind": "unix", "uid": $UID_NUM } ] }
+    "test-runner": { "domain": "host-process", "match": { "all": [ { "process.uid": $UID_NUM } ] } }
   },
   "rules": [
     {
@@ -705,9 +705,8 @@ else
 fi
 
 cat > "$AGENT_CONFIG" <<EOF
-catalog = "$CATALOG"
-policy = "$POLICY"
-bundle = "$BUNDLE"
+schema = "agent"
+schemaVersion = 3
 vault-addr = "$ADDR"
 capability-policy = "strict"
 socket = "$SOCKET"
@@ -721,6 +720,11 @@ svid-ttl-secs = 300
 EOF
 fi
 cat >> "$AGENT_CONFIG" <<EOF
+
+[import]
+catalog = "$CATALOG"
+policy = "$POLICY"
+bundle = "$BUNDLE"
 
 [unlock]
 unlock-passphrase-file = "$PASS_FILE"

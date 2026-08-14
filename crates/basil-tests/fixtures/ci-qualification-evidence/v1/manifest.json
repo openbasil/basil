@@ -1,0 +1,25 @@
+{
+  "schema": "basil.ci.qualification-evidence",
+  "version": 1,
+  "fixture_only": true,
+  "qualification_status": "not-qualified",
+  "provider": "github",
+  "profile": "artifact-sign",
+  "target_key": "ci.qualification.artifact-sign",
+  "invocation_id": "wDCICmc4kiZM703GRgSLywl8oAtFK40VjZQWlJUsHNY",
+  "result": "success",
+  "records": [
+    {
+      "role": "client",
+      "path": "client.json",
+      "size": 281,
+      "sha256": "ed0baf705019819eeba58f01e7394a9131fd328b0b258de4d3c5bd7c7a82ba70"
+    },
+    {
+      "role": "broker-audit",
+      "path": "broker-audit.json",
+      "size": 287,
+      "sha256": "5fcecaebee621a6de9454d408e8992a81a0b664478c0e1d48df3cf88d70d4593"
+    }
+  ]
+}

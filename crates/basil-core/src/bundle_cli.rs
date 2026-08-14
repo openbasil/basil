@@ -10,14 +10,18 @@
 //! values so each source is self-contained and unambiguous.
 
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(test)]
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::io::{Read as _, Write as _};
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use crate::seal::{self, BackendCred, CredBundle, MethodRegistry, SlotSpec, UnlockMethod, format};
+use crate::seal::{
+    self, BackendCred, CredBundle, DepositStatus, MethodRegistry, SlotSpec, UnlockMethod, format,
+};
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
+use rand::RngCore as _;
 use serde::Deserialize;
 use url::Url;
 use zero_secrets::{SecretArray, SecretString};
@@ -28,6 +32,9 @@ use crate::seal::AgeYubikeyMethod;
 #[cfg(feature = "unlock-bip39")]
 use crate::seal::Bip39Method;
 use crate::seal::PassphraseMethod;
+
+const MAX_BUNDLE_BYTES: u64 = 1024 * 1024;
+const MAX_EPOCH_BYTES: u64 = 32;
 
 /// `bundle` subcommands.
 #[derive(Debug, Subcommand)]
@@ -324,7 +331,7 @@ fn create(args: &CreateArgs) -> Result<()> {
 
 fn add_slot(args: &AddSlotArgs) -> Result<()> {
     let lock = acquire_bundle_maintenance_lock(&args.bundle)?;
-    let bytes = read_bundle(&args.bundle)?;
+    let bytes = lock.read_bundle()?;
     let parsed = format::decode(&bytes).context("parsing bundle")?;
     let open_methods = open_methods(&args.open)?;
     let registry = registry_from_methods(&open_methods.methods);
@@ -344,12 +351,21 @@ fn add_slot(args: &AddSlotArgs) -> Result<()> {
 
 fn set_backend(args: &SetBackendArgs) -> Result<()> {
     let lock = acquire_bundle_maintenance_lock(&args.bundle)?;
-    let bytes = read_bundle(&args.bundle)?;
+    let bytes = lock.read_bundle()?;
     let parsed = format::decode(&bytes).context("parsing bundle")?;
     let open_methods = open_methods(&args.open)?;
     let registry = registry_from_methods(&open_methods.methods);
     let mut creds =
         seal::open_bundle(&parsed, &registry).context("opening bundle to update backend")?;
+    if matches!(
+        creds.backends.get(&args.backend.id),
+        Some(BackendCred::DbKeystoreDek { .. })
+    ) {
+        let backend_id = &args.backend.id;
+        bail!(
+            "backend `{backend_id}` is a db-keystore credential; replace it with `basil keystore rekey`"
+        );
+    }
     let (backend_id, cred) = backend_cred(&args.backend)?;
     creds.set(backend_id.clone(), cred);
     let new_file =
@@ -368,8 +384,11 @@ fn set_backend(args: &SetBackendArgs) -> Result<()> {
 }
 
 fn deposit(args: &DepositArgs) -> Result<()> {
+    if args.backend.kind == BackendKind::DbKeystore {
+        bail!("db-keystore credentials cannot be supplied through bundle deposits");
+    }
     let lock = acquire_bundle_maintenance_lock(&args.bundle)?;
-    let bytes = read_bundle(&args.bundle)?;
+    let bytes = lock.read_bundle()?;
     let mut parsed = format::decode(&bytes).context("parsing bundle")?;
     let recipient = read_public_key_token(&args.recipient)?;
     let signing_seed = read_seed_0600(&args.identity)?;
@@ -411,7 +430,7 @@ fn allow(args: &AllowArgs) -> Result<()> {
     if args.backend.is_empty() {
         bail!("allow requires at least one --backend ID");
     }
-    let bytes = read_bundle(&args.bundle)?;
+    let bytes = lock.read_bundle()?;
     let parsed = format::decode(&bytes).context("parsing bundle")?;
     let open_methods = open_methods(&args.open)?;
     let registry = registry_from_methods(&open_methods.methods);
@@ -442,7 +461,7 @@ fn allow(args: &AllowArgs) -> Result<()> {
 
 fn promote(args: &PromoteArgs) -> Result<()> {
     let lock = acquire_bundle_maintenance_lock(&args.bundle)?;
-    let bytes = read_bundle(&args.bundle)?;
+    let bytes = lock.read_bundle()?;
     let parsed = format::decode(&bytes).context("parsing bundle")?;
     let open_methods = open_methods(&args.open)?;
     let registry = registry_from_methods(&open_methods.methods);
@@ -453,6 +472,25 @@ fn promote(args: &PromoteArgs) -> Result<()> {
             seal::open_bundle(&parsed, &registry).context("opening bundle for promote review")?;
         print_deposit_reviews(&seal::review_deposits(&parsed, &creds));
         return Ok(());
+    }
+    let baseline =
+        seal::open_bundle(&parsed, &registry).context("opening bundle for promote validation")?;
+    let reviews = seal::review_deposits(&parsed, &baseline);
+    let targets_db_keystore = reviews.iter().any(|review| {
+        review.status == DepositStatus::Effective
+            && (backend_filter.is_empty() || backend_filter.contains(&review.backend_id))
+            && (contributor_filter.is_empty()
+                || contributor_filter.contains(&review.contributor_key_id))
+            && matches!(
+                baseline.backends.get(&review.backend_id),
+                Some(BackendCred::DbKeystoreDek { .. })
+            )
+    });
+    drop(baseline);
+    if targets_db_keystore {
+        bail!(
+            "an effective deposit targets an existing db-keystore credential; rotate it with `basil keystore rekey`"
+        );
     }
     let (new_file, reviews) =
         seal::promote_deposits(&parsed, &registry, &backend_filter, &contributor_filter)
@@ -468,7 +506,7 @@ fn promote(args: &PromoteArgs) -> Result<()> {
 
 fn deposit_key(args: &DepositKeyArgs) -> Result<()> {
     let lock = acquire_bundle_maintenance_lock(&args.bundle)?;
-    let bytes = read_bundle(&args.bundle)?;
+    let bytes = lock.read_bundle()?;
     let parsed = format::decode(&bytes).context("parsing bundle")?;
     let open_methods = open_methods(&args.open)?;
     let registry = registry_from_methods(&open_methods.methods);
@@ -487,18 +525,35 @@ fn deposit_key(args: &DepositKeyArgs) -> Result<()> {
 }
 
 fn verify(args: &VerifyArgs) -> Result<()> {
-    let bytes = read_bundle(&args.bundle)?;
+    let guard = acquire_bundle_startup_guard(&args.bundle)
+        .context("acquiring sealed-bundle verification guard")?;
+    let bytes = guard.read_bundle()?;
     let parsed = format::decode(&bytes).context("parsing bundle")?;
     let open_methods = open_methods(&args.open)?;
     let registry = registry_from_methods(&open_methods.methods);
     let creds = seal::open_bundle(&parsed, &registry).context("verifying bundle unlock")?;
     drop(creds);
+    guard
+        .validate()
+        .context("revalidating sealed-bundle verification guard")?;
+    drop(guard);
     println!("bundle unlock verified");
     Ok(())
 }
 
 fn show(args: &ShowArgs) -> Result<()> {
-    let bytes = read_bundle(&args.bundle)?;
+    let guard = if args.open.is_empty() {
+        None
+    } else {
+        Some(
+            acquire_bundle_startup_guard(&args.bundle)
+                .context("acquiring sealed-bundle show guard")?,
+        )
+    };
+    let bytes = match &guard {
+        Some(guard) => guard.read_bundle()?,
+        None => read_bundle(&args.bundle)?,
+    };
     let parsed = format::decode(&bytes).context("parsing bundle")?;
     println!("bundle: {}", args.bundle.display());
     println!("epoch: {}", parsed.body.header.epoch);
@@ -528,6 +583,11 @@ fn show(args: &ShowArgs) -> Result<()> {
     }
     print_deposit_reviews(&seal::review_deposits(&parsed, &creds));
     drop(creds);
+    let guard = guard.context("opened bundle show lost its maintenance guard")?;
+    guard
+        .validate()
+        .context("revalidating sealed-bundle show guard")?;
+    drop(guard);
     Ok(())
 }
 
@@ -1138,20 +1198,351 @@ fn require_0600(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) struct BundleMaintenanceLock {
-    target: seal::PinnedPath,
-    file: std::fs::File,
+struct BundleTarget {
+    parent: OwnedFd,
+    file_name: OsString,
 }
 
-impl BundleMaintenanceLock {
+struct ProtectedInput {
+    bytes: Vec<u8>,
+    modified: std::time::SystemTime,
+    mode: u32,
+}
+
+impl BundleTarget {
+    fn new(path: &Path) -> Result<Self> {
+        let file_name = path
+            .file_name()
+            .context("bundle path has no file name")?
+            .to_os_string();
+        let parent = pin_bundle_parent(normalized_bundle_parent(path))?;
+        Ok(Self { parent, file_name })
+    }
+
+    fn read_bundle(&self) -> Result<Vec<u8>> {
+        Ok(self
+            .read_checked(&self.file_name, MAX_BUNDLE_BYTES, "sealed bundle")?
+            .bytes)
+    }
+
+    fn read_bundle_for_startup(&self) -> Result<(Vec<u8>, std::time::SystemTime, u32)> {
+        let input = self
+            .read_checked_optional_with_policy(
+                &self.file_name,
+                MAX_BUNDLE_BYTES,
+                "sealed bundle",
+                false,
+            )?
+            .context("sealed bundle is missing")?;
+        Ok((input.bytes, input.modified, input.mode))
+    }
+
+    fn read_epoch(&self) -> Result<Option<u64>> {
+        let name = suffixed_bundle_name(&self.file_name, ".epoch");
+        let Some(input) = self.read_checked_optional(&name, MAX_EPOCH_BYTES, "epoch sidecar")?
+        else {
+            return Ok(None);
+        };
+        let raw = std::str::from_utf8(&input.bytes).context("epoch sidecar is not UTF-8")?;
+        let epoch = raw
+            .trim()
+            .parse::<u64>()
+            .context("epoch sidecar is not an unsigned integer")?;
+        Ok(Some(epoch))
+    }
+
+    fn read_checked(&self, name: &OsStr, max_bytes: u64, label: &str) -> Result<ProtectedInput> {
+        self.read_checked_optional(name, max_bytes, label)?
+            .with_context(|| format!("{label} is missing"))
+    }
+
+    fn read_checked_optional(
+        &self,
+        name: &OsStr,
+        max_bytes: u64,
+        label: &str,
+    ) -> Result<Option<ProtectedInput>> {
+        self.read_checked_optional_with_policy(name, max_bytes, label, true)
+    }
+
+    fn read_checked_optional_with_policy(
+        &self,
+        name: &OsStr,
+        max_bytes: u64,
+        label: &str,
+        require_owner_only: bool,
+    ) -> Result<Option<ProtectedInput>> {
+        let fd = match rustix::fs::openat(
+            &self.parent,
+            name,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::NOENT) => return Ok(None),
+            Err(error) => return Err(bundle_fs_error("opening protected input", error)),
+        };
+        let stat = rustix::fs::fstat(&fd)
+            .map_err(|error| bundle_fs_error("inspecting protected input", error))?;
+        validate_owner_regular(&stat, label)?;
+        if require_owner_only && stat.st_mode & 0o077 != 0 {
+            bail!("{label} must not grant group or other permissions");
+        }
+        let size = u64::try_from(stat.st_size).unwrap_or(u64::MAX);
+        if size > max_bytes {
+            bail!("{label} exceeds the {max_bytes}-byte limit");
+        }
+        let file = std::fs::File::from(fd);
+        let modified = file
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .with_context(|| format!("reading {label} modification time"))?;
+        let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+        file.take(max_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("reading {label}"))?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+            bail!("{label} exceeds the {max_bytes}-byte limit");
+        }
+        let entry = rustix::fs::statat(&self.parent, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| bundle_fs_error("revalidating protected input", error))?;
+        if entry.st_dev != stat.st_dev || entry.st_ino != stat.st_ino {
+            bail!("{label} changed while it was being read");
+        }
+        Ok(Some(ProtectedInput {
+            bytes,
+            modified,
+            mode: stat.st_mode & 0o777,
+        }))
+    }
+
+    fn open_lock(&self) -> Result<std::fs::File> {
+        let name = suffixed_bundle_name(&self.file_name, ".basil-lock");
+        let fd = rustix::fs::openat(
+            &self.parent,
+            &name,
+            rustix::fs::OFlags::RDWR
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::from_raw_mode(0o600),
+        )
+        .map_err(|error| bundle_fs_error("opening bundle maintenance lock", error))?;
+        let stat = rustix::fs::fstat(&fd)
+            .map_err(|error| bundle_fs_error("inspecting bundle maintenance lock", error))?;
+        validate_lock_metadata(&stat)?;
+        Ok(std::fs::File::from(fd))
+    }
+
+    fn validate_lock_entry(&self, file: &std::fs::File) -> Result<()> {
+        let name = suffixed_bundle_name(&self.file_name, ".basil-lock");
+        let entry = rustix::fs::statat(&self.parent, &name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| bundle_fs_error("revalidating bundle maintenance lock", error))?;
+        let held = rustix::fs::fstat(file)
+            .map_err(|error| bundle_fs_error("inspecting held bundle maintenance lock", error))?;
+        validate_lock_metadata(&held)?;
+        if entry.st_dev != held.st_dev || entry.st_ino != held.st_ino {
+            bail!("bundle maintenance lock path changed after acquisition");
+        }
+        Ok(())
+    }
+
     fn write_bundle(&self, bytes: &[u8]) -> Result<()> {
-        self.target.write_0600(bytes).map_err(anyhow::Error::from)
+        self.write_name(&self.file_name, bytes, "sealed bundle")
     }
 
     fn write_epoch(&self, epoch: u64) -> Result<()> {
-        self.target
-            .write_sibling_0600(".epoch", format!("{epoch}\n").as_bytes())
-            .map_err(anyhow::Error::from)
+        self.write_name(
+            &suffixed_bundle_name(&self.file_name, ".epoch"),
+            format!("{epoch}\n").as_bytes(),
+            "epoch sidecar",
+        )
+    }
+
+    fn write_name(&self, destination: &OsStr, bytes: &[u8], label: &str) -> Result<()> {
+        let mut rng = rand::rngs::OsRng;
+        for _ in 0..32 {
+            let mut entropy = [0u8; 8];
+            rng.try_fill_bytes(&mut entropy)
+                .with_context(|| format!("generating {label} temporary name"))?;
+            let temporary = suffixed_bundle_name(
+                destination,
+                &format!(
+                    ".basil-write-{}-{:016x}.tmp",
+                    std::process::id(),
+                    u64::from_le_bytes(entropy)
+                ),
+            );
+            let owned = match rustix::fs::openat(
+                &self.parent,
+                &temporary,
+                rustix::fs::OFlags::WRONLY
+                    | rustix::fs::OFlags::CREATE
+                    | rustix::fs::OFlags::EXCL
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NOFOLLOW,
+                rustix::fs::Mode::from_raw_mode(0o600),
+            ) {
+                Ok(owned) => owned,
+                Err(rustix::io::Errno::EXIST) => continue,
+                Err(error) => return Err(bundle_fs_error("opening private temporary file", error)),
+            };
+            let mut temporary_file = std::fs::File::from(owned);
+            let result = (|| {
+                temporary_file
+                    .write_all(bytes)
+                    .with_context(|| format!("writing private {label} temporary file"))?;
+                temporary_file
+                    .sync_all()
+                    .with_context(|| format!("syncing private {label} temporary file"))?;
+                drop(temporary_file);
+                rustix::fs::renameat(&self.parent, &temporary, &self.parent, destination)
+                    .map_err(|error| bundle_fs_error("replacing protected file", error))?;
+                rustix::fs::fsync(&self.parent)
+                    .map_err(|error| bundle_fs_error("syncing protected parent", error))
+            })();
+            if result.is_err() {
+                let _ =
+                    rustix::fs::unlinkat(&self.parent, &temporary, rustix::fs::AtFlags::empty());
+            }
+            return result;
+        }
+        bail!("could not allocate a private {label} temporary file")
+    }
+}
+
+fn normalized_bundle_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn pin_bundle_parent(path: &Path) -> Result<OwnedFd> {
+    use std::path::Component;
+
+    let flags = rustix::fs::OFlags::RDONLY
+        | rustix::fs::OFlags::DIRECTORY
+        | rustix::fs::OFlags::CLOEXEC
+        | rustix::fs::OFlags::NOFOLLOW;
+    let mut directory = rustix::fs::open(
+        if path.is_absolute() {
+            Path::new("/")
+        } else {
+            Path::new(".")
+        },
+        flags,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|error| bundle_fs_error("opening bundle path root", error))?;
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => {
+                directory = rustix::fs::openat(&directory, name, flags, rustix::fs::Mode::empty())
+                    .map_err(|error| bundle_fs_error("opening bundle parent component", error))?;
+            }
+            Component::ParentDir => bail!("bundle parent may not contain `..`"),
+            Component::Prefix(_) => bail!("bundle path prefix is unsupported"),
+        }
+    }
+    Ok(directory)
+}
+
+fn validate_owner_only_regular(stat: &rustix::fs::Stat, label: &str) -> Result<()> {
+    validate_owner_regular(stat, label)?;
+    if stat.st_mode & 0o077 != 0 {
+        bail!("{label} must not grant group or other permissions");
+    }
+    Ok(())
+}
+
+fn validate_owner_regular(stat: &rustix::fs::Stat, label: &str) -> Result<()> {
+    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::RegularFile {
+        bail!("{label} is not a regular file");
+    }
+    if stat.st_uid != rustix::process::geteuid().as_raw() {
+        bail!("{label} is not owned by the current user");
+    }
+    Ok(())
+}
+
+fn validate_lock_metadata(stat: &rustix::fs::Stat) -> Result<()> {
+    validate_owner_only_regular(stat, "bundle maintenance lock")?;
+    if stat.st_nlink != 1 {
+        bail!("bundle maintenance lock must have exactly one link");
+    }
+    Ok(())
+}
+
+fn bundle_fs_error(operation: &str, error: rustix::io::Errno) -> anyhow::Error {
+    anyhow::anyhow!("{operation}: {error}")
+}
+
+fn suffixed_bundle_name(name: &OsStr, suffix: &str) -> OsString {
+    let mut value = name.to_os_string();
+    value.push(suffix);
+    value
+}
+
+pub(crate) struct BundleMaintenanceLock {
+    target: BundleTarget,
+    file: std::fs::File,
+}
+
+pub(crate) struct BundleStartupGuard {
+    target: BundleTarget,
+    file: std::fs::File,
+}
+
+impl BundleStartupGuard {
+    pub(crate) fn read_bundle(&self) -> Result<Vec<u8>> {
+        self.target.validate_lock_entry(&self.file)?;
+        self.target.read_bundle()
+    }
+
+    pub(crate) fn read_bundle_for_startup(&self) -> Result<(Vec<u8>, std::time::SystemTime, u32)> {
+        self.target.validate_lock_entry(&self.file)?;
+        self.target.read_bundle_for_startup()
+    }
+
+    pub(crate) fn verify_and_advance_epoch(&self, current: u64) -> Result<()> {
+        self.target.validate_lock_entry(&self.file)?;
+        if let Some(seen) = self.target.read_epoch()? {
+            if current < seen {
+                bail!("bundle epoch rollback: current {current}, last seen {seen}");
+            }
+            if current == seen {
+                return Ok(());
+            }
+        }
+        self.target.write_epoch(current)?;
+        self.target.validate_lock_entry(&self.file)
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        self.target.validate_lock_entry(&self.file)
+    }
+}
+
+impl BundleMaintenanceLock {
+    fn read_bundle(&self) -> Result<Vec<u8>> {
+        self.target.validate_lock_entry(&self.file)?;
+        self.target.read_bundle()
+    }
+
+    fn read_epoch(&self) -> Result<Option<u64>> {
+        self.target.validate_lock_entry(&self.file)?;
+        self.target.read_epoch()
+    }
+
+    fn write_bundle(&self, bytes: &[u8]) -> Result<()> {
+        self.target.validate_lock_entry(&self.file)?;
+        self.target.write_bundle(bytes)
+    }
+
+    fn write_epoch(&self, epoch: u64) -> Result<()> {
+        self.target.validate_lock_entry(&self.file)?;
+        self.target.write_epoch(epoch)
     }
 }
 
@@ -1161,11 +1552,15 @@ impl Drop for BundleMaintenanceLock {
     }
 }
 
+impl Drop for BundleStartupGuard {
+    fn drop(&mut self) {
+        let _ = rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock);
+    }
+}
+
 pub(crate) fn acquire_bundle_maintenance_lock(path: &Path) -> Result<BundleMaintenanceLock> {
-    let target = seal::PinnedPath::new(path).map_err(anyhow::Error::from)?;
-    let file = target
-        .open_lock(".basil-lock")
-        .map_err(anyhow::Error::from)?;
+    let target = BundleTarget::new(path)?;
+    let file = target.open_lock()?;
     rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
         .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))
         .with_context(|| {
@@ -1174,7 +1569,23 @@ pub(crate) fn acquire_bundle_maintenance_lock(path: &Path) -> Result<BundleMaint
                 path.display()
             )
         })?;
+    target.validate_lock_entry(&file)?;
     Ok(BundleMaintenanceLock { target, file })
+}
+
+pub(crate) fn acquire_bundle_startup_guard(path: &Path) -> Result<BundleStartupGuard> {
+    let target = BundleTarget::new(path)?;
+    let file = target.open_lock()?;
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockShared)
+        .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))
+        .with_context(|| {
+            format!(
+                "locking bundle {} for startup; a bundle operation may be active",
+                path.display()
+            )
+        })?;
+    target.validate_lock_entry(&file)?;
+    Ok(BundleStartupGuard { target, file })
 }
 
 #[cfg(test)]
@@ -1190,10 +1601,330 @@ fn write_0600(lock: &BundleMaintenanceLock, bytes: &[u8]) -> Result<()> {
 }
 
 #[cfg(test)]
-pub(crate) fn epoch_sidecar_path(bundle_path: &Path) -> PathBuf {
+fn epoch_sidecar_path(bundle_path: &Path) -> PathBuf {
     let mut path = OsString::from(bundle_path.as_os_str());
     path.push(".epoch");
     PathBuf::from(path)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BundleRekeyBinding {
+    pub(crate) bundle_id: [u8; 16],
+    pub(crate) backend_id: String,
+    pub(crate) pre_epoch: u64,
+    pub(crate) post_epoch: u64,
+    pub(crate) pre_bundle_b3: [u8; 32],
+    pub(crate) post_bundle_b3: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BundleRekeyIdentity {
+    pub(crate) bundle_id: [u8; 16],
+    pub(crate) backend_id: String,
+    pub(crate) epoch: u64,
+    pub(crate) bundle_b3: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BundleCommitCheckpoint {
+    BeforeBundleReplace,
+    AfterBundleReplace,
+    BeforeEpochWrite,
+    AfterEpochWrite,
+}
+
+trait BundleCommitObserver {
+    fn checkpoint(&mut self, checkpoint: BundleCommitCheckpoint) -> Result<()>;
+}
+
+struct NoopBundleCommitObserver;
+
+impl BundleCommitObserver for NoopBundleCommitObserver {
+    fn checkpoint(&mut self, _checkpoint: BundleCommitCheckpoint) -> Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) struct PreparedBundleRekey {
+    lock: BundleMaintenanceLock,
+    binding: BundleRekeyBinding,
+    observed_epoch_sidecar: Option<u64>,
+    post_bytes: Vec<u8>,
+    committed: bool,
+    observer: Box<dyn BundleCommitObserver>,
+}
+
+impl std::fmt::Debug for PreparedBundleRekey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedBundleRekey")
+            .field("binding", &self.binding)
+            .field("observed_epoch_sidecar", &self.observed_epoch_sidecar)
+            .field("committed", &self.committed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedBundleRekey {
+    pub(crate) const fn binding(&self) -> &BundleRekeyBinding {
+        &self.binding
+    }
+
+    #[cfg(test)]
+    const fn observed_epoch_sidecar(&self) -> Option<u64> {
+        self.observed_epoch_sidecar
+    }
+
+    pub(crate) fn commit_bundle(&mut self) -> Result<()> {
+        if self.committed {
+            bail!("prepared bundle transition was already committed");
+        }
+        self.observer
+            .checkpoint(BundleCommitCheckpoint::BeforeBundleReplace)?;
+        self.lock.write_bundle(&self.post_bytes)?;
+        self.committed = true;
+        self.observer
+            .checkpoint(BundleCommitCheckpoint::AfterBundleReplace)
+    }
+
+    pub(crate) fn write_epoch_sidecar(&mut self) -> Result<()> {
+        if !self.committed {
+            bail!("bundle epoch sidecar cannot advance before bundle commit");
+        }
+        self.observer
+            .checkpoint(BundleCommitCheckpoint::BeforeEpochWrite)?;
+        self.lock.write_epoch(self.binding.post_epoch)?;
+        self.observer
+            .checkpoint(BundleCommitCheckpoint::AfterEpochWrite)
+    }
+}
+
+pub(crate) struct LockedBundleRekeyState {
+    lock: BundleMaintenanceLock,
+    identity: BundleRekeyIdentity,
+    observed_epoch_sidecar: Option<u64>,
+}
+
+impl std::fmt::Debug for LockedBundleRekeyState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LockedBundleRekeyState")
+            .field("identity", &self.identity)
+            .field("observed_epoch_sidecar", &self.observed_epoch_sidecar)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LockedBundleRekeyState {
+    pub(crate) const fn identity(&self) -> &BundleRekeyIdentity {
+        &self.identity
+    }
+
+    pub(crate) const fn observed_epoch_sidecar(&self) -> Option<u64> {
+        self.observed_epoch_sidecar
+    }
+
+    pub(crate) fn write_epoch_sidecar(&self, epoch: u64) -> Result<()> {
+        self.lock.write_epoch(epoch)
+    }
+}
+
+fn authenticate_prepared_rekey_bundle(
+    pre: &format::ParsedBundle,
+    registry: &MethodRegistry<'_>,
+    creds: &CredBundle,
+    post_bytes: &[u8],
+    backend_id: &str,
+) -> Result<format::ParsedBundle> {
+    let post = format::decode(post_bytes).context("parsing prepared keystore rekey bundle")?;
+    if post.body.header.bundle_id != pre.body.header.bundle_id {
+        bail!("prepared bundle changed its authenticated bundle id");
+    }
+    let expected_post_epoch = pre
+        .body
+        .header
+        .epoch
+        .checked_add(1)
+        .context("bundle epoch overflow")?;
+    if post.body.header.epoch != expected_post_epoch {
+        bail!("prepared bundle did not advance exactly one epoch");
+    }
+    if post
+        .body
+        .deposits
+        .iter()
+        .any(|deposit| deposit.backend_id == backend_id)
+    {
+        bail!("prepared bundle retained a deposit for the rekeyed backend");
+    }
+
+    let mut reopened = seal::open_bundle(&post, registry)
+        .context("authenticating prepared keystore rekey bundle")?;
+    let post_reviews = seal::apply_authorized_deposits(&post, &mut reopened);
+    if post_reviews
+        .iter()
+        .any(|review| review.status == DepositStatus::Effective)
+    {
+        bail!("prepared bundle retained an effective credential deposit");
+    }
+    let Some(BackendCred::DbKeystoreDek {
+        dek: expected_new_dek,
+    }) = creds.backends.get(backend_id)
+    else {
+        bail!("prepared source state lost the replacement db-keystore credential");
+    };
+    let reopened_new_dek = match reopened.backends.get(backend_id) {
+        Some(BackendCred::DbKeystoreDek { dek }) => dek,
+        Some(other) => {
+            let kind = other.kind();
+            bail!("prepared bundle reopened backend `{backend_id}` as `{kind}`");
+        }
+        None => bail!("prepared bundle reopened without backend `{backend_id}`"),
+    };
+    if reopened_new_dek.expose_secret() != expected_new_dek.expose_secret() {
+        bail!("prepared bundle did not retain the replacement db-keystore credential");
+    }
+    drop(reopened);
+    Ok(post)
+}
+
+pub(crate) fn prepare_db_keystore_rekey(
+    bundle_path: &Path,
+    backend_id: &str,
+    open: &[OpenArg],
+    new_dek: SecretArray<32>,
+) -> Result<(SecretArray<32>, PreparedBundleRekey)> {
+    prepare_db_keystore_rekey_with_observer(
+        bundle_path,
+        backend_id,
+        open,
+        new_dek,
+        Box::new(NoopBundleCommitObserver),
+    )
+}
+
+fn prepare_db_keystore_rekey_with_observer(
+    bundle_path: &Path,
+    backend_id: &str,
+    open: &[OpenArg],
+    new_dek: SecretArray<32>,
+    observer: Box<dyn BundleCommitObserver>,
+) -> Result<(SecretArray<32>, PreparedBundleRekey)> {
+    let lock = acquire_bundle_maintenance_lock(bundle_path)?;
+    let pre_bytes = lock.read_bundle()?;
+    let parsed = format::decode(&pre_bytes).context("parsing bundle for keystore rekey")?;
+    let open_methods = open_methods(open)?;
+    let registry = registry_from_methods(&open_methods.methods);
+    let mut creds =
+        seal::open_bundle(&parsed, &registry).context("opening bundle for keystore rekey")?;
+    let reviews = seal::apply_authorized_deposits(&parsed, &mut creds);
+    let old_cred = creds
+        .backends
+        .remove(backend_id)
+        .with_context(|| format!("bundle has no credential for backend `{backend_id}`"))?;
+    let old_dek = match old_cred {
+        BackendCred::DbKeystoreDek { dek } => dek,
+        other => {
+            let kind = other.kind();
+            drop(other);
+            bail!(
+                "bundle backend `{backend_id}` has credential kind `{kind}`, expected `db-keystore-dek`"
+            );
+        }
+    };
+    let replaced = creds.backends.insert(
+        backend_id.to_owned(),
+        BackendCred::DbKeystoreDek { dek: new_dek },
+    );
+    if replaced.is_some() {
+        drop(replaced);
+        bail!("bundle backend changed while preparing keystore rekey");
+    }
+    let effective_deposits = reviews
+        .iter()
+        .filter(|review| review.status == DepositStatus::Effective)
+        .map(|review| review.index)
+        .collect::<BTreeSet<_>>();
+    let retained_deposits = parsed
+        .body
+        .deposits
+        .iter()
+        .enumerate()
+        .filter(|(index, deposit)| {
+            !effective_deposits.contains(index) && deposit.backend_id != backend_id
+        })
+        .map(|(_, deposit)| deposit.clone())
+        .collect();
+    let post_bytes = seal::reseal_payload_bump_epoch_with_deposits(
+        &parsed,
+        &registry,
+        &creds,
+        retained_deposits,
+    )
+    .context("re-sealing bundle for keystore rekey")?;
+    let post_parsed =
+        authenticate_prepared_rekey_bundle(&parsed, &registry, &creds, &post_bytes, backend_id)?;
+    drop(creds);
+    let observed_epoch_sidecar = lock.read_epoch()?;
+    if observed_epoch_sidecar.is_some_and(|seen| seen > parsed.body.header.epoch) {
+        bail!("bundle epoch is older than its protected epoch sidecar");
+    }
+    let binding = BundleRekeyBinding {
+        bundle_id: parsed.body.header.bundle_id,
+        backend_id: backend_id.to_owned(),
+        pre_epoch: parsed.body.header.epoch,
+        post_epoch: post_parsed.body.header.epoch,
+        pre_bundle_b3: *blake3::hash(&pre_bytes).as_bytes(),
+        post_bundle_b3: *blake3::hash(&post_bytes).as_bytes(),
+    };
+    Ok((
+        old_dek,
+        PreparedBundleRekey {
+            lock,
+            binding,
+            observed_epoch_sidecar,
+            post_bytes,
+            committed: false,
+            observer,
+        },
+    ))
+}
+
+pub(crate) fn resume_db_keystore_rekey(
+    bundle_path: &Path,
+    backend_id: &str,
+    open: &[OpenArg],
+) -> Result<LockedBundleRekeyState> {
+    let lock = acquire_bundle_maintenance_lock(bundle_path)?;
+    let bytes = lock.read_bundle()?;
+    let parsed = format::decode(&bytes).context("parsing bundle for keystore rekey resume")?;
+    let open_methods = open_methods(open)?;
+    let registry = registry_from_methods(&open_methods.methods);
+    let mut creds = seal::open_bundle(&parsed, &registry)
+        .context("opening bundle for keystore rekey resume")?;
+    let _reviews = seal::apply_authorized_deposits(&parsed, &mut creds);
+    let credential = creds
+        .backends
+        .get(backend_id)
+        .with_context(|| format!("bundle has no credential for backend `{backend_id}`"))?;
+    if !matches!(credential, BackendCred::DbKeystoreDek { .. }) {
+        let kind = credential.kind();
+        bail!(
+            "bundle backend `{backend_id}` has credential kind `{kind}`, expected `db-keystore-dek`"
+        );
+    }
+    drop(creds);
+    let observed_epoch_sidecar = lock.read_epoch()?;
+    Ok(LockedBundleRekeyState {
+        lock,
+        identity: BundleRekeyIdentity {
+            bundle_id: parsed.body.header.bundle_id,
+            backend_id: backend_id.to_owned(),
+            epoch: parsed.body.header.epoch,
+            bundle_b3: *blake3::hash(&bytes).as_bytes(),
+        },
+        observed_epoch_sidecar,
+    })
 }
 
 #[cfg(test)]
@@ -1201,6 +1932,8 @@ mod tests {
     #![allow(clippy::indexing_slicing, clippy::too_many_lines, clippy::unwrap_used)]
 
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt as _;
 
     fn temp_path(name: &str) -> PathBuf {
         let unique = format!(
@@ -1224,6 +1957,164 @@ mod tests {
         }
     }
 
+    fn db_bundle_fixture(bundle: &Path, passphrase_file: &Path, dek: [u8; 32]) -> Vec<u8> {
+        write_secret_file(passphrase_file, b"test passphrase\n");
+        let passphrase = PassphraseMethod::with_params(
+            Zeroizing::new(b"test passphrase".to_vec()),
+            seal::Argon2Params {
+                m_cost_kib: 256,
+                t_cost: 1,
+                p_cost: 1,
+            },
+        );
+        let mut creds = CredBundle::empty();
+        creds.set(
+            "local",
+            BackendCred::DbKeystoreDek {
+                dek: SecretArray::new(dek),
+            },
+        );
+        let bytes = seal::seal(
+            &creds,
+            &[SlotSpec {
+                method: &passphrase,
+                label: "test".to_owned(),
+            }],
+        )
+        .expect("seal db bundle");
+        let parsed = format::decode(&bytes).expect("parse db bundle");
+        let lock = acquire_bundle_maintenance_lock(bundle).expect("lock db bundle");
+        lock.write_bundle(&bytes).expect("write db bundle");
+        lock.write_epoch(parsed.body.header.epoch)
+            .expect("write db bundle epoch");
+        drop(lock);
+        bytes
+    }
+
+    fn db_bundle_with_effective_deposit(
+        bundle: &Path,
+        passphrase_file: &Path,
+        baseline_dek: [u8; 32],
+        deposited_dek: [u8; 32],
+    ) -> Vec<u8> {
+        write_secret_file(passphrase_file, b"test passphrase\n");
+        let passphrase = PassphraseMethod::with_params(
+            Zeroizing::new(b"test passphrase".to_vec()),
+            seal::Argon2Params {
+                m_cost_kib: 256,
+                t_cost: 1,
+                p_cost: 1,
+            },
+        );
+        let signing_seed = Zeroizing::new([0x51; 32]);
+        let contributor = seal::contributor_public_token(&signing_seed);
+        let mut creds = CredBundle::empty();
+        creds.set(
+            "local",
+            BackendCred::DbKeystoreDek {
+                dek: SecretArray::new(baseline_dek),
+            },
+        );
+        creds.ensure_deposit_identity();
+        creds.deposit.contributors.insert(
+            contributor.clone(),
+            seal::cred::DepositContributor {
+                public_key: contributor.clone(),
+                allowed_backend_ids: BTreeSet::from(["local".to_owned()]),
+            },
+        );
+        let baseline = seal::seal(
+            &creds,
+            &[SlotSpec {
+                method: &passphrase,
+                label: "test".to_owned(),
+            }],
+        )
+        .expect("seal baseline");
+        let parsed = format::decode(&baseline).expect("parse baseline");
+        let recipient = creds.deposit_recipient().expect("deposit recipient");
+        let record = seal::create_signed_record(
+            &parsed.body.header,
+            "local".to_owned(),
+            contributor,
+            1,
+            &recipient,
+            &signing_seed,
+            &BackendCred::DbKeystoreDek {
+                dek: SecretArray::new(deposited_dek),
+            },
+        )
+        .expect("create db-keystore deposit");
+        let bytes = format::encode_with_deposits(
+            &parsed.body.header,
+            parsed.header_aad(),
+            parsed.body.slots.clone(),
+            parsed.body.payload.clone(),
+            vec![record],
+        )
+        .expect("encode deposited bundle");
+        let lock = acquire_bundle_maintenance_lock(bundle).expect("lock bundle");
+        lock.write_bundle(&bytes).expect("write deposited bundle");
+        lock.write_epoch(parsed.body.header.epoch)
+            .expect("write deposited epoch");
+        drop(lock);
+        bytes
+    }
+
+    fn passphrase_open(path: &Path) -> OpenArg {
+        format!("passphrase:file={}", path.display())
+            .parse()
+            .expect("passphrase open argument")
+    }
+
+    struct RecordingCommitObserver {
+        checkpoints: std::rc::Rc<std::cell::RefCell<Vec<BundleCommitCheckpoint>>>,
+        fail_at: Option<BundleCommitCheckpoint>,
+    }
+
+    impl BundleCommitObserver for RecordingCommitObserver {
+        fn checkpoint(&mut self, checkpoint: BundleCommitCheckpoint) -> Result<()> {
+            self.checkpoints.borrow_mut().push(checkpoint);
+            if self.fail_at == Some(checkpoint) {
+                bail!("injected bundle commit checkpoint failure");
+            }
+            Ok(())
+        }
+    }
+
+    struct AcknowledgedCommitObserver {
+        acknowledge_path: PathBuf,
+    }
+
+    impl BundleCommitObserver for AcknowledgedCommitObserver {
+        fn checkpoint(&mut self, checkpoint: BundleCommitCheckpoint) -> Result<()> {
+            use std::io::Write as _;
+
+            if checkpoint != BundleCommitCheckpoint::AfterBundleReplace {
+                return Ok(());
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&self.acknowledge_path)
+                .context("creating post-commit acknowledgement")?;
+            file.write_all(b"bundle-committed\n")
+                .context("writing post-commit acknowledgement")?;
+            file.sync_all()
+                .context("syncing post-commit acknowledgement")?;
+            let parent = self
+                .acknowledge_path
+                .parent()
+                .context("post-commit acknowledgement has no parent")?;
+            std::fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .context("syncing post-commit acknowledgement parent")?;
+            loop {
+                std::thread::park();
+            }
+        }
+    }
+
     #[test]
     fn bundle_maintenance_lock_serializes_writers() {
         let bundle = temp_path("maintenance-lock");
@@ -1232,6 +2123,53 @@ mod tests {
         drop(first);
         acquire_bundle_maintenance_lock(&bundle).expect("lock after release");
         let _ = std::fs::remove_file(append_path_suffix(&bundle, ".basil-lock"));
+    }
+
+    #[test]
+    fn startup_guard_and_maintenance_lock_fail_closed_without_waiting() {
+        let bundle = temp_path("startup-maintenance-lock-order");
+        let startup = acquire_bundle_startup_guard(&bundle).expect("startup guard");
+        assert!(acquire_bundle_maintenance_lock(&bundle).is_err());
+        drop(startup);
+
+        let maintenance = acquire_bundle_maintenance_lock(&bundle).expect("maintenance lock");
+        assert!(acquire_bundle_startup_guard(&bundle).is_err());
+        drop(maintenance);
+        acquire_bundle_startup_guard(&bundle).expect("startup guard after maintenance release");
+        let _ = std::fs::remove_file(append_path_suffix(&bundle, ".basil-lock"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundle_maintenance_lock_rejects_hardlinked_inode() {
+        let bundle = temp_path("maintenance-lock-hardlink");
+        let lock_path = append_path_suffix(&bundle, ".basil-lock");
+        let alias = temp_path("maintenance-lock-hardlink-alias");
+        write_secret_file(&lock_path, b"");
+        std::fs::hard_link(&lock_path, &alias).expect("hardlink lock");
+
+        assert!(acquire_bundle_maintenance_lock(&bundle).is_err());
+
+        let _ = std::fs::remove_file(lock_path);
+        let _ = std::fs::remove_file(alias);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn held_lock_path_replacement_stops_protected_writes() {
+        let bundle = temp_path("maintenance-lock-replacement");
+        let lock_path = append_path_suffix(&bundle, ".basil-lock");
+        let lock = acquire_bundle_maintenance_lock(&bundle).expect("maintenance lock");
+        lock.write_bundle(b"baseline").expect("write baseline");
+        std::fs::remove_file(&lock_path).expect("unlink held lock path");
+        write_secret_file(&lock_path, b"replacement");
+
+        assert!(lock.write_bundle(b"must-not-commit").is_err());
+        assert_eq!(std::fs::read(&bundle).expect("read bundle"), b"baseline");
+
+        drop(lock);
+        let _ = std::fs::remove_file(bundle);
+        let _ = std::fs::remove_file(lock_path);
     }
 
     #[cfg(unix)]
@@ -1314,9 +2252,16 @@ mod tests {
         std::fs::create_dir_all(&alternate).expect("create alternate");
         let bundle = original.join("creds.sealed");
         let lock = acquire_bundle_maintenance_lock(&bundle).expect("pin and lock original");
+        write_0600(&lock, b"original-bytes").expect("write original bundle");
+        let alternate_bundle = alternate.join("creds.sealed");
+        write_secret_file(&alternate_bundle, b"alternate-bytes");
         std::fs::rename(&original, &pinned).expect("move pinned ancestor");
         symlink(&alternate, &original).expect("substitute ancestor symlink");
 
+        assert_eq!(
+            lock.read_bundle().expect("read pinned bundle"),
+            b"original-bytes"
+        );
         write_0600(&lock, b"pinned-bytes").expect("write through pinned descriptor");
         lock.write_epoch(9).expect("write pinned sidecar");
         assert_eq!(
@@ -1327,9 +2272,33 @@ mod tests {
             std::fs::read_to_string(pinned.join("creds.sealed.epoch")).unwrap(),
             "9\n"
         );
-        assert!(!alternate.join("creds.sealed").exists());
+        assert_eq!(
+            std::fs::read(alternate.join("creds.sealed")).unwrap(),
+            b"alternate-bytes"
+        );
         assert!(!alternate.join("creds.sealed.epoch").exists());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_reads_reject_bundle_and_epoch_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = temp_path("protected-read-symlinks");
+        std::fs::create_dir(&directory).expect("create protected read directory");
+        let bundle = directory.join("creds.sealed");
+        let victim = directory.join("victim");
+        write_secret_file(&victim, b"victim");
+        let lock = acquire_bundle_maintenance_lock(&bundle).expect("maintenance lock");
+        symlink(&victim, &bundle).expect("bundle symlink");
+        assert!(lock.read_bundle().is_err());
+        std::fs::remove_file(&bundle).expect("remove bundle symlink");
+        lock.write_bundle(b"bundle").expect("write regular bundle");
+        symlink(&victim, epoch_sidecar_path(&bundle)).expect("epoch symlink");
+        assert!(lock.read_epoch().is_err());
+        assert_eq!(std::fs::read(&victim).expect("read victim"), b"victim");
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -1577,6 +2546,35 @@ region = "us-east-1"
     }
 
     #[test]
+    fn plaintext_inspection_refuses_concurrent_bundle_maintenance() {
+        let bundle = temp_path("plaintext-inspection-maintenance");
+        let passphrase = temp_path("plaintext-inspection-passphrase");
+        db_bundle_fixture(&bundle, &passphrase, [0x61; 32]);
+        let maintenance =
+            acquire_bundle_maintenance_lock(&bundle).expect("exclusive maintenance lock");
+
+        let verify_error = verify(&VerifyArgs {
+            bundle: bundle.clone(),
+            open: vec![passphrase_open(&passphrase)],
+        })
+        .expect_err("verify must fail while maintenance holds the bundle");
+        assert!(verify_error.to_string().contains("verification guard"));
+
+        let show_error = show(&ShowArgs {
+            bundle: bundle.clone(),
+            open: vec![passphrase_open(&passphrase)],
+        })
+        .expect_err("open show must fail while maintenance holds the bundle");
+        assert!(show_error.to_string().contains("show guard"));
+
+        drop(maintenance);
+        let _ = std::fs::remove_file(&bundle);
+        let _ = std::fs::remove_file(&passphrase);
+        let _ = std::fs::remove_file(epoch_sidecar_path(&bundle));
+        let _ = std::fs::remove_file(append_path_suffix(&bundle, ".basil-lock"));
+    }
+
+    #[test]
     fn raw_dek_reader_preserves_terminal_cr_and_lf_bytes() {
         let path = temp_path("raw-dek-terminal-bytes");
         let mut raw = [0x44; 32];
@@ -1597,6 +2595,343 @@ region = "us-east-1"
         let error = read_dek_0600(&path).expect_err("33 raw bytes rejected");
         assert!(error.to_string().contains("exactly 32 raw bytes"));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn prepared_rekey_commits_bundle_before_epoch_and_retains_lock() {
+        let bundle = temp_path("prepared-rekey-bundle");
+        let passphrase = temp_path("prepared-rekey-passphrase");
+        let pre_bytes = db_bundle_fixture(&bundle, &passphrase, [0x11; 32]);
+        let pre_parsed = format::decode(&pre_bytes).expect("parse pre bundle");
+        let (old_dek, mut prepared) = prepare_db_keystore_rekey(
+            &bundle,
+            "local",
+            &[passphrase_open(&passphrase)],
+            SecretArray::new([0x22; 32]),
+        )
+        .expect("prepare rekey bundle");
+        assert_eq!(old_dek.expose_secret(), &[0x11; 32]);
+        assert_eq!(prepared.binding().backend_id, "local");
+        assert_eq!(
+            prepared.binding().bundle_id,
+            pre_parsed.body.header.bundle_id
+        );
+        assert_eq!(prepared.binding().pre_epoch, pre_parsed.body.header.epoch);
+        assert_eq!(
+            prepared.binding().post_epoch,
+            pre_parsed.body.header.epoch + 1
+        );
+        assert_eq!(
+            prepared.binding().pre_bundle_b3,
+            *blake3::hash(&pre_bytes).as_bytes()
+        );
+        assert_eq!(
+            prepared.observed_epoch_sidecar(),
+            Some(pre_parsed.body.header.epoch)
+        );
+        assert_eq!(std::fs::read(&bundle).expect("read pre bundle"), pre_bytes);
+        assert!(prepared.write_epoch_sidecar().is_err());
+        assert!(acquire_bundle_startup_guard(&bundle).is_err());
+
+        prepared.commit_bundle().expect("commit bundle");
+        let post_bytes = std::fs::read(&bundle).expect("read post bundle");
+        assert_eq!(
+            *blake3::hash(&post_bytes).as_bytes(),
+            prepared.binding().post_bundle_b3
+        );
+        assert_eq!(
+            std::fs::read_to_string(epoch_sidecar_path(&bundle)).expect("read old epoch"),
+            format!("{}\n", prepared.binding().pre_epoch)
+        );
+        prepared.write_epoch_sidecar().expect("advance sidecar");
+        assert_eq!(
+            std::fs::read_to_string(epoch_sidecar_path(&bundle)).expect("read new epoch"),
+            format!("{}\n", prepared.binding().post_epoch)
+        );
+        drop(prepared);
+
+        let resumed = resume_db_keystore_rekey(&bundle, "local", &[passphrase_open(&passphrase)])
+            .expect("authenticate committed bundle");
+        assert_eq!(
+            resumed.identity().bundle_b3,
+            *blake3::hash(&post_bytes).as_bytes()
+        );
+        assert_eq!(resumed.identity().backend_id, "local");
+        assert_eq!(
+            resumed.observed_epoch_sidecar(),
+            Some(resumed.identity().epoch)
+        );
+        drop(resumed);
+        drop(old_dek);
+
+        let _ = std::fs::remove_file(&bundle);
+        let _ = std::fs::remove_file(epoch_sidecar_path(&bundle));
+        let _ = std::fs::remove_file(append_path_suffix(&bundle, ".basil-lock"));
+        let _ = std::fs::remove_file(passphrase);
+    }
+
+    #[test]
+    fn post_replace_checkpoint_failure_is_classified_from_authenticated_bytes() {
+        let bundle = temp_path("rekey-post-replace-fault");
+        let passphrase = temp_path("rekey-post-replace-passphrase");
+        let pre_bytes = db_bundle_fixture(&bundle, &passphrase, [0x31; 32]);
+        let pre_epoch = format::decode(&pre_bytes)
+            .expect("parse pre bundle")
+            .body
+            .header
+            .epoch;
+        let checkpoints = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let observer = RecordingCommitObserver {
+            checkpoints: std::rc::Rc::clone(&checkpoints),
+            fail_at: Some(BundleCommitCheckpoint::AfterBundleReplace),
+        };
+        let (old_dek, mut prepared) = prepare_db_keystore_rekey_with_observer(
+            &bundle,
+            "local",
+            &[passphrase_open(&passphrase)],
+            SecretArray::new([0x32; 32]),
+            Box::new(observer),
+        )
+        .expect("prepare bundle");
+        let post_b3 = prepared.binding().post_bundle_b3;
+        let post_epoch = prepared.binding().post_epoch;
+        assert!(prepared.commit_bundle().is_err());
+        assert_eq!(
+            *checkpoints.borrow(),
+            vec![
+                BundleCommitCheckpoint::BeforeBundleReplace,
+                BundleCommitCheckpoint::AfterBundleReplace
+            ]
+        );
+        drop(prepared);
+        drop(old_dek);
+
+        let resumed = resume_db_keystore_rekey(&bundle, "local", &[passphrase_open(&passphrase)])
+            .expect("resume after uncertain commit result");
+        assert_eq!(resumed.identity().bundle_b3, post_b3);
+        assert_eq!(resumed.identity().epoch, post_epoch);
+        assert_eq!(resumed.observed_epoch_sidecar(), Some(pre_epoch));
+        resumed
+            .write_epoch_sidecar(post_epoch)
+            .expect("repair epoch sidecar");
+        drop(resumed);
+
+        let _ = std::fs::remove_file(&bundle);
+        let _ = std::fs::remove_file(epoch_sidecar_path(&bundle));
+        let _ = std::fs::remove_file(append_path_suffix(&bundle, ".basil-lock"));
+        let _ = std::fs::remove_file(passphrase);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acknowledged_post_bundle_commit_checkpoint_survives_sigkill() {
+        const ROLE_ENV: &str = "BASIL_BUNDLE_COMMIT_CHECKPOINT_ROLE";
+        const BUNDLE_ENV: &str = "BASIL_BUNDLE_COMMIT_CHECKPOINT_BUNDLE";
+        const PASSPHRASE_ENV: &str = "BASIL_BUNDLE_COMMIT_CHECKPOINT_PASSPHRASE";
+        const ACK_ENV: &str = "BASIL_BUNDLE_COMMIT_CHECKPOINT_ACK";
+
+        if std::env::var_os(ROLE_ENV).is_some() {
+            let bundle = PathBuf::from(std::env::var_os(BUNDLE_ENV).expect("bundle path"));
+            let passphrase =
+                PathBuf::from(std::env::var_os(PASSPHRASE_ENV).expect("passphrase path"));
+            let acknowledge_path =
+                PathBuf::from(std::env::var_os(ACK_ENV).expect("acknowledgement path"));
+            let observer = AcknowledgedCommitObserver { acknowledge_path };
+            let (_old_dek, mut prepared) = prepare_db_keystore_rekey_with_observer(
+                &bundle,
+                "local",
+                &[passphrase_open(&passphrase)],
+                SecretArray::new([0x72; 32]),
+                Box::new(observer),
+            )
+            .expect("prepare child bundle transition");
+            let result = prepared.commit_bundle();
+            panic!("child escaped acknowledged checkpoint: {result:?}");
+        }
+
+        let directory = temp_path("acknowledged-commit-directory");
+        std::fs::create_dir(&directory).expect("create checkpoint directory");
+        let bundle = directory.join("creds.sealed");
+        let passphrase = directory.join("passphrase");
+        let acknowledge = directory.join("bundle-committed.ack");
+        let pre_bytes = db_bundle_fixture(&bundle, &passphrase, [0x71; 32]);
+        let pre_epoch = format::decode(&pre_bytes)
+            .expect("parse pre bundle")
+            .body
+            .header
+            .epoch;
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "bundle_cli::tests::acknowledged_post_bundle_commit_checkpoint_survives_sigkill",
+                "--nocapture",
+            ])
+            .env(ROLE_ENV, "child")
+            .env(BUNDLE_ENV, &bundle)
+            .env(PASSPHRASE_ENV, &passphrase)
+            .env(ACK_ENV, &acknowledge)
+            .spawn()
+            .expect("spawn checkpoint child");
+        for _ in 0..500 {
+            if acknowledge.exists() {
+                break;
+            }
+            if let Some(status) = child.try_wait().expect("poll checkpoint child") {
+                panic!("checkpoint child exited before acknowledgement: {status}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            acknowledge.exists(),
+            "child must acknowledge the durable post-bundle-commit checkpoint"
+        );
+        child.kill().expect("SIGKILL checkpoint child");
+        let status = child.wait().expect("wait for checkpoint child");
+        assert_eq!(status.signal(), Some(9));
+
+        let post_bytes = std::fs::read(&bundle).expect("read committed bundle");
+        assert_ne!(post_bytes, pre_bytes);
+        let resumed = resume_db_keystore_rekey(&bundle, "local", &[passphrase_open(&passphrase)])
+            .expect("resume after post-commit SIGKILL");
+        assert_eq!(resumed.observed_epoch_sidecar(), Some(pre_epoch));
+        let post_epoch = resumed.identity().epoch;
+        resumed
+            .write_epoch_sidecar(post_epoch)
+            .expect("repair epoch after SIGKILL");
+        drop(resumed);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn generic_backend_and_deposit_paths_refuse_db_keystore_without_mutation() {
+        let bundle = temp_path("generic-db-keystore-refusal");
+        let passphrase = temp_path("generic-db-keystore-passphrase");
+        let baseline = db_bundle_fixture(&bundle, &passphrase, [0x41; 32]);
+        let baseline_epoch =
+            std::fs::read(epoch_sidecar_path(&bundle)).expect("read baseline epoch");
+
+        let replacement: BackendArg =
+            "id=local,type=vault,addr=http://127.0.0.1:8200,token-file=/must/not/be/read"
+                .parse()
+                .expect("replacement backend argument");
+        assert!(
+            set_backend(&SetBackendArgs {
+                bundle: bundle.clone(),
+                backend: replacement,
+                open: vec![passphrase_open(&passphrase)],
+            })
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&bundle).expect("read bundle"), baseline);
+        assert_eq!(
+            std::fs::read(epoch_sidecar_path(&bundle)).expect("read epoch"),
+            baseline_epoch
+        );
+
+        let deposit_backend: BackendArg =
+            "id=local,type=db-keystore,path=unused,dek-file=/must/not/be/read"
+                .parse()
+                .expect("deposit backend argument");
+        assert!(
+            deposit(&DepositArgs {
+                bundle: bundle.clone(),
+                backend: deposit_backend,
+                recipient: PathBuf::from("/must/not/be/read"),
+                identity: PathBuf::from("/must/not/be/read"),
+                contributor_id: None,
+                seq: None,
+            })
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&bundle).expect("read bundle"), baseline);
+        assert_eq!(
+            std::fs::read(epoch_sidecar_path(&bundle)).expect("read epoch"),
+            baseline_epoch
+        );
+
+        let _ = std::fs::remove_file(&bundle);
+        let _ = std::fs::remove_file(epoch_sidecar_path(&bundle));
+        let _ = std::fs::remove_file(append_path_suffix(&bundle, ".basil-lock"));
+        let _ = std::fs::remove_file(passphrase);
+    }
+
+    #[test]
+    fn promote_refuses_effective_deposit_over_existing_db_keystore() {
+        let bundle = temp_path("promote-db-keystore-refusal");
+        let passphrase_file = temp_path("promote-db-keystore-passphrase");
+        let bytes =
+            db_bundle_with_effective_deposit(&bundle, &passphrase_file, [0x52; 32], [0x53; 32]);
+        let baseline_epoch =
+            std::fs::read(epoch_sidecar_path(&bundle)).expect("read baseline epoch");
+
+        assert!(
+            promote(&PromoteArgs {
+                bundle: bundle.clone(),
+                dry_run: false,
+                backend: Vec::new(),
+                contributor: Vec::new(),
+                open: vec![passphrase_open(&passphrase_file)],
+            })
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&bundle).expect("read bundle"), bytes);
+        assert_eq!(
+            std::fs::read(epoch_sidecar_path(&bundle)).expect("read epoch"),
+            baseline_epoch
+        );
+
+        let _ = std::fs::remove_file(&bundle);
+        let _ = std::fs::remove_file(epoch_sidecar_path(&bundle));
+        let _ = std::fs::remove_file(append_path_suffix(&bundle, ".basil-lock"));
+        let _ = std::fs::remove_file(passphrase_file);
+    }
+
+    #[test]
+    fn rekey_materializes_and_prunes_effective_deposit_before_epoch_bump() {
+        let bundle = temp_path("rekey-effective-deposit");
+        let passphrase_file = temp_path("rekey-effective-deposit-passphrase");
+        let _bytes =
+            db_bundle_with_effective_deposit(&bundle, &passphrase_file, [0x61; 32], [0x62; 32]);
+        let (old_dek, mut prepared) = prepare_db_keystore_rekey(
+            &bundle,
+            "local",
+            &[passphrase_open(&passphrase_file)],
+            SecretArray::new([0x63; 32]),
+        )
+        .expect("prepare bundle with effective deposit");
+        assert_eq!(old_dek.expose_secret(), &[0x62; 32]);
+        prepared.commit_bundle().expect("commit bundle");
+        prepared.write_epoch_sidecar().expect("write epoch");
+        drop(prepared);
+        drop(old_dek);
+
+        let post_bytes = std::fs::read(&bundle).expect("read post bundle");
+        let post = format::decode(&post_bytes).expect("parse post bundle");
+        assert!(post.body.deposits.is_empty());
+        let methods = open_methods(&[passphrase_open(&passphrase_file)]).expect("open methods");
+        let registry = registry_from_methods(&methods.methods);
+        let mut reopened = seal::open_bundle(&post, &registry).expect("open post bundle");
+        let reviews = seal::apply_authorized_deposits(&post, &mut reopened);
+        assert!(
+            reviews
+                .iter()
+                .all(|review| review.status != DepositStatus::Effective)
+        );
+        match reopened.backends.get("local") {
+            Some(BackendCred::DbKeystoreDek { dek }) => {
+                assert_eq!(dek.expose_secret(), &[0x63; 32]);
+            }
+            other => panic!(
+                "unexpected reopened credential: {:?}",
+                other.map(BackendCred::kind)
+            ),
+        }
+
+        let _ = std::fs::remove_file(&bundle);
+        let _ = std::fs::remove_file(epoch_sidecar_path(&bundle));
+        let _ = std::fs::remove_file(append_path_suffix(&bundle, ".basil-lock"));
+        let _ = std::fs::remove_file(passphrase_file);
     }
 
     #[test]
@@ -1690,12 +3025,13 @@ region = "us-east-1"
             },
         )
         .expect("startup unlock");
-        match unlocked.backends.get("vault") {
+        match unlocked.creds().backends.get("vault") {
             Some(BackendCred::VaultToken { token, .. }) => {
                 assert_eq!(token.expose_secret(), "s.replacement");
             }
             other => panic!("wrong cred: {:?}", other.map(BackendCred::kind)),
         }
+        drop(unlocked);
 
         promote(&PromoteArgs {
             bundle: bundle.clone(),

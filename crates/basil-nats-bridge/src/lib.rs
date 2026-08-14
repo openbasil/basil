@@ -11,35 +11,45 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use basil_proto::broker::v1::invocation_service_client::InvocationServiceClient;
-use basil_proto::broker::v1::{SealedRequest, SealedResponse};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use basil_courier::{
+    CourierCallError, InvocationCourierClient, InvocationOnlyClient, MAX_COURIER_SOURCE_BYTES,
+    TrustedUdsPolicy,
+};
+use basil_proto::broker::v1::{
+    GetInvocationChallengeRequest, GetInvocationChallengeResponse, SealedRequest, SealedResponse,
+};
 use bytes::Bytes;
-use futures::StreamExt;
-use hyper_util::rt::TokioIo;
+use futures::{StreamExt, stream};
+use prost::Message;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::net::UnixStream;
+use tokio::sync::Mutex;
 use tokio::task::JoinSet;
-use tokio::time::timeout;
-use tonic::transport::{Channel, Endpoint, Uri};
-use tonic::{Code, Status};
-use tower::service_fn;
+use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, warn};
 
 /// NATS header carrying the stable bridge error token.
 pub const ERROR_HEADER: &str = "Basil-Bridge-Error";
 /// NATS header carrying bridge error detail intended for logs/operators.
-pub const MESSAGE_HEADER: &str = "Basil-Bridge-Message";
-/// NATS header carrying `true` when the caller may retry unchanged.
 pub const RETRYABLE_HEADER: &str = "Basil-Bridge-Retryable";
 
 const DEFAULT_BASIL_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_CONCURRENCY_LIMIT: usize = 32;
-const MAX_ALLOWED_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_CHALLENGE_CONCURRENCY_LIMIT: usize = 8;
+const DEFAULT_MAX_MESSAGE_BYTES: usize = 1024 * 1024;
+const MAX_ALLOWED_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CHALLENGE_MESSAGE_BYTES: usize = 4 * 1024;
+const MAX_CONCURRENCY_LIMIT: usize = 256;
+const LEASE_MAX_AGE: Duration = Duration::from_secs(15);
+const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Command-line arguments for the `basil-nats-bridge` binary.
 #[derive(Debug, clap::Parser)]
@@ -82,6 +92,16 @@ pub struct NatsConfig {
 pub struct BasilConfig {
     /// Unix-domain socket path for the Basil broker.
     pub socket: PathBuf,
+    /// Non-root UID allowed to own socket-path ancestors.
+    pub service_owner_uid: u32,
+    /// Required owner UID of the final socket directory.
+    pub directory_owner_uid: u32,
+    /// Required final-directory mode.
+    pub directory_mode: u32,
+    /// Required socket owner and kernel peer UID.
+    pub server_uid: u32,
+    /// Required socket mode.
+    pub socket_mode: u32,
 }
 
 /// Bridge routing and request size settings.
@@ -89,16 +109,24 @@ pub struct BasilConfig {
 pub struct BridgeConfig {
     /// NATS subject accepting sealed invocation request bytes.
     pub request_subject: String,
+    /// Federation challenge subject; absent selects local legacy mode.
+    pub challenge_subject: Option<String>,
+    /// Trusted rate-limit partition inserted into challenge requests.
+    pub source_partition: Option<String>,
+    /// Pre-created `JetStream` Key/Value bucket for the federation lease.
+    pub lease_bucket: Option<String>,
     /// Optional NATS queue group for shared bridge workers.
     pub queue_group: Option<String>,
     /// Maximum accepted NATS payload size in bytes.
     pub max_message_bytes: usize,
-    /// Maximum broker calls in flight at once.
+    /// Maximum invocation calls in flight at once.
     pub concurrency_limit: usize,
+    /// Maximum freshness-challenge calls in flight at once.
+    pub challenge_concurrency_limit: usize,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct RawConfig {
     nats: RawNatsConfig,
     basil: RawBasilConfig,
@@ -106,25 +134,34 @@ struct RawConfig {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct RawNatsConfig {
     url: String,
     creds: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct RawBasilConfig {
     socket: PathBuf,
+    service_owner_uid: u32,
+    directory_owner_uid: u32,
+    directory_mode: u32,
+    server_uid: u32,
+    socket_mode: u32,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct RawBridgeConfig {
     request_subject: String,
+    challenge_subject: Option<String>,
+    source_partition: Option<String>,
+    lease_bucket: Option<String>,
     queue_group: Option<String>,
-    max_message_bytes: usize,
+    max_message_bytes: Option<usize>,
     concurrency_limit: Option<usize>,
+    challenge_concurrency_limit: Option<usize>,
 }
 
 impl Config {
@@ -133,7 +170,7 @@ impl Config {
     /// # Errors
     ///
     /// Returns an error when TOML is malformed, a required field is empty, or
-    /// `max-message-bytes` is outside the supported bounds.
+    /// a configured message or worker bound is outside its supported range.
     pub fn from_toml_str(input: &str) -> Result<Self, ConfigError> {
         let raw: RawConfig = toml::from_str(input)?;
         Self::try_from(raw)
@@ -162,29 +199,97 @@ impl TryFrom<RawConfig> for Config {
             .transpose()?;
         let socket = non_empty_path(raw.basil.socket, "basil.socket")?;
         let request_subject = non_empty(&raw.bridge.request_subject, "bridge.request-subject")?;
+        validate_subject(&request_subject, "bridge.request-subject")?;
+        let challenge_subject = raw
+            .bridge
+            .challenge_subject
+            .map(|value| non_empty(&value, "bridge.challenge-subject"))
+            .transpose()?;
+        if let Some(subject) = challenge_subject.as_deref() {
+            validate_subject(subject, "bridge.challenge-subject")?;
+            if subject == request_subject {
+                return Err(ConfigError::SubjectsMustDiffer);
+            }
+        }
+        let source_partition = raw
+            .bridge
+            .source_partition
+            .map(|value| non_empty(&value, "bridge.source-partition"))
+            .transpose()?;
+        let lease_bucket = raw
+            .bridge
+            .lease_bucket
+            .map(|value| non_empty(&value, "bridge.lease-bucket"))
+            .transpose()?;
         let queue_group = raw
             .bridge
             .queue_group
             .map(|value| non_empty(&value, "bridge.queue-group"))
             .transpose()?;
-        validate_max_message_bytes(raw.bridge.max_message_bytes)?;
+        let max_message_bytes = raw
+            .bridge
+            .max_message_bytes
+            .unwrap_or(DEFAULT_MAX_MESSAGE_BYTES);
+        validate_max_message_bytes(max_message_bytes)?;
         let concurrency_limit = raw
             .bridge
             .concurrency_limit
             .unwrap_or(DEFAULT_CONCURRENCY_LIMIT);
         validate_concurrency_limit(concurrency_limit)?;
+        let challenge_concurrency_limit = raw
+            .bridge
+            .challenge_concurrency_limit
+            .unwrap_or_else(|| concurrency_limit.min(DEFAULT_CHALLENGE_CONCURRENCY_LIMIT));
+        validate_challenge_concurrency_limit(challenge_concurrency_limit)?;
+        let federation = challenge_subject.is_some();
+        if federation != source_partition.is_some() || federation != lease_bucket.is_some() {
+            return Err(ConfigError::IncompleteFederation);
+        }
+        if federation && queue_group.is_some() {
+            return Err(ConfigError::FederationQueueGroup);
+        }
+        if source_partition
+            .as_ref()
+            .is_some_and(|value| value.len() > MAX_COURIER_SOURCE_BYTES)
+        {
+            return Err(ConfigError::SourcePartitionTooLong);
+        }
+
+        let policy = TrustedUdsPolicy {
+            socket_path: socket.clone(),
+            service_owner_uid: raw.basil.service_owner_uid,
+            directory_owner_uid: raw.basil.directory_owner_uid,
+            directory_mode: raw.basil.directory_mode,
+            socket_owner_uid: raw.basil.server_uid,
+            socket_mode: raw.basil.socket_mode,
+            expected_peer_uid: raw.basil.server_uid,
+        };
+        policy
+            .validate()
+            .map_err(|_| ConfigError::InvalidTrustedSocketPolicy)?;
 
         Ok(Self {
             nats: NatsConfig {
                 url: nats_url,
                 creds,
             },
-            basil: BasilConfig { socket },
+            basil: BasilConfig {
+                socket,
+                service_owner_uid: raw.basil.service_owner_uid,
+                directory_owner_uid: raw.basil.directory_owner_uid,
+                directory_mode: raw.basil.directory_mode,
+                server_uid: raw.basil.server_uid,
+                socket_mode: raw.basil.socket_mode,
+            },
             bridge: BridgeConfig {
                 request_subject,
+                challenge_subject,
+                source_partition,
+                lease_bucket,
                 queue_group,
-                max_message_bytes: raw.bridge.max_message_bytes,
+                max_message_bytes,
                 concurrency_limit,
+                challenge_concurrency_limit,
             },
         })
     }
@@ -222,8 +327,23 @@ const fn validate_max_message_bytes(value: usize) -> Result<(), ConfigError> {
 }
 
 const fn validate_concurrency_limit(value: usize) -> Result<(), ConfigError> {
-    if value == 0 {
+    if value == 0 || value > MAX_CONCURRENCY_LIMIT {
         return Err(ConfigError::InvalidConcurrencyLimit { value });
+    }
+    Ok(())
+}
+
+const fn validate_challenge_concurrency_limit(value: usize) -> Result<(), ConfigError> {
+    if value == 0 || value > MAX_CONCURRENCY_LIMIT {
+        return Err(ConfigError::InvalidChallengeConcurrencyLimit { value });
+    }
+    Ok(())
+}
+
+fn validate_subject(value: &str, field: &'static str) -> Result<(), ConfigError> {
+    if value.contains('*') || value.contains('>') || async_nats::Subject::validated(value).is_err()
+    {
+        return Err(ConfigError::InvalidSubject(field));
     }
     Ok(())
 }
@@ -249,11 +369,37 @@ pub enum ConfigError {
         max: usize,
     },
     /// Concurrency bound is unsupported.
-    #[error("`bridge.concurrency-limit` must be >= 1, got {value}")]
+    #[error("`bridge.concurrency-limit` must be in 1..=256, got {value}")]
     InvalidConcurrencyLimit {
         /// Configured value.
         value: usize,
     },
+    /// Challenge-worker concurrency bound is unsupported.
+    #[error("`bridge.challenge-concurrency-limit` must be in 1..=256, got {value}")]
+    InvalidChallengeConcurrencyLimit {
+        /// Configured value.
+        value: usize,
+    },
+    /// A configured subject is invalid or contains wildcards.
+    #[error("config field `{0}` must be one concrete NATS subject")]
+    InvalidSubject(&'static str),
+    /// Federation requires both a challenge subject and source partition.
+    #[error(
+        "federation requires `challenge-subject`, `source-partition`, and `lease-bucket` together"
+    )]
+    IncompleteFederation,
+    /// Federation subject pairs must be distinct.
+    #[error("federation challenge and invocation subjects must differ")]
+    SubjectsMustDiffer,
+    /// Queue groups violate single-agent federation routing.
+    #[error("federation mode forbids `queue-group`")]
+    FederationQueueGroup,
+    /// The trusted source partition is larger than the wire maximum.
+    #[error("`bridge.source-partition` exceeds 128 bytes")]
+    SourcePartitionTooLong,
+    /// The Basil socket trust policy is not closed and valid.
+    #[error("Basil trusted Unix socket policy is invalid")]
+    InvalidTrustedSocketPolicy,
 }
 
 /// Inbound NATS request metadata and payload.
@@ -338,6 +484,12 @@ pub enum BridgeErrorCode {
     Timeout,
     /// Unexpected bridge failure.
     Internal,
+    /// The broker declined freshness issuance under bounded pressure.
+    ChallengeIssuanceDeclined,
+    /// The local listener is not the frozen courier profile.
+    CapabilityMismatch,
+    /// The bridge's no-queue in-flight bound is full.
+    Overloaded,
 }
 
 impl BridgeErrorCode {
@@ -351,6 +503,9 @@ impl BridgeErrorCode {
             Self::BasilRejected => "BASIL_REJECTED",
             Self::Timeout => "TIMEOUT",
             Self::Internal => "INTERNAL",
+            Self::ChallengeIssuanceDeclined => "CHALLENGE_ISSUANCE_DECLINED",
+            Self::CapabilityMismatch => "CAPABILITY_MISMATCH",
+            Self::Overloaded => "OVERLOADED",
         }
     }
 }
@@ -360,8 +515,6 @@ impl BridgeErrorCode {
 pub struct BridgeErrorReply {
     /// Stable error token.
     pub code: BridgeErrorCode,
-    /// Operator-facing detail.
-    pub message: String,
     /// True when retrying the same request may succeed.
     pub retryable: bool,
 }
@@ -372,7 +525,6 @@ impl BridgeErrorReply {
     pub fn headers(&self) -> BridgeHeaders {
         let mut headers = BridgeHeaders::new();
         headers.insert(ERROR_HEADER, self.code.as_token());
-        headers.insert(MESSAGE_HEADER, self.message.clone());
         headers.insert(
             RETRYABLE_HEADER,
             if self.retryable { "true" } else { "false" },
@@ -390,24 +542,14 @@ pub trait BasilInvoker {
     ///
     /// Returns a transport/status error when Basil does not produce a sealed
     /// response.
-    async fn invoke(&mut self, request: SealedRequest) -> Result<SealedResponse, BasilInvokeError>;
-}
+    async fn invoke(&mut self, request: SealedRequest) -> Result<SealedResponse, CourierCallError>;
 
-/// Basil invocation failure as seen by the bridge.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum BasilInvokeError {
-    /// Basil could not be reached.
-    #[error("Basil unavailable: {0}")]
-    Unavailable(String),
-    /// Basil rejected the request without a sealed response.
-    #[error("Basil rejected invocation: {0}")]
-    Rejected(String),
-    /// Basil did not respond before the timeout.
-    #[error("Basil invocation timed out")]
-    Timeout,
-    /// Unexpected bridge-side failure.
-    #[error("internal bridge error: {0}")]
-    Internal(String),
+    /// Request one freshness challenge through the trusted courier client.
+    async fn get_challenge(
+        &mut self,
+        request: GetInvocationChallengeRequest,
+        source: &str,
+    ) -> Result<GetInvocationChallengeResponse, CourierCallError>;
 }
 
 /// Handle one NATS request according to the sealed-message bridge contract.
@@ -423,24 +565,11 @@ pub async fn handle_request(
     basil: &mut impl BasilInvoker,
 ) -> BridgeAction {
     let Some(reply_subject) = request.reply.clone() else {
-        return BridgeAction::NoReply(error_reply(
-            BridgeErrorCode::MalformedRequest,
-            "NATS request is missing a reply subject",
-            false,
-        ));
+        return BridgeAction::NoReply(error_reply(BridgeErrorCode::MalformedRequest, false));
     };
 
     if request.payload.len() > max_message_bytes {
-        return error_action(
-            reply_subject,
-            BridgeErrorCode::MessageTooLarge,
-            format!(
-                "request payload is {} bytes, exceeding the configured {} byte limit",
-                request.payload.len(),
-                max_message_bytes
-            ),
-            false,
-        );
+        return error_action(reply_subject, BridgeErrorCode::MessageTooLarge, false);
     }
 
     let sealed_request = SealedRequest {
@@ -454,14 +583,37 @@ pub async fn handle_request(
                 payload: response.message,
                 headers: BridgeHeaders::new(),
             }),
-            Err(error) => error_action(
-                reply_subject,
-                BridgeErrorCode::MalformedRequest,
-                error,
-                false,
-            ),
+            Err(_) => error_action(reply_subject, BridgeErrorCode::MalformedRequest, false),
         },
-        Err(error) => basil_error_action(reply_subject, error),
+        Err(error) => courier_error_action(reply_subject, error),
+    }
+}
+
+/// Handle one protobuf freshness-challenge request in federation mode.
+pub async fn handle_challenge_request(
+    request: BridgeRequest,
+    source_partition: &str,
+    basil: &mut impl BasilInvoker,
+) -> BridgeAction {
+    let Some(reply_subject) = request.reply else {
+        return BridgeAction::NoReply(error_reply(BridgeErrorCode::MalformedRequest, false));
+    };
+    if request.payload.len() > MAX_CHALLENGE_MESSAGE_BYTES {
+        return error_action(reply_subject, BridgeErrorCode::MessageTooLarge, false);
+    }
+    let Ok(challenge) = GetInvocationChallengeRequest::decode(request.payload.as_slice()) else {
+        return error_action(reply_subject, BridgeErrorCode::MalformedRequest, false);
+    };
+    if challenge.courier_observed_source.is_some() {
+        return error_action(reply_subject, BridgeErrorCode::MalformedRequest, false);
+    }
+    match basil.get_challenge(challenge, source_partition).await {
+        Ok(response) => BridgeAction::Reply(BridgeReply {
+            subject: reply_subject,
+            payload: response.encode_to_vec(),
+            headers: BridgeHeaders::new(),
+        }),
+        Err(error) => courier_error_action(reply_subject, error),
     }
 }
 
@@ -484,39 +636,24 @@ fn response_subject(response: &SealedResponse, fallback_subject: &str) -> Result
     }
 }
 
-fn basil_error_action(reply_subject: String, error: BasilInvokeError) -> BridgeAction {
-    match error {
-        BasilInvokeError::Unavailable(message) => error_action(
-            reply_subject,
-            BridgeErrorCode::BasilUnavailable,
-            message,
-            true,
-        ),
-        BasilInvokeError::Rejected(message) => error_action(
-            reply_subject,
-            BridgeErrorCode::BasilRejected,
-            message,
-            false,
-        ),
-        BasilInvokeError::Timeout => error_action(
-            reply_subject,
-            BridgeErrorCode::Timeout,
-            "Basil invocation timed out",
-            true,
-        ),
-        BasilInvokeError::Internal(message) => {
-            error_action(reply_subject, BridgeErrorCode::Internal, message, true)
+fn courier_error_action(reply_subject: String, error: CourierCallError) -> BridgeAction {
+    let code = match error {
+        CourierCallError::InvalidRequest => BridgeErrorCode::MalformedRequest,
+        CourierCallError::UnavailableBeforeForward | CourierCallError::UnavailableAfterForward => {
+            BridgeErrorCode::BasilUnavailable
         }
-    }
+        CourierCallError::DeadlineBeforeForward | CourierCallError::DeadlineAfterForward => {
+            BridgeErrorCode::Timeout
+        }
+        CourierCallError::CapabilityMismatch => BridgeErrorCode::CapabilityMismatch,
+        CourierCallError::ChallengeDeclined => BridgeErrorCode::ChallengeIssuanceDeclined,
+        CourierCallError::BrokerRejected => BridgeErrorCode::BasilRejected,
+    };
+    error_action(reply_subject, code, error.retryable())
 }
 
-fn error_action(
-    reply_subject: String,
-    code: BridgeErrorCode,
-    message: impl Into<String>,
-    retryable: bool,
-) -> BridgeAction {
-    let error = error_reply(code, message, retryable);
+fn error_action(reply_subject: String, code: BridgeErrorCode, retryable: bool) -> BridgeAction {
+    let error = error_reply(code, retryable);
     BridgeAction::Reply(BridgeReply {
         subject: reply_subject,
         payload: Vec::new(),
@@ -524,23 +661,27 @@ fn error_action(
     })
 }
 
-fn error_reply(
-    code: BridgeErrorCode,
-    message: impl Into<String>,
-    retryable: bool,
-) -> BridgeErrorReply {
-    BridgeErrorReply {
-        code,
-        message: message.into(),
-        retryable,
-    }
+fn overloaded_action(reply_subject: Option<String>) -> BridgeAction {
+    reply_subject.map_or_else(
+        || BridgeAction::NoReply(error_reply(BridgeErrorCode::Overloaded, true)),
+        |reply| error_action(reply, BridgeErrorCode::Overloaded, true),
+    )
+}
+
+const fn error_reply(code: BridgeErrorCode, retryable: bool) -> BridgeErrorReply {
+    BridgeErrorReply { code, retryable }
 }
 
 /// gRPC client for Basil's invocation service over a Unix-domain socket.
 #[derive(Debug, Clone)]
 pub struct BasilGrpcInvoker {
-    client: InvocationServiceClient<Channel>,
-    timeout: Duration,
+    client: BasilInvocationClient,
+}
+
+#[derive(Debug, Clone)]
+enum BasilInvocationClient {
+    Federation(InvocationCourierClient),
+    Legacy(InvocationOnlyClient),
 }
 
 impl BasilGrpcInvoker {
@@ -549,47 +690,222 @@ impl BasilGrpcInvoker {
     /// # Errors
     ///
     /// Returns a transport error when the socket cannot be reached.
-    pub async fn connect(socket: &Path) -> Result<Self, RuntimeError> {
-        let channel = uds_channel(socket, DEFAULT_CONNECT_TIMEOUT).await?;
-        Ok(Self {
-            client: InvocationServiceClient::new(channel),
-            timeout: DEFAULT_BASIL_TIMEOUT,
-        })
+    pub async fn connect(config: &BasilConfig, federation: bool) -> Result<Self, RuntimeError> {
+        let policy = TrustedUdsPolicy {
+            socket_path: config.socket.clone(),
+            service_owner_uid: config.service_owner_uid,
+            directory_owner_uid: config.directory_owner_uid,
+            directory_mode: config.directory_mode,
+            socket_owner_uid: config.server_uid,
+            socket_mode: config.socket_mode,
+            expected_peer_uid: config.server_uid,
+        };
+        let client = if federation {
+            BasilInvocationClient::Federation(
+                InvocationCourierClient::connect(
+                    policy,
+                    DEFAULT_CONNECT_TIMEOUT,
+                    DEFAULT_BASIL_TIMEOUT,
+                )
+                .await
+                .map_err(|_| RuntimeError::BasilConnect)?,
+            )
+        } else {
+            BasilInvocationClient::Legacy(
+                InvocationOnlyClient::connect(
+                    policy,
+                    DEFAULT_CONNECT_TIMEOUT,
+                    DEFAULT_BASIL_TIMEOUT,
+                )
+                .await
+                .map_err(|_| RuntimeError::BasilConnect)?,
+            )
+        };
+        Ok(Self { client })
     }
 }
 
 #[async_trait]
 impl BasilInvoker for BasilGrpcInvoker {
-    async fn invoke(&mut self, request: SealedRequest) -> Result<SealedResponse, BasilInvokeError> {
-        let response = timeout(self.timeout, self.client.invoke(request))
+    async fn invoke(&mut self, request: SealedRequest) -> Result<SealedResponse, CourierCallError> {
+        match &mut self.client {
+            BasilInvocationClient::Federation(client) => client.invoke(request).await,
+            BasilInvocationClient::Legacy(client) => client.invoke(request).await,
+        }
+    }
+
+    async fn get_challenge(
+        &mut self,
+        request: GetInvocationChallengeRequest,
+        source: &str,
+    ) -> Result<GetInvocationChallengeResponse, CourierCallError> {
+        match &mut self.client {
+            BasilInvocationClient::Federation(client) => {
+                client.get_challenge(request, source).await
+            }
+            BasilInvocationClient::Legacy(_) => Err(CourierCallError::InvalidRequest),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error("federation lease operation failed")]
+struct LeaseError;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LeaseBucketStatus {
+    history: i64,
+    max_age: Duration,
+}
+
+#[async_trait]
+trait LeaseBackend: Clone + Send + Sync + 'static {
+    async fn status(&self) -> Result<LeaseBucketStatus, LeaseError>;
+    async fn create(&self, key: &str, value: Bytes) -> Result<u64, LeaseError>;
+    async fn update(&self, key: &str, value: Bytes, revision: u64) -> Result<u64, LeaseError>;
+    async fn delete(&self, key: &str, revision: u64) -> Result<(), LeaseError>;
+}
+
+#[derive(Clone, Debug)]
+struct JetStreamLeaseBackend {
+    store: async_nats::jetstream::kv::Store,
+}
+
+#[async_trait]
+impl LeaseBackend for JetStreamLeaseBackend {
+    async fn status(&self) -> Result<LeaseBucketStatus, LeaseError> {
+        let status = self.store.status().await.map_err(|_| LeaseError)?;
+        Ok(LeaseBucketStatus {
+            history: status.history(),
+            max_age: status.max_age(),
+        })
+    }
+
+    async fn create(&self, key: &str, value: Bytes) -> Result<u64, LeaseError> {
+        self.store.create(key, value).await.map_err(|_| LeaseError)
+    }
+
+    async fn update(&self, key: &str, value: Bytes, revision: u64) -> Result<u64, LeaseError> {
+        self.store
+            .update(key, value, revision)
             .await
-            .map_err(|_| BasilInvokeError::Timeout)?;
+            .map_err(|_| LeaseError)
+    }
 
-        response
-            .map(tonic::Response::into_inner)
-            .map_err(|status| classify_status(&status))
+    async fn delete(&self, key: &str, revision: u64) -> Result<(), LeaseError> {
+        self.store
+            .delete_expect_revision(key, Some(revision))
+            .await
+            .map_err(|_| LeaseError)
     }
 }
 
-fn classify_status(status: &Status) -> BasilInvokeError {
-    match status.code() {
-        Code::Unavailable => BasilInvokeError::Unavailable(status.message().to_owned()),
-        Code::DeadlineExceeded => BasilInvokeError::Timeout,
-        Code::Internal | Code::Unknown => BasilInvokeError::Internal(status.message().to_owned()),
-        _ => BasilInvokeError::Rejected(status.message().to_owned()),
+#[derive(Debug)]
+struct LeaseState<B> {
+    backend: B,
+    key: String,
+    value: Bytes,
+    revision: u64,
+}
+
+#[derive(Clone, Debug)]
+struct FederationLease<B> {
+    state: Arc<Mutex<LeaseState<B>>>,
+}
+
+impl<B: LeaseBackend> FederationLease<B> {
+    async fn acquire(
+        backend: B,
+        challenge_subject: &str,
+        request_subject: &str,
+    ) -> Result<Self, LeaseError> {
+        let status = backend.status().await?;
+        if status.history != 1 || status.max_age != LEASE_MAX_AGE {
+            return Err(LeaseError);
+        }
+        let key = lease_key(challenge_subject, request_subject);
+        let mut instance_id = [0_u8; 32];
+        getrandom::fill(&mut instance_id).map_err(|_| LeaseError)?;
+        let value = Bytes::copy_from_slice(&instance_id);
+        let revision = backend.create(&key, value.clone()).await?;
+        Ok(Self {
+            state: Arc::new(Mutex::new(LeaseState {
+                backend,
+                key,
+                value,
+                revision,
+            })),
+        })
+    }
+
+    async fn renew(&self) -> Result<(), LeaseError> {
+        let mut state = self.state.lock().await;
+        let revision = state
+            .backend
+            .update(&state.key, state.value.clone(), state.revision)
+            .await?;
+        state.revision = revision;
+        drop(state);
+        Ok(())
+    }
+
+    async fn release(&self) -> Result<(), LeaseError> {
+        let state = self.state.lock().await;
+        state.backend.delete(&state.key, state.revision).await
     }
 }
 
-async fn uds_channel(path: &Path, connect_timeout: Duration) -> Result<Channel, RuntimeError> {
-    let path = path.to_path_buf();
-    let endpoint = Endpoint::try_from("http://[::]:50051")?.connect_timeout(connect_timeout);
-    endpoint
-        .connect_with_connector(service_fn(move |_: Uri| {
-            let path = path.clone();
-            async move { UnixStream::connect(path).await.map(TokioIo::new) }
-        }))
+fn lease_key(challenge_subject: &str, request_subject: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"basil-courier-nats-v1\0");
+    digest.update(challenge_subject.as_bytes());
+    digest.update(b"\0");
+    digest.update(request_subject.as_bytes());
+    format!("lease.{}", URL_SAFE_NO_PAD.encode(digest.finalize()))
+}
+
+async fn acquire_federation_lease(
+    nats: &async_nats::Client,
+    config: &Config,
+) -> Result<Option<FederationLease<JetStreamLeaseBackend>>, RuntimeError> {
+    let (Some(challenge_subject), Some(bucket)) = (
+        config.bridge.challenge_subject.as_deref(),
+        config.bridge.lease_bucket.as_deref(),
+    ) else {
+        return Ok(None);
+    };
+    let context = async_nats::jetstream::new(nats.clone());
+    let store = context
+        .get_key_value(bucket)
         .await
-        .map_err(RuntimeError::Endpoint)
+        .map_err(|_| RuntimeError::LeaseSetup)?;
+    FederationLease::acquire(
+        JetStreamLeaseBackend { store },
+        challenge_subject,
+        &config.bridge.request_subject,
+    )
+    .await
+    .map(Some)
+    .map_err(|_| RuntimeError::LeaseSetup)
+}
+
+async fn abort_workers(tasks: &mut JoinSet<()>) {
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+}
+
+async fn abort_all_workers(invocation_tasks: &mut JoinSet<()>, challenge_tasks: &mut JoinSet<()>) {
+    abort_workers(invocation_tasks).await;
+    abort_workers(challenge_tasks).await;
+}
+
+async fn terminate_workers(
+    invocation_tasks: &mut JoinSet<()>,
+    challenge_tasks: &mut JoinSet<()>,
+    error: RuntimeError,
+) -> RuntimeError {
+    abort_all_workers(invocation_tasks, challenge_tasks).await;
+    error
 }
 
 /// Run the bridge until the NATS subscription ends or a runtime error occurs.
@@ -602,48 +918,154 @@ async fn uds_channel(path: &Path, connect_timeout: Duration) -> Result<Channel, 
 /// the subscription stream ends ([`RuntimeError::SubscriptionEnded`]), so an
 /// on-failure supervisor restarts the bridge instead of seeing a clean exit.
 #[allow(clippy::significant_drop_tightening)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the linear loop keeps independent invoke and challenge worker lifecycles auditable"
+)]
 pub async fn run(config: Config) -> Result<(), RuntimeError> {
     let nats = connect_nats(&config).await?;
-    let basil = BasilGrpcInvoker::connect(&config.basil.socket).await?;
-    let mut subscriber = subscribe(&nats, &config).await?;
-    let concurrency_limit = config.bridge.concurrency_limit;
+    let basil =
+        BasilGrpcInvoker::connect(&config.basil, config.bridge.challenge_subject.is_some()).await?;
+    let lease = acquire_federation_lease(&nats, &config).await?;
+    let invocation = subscribe_invocations(&nats, &config)
+        .await?
+        .map(|message| (RequestKind::Invocation, message))
+        .boxed();
+    let challenges = if let Some(subject) = config.bridge.challenge_subject.as_ref() {
+        nats.subscribe(subject.clone())
+            .await
+            .map_err(RuntimeError::NatsSubscribe)?
+            .map(|message| (RequestKind::Challenge, message))
+            .boxed()
+    } else {
+        stream::empty().boxed()
+    };
+    let mut subscribers = stream::select(invocation, challenges);
+    let invocation_concurrency_limit = config.bridge.concurrency_limit;
+    let challenge_concurrency_limit = config.bridge.challenge_concurrency_limit;
 
     info!(
         request_subject = %config.bridge.request_subject,
+        challenge_subject = ?config.bridge.challenge_subject,
         queue_group = ?config.bridge.queue_group,
-        concurrency_limit,
+        invocation_concurrency_limit,
+        challenge_concurrency_limit,
         "Basil NATS bridge listening",
     );
 
-    let mut tasks = JoinSet::new();
-    while let Some(message) = subscriber.next().await {
-        while tasks.len() >= concurrency_limit {
-            drain_one_task(&mut tasks).await?;
+    let mut invocation_tasks = JoinSet::new();
+    let mut challenge_tasks = JoinSet::new();
+    let first_renewal = tokio::time::Instant::now() + LEASE_RENEW_INTERVAL;
+    let mut heartbeat = tokio::time::interval_at(first_renewal, LEASE_RENEW_INTERVAL);
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let shutdown = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            shutdown_result = &mut shutdown => {
+                abort_all_workers(&mut invocation_tasks, &mut challenge_tasks).await;
+                shutdown_result.map_err(RuntimeError::ShutdownSignal)?;
+                if let Some(lease) = lease.as_ref() {
+                    lease.release().await.map_err(|_| RuntimeError::LeaseLost)?;
+                }
+                return Ok(());
+            }
+            _ = heartbeat.tick(), if lease.is_some() => {
+                let Some(active_lease) = lease.as_ref() else {
+                    continue;
+                };
+                if active_lease.renew().await.is_err() {
+                    return Err(terminate_workers(
+                        &mut invocation_tasks,
+                        &mut challenge_tasks,
+                        RuntimeError::LeaseLost,
+                    ).await);
+                }
+            }
+            joined = invocation_tasks.join_next(), if !invocation_tasks.is_empty() => {
+                if let Some(Err(error)) = joined {
+                    return Err(terminate_workers(
+                        &mut invocation_tasks,
+                        &mut challenge_tasks,
+                        RuntimeError::WorkerJoin(error),
+                    ).await);
+                }
+            }
+            joined = challenge_tasks.join_next(), if !challenge_tasks.is_empty() => {
+                if let Some(Err(error)) = joined {
+                    return Err(terminate_workers(
+                        &mut invocation_tasks,
+                        &mut challenge_tasks,
+                        RuntimeError::WorkerJoin(error),
+                    ).await);
+                }
+            }
+            message = subscribers.next() => {
+                let Some((kind, message)) = message else {
+                    return Err(terminate_workers(
+                        &mut invocation_tasks,
+                        &mut challenge_tasks,
+                        RuntimeError::SubscriptionEnded,
+                    ).await);
+                };
+                let request = BridgeRequest {
+                    subject: message.subject.to_string(),
+                    reply: message.reply.map(|subject| subject.to_string()),
+                    payload: message.payload.to_vec(),
+                };
+                let concurrency_limit = match kind {
+                    RequestKind::Invocation => invocation_concurrency_limit,
+                    RequestKind::Challenge => challenge_concurrency_limit,
+                };
+                let worker_count = match kind {
+                    RequestKind::Invocation => invocation_tasks.len(),
+                    RequestKind::Challenge => challenge_tasks.len(),
+                };
+                if worker_count >= concurrency_limit {
+                    let action = overloaded_action(request.reply.clone());
+                    publish_action(&nats, action).await;
+                    continue;
+                }
+                if let Some(active_lease) = lease.as_ref()
+                    && active_lease.renew().await.is_err()
+                {
+                    return Err(terminate_workers(
+                        &mut invocation_tasks,
+                        &mut challenge_tasks,
+                        RuntimeError::LeaseLost,
+                    ).await);
+                }
+                let tasks = match kind {
+                    RequestKind::Invocation => &mut invocation_tasks,
+                    RequestKind::Challenge => &mut challenge_tasks,
+                };
+                let nats = nats.clone();
+                let mut basil = basil.clone();
+                let max_message_bytes = config.bridge.max_message_bytes;
+                let source_partition = config.bridge.source_partition.clone();
+                tasks.spawn(async move {
+                    let action = match kind {
+                        RequestKind::Invocation => {
+                            handle_request(request, max_message_bytes, &mut basil).await
+                        }
+                        RequestKind::Challenge => {
+                            let Some(source) = source_partition.as_deref() else {
+                                return;
+                            };
+                            handle_challenge_request(request, source, &mut basil).await
+                        }
+                    };
+                    publish_action(&nats, action).await;
+                });
+            }
         }
-        let request = BridgeRequest {
-            subject: message.subject.to_string(),
-            reply: message.reply.map(|subject| subject.to_string()),
-            payload: message.payload.to_vec(),
-        };
-        let nats = nats.clone();
-        let mut basil = basil.clone();
-        let max_message_bytes = config.bridge.max_message_bytes;
-        tasks.spawn(async move {
-            let action = handle_request(request, max_message_bytes, &mut basil).await;
-            publish_action(&nats, action).await;
-        });
     }
-    while !tasks.is_empty() {
-        drain_one_task(&mut tasks).await?;
-    }
-    Err(RuntimeError::SubscriptionEnded)
 }
 
-async fn drain_one_task(tasks: &mut JoinSet<()>) -> Result<(), RuntimeError> {
-    if let Some(result) = tasks.join_next().await {
-        result.map_err(RuntimeError::WorkerJoin)?;
-    }
-    Ok(())
+#[derive(Clone, Copy, Debug)]
+enum RequestKind {
+    Invocation,
+    Challenge,
 }
 
 async fn connect_nats(config: &Config) -> Result<async_nats::Client, RuntimeError> {
@@ -661,7 +1083,7 @@ async fn connect_nats(config: &Config) -> Result<async_nats::Client, RuntimeErro
         .map_err(RuntimeError::NatsConnect)
 }
 
-async fn subscribe(
+async fn subscribe_invocations(
     nats: &async_nats::Client,
     config: &Config,
 ) -> Result<async_nats::Subscriber, RuntimeError> {
@@ -704,7 +1126,6 @@ async fn publish_action(nats: &async_nats::Client, action: BridgeAction) {
         BridgeAction::NoReply(error) => {
             warn!(
                 error = error.code.as_token(),
-                message = %error.message,
                 "dropping request because no NATS reply subject was present",
             );
             return;
@@ -730,12 +1151,9 @@ fn to_nats_headers(headers: &BridgeHeaders) -> async_nats::HeaderMap {
 /// Runtime setup and transport error.
 #[derive(Debug, Error)]
 pub enum RuntimeError {
-    /// Basil gRPC endpoint construction failed.
-    #[error("Basil endpoint configuration failed: {0}")]
-    EndpointConfig(#[from] tonic::transport::Error),
-    /// Basil gRPC Unix socket connection failed.
-    #[error("Basil socket connection failed: {0}")]
-    Endpoint(tonic::transport::Error),
+    /// Basil trusted courier channel could not be established.
+    #[error("Basil trusted courier connection failed")]
+    BasilConnect,
     /// NATS credentials file could not be loaded.
     #[error("NATS credentials file could not be loaded: {0}")]
     NatsCredentials(#[from] std::io::Error),
@@ -745,6 +1163,15 @@ pub enum RuntimeError {
     /// NATS subscription failed.
     #[error("NATS subscription failed: {0}")]
     NatsSubscribe(async_nats::SubscribeError),
+    /// Federation lease setup failed before subscriptions opened.
+    #[error("federation lease setup failed")]
+    LeaseSetup,
+    /// Federation lease ownership was lost or could not be renewed.
+    #[error("federation lease ownership lost")]
+    LeaseLost,
+    /// Clean-shutdown signal registration failed.
+    #[error("shutdown signal registration failed: {0}")]
+    ShutdownSignal(std::io::Error),
     /// The NATS subscription stream ended; the bridge can no longer serve
     /// requests and a supervisor should restart it.
     #[error("NATS subscription stream ended")]
@@ -758,9 +1185,15 @@ pub enum RuntimeError {
 mod tests {
     #![allow(clippy::missing_panics_doc, clippy::unwrap_used)]
 
+    use std::collections::BTreeMap;
+    use std::future::pending;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex as StdMutex};
+
     use super::*;
     use basil_proto::KeyType;
     use basil_proto::broker::v1::{GetSecretResponse, ImportRequest, KeyMaterial, key_material};
+    use tokio::sync::Barrier;
 
     const VALID_CONFIG: &str = r#"
 [nats]
@@ -769,33 +1202,141 @@ creds = "/run/basil/bridge.creds"
 
 [basil]
 socket = "/run/basil/basil.sock"
+service-owner-uid = 991
+directory-owner-uid = 0
+directory-mode = 493
+server-uid = 991
+socket-mode = 432
 
 [bridge]
 request-subject = "basil.invocation"
 queue-group = "basil-bridge"
 max-message-bytes = 1048576
 concurrency-limit = 8
+challenge-concurrency-limit = 3
 "#;
 
     #[derive(Debug)]
     struct FakeBasil {
-        result: Result<SealedResponse, BasilInvokeError>,
+        result: Result<SealedResponse, CourierCallError>,
+        challenge_result: Result<GetInvocationChallengeResponse, CourierCallError>,
         received: Vec<SealedRequest>,
+        challenges: Vec<(GetInvocationChallengeRequest, String)>,
     }
 
     impl FakeBasil {
         fn ok(response: SealedResponse) -> Self {
             Self {
                 result: Ok(response),
+                challenge_result: Ok(GetInvocationChallengeResponse {
+                    challenge: vec![7; 32],
+                    generation: 9,
+                    expires_at_unix: 100,
+                }),
                 received: Vec::new(),
+                challenges: Vec::new(),
             }
         }
 
-        fn err(error: BasilInvokeError) -> Self {
+        fn err(error: CourierCallError) -> Self {
             Self {
                 result: Err(error),
+                challenge_result: Ok(GetInvocationChallengeResponse {
+                    challenge: vec![7; 32],
+                    generation: 9,
+                    expires_at_unix: 100,
+                }),
                 received: Vec::new(),
+                challenges: Vec::new(),
             }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct FakeLeaseBackend {
+        state: Arc<StdMutex<FakeLeaseBackendState>>,
+    }
+
+    #[derive(Debug)]
+    struct FakeLeaseBackendState {
+        status: LeaseBucketStatus,
+        entries: BTreeMap<String, (Bytes, u64)>,
+        next_revision: u64,
+    }
+
+    impl FakeLeaseBackend {
+        fn qualified() -> Self {
+            Self::with_status(1, LEASE_MAX_AGE)
+        }
+
+        fn with_status(history: i64, max_age: Duration) -> Self {
+            Self {
+                state: Arc::new(StdMutex::new(FakeLeaseBackendState {
+                    status: LeaseBucketStatus { history, max_age },
+                    entries: BTreeMap::new(),
+                    next_revision: 1,
+                })),
+            }
+        }
+
+        fn expire(&self, key: &str) {
+            self.state.lock().unwrap().entries.remove(key);
+        }
+
+        fn replace(&self, key: &str, value: Bytes) -> u64 {
+            let mut state = self.state.lock().unwrap();
+            let revision = state.next_revision;
+            state.next_revision += 1;
+            state.entries.insert(key.to_owned(), (value, revision));
+            revision
+        }
+
+        fn entry(&self, key: &str) -> Option<(Bytes, u64)> {
+            self.state.lock().unwrap().entries.get(key).cloned()
+        }
+    }
+
+    #[async_trait]
+    impl LeaseBackend for FakeLeaseBackend {
+        async fn status(&self) -> Result<LeaseBucketStatus, LeaseError> {
+            Ok(self.state.lock().unwrap().status)
+        }
+
+        async fn create(&self, key: &str, value: Bytes) -> Result<u64, LeaseError> {
+            let mut state = self.state.lock().unwrap();
+            if state.entries.contains_key(key) {
+                drop(state);
+                return Err(LeaseError);
+            }
+            let revision = state.next_revision;
+            state.next_revision += 1;
+            state.entries.insert(key.to_owned(), (value, revision));
+            drop(state);
+            Ok(revision)
+        }
+
+        async fn update(&self, key: &str, value: Bytes, revision: u64) -> Result<u64, LeaseError> {
+            let mut state = self.state.lock().unwrap();
+            if state.entries.get(key).map(|entry| entry.1) != Some(revision) {
+                drop(state);
+                return Err(LeaseError);
+            }
+            let next_revision = state.next_revision;
+            state.next_revision += 1;
+            state.entries.insert(key.to_owned(), (value, next_revision));
+            drop(state);
+            Ok(next_revision)
+        }
+
+        async fn delete(&self, key: &str, revision: u64) -> Result<(), LeaseError> {
+            let mut state = self.state.lock().unwrap();
+            if state.entries.get(key).map(|entry| entry.1) != Some(revision) {
+                drop(state);
+                return Err(LeaseError);
+            }
+            state.entries.remove(key);
+            drop(state);
+            Ok(())
         }
     }
 
@@ -804,10 +1345,115 @@ concurrency-limit = 8
         async fn invoke(
             &mut self,
             request: SealedRequest,
-        ) -> Result<SealedResponse, BasilInvokeError> {
+        ) -> Result<SealedResponse, CourierCallError> {
             self.received.push(request);
             self.result.clone()
         }
+
+        async fn get_challenge(
+            &mut self,
+            request: GetInvocationChallengeRequest,
+            source: &str,
+        ) -> Result<GetInvocationChallengeResponse, CourierCallError> {
+            self.challenges.push((request, source.to_owned()));
+            self.challenge_result.clone()
+        }
+    }
+
+    #[test]
+    fn overload_before_forward_is_retryable() {
+        let BridgeAction::Reply(reply) = overloaded_action(Some("_INBOX.full".to_owned())) else {
+            panic!("expected reply");
+        };
+        assert_error(&reply, BridgeErrorCode::Overloaded, true);
+
+        let BridgeAction::NoReply(error) = overloaded_action(None) else {
+            panic!("expected no-reply action");
+        };
+        assert_eq!(error.code, BridgeErrorCode::Overloaded);
+        assert!(error.retryable);
+    }
+
+    #[tokio::test]
+    async fn lease_acquire_is_atomic_and_expired_entry_can_be_reacquired() {
+        let backend = FakeLeaseBackend::qualified();
+        let first = FederationLease::acquire(backend.clone(), "basil.challenge", "basil.invoke");
+        let second = FederationLease::acquire(backend.clone(), "basil.challenge", "basil.invoke");
+        let (first, second) = tokio::join!(first, second);
+        assert_ne!(first.is_ok(), second.is_ok());
+
+        let key = lease_key("basil.challenge", "basil.invoke");
+        let (value, _) = backend.entry(&key).unwrap();
+        assert_eq!(value.len(), 32);
+        backend.expire(&key);
+        FederationLease::acquire(backend, "basil.challenge", "basil.invoke")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn lease_rejects_wrong_bucket_history_or_max_age() {
+        for backend in [
+            FakeLeaseBackend::with_status(2, LEASE_MAX_AGE),
+            FakeLeaseBackend::with_status(1, Duration::from_secs(14)),
+        ] {
+            assert!(
+                FederationLease::acquire(backend, "basil.challenge", "basil.invoke")
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lease_cas_loss_fails_renewal_and_preserves_new_owner() {
+        let backend = FakeLeaseBackend::qualified();
+        let lease = FederationLease::acquire(backend.clone(), "basil.challenge", "basil.invoke")
+            .await
+            .unwrap();
+        let key = lease_key("basil.challenge", "basil.invoke");
+        let replacement = Bytes::from_static(b"replacement-owner");
+        let replacement_revision = backend.replace(&key, replacement.clone());
+
+        assert!(lease.renew().await.is_err());
+        assert_eq!(
+            backend.entry(&key),
+            Some((replacement, replacement_revision))
+        );
+    }
+
+    #[tokio::test]
+    async fn lease_release_uses_expected_revision() {
+        let backend = FakeLeaseBackend::qualified();
+        let lease = FederationLease::acquire(backend.clone(), "basil.challenge", "basil.invoke")
+            .await
+            .unwrap();
+        let key = lease_key("basil.challenge", "basil.invoke");
+        let replacement = Bytes::from_static(b"replacement-owner");
+        let replacement_revision = backend.replace(&key, replacement.clone());
+
+        assert!(lease.release().await.is_err());
+        assert_eq!(
+            backend.entry(&key),
+            Some((replacement, replacement_revision))
+        );
+    }
+
+    #[tokio::test]
+    async fn distinct_subject_pairs_have_independent_leases() {
+        let backend = FakeLeaseBackend::qualified();
+        FederationLease::acquire(backend.clone(), "basil.a", "basil.bc")
+            .await
+            .unwrap();
+        FederationLease::acquire(backend.clone(), "basil.ab", "basil.c")
+            .await
+            .unwrap();
+
+        let first_key = lease_key("basil.a", "basil.bc");
+        let second_key = lease_key("basil.ab", "basil.c");
+        assert_ne!(first_key, second_key);
+        assert!(backend.entry(&first_key).is_some());
+        assert!(backend.entry(&second_key).is_some());
     }
 
     #[test]
@@ -824,6 +1470,7 @@ concurrency-limit = 8
         assert_eq!(config.bridge.queue_group.as_deref(), Some("basil-bridge"));
         assert_eq!(config.bridge.max_message_bytes, 1_048_576);
         assert_eq!(config.bridge.concurrency_limit, 8);
+        assert_eq!(config.bridge.challenge_concurrency_limit, 3);
     }
 
     #[test]
@@ -835,6 +1482,11 @@ url = "nats://127.0.0.1:4222"
 
 [basil]
 socket = "/run/basil/basil.sock"
+service-owner-uid = 991
+directory-owner-uid = 0
+directory-mode = 493
+server-uid = 991
+socket-mode = 432
 
 [bridge]
 request-subject = "basil.invocation"
@@ -846,6 +1498,10 @@ max-message-bytes = 4096
         assert_eq!(config.nats.creds, None);
         assert_eq!(config.bridge.queue_group, None);
         assert_eq!(config.bridge.concurrency_limit, DEFAULT_CONCURRENCY_LIMIT);
+        assert_eq!(
+            config.bridge.challenge_concurrency_limit,
+            DEFAULT_CHALLENGE_CONCURRENCY_LIMIT
+        );
     }
 
     #[test]
@@ -857,6 +1513,11 @@ url = "nats://127.0.0.1:4222"
 
 [basil]
 socket = "/run/basil/basil.sock"
+service-owner-uid = 991
+directory-owner-uid = 0
+directory-mode = 493
+server-uid = 991
+socket-mode = 432
 
 [bridge]
 request-subject = "basil.invocation"
@@ -873,6 +1534,35 @@ concurrency-limit = 0
     }
 
     #[test]
+    fn rejects_zero_challenge_concurrency_limit() {
+        let error = Config::from_toml_str(
+            r#"
+[nats]
+url = "nats://127.0.0.1:4222"
+
+[basil]
+socket = "/run/basil/basil.sock"
+service-owner-uid = 991
+directory-owner-uid = 0
+directory-mode = 493
+server-uid = 991
+socket-mode = 432
+
+[bridge]
+request-subject = "basil.invocation"
+max-message-bytes = 1024
+challenge-concurrency-limit = 0
+"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ConfigError::InvalidChallengeConcurrencyLimit { value: 0 }
+        ));
+    }
+
+    #[test]
     fn rejects_empty_config_fields() {
         let error = Config::from_toml_str(
             r#"
@@ -881,6 +1571,11 @@ url = " "
 
 [basil]
 socket = "/run/basil/basil.sock"
+service-owner-uid = 991
+directory-owner-uid = 0
+directory-mode = 493
+server-uid = 991
+socket-mode = 432
 
 [bridge]
 request-subject = "basil.invocation"
@@ -901,6 +1596,11 @@ url = "nats://127.0.0.1:4222"
 
 [basil]
 socket = "/run/basil/basil.sock"
+service-owner-uid = 991
+directory-owner-uid = 0
+directory-mode = 493
+server-uid = 991
+socket-mode = 432
 
 [bridge]
 request-subject = "basil.invocation"
@@ -913,6 +1613,119 @@ max-message-bytes = 0
             error,
             ConfigError::InvalidMaxMessageBytes { value: 0, .. }
         ));
+    }
+
+    #[test]
+    fn federation_requires_distinct_subject_pair_without_queue_group() {
+        let same = VALID_CONFIG
+            .replace("queue-group = \"basil-bridge\"\n", "")
+            .replace(
+                "max-message-bytes = 1048576",
+                "challenge-subject = \"basil.invocation\"\nsource-partition = \"agent-a\"\nlease-bucket = \"BASIL_COURIER_LEASES\"\nmax-message-bytes = 1048576",
+            );
+        assert!(matches!(
+            Config::from_toml_str(&same),
+            Err(ConfigError::SubjectsMustDiffer)
+        ));
+
+        let queued = VALID_CONFIG.replace(
+            "max-message-bytes = 1048576",
+            "challenge-subject = \"basil.challenge\"\nsource-partition = \"agent-a\"\nlease-bucket = \"BASIL_COURIER_LEASES\"\nmax-message-bytes = 1048576",
+        );
+        assert!(matches!(
+            Config::from_toml_str(&queued),
+            Err(ConfigError::FederationQueueGroup)
+        ));
+    }
+
+    #[test]
+    fn federation_requires_both_challenge_subject_and_partition() {
+        let incomplete = VALID_CONFIG.replace(
+            "max-message-bytes = 1048576",
+            "challenge-subject = \"basil.challenge\"\nmax-message-bytes = 1048576",
+        );
+        assert!(matches!(
+            Config::from_toml_str(&incomplete),
+            Err(ConfigError::IncompleteFederation)
+        ));
+    }
+
+    #[tokio::test]
+    async fn challenge_contract_injects_partition_and_returns_protobuf() {
+        let request = GetInvocationChallengeRequest {
+            jkt: vec![3; 32],
+            courier_observed_source: None,
+        };
+        let mut basil = FakeBasil::ok(sealed_response(b"unused"));
+        let action = handle_challenge_request(
+            BridgeRequest {
+                subject: "basil.challenge".to_owned(),
+                reply: Some("_INBOX.challenge".to_owned()),
+                payload: request.encode_to_vec(),
+            },
+            "agent-a",
+            &mut basil,
+        )
+        .await;
+
+        assert_eq!(basil.challenges, vec![(request, "agent-a".to_owned())]);
+        let BridgeAction::Reply(reply) = action else {
+            panic!("expected reply");
+        };
+        assert!(reply.headers.is_empty());
+        let response = GetInvocationChallengeResponse::decode(reply.payload.as_slice()).unwrap();
+        assert_eq!(response.challenge, vec![7; 32]);
+        assert_eq!(response.generation, 9);
+    }
+
+    #[tokio::test]
+    async fn challenge_rejects_caller_supplied_source_without_forwarding() {
+        let request = GetInvocationChallengeRequest {
+            jkt: vec![3; 32],
+            courier_observed_source: Some("attacker".to_owned()),
+        };
+        let mut basil = FakeBasil::ok(sealed_response(b"unused"));
+        let action = handle_challenge_request(
+            BridgeRequest {
+                subject: "basil.challenge".to_owned(),
+                reply: Some("_INBOX.challenge".to_owned()),
+                payload: request.encode_to_vec(),
+            },
+            "agent-a",
+            &mut basil,
+        )
+        .await;
+
+        assert!(basil.challenges.is_empty());
+        let BridgeAction::Reply(reply) = action else {
+            panic!("expected reply");
+        };
+        assert_error(&reply, BridgeErrorCode::MalformedRequest, false);
+    }
+
+    #[tokio::test]
+    async fn challenge_pressure_uses_sanitized_retryable_token() {
+        let mut basil = FakeBasil::ok(sealed_response(b"unused"));
+        basil.challenge_result = Err(CourierCallError::ChallengeDeclined);
+        let action = handle_challenge_request(
+            BridgeRequest {
+                subject: "basil.challenge".to_owned(),
+                reply: Some("_INBOX.challenge".to_owned()),
+                payload: GetInvocationChallengeRequest {
+                    jkt: vec![3; 32],
+                    courier_observed_source: None,
+                }
+                .encode_to_vec(),
+            },
+            "agent-a",
+            &mut basil,
+        )
+        .await;
+
+        let BridgeAction::Reply(reply) = action else {
+            panic!("expected reply");
+        };
+        assert_error(&reply, BridgeErrorCode::ChallengeIssuanceDeclined, true);
     }
 
     #[tokio::test]
@@ -1032,7 +1845,7 @@ max-message-bytes = 0
 
     #[tokio::test]
     async fn preserves_routing_metadata_in_error_reply_subject() {
-        let mut basil = FakeBasil::err(BasilInvokeError::Unavailable("down".to_owned()));
+        let mut basil = FakeBasil::err(CourierCallError::UnavailableAfterForward);
         let action = handle_request(
             BridgeRequest {
                 subject: "basil.invocation".to_owned(),
@@ -1048,7 +1861,7 @@ max-message-bytes = 0
             panic!("expected reply");
         };
         assert_eq!(reply.subject, "_INBOX.route");
-        assert_error(&reply, BridgeErrorCode::BasilUnavailable, true);
+        assert_error(&reply, BridgeErrorCode::BasilUnavailable, false);
     }
 
     #[tokio::test]
@@ -1131,9 +1944,7 @@ max-message-bytes = 0
     #[tokio::test]
     async fn basil_authorization_rejection_is_not_masked_by_bridge_grants() {
         let payload = adversarial_cose_like_payload();
-        let mut basil = FakeBasil::err(BasilInvokeError::Rejected(
-            "permission denied for actor".to_owned(),
-        ));
+        let mut basil = FakeBasil::err(CourierCallError::BrokerRejected);
 
         let action = handle_request(
             BridgeRequest {
@@ -1152,10 +1963,7 @@ max-message-bytes = 0
         };
         assert_eq!(reply.subject, "_INBOX.original");
         assert_error(&reply, BridgeErrorCode::BasilRejected, false);
-        assert_eq!(
-            reply.headers.get(MESSAGE_HEADER),
-            Some("permission denied for actor")
-        );
+        assert_eq!(reply.headers.inner.len(), 2);
     }
 
     #[tokio::test]
@@ -1256,26 +2064,26 @@ max-message-bytes = 0
 
     #[tokio::test]
     async fn basil_rejection_maps_to_stable_error_headers() {
-        let mut basil = FakeBasil::err(BasilInvokeError::Rejected("denied".to_owned()));
+        let mut basil = FakeBasil::err(CourierCallError::BrokerRejected);
         let reply = invoke_error_reply(&mut basil).await;
 
         assert_error(&reply, BridgeErrorCode::BasilRejected, false);
     }
 
     #[tokio::test]
-    async fn basil_timeout_maps_to_retryable_error_headers() {
-        let mut basil = FakeBasil::err(BasilInvokeError::Timeout);
+    async fn post_forward_timeout_is_not_retryable() {
+        let mut basil = FakeBasil::err(CourierCallError::DeadlineAfterForward);
         let reply = invoke_error_reply(&mut basil).await;
 
-        assert_error(&reply, BridgeErrorCode::Timeout, true);
+        assert_error(&reply, BridgeErrorCode::Timeout, false);
     }
 
     #[tokio::test]
-    async fn basil_unavailable_maps_to_retryable_error_headers() {
-        let mut basil = FakeBasil::err(BasilInvokeError::Unavailable("socket closed".to_owned()));
+    async fn post_forward_unavailable_is_not_retryable() {
+        let mut basil = FakeBasil::err(CourierCallError::UnavailableAfterForward);
         let reply = invoke_error_reply(&mut basil).await;
 
-        assert_error(&reply, BridgeErrorCode::BasilUnavailable, true);
+        assert_error(&reply, BridgeErrorCode::BasilUnavailable, false);
     }
 
     async fn invoke_error_reply(basil: &mut FakeBasil) -> BridgeReply {
@@ -1303,7 +2111,7 @@ max-message-bytes = 0
             reply.headers.get(RETRYABLE_HEADER),
             Some(if retryable { "true" } else { "false" })
         );
-        assert!(reply.headers.get(MESSAGE_HEADER).is_some());
+        assert_eq!(reply.headers.inner.len(), 2);
     }
 
     fn sealed_request(body: &[u8]) -> SealedRequest {
@@ -1368,5 +2176,82 @@ max-message-bytes = 0
         haystack
             .windows(needle.len())
             .any(|window| window == needle)
+    }
+
+    struct WorkerDrop(Arc<AtomicBool>);
+
+    impl Drop for WorkerDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    async fn blocked_worker(dropped: Arc<AtomicBool>, started: Arc<Barrier>) {
+        let _guard = WorkerDrop(dropped);
+        started.wait().await;
+        pending::<()>().await;
+    }
+
+    #[tokio::test]
+    async fn subscription_end_cleanup_aborts_and_drains_both_blocked_pools() {
+        let invocation_dropped = Arc::new(AtomicBool::new(false));
+        let challenge_dropped = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(Barrier::new(3));
+        let mut invocation_tasks = JoinSet::new();
+        let mut challenge_tasks = JoinSet::new();
+        invocation_tasks.spawn(blocked_worker(
+            Arc::clone(&invocation_dropped),
+            Arc::clone(&started),
+        ));
+        challenge_tasks.spawn(blocked_worker(
+            Arc::clone(&challenge_dropped),
+            Arc::clone(&started),
+        ));
+        started.wait().await;
+
+        let terminal = terminate_workers(
+            &mut invocation_tasks,
+            &mut challenge_tasks,
+            RuntimeError::SubscriptionEnded,
+        )
+        .await;
+
+        assert!(matches!(terminal, RuntimeError::SubscriptionEnded));
+        assert!(invocation_tasks.is_empty());
+        assert!(challenge_tasks.is_empty());
+        assert!(invocation_dropped.load(Ordering::Acquire));
+        assert!(challenge_dropped.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn worker_join_failure_cleanup_aborts_and_drains_the_other_pool() {
+        let challenge_dropped = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(Barrier::new(2));
+        let mut invocation_tasks = JoinSet::new();
+        let mut challenge_tasks = JoinSet::new();
+        invocation_tasks.spawn(async { panic!("injected worker failure") });
+        challenge_tasks.spawn(blocked_worker(
+            Arc::clone(&challenge_dropped),
+            Arc::clone(&started),
+        ));
+        started.wait().await;
+
+        let error = invocation_tasks
+            .join_next()
+            .await
+            .expect("injected worker joined")
+            .expect_err("injected worker failed");
+        assert!(error.is_panic());
+        let terminal = terminate_workers(
+            &mut invocation_tasks,
+            &mut challenge_tasks,
+            RuntimeError::WorkerJoin(error),
+        )
+        .await;
+
+        assert!(matches!(terminal, RuntimeError::WorkerJoin(_)));
+        assert!(invocation_tasks.is_empty());
+        assert!(challenge_tasks.is_empty());
+        assert!(challenge_dropped.load(Ordering::Acquire));
     }
 }

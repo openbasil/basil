@@ -37,6 +37,7 @@
 )]
 
 use std::collections::BTreeSet;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -52,7 +53,11 @@ use basil_nats_bridge::{BasilConfig, BridgeConfig, Config, NatsConfig};
 use basil_proto::broker::v1::invocation_service_server::{
     InvocationService, InvocationServiceServer,
 };
-use basil_proto::broker::v1::{SealedRequest, SealedResponse, SigningAlgorithm};
+use basil_proto::broker::v1::{
+    GetInvocationCapabilitiesRequest, GetInvocationCapabilitiesResponse,
+    GetInvocationChallengeRequest, GetInvocationChallengeResponse, ListenerProfile, SealedRequest,
+    SealedResponse, SigningAlgorithm,
+};
 use basil_proto::invocation::{
     CONTENT_TYPE_SIGN_REQUEST, CONTENT_TYPE_SIGN_RESPONSE, InvocationStatus, SignInvocationRequest,
     SignInvocationResponse,
@@ -94,6 +99,23 @@ impl InvocationService for FakeInvocationService {
             response_subject: None,
         }))
     }
+
+    // The courier never calls this RPC; mirror the broker's wire-surface stub
+    // (basil-jjgi.3.1) so the fake stays a faithful `InvocationService`.
+    async fn get_invocation_challenge(
+        &self,
+        _request: Request<GetInvocationChallengeRequest>,
+    ) -> Result<Response<GetInvocationChallengeResponse>, Status> {
+        Err(Status::unimplemented(
+            "GetInvocationChallenge is not part of the courier round-trip",
+        ))
+    }
+    async fn get_invocation_capabilities(
+        &self,
+        _request: Request<GetInvocationCapabilitiesRequest>,
+    ) -> Result<Response<GetInvocationCapabilitiesResponse>, Status> {
+        Ok(Response::new(local_invocation_capabilities()))
+    }
 }
 
 /// A minimal Basil `InvocationService` for the Go interop leg. Unlike
@@ -118,9 +140,9 @@ impl InvocationService for VerifyingInvocationService {
         let message = &request.get_ref().message;
         let validation = ValidationParams {
             now: self.now,
-            max_clock_skew: Duration::from_secs(60),
-            max_ttl: Duration::from_secs(300),
-            default_ttl: Duration::from_secs(300),
+            max_clock_skew: Duration::from_mins(1),
+            max_ttl: Duration::from_mins(5),
+            default_ttl: Duration::from_mins(5),
             allowed_audiences: BTreeSet::new(),
             role: MessageRole::Request,
         };
@@ -188,6 +210,31 @@ impl InvocationService for VerifyingInvocationService {
             response_subject: None,
         }))
     }
+
+    // The courier never calls this RPC; mirror the broker's wire-surface stub
+    // (basil-jjgi.3.1) so the fake stays a faithful `InvocationService`.
+    async fn get_invocation_challenge(
+        &self,
+        _request: Request<GetInvocationChallengeRequest>,
+    ) -> Result<Response<GetInvocationChallengeResponse>, Status> {
+        Err(Status::unimplemented(
+            "GetInvocationChallenge is not part of the courier round-trip",
+        ))
+    }
+    async fn get_invocation_capabilities(
+        &self,
+        _request: Request<GetInvocationCapabilitiesRequest>,
+    ) -> Result<Response<GetInvocationCapabilitiesResponse>, Status> {
+        Ok(Response::new(local_invocation_capabilities()))
+    }
+}
+
+const fn local_invocation_capabilities() -> GetInvocationCapabilitiesResponse {
+    GetInvocationCapabilitiesResponse {
+        listener_profile: ListenerProfile::Host as i32,
+        require_challenge: false,
+        courier_protocol_version: 1,
+    }
 }
 
 /// RAII guard that reaps the spawned `nats-server` on drop (incl. on panic).
@@ -241,6 +288,8 @@ fn request_claims(
         response_subject: None,
         in_reply_to: None,
         request_hash: None,
+        freshness_challenge: None,
+        response_public_key_cose: None,
     }
 }
 
@@ -263,6 +312,8 @@ fn response_claims(
         response_subject: None,
         in_reply_to: Some(in_reply_to),
         request_hash: Some(request_hash),
+        freshness_challenge: None,
+        response_public_key_cose: None,
     }
 }
 
@@ -386,13 +437,7 @@ async fn nats_bridge_round_trips_sealed_cose() {
     let (_nats, nats_url) = start_nats_server(port).await;
 
     // --- minimal in-process Basil InvocationService gRPC server over a unix socket.
-    let socket: PathBuf = std::env::temp_dir().join(format!(
-        "basil-nats-bridge-e2e-{}-{}.sock",
-        std::process::id(),
-        port
-    ));
-    let _ = std::fs::remove_file(&socket);
-    let listener = tokio::net::UnixListener::bind(&socket).expect("bind basil uds");
+    let (socket_dir, socket, listener, server_uid) = bind_test_socket(port, "rust");
     let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
     let service = FakeInvocationService {
         expected_request: request_bytes.clone(),
@@ -413,12 +458,21 @@ async fn nats_bridge_round_trips_sealed_cose() {
         },
         basil: BasilConfig {
             socket: socket.clone(),
+            service_owner_uid: server_uid,
+            directory_owner_uid: server_uid,
+            directory_mode: 0o750,
+            server_uid,
+            socket_mode: 0o660,
         },
         bridge: BridgeConfig {
             request_subject: REQUEST_SUBJECT.to_string(),
+            challenge_subject: None,
+            source_partition: None,
+            lease_bucket: None,
             queue_group: None,
             max_message_bytes: 1024 * 1024,
             concurrency_limit: 32,
+            challenge_concurrency_limit: 8,
         },
     };
     let bridge = tokio::spawn(async move { basil_nats_bridge::run(config).await });
@@ -447,9 +501,9 @@ async fn nats_bridge_round_trips_sealed_cose() {
 
     let validation = ValidationParams {
         now,
-        max_clock_skew: Duration::from_secs(60),
-        max_ttl: Duration::from_secs(300),
-        default_ttl: Duration::from_secs(300),
+        max_clock_skew: Duration::from_mins(1),
+        max_ttl: Duration::from_mins(5),
+        default_ttl: Duration::from_mins(5),
         allowed_audiences: BTreeSet::new(),
         role: MessageRole::Response,
     };
@@ -479,6 +533,8 @@ async fn nats_bridge_round_trips_sealed_cose() {
 
     bridge.abort();
     server.abort();
+    let _ = std::fs::remove_file(&socket);
+    let _ = std::fs::remove_dir(&socket_dir);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -509,13 +565,7 @@ async fn go_client_round_trips_sealed_cose_through_nats_bridge() {
     let port = port_from(&alloc_addr());
     let (_nats, nats_url) = start_nats_server(port).await;
 
-    let socket: PathBuf = std::env::temp_dir().join(format!(
-        "basil-nats-bridge-go-e2e-{}-{}.sock",
-        std::process::id(),
-        port
-    ));
-    let _ = std::fs::remove_file(&socket);
-    let listener = tokio::net::UnixListener::bind(&socket).expect("bind basil uds");
+    let (socket_dir, socket, listener, server_uid) = bind_test_socket(port, "go");
     let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
     let service = VerifyingInvocationService {
         client_verifier,
@@ -539,12 +589,21 @@ async fn go_client_round_trips_sealed_cose_through_nats_bridge() {
         },
         basil: BasilConfig {
             socket: socket.clone(),
+            service_owner_uid: server_uid,
+            directory_owner_uid: server_uid,
+            directory_mode: 0o750,
+            server_uid,
+            socket_mode: 0o660,
         },
         bridge: BridgeConfig {
             request_subject: REQUEST_SUBJECT.to_string(),
+            challenge_subject: None,
+            source_partition: None,
+            lease_bucket: None,
             queue_group: None,
             max_message_bytes: 1024 * 1024,
             concurrency_limit: 32,
+            challenge_concurrency_limit: 8,
         },
     };
     let bridge = tokio::spawn(async move { basil_nats_bridge::run(config).await });
@@ -590,6 +649,24 @@ async fn go_client_round_trips_sealed_cose_through_nats_bridge() {
 
     bridge.abort();
     server.abort();
+    let _ = std::fs::remove_file(&socket);
+    let _ = std::fs::remove_dir(&socket_dir);
+}
+
+fn bind_test_socket(port: u16, label: &str) -> (PathBuf, PathBuf, tokio::net::UnixListener, u32) {
+    let directory = std::env::current_dir()
+        .expect("current directory")
+        .join(format!(".bct-{label}-{port}"));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("create trusted socket directory");
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o750))
+        .expect("set trusted socket directory mode");
+    let socket = directory.join("broker.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).expect("bind Basil UDS");
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o660))
+        .expect("set Basil UDS mode");
+    let uid = std::fs::metadata(&socket).expect("stat Basil UDS").uid();
+    (directory, socket, listener, uid)
 }
 
 /// Parse the `127.0.0.1:<port>` port out of an `alloc_addr()` `http://` URL.

@@ -136,7 +136,7 @@ hex_of() {
 
 main() {
   render_template "$SCRIPT_DIR/catalog.template.json" "$BASIL_EXAMPLE_CATALOG"
-  render_template "$SCRIPT_DIR/policy.template.json" "$BASIL_EXAMPLE_POLICY"
+  render_template "$SCRIPT_DIR/policy.template" "$BASIL_EXAMPLE_POLICY"
   make_secret_files
   build_binary
   init_bundle

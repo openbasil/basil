@@ -16,8 +16,8 @@ use basil_proto::{AeadAlgorithm, CiphertextEnvelope, KeyMaterial, KeyType};
 use super::pki::PkiClient;
 use super::transit::{TransitClient, transit_aead_type};
 use super::{
-    Backend, BackendError, KeyMetadata, KvSecret, KvValue, NewKey, PublicKey, SignOptions,
-    X509Bundle, X509Svid,
+    Backend, BackendError, KeyMetadata, KvSecret, KvValue, NewKey, NixCacheKeyPosture, PublicKey,
+    SignOptions, X509Bundle, X509Svid,
 };
 
 pub struct VaultBackend {
@@ -64,6 +64,29 @@ impl Backend for VaultBackend {
     ) -> Result<NewKey, BackendError> {
         self.transit
             .create_named_key(&self.token, key_id, key_type)
+            .await
+    }
+
+    async fn create_nix_cache_key(&self, key_id: &str) -> Result<(), BackendError> {
+        self.transit.create_nix_cache_key(&self.token, key_id).await
+    }
+
+    async fn nix_cache_key_posture(
+        &self,
+        key_id: &str,
+    ) -> Result<NixCacheKeyPosture, BackendError> {
+        self.transit
+            .read_nix_cache_key_posture(&self.token, key_id)
+            .await
+    }
+
+    async fn sign_nix_cache_fingerprint(
+        &self,
+        key_id: &str,
+        fingerprint: &[u8],
+    ) -> Result<super::NixCacheBackendSignature, BackendError> {
+        self.transit
+            .sign_nix_cache_fingerprint(&self.token, key_id, fingerprint)
             .await
     }
 

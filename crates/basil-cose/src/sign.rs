@@ -62,6 +62,9 @@ pub async fn build_signed_with_headers<S: Signer>(
         {
             return Err(BuildError::ResponseKeyNotText);
         }
+        if claims.response_public_key_cose.is_some() {
+            return Err(BuildError::ResponsePublicKeyRequiresEncryption);
+        }
     }
     let protected = codec::encode_sign1_protected_bare_with_headers(
         signer.algorithm(),

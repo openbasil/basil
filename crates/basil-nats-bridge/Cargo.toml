@@ -4,19 +4,19 @@
 
 [package]
 name = "basil-nats-bridge"
-description = "NATS request/reply courier for Basil sealed invocation envelopes."
 version.workspace = true
-edition.workspace = true
-license.workspace = true
 authors.workspace = true
-repository.workspace = true
-homepage.workspace = true
-documentation = "https://docs.openbasil.org/clients/nats-bridge/"
-keywords = ["basil", "nats", "grpc", "bridge", "messaging"]
-categories = ["network-programming", "command-line-utilities"]
-rust-version = "1.88"
-publish = true
 autobins = false
+categories = ["network-programming", "command-line-utilities"]
+documentation = "https://docs.openbasil.org/clients/nats-bridge/"
+edition.workspace = true
+homepage.workspace = true
+keywords = ["basil", "nats", "grpc", "bridge", "messaging"]
+license.workspace = true
+publish = true
+repository.workspace = true
+rust-version = "1.88"
+description = "NATS request/reply courier for Basil sealed invocation envelopes."
 
 [package.metadata.dist]
 # Keep the bridge in GitHub release archives and shell installers, but do not
@@ -32,23 +32,25 @@ default = []
 secure-alloc = ["mimalloc/secure"]
 
 [dependencies]
+basil-courier = { workspace = true }
 basil-proto = { workspace = true }
 
 anyhow = { workspace = true }
-async-nats = { workspace = true }
+async-nats = { workspace = true, features = ["jetstream", "kv"] }
 async-trait = { workspace = true }
+base64 = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true }
 futures = { workspace = true }
-hyper-util = { workspace = true }
+getrandom = { workspace = true }
 mimalloc = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true, features = ["std"] }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 tonic = { workspace = true }
-tower = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 

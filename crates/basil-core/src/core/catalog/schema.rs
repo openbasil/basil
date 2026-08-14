@@ -9,9 +9,12 @@
 //! (`ed25519-nkey`, `ascii-printable`, …).
 
 use std::collections::BTreeMap;
+use std::fmt;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use basil_proto::KeyType;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 /// The catalog: one document, per-generation immutable.
 ///
@@ -289,6 +292,92 @@ pub enum MissingPolicy {
     Generate,
 }
 
+/// Enrollment state for a purpose-bound Nix binary-cache signing identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NixCacheState {
+    /// Backend material has not yet been enrolled and no public key is pinned.
+    Pending,
+    /// Version-one backend material and its public key are pinned for use.
+    Enrolled,
+}
+
+/// A canonical padded-standard-base64 Ed25519 public key.
+///
+/// The representation is validated during deserialization and retained as the
+/// decoded 32 bytes. Serialization always emits the single canonical padded
+/// spelling, so an accepted catalog cannot carry an alternative text encoding.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NixCachePublicKey([u8; 32]);
+
+impl NixCachePublicKey {
+    /// Construct a public-key pin from exact Ed25519 public bytes.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Return the exact decoded Ed25519 public bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for NixCachePublicKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("NixCachePublicKey")
+            .field(&STANDARD.encode(self.0))
+            .finish()
+    }
+}
+
+impl Serialize for NixCachePublicKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&STANDARD.encode(self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for NixCachePublicKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        let decoded = STANDARD
+            .decode(&encoded)
+            .map_err(|_| de::Error::custom("nixCache publicKey must be padded standard base64"))?;
+        let bytes: [u8; 32] = decoded
+            .try_into()
+            .map_err(|_| de::Error::custom("nixCache publicKey must decode to exactly 32 bytes"))?;
+        if STANDARD.encode(bytes) != encoded {
+            return Err(de::Error::custom(
+                "nixCache publicKey must use canonical padded standard base64",
+            ));
+        }
+        Ok(Self(bytes))
+    }
+}
+
+/// Purpose-bound identity metadata for one Nix binary-cache signing key.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NixCacheIdentity {
+    /// Nix verifier identity, unique across the entire catalog.
+    pub key_name: String,
+    /// Whether the backend material is pending enrollment or already pinned.
+    pub state: NixCacheState,
+    /// Immutable backend key version. Version 1 is the only v1 value.
+    pub backend_version: u32,
+    /// Enrolled Ed25519 public-key pin; absent while pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<NixCachePublicKey>,
+}
+
 /// Optional COSE unseal-context pinning for a [`Class::Sealing`] key
 /// (`basil-2rqj`).
 ///
@@ -411,6 +500,9 @@ pub struct KeyEntry {
     /// Behavior when the material is absent at reconcile (default `Error`, §3.7).
     #[serde(default)]
     pub missing: MissingPolicy,
+    /// Optional purpose-bound Nix binary-cache signing identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nix_cache: Option<NixCacheIdentity>,
     /// Generation recipe (value/public material only, §2.5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generate: Option<GenerateSpec>,

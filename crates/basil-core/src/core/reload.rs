@@ -19,7 +19,11 @@
 //! The reloadable surface is the **content** the [`Pdp`](crate::catalog::Pdp) and
 //! the audit trail consume: the entire policy (rules / roles / name + membership
 //! tables) and the per-key *authorization* attributes: `writable`, `labels`,
-//! `description`, `missing`. The **routing shape** is restart-only:
+//! `description`, `missing`. A declared `nixCache` identity has one additional,
+//! purpose-specific transition: `pending` may become `enrolled` exactly once.
+//! Its name, route, version, and enrolled public key are process-lifetime
+//! immutable, including through a monotonic enrolled-name tombstone. The
+//! **routing shape** is otherwise restart-only:
 //! the [`BackendManager`](crate::manager::BackendManager) and the live backend
 //! instances were built from the sealed bundle at startup, so adding/removing a
 //! backend, or changing any key's `class`/`backend`/`path`/`engine`/`key_type`/
@@ -43,7 +47,7 @@
 //! path beyond what startup reconcile already settled.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::catalog::loader::LoadError;
@@ -61,28 +65,20 @@ use crate::state::{BrokerState, Generation};
 /// Stored on [`BrokerState`] at construction so the reload engine reads from the
 /// **same** paths startup used, never from anywhere else, never from the wire.
 #[derive(Debug, Clone)]
-pub enum ReloadInputs {
-    /// A schema-3 corpus selected by one bootstrap.
-    Corpus {
-        /// Path to the selected schema-3 bootstrap.
-        config_path: std::path::PathBuf,
-        /// Immutable startup overrides reapplied to every candidate.
-        overrides: Vec<ConfigOverride>,
-    },
-    /// The catalog and policy paths accepted by Basil 0.7.1.
-    Direct {
-        /// Path to the exported catalog JSON.
-        catalog_path: std::path::PathBuf,
-        /// Path to the exported policy JSON.
-        policy_path: std::path::PathBuf,
-    },
+pub struct ReloadInputs {
+    /// Path to the selected schema-3 bootstrap.
+    pub config_path: std::path::PathBuf,
+    /// Immutable startup overrides reapplied to every candidate.
+    pub overrides: Vec<ConfigOverride>,
 }
 
 /// The result of a **successful** [`reload_generation`].
 ///
 /// Carries the old → new generation ids plus summary counts so the SIGHUP handler
-/// (and the future gRPC admin-reload, `basil-atq`) can log/return what changed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// (and the gRPC admin-reload, `basil-atq`) can log/return what changed, and the
+/// candidate-aware listener impact so a dry-run reports exactly what a SIGHUP
+/// would do to the listener surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReloadOutcome {
     /// The generation id that was serving before the swap.
     pub previous_generation: u64,
@@ -92,6 +88,10 @@ pub struct ReloadOutcome {
     pub key_count: usize,
     /// Number of resolved policy allow-grants in the new generation.
     pub grant_count: usize,
+    /// Every listener the candidate adds, removes, or reconfigures, with its
+    /// exact active-transport count at assessment time. Empty when the
+    /// candidate changes no listener.
+    pub listener_impacts: Vec<crate::transport::listener_manager::ListenerImpact>,
 }
 
 /// Why a [`reload_generation`] was **rejected**. On any of these the previous
@@ -125,6 +125,25 @@ pub enum ReloadError {
     #[error("validating reloaded configuration corpus: {0}")]
     Configuration(#[from] crate::configuration::ConfigurationError),
 
+    /// Typed listener inputs failed closed validation.
+    #[error("validating reloaded listener inputs: {0}")]
+    ListenerConfiguration(String),
+
+    /// CI federation trust or generation-owned clients failed validation.
+    #[error("validating reloaded CI federation trust: {0}")]
+    Federation(#[from] crate::core::ci_federation::FederationError),
+
+    /// Listener transition could not be committed without disruption.
+    #[error("validating listener transition: {0}")]
+    ListenerTransition(String),
+
+    /// A listener removal or reconfiguration still has accepted transports, so
+    /// applying the candidate would disrupt them. The carried impact set names
+    /// exactly the blocking listeners and their active-transport counts (the
+    /// candidate-aware SIGHUP impact an operator drains before retrying).
+    #[error("validating listener transition: {0}")]
+    ListenerTransitionBlocked(#[from] crate::transport::listener_manager::ActiveListenerTransition),
+
     /// The candidate changed a **restart-only** routing dimension (a backend was
     /// added/removed/repathed, or a key's `backend`/`path`/`engine`/`key_type`/
     /// `public_path` changed). Such an edit needs a re-unlock and is rejected on
@@ -132,11 +151,21 @@ pub enum ReloadError {
     #[error("reload touches a restart-only routing dimension: {0}")]
     RoutingShapeChanged(String),
 
+    /// A candidate violated the one-way, process-lifetime Nix cache identity
+    /// enrollment contract.
+    #[error("reload violates immutable nixCache identity: {0}")]
+    NixCacheIdentityChanged(String),
+
     /// The broker was constructed without [`ReloadInputs`] (no configured
     /// catalog/policy paths), so it has nothing to re-read. A reload is a no-op
     /// fail-closed rather than reading from an unknown source.
     #[error("reload unavailable: broker has no configured catalog/policy paths")]
     NoInputs,
+
+    /// A synchronous reload was attempted after live accept-loop management was
+    /// installed; callers must use [`reload_generation_live`].
+    #[error("reload requires the listener-aware asynchronous reload path")]
+    LiveRuntimeRequired,
 }
 
 impl ReloadError {
@@ -146,9 +175,16 @@ impl ReloadError {
         match self {
             Self::ReadInput { .. } => "configuration_read_failed",
             Self::TornSnapshot { .. } => "inputs_changed_during_read",
-            Self::Validate(_) | Self::Configuration(_) => "validation_failed",
+            Self::Validate(_)
+            | Self::Configuration(_)
+            | Self::ListenerConfiguration(_)
+            | Self::Federation(_)
+            | Self::ListenerTransition(_) => "validation_failed",
+            Self::ListenerTransitionBlocked(_) => "listener_transition_blocked",
             Self::RoutingShapeChanged(_) => "routing_shape_changed",
+            Self::NixCacheIdentityChanged(_) => "nix_cache_identity_changed",
             Self::NoInputs => "no_reload_inputs",
+            Self::LiveRuntimeRequired => "listener_runtime_required",
         }
     }
 }
@@ -170,6 +206,8 @@ struct BackendShape {
 /// backend instance, a backend-native locator, and the materialize footprint.
 /// `writable` is not here (it is reloadable), but `class` selects the op surface,
 /// engine inference, and the materialize arm, so it is restart-only shape.
+/// `nixCache` is validated separately because its sole pending-to-enrolled
+/// transition is reloadable while all of its identity fields are immutable.
 #[derive(Debug, PartialEq, Eq)]
 struct KeyShape {
     class: Class,
@@ -247,6 +285,92 @@ fn ensure_reloadable(current: &Catalog, candidate: &Catalog) -> Result<(), Reloa
     Ok(())
 }
 
+fn ensure_nix_cache_reloadable(
+    current: &Catalog,
+    candidate: &Catalog,
+    enrolled_tombstones: &BTreeSet<String>,
+) -> Result<(), ReloadError> {
+    for (key_id, current_key) in &current.keys {
+        let candidate_key = candidate.keys.get(key_id).ok_or_else(|| {
+            ReloadError::NixCacheIdentityChanged(format!("catalog key `{key_id}` was removed"))
+        })?;
+        match (
+            current_key.nix_cache.as_ref(),
+            candidate_key.nix_cache.as_ref(),
+        ) {
+            (None, None) => {}
+            (None, Some(_)) => {
+                return Err(ReloadError::NixCacheIdentityChanged(format!(
+                    "catalog key `{key_id}` added nixCache metadata; declare the identity at startup"
+                )));
+            }
+            (Some(_), None) => {
+                return Err(ReloadError::NixCacheIdentityChanged(format!(
+                    "catalog key `{key_id}` removed nixCache metadata"
+                )));
+            }
+            (Some(previous), Some(next)) => {
+                if previous.key_name != next.key_name {
+                    return Err(ReloadError::NixCacheIdentityChanged(format!(
+                        "catalog key `{key_id}` changed keyName"
+                    )));
+                }
+                if previous.backend_version != next.backend_version {
+                    return Err(ReloadError::NixCacheIdentityChanged(format!(
+                        "catalog key `{key_id}` changed backendVersion"
+                    )));
+                }
+                match (previous.state, next.state) {
+                    (
+                        crate::catalog::NixCacheState::Pending,
+                        crate::catalog::NixCacheState::Pending
+                        | crate::catalog::NixCacheState::Enrolled,
+                    ) => {}
+                    (
+                        crate::catalog::NixCacheState::Enrolled,
+                        crate::catalog::NixCacheState::Pending,
+                    ) => {
+                        return Err(ReloadError::NixCacheIdentityChanged(format!(
+                            "catalog key `{key_id}` moved from enrolled back to pending"
+                        )));
+                    }
+                    (
+                        crate::catalog::NixCacheState::Enrolled,
+                        crate::catalog::NixCacheState::Enrolled,
+                    ) => {
+                        if previous.public_key != next.public_key {
+                            return Err(ReloadError::NixCacheIdentityChanged(format!(
+                                "catalog key `{key_id}` replaced its enrolled publicKey"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for (key_id, candidate_key) in &candidate.keys {
+        let Some(identity) = candidate_key.nix_cache.as_ref() else {
+            continue;
+        };
+        if !enrolled_tombstones.contains(&identity.key_name) {
+            continue;
+        }
+        let preserves_current_enrollment = current.keys.get(key_id).is_some_and(|current_key| {
+            current_key.nix_cache.as_ref().is_some_and(|previous| {
+                previous.state == crate::catalog::NixCacheState::Enrolled && previous == identity
+            })
+        });
+        if !preserves_current_enrollment {
+            return Err(ReloadError::NixCacheIdentityChanged(format!(
+                "keyName `{}` was already enrolled during this process lifetime",
+                identity.key_name
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn spiffe_bundle_publishers(catalog: &Catalog) -> BTreeMap<String, (String, String)> {
     catalog
         .keys
@@ -291,6 +415,51 @@ struct FileFingerprint {
     mtime_nsec: i64,
     ctime_sec: i64,
     ctime_nsec: i64,
+}
+
+const MAX_RELOAD_FINGERPRINT_PATHS: usize = 2048;
+
+#[derive(Debug)]
+struct ReloadFingerprintSnapshot {
+    files: BTreeMap<PathBuf, FileFingerprint>,
+}
+
+impl ReloadFingerprintSnapshot {
+    fn capture(paths: impl IntoIterator<Item = PathBuf>) -> Result<Self, ReloadError> {
+        let mut snapshot = Self {
+            files: BTreeMap::new(),
+        };
+        snapshot.extend(paths)?;
+        Ok(snapshot)
+    }
+
+    fn extend(&mut self, paths: impl IntoIterator<Item = PathBuf>) -> Result<(), ReloadError> {
+        for path in paths {
+            if self.files.contains_key(&path) {
+                continue;
+            }
+            if self.files.len() >= MAX_RELOAD_FINGERPRINT_PATHS {
+                return Err(ReloadError::Configuration(
+                    crate::configuration::ConfigurationError::InvalidCorpus(
+                        "reload input fingerprint set exceeds safety bound".to_owned(),
+                    ),
+                ));
+            }
+            self.files.insert(path.clone(), fingerprint(&path)?);
+        }
+        Ok(())
+    }
+
+    fn verify_unchanged(&self) -> Result<(), ReloadError> {
+        for (path, expected) in &self.files {
+            if expected != &fingerprint(path)? {
+                return Err(ReloadError::TornSnapshot {
+                    path: path.display().to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(unix)]
@@ -344,60 +513,70 @@ fn read_reload_inputs_with_observer_and_context(
     trace_context: ConfigurationTraceContext,
 ) -> Result<CorpusDocuments, ReloadError> {
     let mut traces = Vec::new();
-    let result = read_reload_inputs_with_observer_and_collector(inputs, observer, &mut traces);
+    let result = read_reload_inputs_with_observer_and_collector(inputs, observer, &mut traces)
+        .map(|(documents, _, _, _)| documents);
     for trace in &traces {
         emit_configuration_source_trace(trace, trace_context, result.is_ok());
     }
     result
 }
 
+type ReloadInputsResult = (
+    CorpusDocuments,
+    crate::transport::listener::ListenerConfigSet,
+    Option<Arc<crate::core::ci_federation::ProviderCatalog>>,
+    ReloadFingerprintSnapshot,
+);
+
+#[cfg(test)]
+fn read_reload_inputs_with_bootstrap_observer(
+    inputs: &ReloadInputs,
+    observer: impl FnOnce(),
+) -> Result<CorpusDocuments, ReloadError> {
+    let mut traces = Vec::new();
+    read_reload_inputs_with_observers_and_collector(inputs, observer, || {}, &mut traces)
+        .map(|(documents, _, _, _)| documents)
+}
+
 fn read_reload_inputs_with_observer_and_collector(
     inputs: &ReloadInputs,
     observer: impl FnOnce(),
     traces: &mut Vec<ConfigurationSourceTrace>,
-) -> Result<CorpusDocuments, ReloadError> {
-    match inputs {
-        ReloadInputs::Corpus {
-            config_path,
-            overrides,
-        } => read_corpus_reload_inputs(config_path, overrides, observer, traces),
-        ReloadInputs::Direct {
-            catalog_path,
-            policy_path,
-        } => read_direct_reload_inputs(catalog_path, policy_path, observer, traces),
-    }
+) -> Result<ReloadInputsResult, ReloadError> {
+    read_reload_inputs_with_observers_and_collector(inputs, || {}, observer, traces)
 }
 
-fn read_corpus_reload_inputs(
-    config_path: &Path,
-    overrides: &[ConfigOverride],
+fn read_reload_inputs_with_observers_and_collector(
+    inputs: &ReloadInputs,
+    bootstrap_observer: impl FnOnce(),
     observer: impl FnOnce(),
     traces: &mut Vec<ConfigurationSourceTrace>,
-) -> Result<CorpusDocuments, ReloadError> {
-    let config_before = fingerprint(config_path)?;
-    let bootstrap = load_bootstrap_with_trace_collector(Some(config_path), overrides, traces)?;
-    let paths = [
+) -> Result<ReloadInputsResult, ReloadError> {
+    // Seed the snapshot before reading the bootstrap. Keeping this exact
+    // fingerprint through the final verification closes the gap where an atomic
+    // replacement after parsing could otherwise pair old listener values
+    // with newly discovered corpus inputs.
+    let mut snapshot = ReloadFingerprintSnapshot::capture([inputs.config_path.clone()])?;
+    let bootstrap =
+        load_bootstrap_with_trace_collector(Some(&inputs.config_path), &inputs.overrides, traces)?;
+    let federation =
+        crate::agent_cli::parse_reload_federation_config(&bootstrap.value).map_err(|error| {
+            ReloadError::Configuration(crate::configuration::ConfigurationError::InvalidCorpus(
+                error.to_string(),
+            ))
+        })?;
+    let listeners = crate::agent_cli::parse_reload_listener_config(&bootstrap.value)
+        .map_err(|error| ReloadError::ListenerConfiguration(error.to_string()))?;
+    // Verify immediately after every source and bootstrap-owned serving value is
+    // discovered. The final verification below protects the same fingerprint
+    // through candidate installation.
+    bootstrap_observer();
+    snapshot.verify_unchanged()?;
+    let paths = vec![
         bootstrap.sources.catalog.clone(),
         bootstrap.sources.policy.clone(),
     ];
-    let before = paths
-        .iter()
-        .map(|path| fingerprint(path).map(|value| (path.clone(), value)))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    observer();
-    if config_before != fingerprint(config_path)? {
-        return Err(ReloadError::TornSnapshot {
-            path: config_path.display().to_string(),
-        });
-    }
-    for (path, expected) in &before {
-        if expected != &fingerprint(path)? {
-            return Err(ReloadError::TornSnapshot {
-                path: path.display().to_string(),
-            });
-        }
-    }
+    snapshot.extend(paths)?;
     let documents = load_documents_with_trace_collector(
         &bootstrap.sources,
         &bootstrap.document_overrides,
@@ -408,80 +587,11 @@ fn read_corpus_reload_inputs(
         crate::configuration::ConfigurationError::Catalog(error) => ReloadError::Validate(error),
         other => ReloadError::Configuration(other),
     })?;
-
-    if config_before != fingerprint(config_path)? {
-        return Err(ReloadError::TornSnapshot {
-            path: config_path.display().to_string(),
-        });
-    }
-    for (path, expected) in before {
-        if expected != fingerprint(&path)? {
-            return Err(ReloadError::TornSnapshot {
-                path: path.display().to_string(),
-            });
-        }
-    }
-    Ok(documents)
-}
-
-fn read_direct_reload_inputs(
-    catalog_path: &Path,
-    policy_path: &Path,
-    observer: impl FnOnce(),
-    traces: &mut Vec<ConfigurationSourceTrace>,
-) -> Result<CorpusDocuments, ReloadError> {
-    let paths = [catalog_path, policy_path];
-    let before = paths
-        .iter()
-        .map(|path| fingerprint(path))
-        .collect::<Result<Vec<_>, _>>()?;
-    let (catalog_bytes, catalog_trace) =
-        crate::configuration::read_configuration_source("catalog", None, catalog_path).map_err(
-            |source| ReloadError::ReadInput {
-                path: catalog_path.display().to_string(),
-                source,
-            },
-        )?;
-    traces.push(catalog_trace);
-    let (policy_bytes, policy_trace) =
-        crate::configuration::read_configuration_source("policy", None, policy_path).map_err(
-            |source| ReloadError::ReadInput {
-                path: policy_path.display().to_string(),
-                source,
-            },
-        )?;
-    traces.push(policy_trace);
+    // The observer models a writer racing after every input has been identified
+    // and fingerprinted but before trust bytes are captured for the candidate.
     observer();
-    for (path, expected) in paths.iter().zip(&before) {
-        if *expected != fingerprint(path)? {
-            return Err(ReloadError::TornSnapshot {
-                path: path.display().to_string(),
-            });
-        }
-    }
-    let catalog_json = std::str::from_utf8(&catalog_bytes).map_err(|source| {
-        ReloadError::Configuration(crate::configuration::ConfigurationError::DecodeDocument {
-            slot: "catalog".to_string(),
-            path: catalog_path.to_path_buf(),
-            source,
-        })
-    })?;
-    let policy_json = std::str::from_utf8(&policy_bytes).map_err(|source| {
-        ReloadError::Configuration(crate::configuration::ConfigurationError::DecodeDocument {
-            slot: "policy".to_string(),
-            path: policy_path.to_path_buf(),
-            source,
-        })
-    })?;
-    let (catalog, policy, policy_config, warnings) =
-        crate::catalog::load(catalog_json, policy_json)?;
-    Ok(CorpusDocuments {
-        catalog,
-        policy,
-        policy_config,
-        warnings,
-        overrides: Vec::new(),
-    })
+    snapshot.verify_unchanged()?;
+    Ok((documents, listeners, federation, snapshot))
 }
 
 fn fingerprint(path: &Path) -> Result<FileFingerprint, ReloadError> {
@@ -505,6 +615,8 @@ struct ValidatedCandidate {
     policy: ResolvedPolicy,
     config: Config,
     overrides: Vec<OverrideProvenance>,
+    federation: Option<Arc<crate::core::ci_federation::ProviderCatalog>>,
+    listeners: crate::transport::listener::ListenerConfigSet,
     outcome: ReloadOutcome,
     bundle_changed_trust_domains: Vec<String>,
 }
@@ -542,14 +654,28 @@ fn validate_candidate_with_trace_collector(
     state: &BrokerState,
     traces: &mut Vec<ConfigurationSourceTrace>,
 ) -> Result<ValidatedCandidate, ReloadError> {
+    validate_candidate_with_trace_collector_and_observer(state, traces, || {})
+}
+
+fn validate_candidate_with_trace_collector_and_observer(
+    state: &BrokerState,
+    traces: &mut Vec<ConfigurationSourceTrace>,
+    observer: impl FnOnce(),
+) -> Result<ValidatedCandidate, ReloadError> {
     let inputs = state.reload_inputs().ok_or(ReloadError::NoInputs)?;
-    let CorpusDocuments {
-        catalog,
-        policy,
-        policy_config: config,
-        warnings,
-        overrides,
-    } = read_reload_inputs_with_observer_and_collector(inputs, || {}, traces)?;
+    let (
+        CorpusDocuments {
+            catalog,
+            policy,
+            policy_config: config,
+            warnings,
+            overrides,
+            ..
+        },
+        listeners,
+        federation,
+        input_snapshot,
+    ) = read_reload_inputs_with_observer_and_collector(inputs, || {}, traces)?;
     for w in &warnings {
         tracing::warn!(warning = %w, "reload: catalog/policy load warning");
     }
@@ -558,15 +684,28 @@ fn validate_candidate_with_trace_collector(
     // and (b) read the previous id to bump from: one coherent snapshot.
     let current = state.load_generation();
     ensure_reloadable(current.catalog(), &catalog)?;
-
+    ensure_nix_cache_reloadable(
+        current.catalog(),
+        &catalog,
+        &state.nix_cache_enrolled_tombstones(),
+    )?;
+    let listener_impacts = crate::transport::listener_manager::assess_transition(
+        current.listeners(),
+        &listeners,
+        state.connections(),
+    );
+    crate::transport::listener_manager::require_zero_active(&listener_impacts)?;
     let previous_generation = current.id();
     let new_generation = previous_generation.saturating_add(1);
     let bundle_changed_trust_domains = bundle_changed_trust_domains(current.catalog(), &catalog);
+    observer();
+    input_snapshot.verify_unchanged()?;
     let outcome = ReloadOutcome {
         previous_generation,
         new_generation,
         key_count: catalog.keys.len(),
         grant_count: policy.grant_count(),
+        listener_impacts,
     };
 
     Ok(ValidatedCandidate {
@@ -574,6 +713,8 @@ fn validate_candidate_with_trace_collector(
         policy,
         config,
         overrides,
+        federation,
+        listeners,
         outcome,
         bundle_changed_trust_domains,
     })
@@ -614,6 +755,9 @@ pub fn check_reload(state: &BrokerState) -> Result<ReloadOutcome, ReloadError> {
 /// ([`ReloadError::Validate`]), or the candidate changes a restart-only routing
 /// dimension ([`ReloadError::RoutingShapeChanged`]).
 pub fn reload_generation(state: &BrokerState) -> Result<ReloadOutcome, ReloadError> {
+    if state.listener_runtime().is_some() {
+        return Err(ReloadError::LiveRuntimeRequired);
+    }
     // Serialize the whole validate→swap sequence: SIGHUP and the admin RPC can
     // trigger concurrently, and without this two reloads could both pin
     // generation N, both stamp N+1, and let the staler candidate silently
@@ -629,31 +773,137 @@ pub fn reload_generation(state: &BrokerState) -> Result<ReloadOutcome, ReloadErr
         policy,
         config,
         overrides,
+        federation,
+        listeners,
         outcome,
         bundle_changed_trust_domains,
     } = candidate;
 
-    let next = Generation::new_with_overrides(
+    let current = state.load_generation();
+    let (_, listener_guard) = crate::transport::listener_manager::begin_transition(
+        current.listeners(),
+        &listeners,
+        state.connections(),
+    )
+    .map_err(|error| match error {
+        crate::transport::listener_manager::ListenerTransitionError::Active(active) => {
+            ReloadError::ListenerTransitionBlocked(active)
+        }
+        registry @ crate::transport::listener_manager::ListenerTransitionError::Registry(_) => {
+            ReloadError::ListenerTransition(registry.to_string())
+        }
+    })?;
+    let rewire_updates = crate::transport::rewire::rewire_updates(
+        current.listeners(),
+        &listeners,
         outcome.new_generation,
-        Arc::new(catalog),
+        unix_now(),
+    );
+    let catalog = Arc::new(catalog);
+    let next = Generation::new_with_overrides_listeners_and_federation(
+        outcome.new_generation,
+        Arc::clone(&catalog),
         policy,
         config,
         overrides,
-    );
-    state.swap_generation(Arc::new(next));
-    for trust_domain in bundle_changed_trust_domains {
-        state.events().bundle_changed(trust_domain);
-    }
+        Arc::new(listeners),
+        federation,
+    )?;
+    drop(current);
+    listener_guard.commit(|| {
+        state.swap_generation(Arc::new(next));
+        state.record_nix_cache_enrollments(&catalog);
+        state.connections().rewire().apply(rewire_updates);
+        for trust_domain in bundle_changed_trust_domains {
+            state.events().bundle_changed(trust_domain);
+        }
+    });
 
+    Ok(outcome)
+}
+
+/// Wall-clock Unix seconds for diagnostic stamps; `0` before the epoch (never
+/// panics on a skewed clock).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+/// Reload a running agent and apply listener accept-loop changes atomically with
+/// the new generation.
+///
+/// When no live listener runtime is installed, this delegates to
+/// [`reload_generation`]. A running agent serializes validation and transition,
+/// gates affected listener admission, requires zero active transports for
+/// removals and reconfiguration, and swaps the generation only after every new
+/// socket has been published successfully.
+///
+/// # Errors
+///
+/// Returns the same validation errors as [`reload_generation`] plus a listener
+/// transition error when an accept loop cannot be changed or restored safely.
+pub async fn reload_generation_live(state: &BrokerState) -> Result<ReloadOutcome, ReloadError> {
+    let Some(runtime) = state.listener_runtime() else {
+        return reload_generation(state);
+    };
+    let _reload_guard = state.live_reload_lock().lock().await;
+    let candidate = validate_candidate(state)?;
+    let ValidatedCandidate {
+        catalog,
+        policy,
+        config,
+        overrides,
+        federation,
+        listeners,
+        outcome,
+        bundle_changed_trust_domains,
+    } = candidate;
+    let current = state.load_generation();
+    if current.id() != outcome.previous_generation {
+        return Err(ReloadError::ListenerTransition(
+            "serving generation changed during listener-aware reload".to_string(),
+        ));
+    }
+    let current_listeners = current.listeners().clone();
+    drop(current);
+    let rewire_updates = crate::transport::rewire::rewire_updates(
+        &current_listeners,
+        &listeners,
+        outcome.new_generation,
+        unix_now(),
+    );
+    let catalog = Arc::new(catalog);
+    let next = Generation::new_with_overrides_listeners_and_federation(
+        outcome.new_generation,
+        Arc::clone(&catalog),
+        policy,
+        config,
+        overrides,
+        Arc::new(listeners.clone()),
+        federation,
+    )?;
+    runtime
+        .transition(&current_listeners, &listeners, || {
+            state.swap_generation(Arc::new(next));
+            state.record_nix_cache_enrollments(&catalog);
+            state.connections().rewire().apply(rewire_updates);
+            for trust_domain in bundle_changed_trust_domains {
+                state.events().bundle_changed(trust_domain);
+            }
+        })
+        .await
+        .map_err(|error| ReloadError::ListenerTransition(error.to_string()))?;
     Ok(outcome)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
+    use base64::Engine as _;
     use basil_proto::KeyType;
     use tracing::field::{Field, Visit};
     use tracing::{Event, Level, Subscriber};
@@ -662,14 +912,19 @@ mod tests {
 
     use super::{
         ReloadError, ReloadInputs, check_reload, read_reload_inputs,
-        read_reload_inputs_with_observer, reload_generation,
-        validate_candidate_with_trace_collector,
+        read_reload_inputs_with_bootstrap_observer, read_reload_inputs_with_observer,
+        reload_generation, reload_generation_live, validate_candidate_with_trace_collector,
     };
     use crate::backend::{Backend, BackendError, NewKey};
     use crate::catalog::load;
     use crate::configuration::ConfigOverride;
     use crate::manager::BackendManager;
+    use crate::service::broker::InvocationRuntimeConfig;
     use crate::state::{BrokerState, INITIAL_GENERATION_ID};
+    use crate::transport::grpc_server::{ListenerRuntime, ListenerType, ServerConfig};
+    use crate::transport::listener::{
+        LegacyListenerConfig, ListenerConfigInput, ListenerConfigSet,
+    };
 
     #[derive(Clone, Default)]
     struct EventCapture {
@@ -819,6 +1074,26 @@ mod tests {
         .to_string()
     }
 
+    fn nix_catalog_json(state: &str, key_name: &str, public_key: Option<&str>) -> String {
+        let public_key =
+            public_key.map_or_else(String::new, |value| format!(r#", "publicKey": "{value}""#));
+        format!(
+            r#"{{
+              "schema": "catalog",
+              "backends": {{ "bao": {{ "kind": "vault", "addr": "http://127.0.0.1:8200" }} }},
+              "keys": {{
+                "cache.signer": {{
+                  "class": "asymmetric", "keyType": "ed25519", "backend": "bao",
+                  "engine": "transit", "path": "cache-signer", "writable": false,
+                  "nixCache": {{ "keyName": "{key_name}", "state": "{state}",
+                    "backendVersion": 1{public_key} }},
+                  "description": "Nix cache signer"
+                }}
+              }}
+            }}"#
+        )
+    }
+
     fn policy_json(grant_sign: bool) -> String {
         let rules = if grant_sign {
             r#"[ { "id": "r1", "subjects": ["svc.web"], "action": ["op:sign"], "target": ["web.signer"] } ]"#
@@ -828,7 +1103,7 @@ mod tests {
         format!(
             r#"{{
               "schema": "policy",
-              "subjects": {{ "svc.web": {{ "allOf": [ {{ "kind": "unix", "uid": 1000 }} ] }} }},
+              "subjects": {{ "svc.web": {{ "domain": "host-process", "match": {{ "all": [ {{ "process.uid": 1000 }} ] }} }} }},
               "roles": {{}},
               "rules": {rules},
               "config": {{}}
@@ -861,7 +1136,7 @@ mod tests {
         let mut backends: BTreeMap<String, Box<dyn Backend>> = BTreeMap::new();
         backends.insert("bao".into(), Box::new(NoopBackend));
         let manager = BackendManager::new(cat.clone(), backends).expect("manager builds");
-        let inputs = ReloadInputs::Corpus {
+        let inputs = ReloadInputs {
             config_path,
             overrides: Vec::new(),
         };
@@ -874,10 +1149,7 @@ mod tests {
     #[test]
     fn reload_reapplies_document_override_and_retains_provenance() {
         let (_state, mut inputs) = state_with_files(&catalog_json(false), &policy_json(false));
-        let ReloadInputs::Corpus { overrides, .. } = &mut inputs else {
-            panic!("fixture uses corpus reload inputs");
-        };
-        *overrides = vec![
+        inputs.overrides = vec![
             ConfigOverride::parse("catalog.keys.web.signer.writable=true")
                 .expect("override parses"),
         ];
@@ -886,54 +1158,15 @@ mod tests {
         assert!(first.catalog.keys.get("web.signer").expect("key").writable);
         assert_eq!(first.overrides[0].path, "catalog.keys.web.signer.writable");
 
-        let ReloadInputs::Corpus { config_path, .. } = &inputs else {
-            panic!("fixture uses corpus reload inputs");
-        };
-        let bootstrap = crate::load_bootstrap(Some(config_path), &[]).expect("bootstrap");
+        let bootstrap = crate::load_bootstrap(Some(&inputs.config_path), &[]).expect("bootstrap");
         std::fs::write(&bootstrap.sources.catalog, catalog_json(false)).expect("replace catalog");
         let second = read_reload_inputs(&inputs).expect("second candidate");
         assert!(second.catalog.keys.get("web.signer").expect("key").writable);
         assert_eq!(second.overrides[0].masked_source, bootstrap.sources.catalog);
     }
 
-    #[test]
-    fn direct_reload_inputs_keep_legacy_documents_working() {
-        let (_state, corpus_inputs) = state_with_files(&catalog_json(false), &policy_json(false));
-        let ReloadInputs::Corpus { config_path, .. } = &corpus_inputs else {
-            panic!("fixture uses corpus reload inputs");
-        };
-        let dir = config_path.parent().expect("config parent");
-        let catalog_path = dir.join("catalog.json");
-        let policy_path = dir.join("policy.json");
-        std::fs::write(
-            &catalog_path,
-            catalog_json(false).replacen("\"schema\": \"catalog\"", "\"schemaVersion\": 1", 1),
-        )
-        .expect("write catalog v1");
-        std::fs::write(
-            &policy_path,
-            policy_json(false).replacen("\"schema\": \"policy\"", "\"schemaVersion\": 2", 1),
-        )
-        .expect("write policy v2");
-        let inputs = ReloadInputs::Direct {
-            catalog_path,
-            policy_path,
-        };
-
-        let documents = read_reload_inputs(&inputs).expect("legacy direct reload succeeds");
-
-        assert_eq!(
-            documents.catalog.schema,
-            crate::catalog::CatalogSchema::Catalog
-        );
-        assert!(documents.overrides.is_empty());
-    }
-
     fn write_files(inputs: &ReloadInputs, catalog: &str, policy: &str) {
-        let ReloadInputs::Corpus { config_path, .. } = inputs else {
-            panic!("fixture uses corpus reload inputs");
-        };
-        let dir = config_path.parent().expect("config parent");
+        let dir = inputs.config_path.parent().expect("config parent");
         std::fs::write(dir.join("catalog.json"), catalog).expect("rewrite catalog");
         std::fs::write(dir.join("policy.json"), policy).expect("rewrite policy");
     }
@@ -966,6 +1199,285 @@ mod tests {
         assert_eq!(state.active_generation_id(), INITIAL_GENERATION_ID + 1);
     }
 
+    #[test]
+    fn nix_cache_pending_enrolls_once_and_check_is_non_mutating() {
+        let pending = nix_catalog_json("pending", "cache.example.org-1", None);
+        let (state, inputs) = state_with_files(&pending, &policy_json(false));
+        assert!(state.nix_cache_enrolled_tombstones().is_empty());
+
+        let public_key = base64::engine::general_purpose::STANDARD.encode([0x42; 32]);
+        let enrolled = nix_catalog_json("enrolled", "cache.example.org-1", Some(&public_key));
+        write_files(&inputs, &enrolled, &policy_json(false));
+        check_reload(&state).expect("pending to enrolled dry-run validates");
+        assert!(
+            state.nix_cache_enrolled_tombstones().is_empty(),
+            "a dry-run must not mutate enrollment history"
+        );
+
+        reload_generation(&state).expect("pending to enrolled reload applies");
+        let current = state.load_generation();
+        assert_eq!(
+            current.catalog().keys["cache.signer"]
+                .nix_cache
+                .as_ref()
+                .expect("identity")
+                .state,
+            crate::catalog::NixCacheState::Enrolled
+        );
+        assert_eq!(
+            state.nix_cache_enrolled_tombstones(),
+            BTreeSet::from(["cache.example.org-1".to_string()])
+        );
+    }
+
+    #[test]
+    fn nix_cache_enrollment_reverse_replacement_and_removal_fail_closed() {
+        let public_key = base64::engine::general_purpose::STANDARD.encode([0x42; 32]);
+        let enrolled = nix_catalog_json("enrolled", "cache.example.org-1", Some(&public_key));
+        let (state, inputs) = state_with_files(&enrolled, &policy_json(false));
+        let initial_generation = state.active_generation_id();
+        let replacement = base64::engine::general_purpose::STANDARD.encode([0x43; 32]);
+        let mut without_identity: serde_json::Value =
+            serde_json::from_str(&enrolled).expect("enrolled JSON parses");
+        without_identity["keys"]["cache.signer"]
+            .as_object_mut()
+            .expect("key is an object")
+            .remove("nixCache");
+        let without_identity =
+            serde_json::to_string(&without_identity).expect("candidate serializes");
+        let candidates = [
+            nix_catalog_json("pending", "cache.example.org-1", None),
+            nix_catalog_json("enrolled", "cache.example.org-1", Some(&replacement)),
+            nix_catalog_json("enrolled", "cache.example.org-2", Some(&public_key)),
+            without_identity,
+        ];
+        for candidate in candidates {
+            write_files(&inputs, &candidate, &policy_json(false));
+            assert!(
+                matches!(
+                    reload_generation(&state),
+                    Err(ReloadError::NixCacheIdentityChanged(_))
+                ),
+                "immutable identity edit must fail closed"
+            );
+            assert_eq!(state.active_generation_id(), initial_generation);
+        }
+    }
+
+    #[test]
+    fn nix_cache_metadata_cannot_be_added_by_reload() {
+        let generic = catalog_json(false);
+        let (state, inputs) = state_with_files(&generic, &policy_json(false));
+        let pending = generic.replacen(
+            r#", "writable": false, "description": "a signer""#,
+            r#", "writable": false, "nixCache": { "keyName": "cache.example.org-1", "state": "pending", "backendVersion": 1 }, "description": "a signer""#,
+            1,
+        );
+        write_files(&inputs, &pending, &policy_json(false));
+        assert!(matches!(
+            reload_generation(&state),
+            Err(ReloadError::NixCacheIdentityChanged(_))
+        ));
+    }
+
+    #[test]
+    fn nix_cache_tombstone_rejects_redeclaration_after_absence() {
+        let current_json = catalog_json(false);
+        let candidate_json = current_json.replacen(
+            r#", "writable": false, "description": "a signer""#,
+            r#", "writable": false, "nixCache": { "keyName": "cache.example.org-1", "state": "pending", "backendVersion": 1 }, "description": "a signer""#,
+            1,
+        );
+        let (current, _, _, _) = load(&current_json, &policy_json(false)).expect("current loads");
+        let (candidate, _, _, _) =
+            load(&candidate_json, &policy_json(false)).expect("candidate loads");
+        assert!(matches!(
+            super::ensure_nix_cache_reloadable(
+                &current,
+                &candidate,
+                &BTreeSet::from(["cache.example.org-1".to_string()]),
+            ),
+            Err(ReloadError::NixCacheIdentityChanged(_))
+        ));
+    }
+
+    #[test]
+    fn failed_nix_cache_reload_does_not_add_tombstone() {
+        let pending = nix_catalog_json("pending", "cache.example.org-1", None);
+        let (state, inputs) = state_with_files(&pending, &policy_json(false));
+        let public_key = base64::engine::general_purpose::STANDARD.encode([0x42; 32]);
+        let enrolled = nix_catalog_json("enrolled", "cache.example.org-1", Some(&public_key));
+        write_files(&inputs, &enrolled, "not-json");
+        assert!(reload_generation(&state).is_err());
+        assert!(state.nix_cache_enrolled_tombstones().is_empty());
+    }
+
+    #[test]
+    fn listener_candidate_uses_bootstrap_snapshot_and_commits_with_generation() {
+        let (state, inputs) = state_with_files(&catalog_json(false), &policy_json(false));
+        let socket = format!("/tmp/basil-reload-listener-{}.sock", uuid::Uuid::new_v4());
+        std::fs::write(
+            &inputs.config_path,
+            format!(
+                "schema = \"agent\"\nschemaVersion = 3\n[import]\ncatalog = \"catalog.json\"\npolicy = \"policy.json\"\nbundle = \"bundle.age\"\n[listeners.control]\ntype = \"host\"\npath = {socket:?}\nmode = \"0600\"\n"
+            ),
+        )
+        .expect("write named listener candidate");
+
+        let dry = check_reload(&state).expect("listener dry-run validates");
+        assert_eq!(dry.previous_generation, INITIAL_GENERATION_ID);
+        let pinned = state.load_generation();
+        assert_eq!(pinned.id(), INITIAL_GENERATION_ID);
+        assert!(pinned.listeners().get("control").is_none());
+
+        reload_generation(&state).expect("listener candidate commits");
+        let current = state.load_generation();
+        let control = current
+            .listeners()
+            .get("control")
+            .expect("control listener installed");
+        assert_eq!(control.path(), std::path::Path::new(&socket));
+        assert_eq!(current.id(), INITIAL_GENERATION_ID + 1);
+        assert_eq!(pinned.id(), INITIAL_GENERATION_ID);
+        assert!(pinned.listeners().get("control").is_none());
+    }
+
+    #[test]
+    fn reload_treats_courier_type_change_as_listener_routing_reconfiguration() {
+        use crate::transport::listener_manager::ListenerChangeKind;
+
+        let (state, inputs) = state_with_files(&catalog_json(false), &policy_json(false));
+        let parent = inputs.config_path.parent().expect("config parent");
+        let host_socket = parent.join("host.sock");
+        let edge_socket = parent.join("edge.sock");
+        let initial = ListenerConfigSet::resolve(
+            BTreeMap::from([
+                (
+                    "host".to_string(),
+                    ListenerConfigInput {
+                        listener_type: ListenerType::Host,
+                        path: host_socket.clone(),
+                        mode: None,
+                        group: None,
+                    },
+                ),
+                (
+                    "edge".to_string(),
+                    ListenerConfigInput {
+                        listener_type: ListenerType::Host,
+                        path: edge_socket.clone(),
+                        mode: None,
+                        group: None,
+                    },
+                ),
+            ]),
+            LegacyListenerConfig::default(),
+        )
+        .expect("initial listeners validate");
+        let state = Arc::new(
+            Arc::try_unwrap(state)
+                .unwrap_or_else(|_| panic!("fixture state has one owner"))
+                .with_listener_configs(initial),
+        );
+        std::fs::write(
+            &inputs.config_path,
+            format!(
+                "schema = \"agent\"\nschemaVersion = 3\n[import]\ncatalog = \"catalog.json\"\npolicy = \"policy.json\"\nbundle = \"bundle.age\"\n[listeners.host]\ntype = \"host\"\npath = {host_socket:?}\n[listeners.edge]\ntype = \"courier\"\npath = {edge_socket:?}\n"
+            ),
+        )
+        .expect("write courier listener candidate");
+
+        let dry = check_reload(&state).expect("courier type candidate validates");
+        assert_eq!(dry.listener_impacts.len(), 1, "{:?}", dry.listener_impacts);
+        let impact = dry
+            .listener_impacts
+            .first()
+            .expect("one type reconfiguration");
+        assert_eq!(impact.name(), "edge");
+        assert_eq!(impact.kind(), ListenerChangeKind::Reconfigure);
+        assert_eq!(impact.previous_path(), Some(edge_socket.as_path()));
+        assert_eq!(impact.new_path(), Some(edge_socket.as_path()));
+
+        reload_generation(&state).expect("courier type candidate applies");
+        assert_eq!(
+            state
+                .load_generation()
+                .listeners()
+                .get("edge")
+                .expect("edge listener retained")
+                .listener_type(),
+            ListenerType::Courier
+        );
+    }
+
+    #[tokio::test]
+    async fn live_reload_publishes_added_listener_with_generation() {
+        let (state, inputs) = state_with_files(&catalog_json(false), &policy_json(false));
+        let parent = inputs.config_path.parent().expect("config parent");
+        let host_socket = parent.join("host.sock");
+        let workload_socket = parent.join("workload.sock");
+        let initial = ListenerConfigSet::resolve(
+            BTreeMap::from([(
+                "control".to_string(),
+                ListenerConfigInput {
+                    listener_type: ListenerType::Host,
+                    path: host_socket.clone(),
+                    mode: None,
+                    group: None,
+                },
+            )]),
+            LegacyListenerConfig::default(),
+        )
+        .expect("initial listener config");
+        let state = Arc::new(
+            Arc::try_unwrap(state)
+                .unwrap_or_else(|_| panic!("fixture state has one owner"))
+                .with_listener_configs(initial),
+        );
+        let runtime = Arc::new(
+            ListenerRuntime::start(
+                vec![ServerConfig {
+                    listener_name: "control".to_string(),
+                    listener_type: ListenerType::Host,
+                    connections: state.connections().clone(),
+                    socket_path: host_socket.to_string_lossy().into_owned(),
+                    socket_mode: crate::DEFAULT_SOCKET_MODE,
+                    socket_group: None,
+                    invocation: InvocationRuntimeConfig::default(),
+                }],
+                Arc::clone(&state),
+            )
+            .await
+            .expect("start listener runtime"),
+        );
+        state
+            .install_listener_runtime(Arc::clone(&runtime))
+            .expect("install listener runtime");
+        std::fs::write(
+            &inputs.config_path,
+            format!(
+                "schema = \"agent\"\nschemaVersion = 3\n[import]\ncatalog = \"catalog.json\"\npolicy = \"policy.json\"\nbundle = \"bundle.age\"\n[listeners.control]\ntype = \"host\"\npath = {host_socket:?}\n[listeners.workloads]\ntype = \"courier\"\npath = {workload_socket:?}\n"
+            ),
+        )
+        .expect("write added-listener candidate");
+
+        let outcome = reload_generation_live(&state)
+            .await
+            .expect("live reload succeeds");
+        assert_eq!(outcome.new_generation, INITIAL_GENERATION_ID + 1);
+        assert!(workload_socket.exists());
+        let generation = state.load_generation();
+        assert_eq!(generation.id(), outcome.new_generation);
+        assert!(generation.listeners().get("workloads").is_some());
+        drop(generation);
+        runtime
+            .run_until_shutdown(std::future::ready(()))
+            .await
+            .expect("listener runtime shuts down");
+        assert!(!host_socket.exists());
+        assert!(!workload_socket.exists());
+    }
+
     /// An invalid candidate (malformed policy) is REJECTED, the previous
     /// generation keeps serving, and the engine never panics.
     #[test]
@@ -978,7 +1490,7 @@ mod tests {
         write_files(
             &inputs,
             &catalog_json(true),
-            r#"{ "schema": "policy", "subjects": { "svc.web": { "allOf": [ { "kind": "unix", "uid": 1000 } ] } }, "roles": {}, "rules": [ { "id": "bad", "subjects": ["svc.web"], "action": ["role:nonexistent"], "target": ["web.signer"] } ], "config": {} }"#,
+            r#"{ "schema": "policy", "subjects": { "svc.web": { "domain": "host-process", "match": { "all": [ { "process.uid": 1000 } ] } } }, "roles": {}, "rules": [ { "id": "bad", "subjects": ["svc.web"], "action": ["role:nonexistent"], "target": ["web.signer"] } ], "config": {} }"#,
         );
 
         let err = reload_generation(&state).expect_err("malformed policy rejected");
@@ -1106,7 +1618,7 @@ mod tests {
 
             let rejected_policy = r#"{
               "schema": "policy",
-              "subjects": { "svc.web": { "allOf": [ { "kind": "unix", "uid": 1000 } ] } },
+              "subjects": { "svc.web": { "domain": "host-process", "match": { "all": [ { "process.uid": 1000 } ] } } },
               "roles": {},
               "rules": [ {
                 "id": "bad", "subjects": ["svc.web"],
@@ -1135,11 +1647,9 @@ mod tests {
         let (state, inputs) = state_with_files(&catalog_json(true), &policy_json(true));
 
         let err = read_reload_inputs_with_observer(&inputs, || {
-            let ReloadInputs::Corpus { config_path, .. } = &inputs else {
-                panic!("fixture uses corpus reload inputs");
-            };
             std::fs::write(
-                config_path
+                inputs
+                    .config_path
                     .parent()
                     .expect("config parent")
                     .join("policy.json"),
@@ -1156,6 +1666,38 @@ mod tests {
             INITIAL_GENERATION_ID,
             "helper rejection leaves the serving generation untouched"
         );
+    }
+
+    #[test]
+    fn atomic_bootstrap_replacement_after_listener_parse_is_rejected() {
+        let (state, inputs) = state_with_files(&catalog_json(false), &policy_json(false));
+        let parent = inputs.config_path.parent().expect("config parent");
+        let replacement_policy = parent.join("policy.replacement.json");
+        let replacement_bootstrap = parent.join("config.replacement.toml");
+        std::fs::write(&replacement_policy, policy_json(true)).expect("stage replacement policy");
+        std::fs::write(
+            &replacement_bootstrap,
+            "schema = \"agent\"\nschemaVersion = 3\n[import]\ncatalog = \"catalog.json\"\npolicy = \"policy.json\"\nbundle = \"bundle.age\"\n[listeners.replaced]\ntype = \"host\"\npath = \"/tmp/basil-replaced.sock\"\n",
+        )
+        .expect("stage replacement bootstrap");
+
+        let error = read_reload_inputs_with_bootstrap_observer(&inputs, || {
+            std::fs::rename(&replacement_policy, parent.join("policy.json"))
+                .expect("atomically replace policy");
+            std::fs::rename(&replacement_bootstrap, &inputs.config_path)
+                .expect("atomically replace bootstrap after listener parse");
+        })
+        .expect_err("mixed bootstrap and corpus snapshot must be rejected");
+
+        assert!(matches!(
+            error,
+            ReloadError::TornSnapshot { ref path }
+                if path == &inputs.config_path.display().to_string()
+        ));
+        assert_eq!(state.active_generation_id(), INITIAL_GENERATION_ID);
+        let generation = state.load_generation();
+        assert!(generation.listeners().get("replaced").is_none());
+        assert_eq!(generation.policy().grant_count(), 0);
     }
 
     /// A non-profile JWT-SVID issuer candidate is rejected: the loader's fail-closed
@@ -1282,6 +1824,143 @@ mod tests {
             ]
         );
         assert_eq!(state.active_generation_id(), INITIAL_GENERATION_ID + 2);
+    }
+
+    /// The dry-run outcome enumerates the candidate-aware listener impact: what
+    /// a SIGHUP would do to the listener surface right now (adds/removals with
+    /// exact active counts and paths), without swapping anything.
+    #[test]
+    fn check_reload_reports_candidate_listener_impacts() {
+        use crate::transport::listener_manager::ListenerChangeKind;
+
+        let (state, inputs) = state_with_files(&catalog_json(false), &policy_json(false));
+        let socket = format!("/tmp/basil-reload-impact-{}.sock", uuid::Uuid::new_v4());
+        std::fs::write(
+            &inputs.config_path,
+            format!(
+                "schema = \"agent\"\nschemaVersion = 3\n[import]\ncatalog = \"catalog.json\"\npolicy = \"policy.json\"\nbundle = \"bundle.age\"\n[listeners.control]\ntype = \"host\"\npath = {socket:?}\n"
+            ),
+        )
+        .expect("write named listener candidate");
+
+        let dry = check_reload(&state).expect("candidate validates");
+        assert_eq!(dry.listener_impacts.len(), 2, "{:?}", dry.listener_impacts);
+        let add = dry
+            .listener_impacts
+            .iter()
+            .find(|impact| impact.kind() == ListenerChangeKind::Add)
+            .expect("an added listener impact");
+        assert_eq!(add.name(), "control");
+        assert_eq!(add.active_connections(), 0);
+        assert_eq!(add.previous_path(), None);
+        assert_eq!(add.new_path(), Some(std::path::Path::new(socket.as_str())));
+        let remove = dry
+            .listener_impacts
+            .iter()
+            .find(|impact| impact.kind() == ListenerChangeKind::Remove)
+            .expect("the replaced default host listener impact");
+        assert_eq!(remove.name(), "host");
+        assert_eq!(
+            remove.previous_path(),
+            Some(std::path::Path::new(crate::DEFAULT_SOCKET_PATH))
+        );
+        assert_eq!(remove.new_path(), None);
+        assert_eq!(state.active_generation_id(), INITIAL_GENERATION_ID);
+
+        // The applied reload reports the identical impacts.
+        let applied = reload_generation(&state).expect("candidate applies");
+        assert_eq!(applied, dry);
+    }
+
+    /// A removal/reconfiguration of a listener with accepted transports is
+    /// rejected with the STRUCTURED blocking impact set (its own stable audit
+    /// token), and both the dry-run and the real reload reject identically.
+    #[tokio::test]
+    async fn active_listener_transition_is_rejected_with_blocking_impacts() {
+        use crate::transport::grpc_server::ListenerType;
+        use crate::transport::listener_manager::ListenerChangeKind;
+
+        let (state, inputs) = state_with_files(&catalog_json(false), &policy_json(false));
+        let (stream, _peer) = tokio::net::UnixStream::pair().expect("stream pair");
+        let tracked = state
+            .connections()
+            .register(stream, "host", ListenerType::Host)
+            .expect("track a host connection");
+        let socket = format!("/tmp/basil-reload-blocked-{}.sock", uuid::Uuid::new_v4());
+        std::fs::write(
+            &inputs.config_path,
+            format!(
+                "schema = \"agent\"\nschemaVersion = 3\n[import]\ncatalog = \"catalog.json\"\npolicy = \"policy.json\"\nbundle = \"bundle.age\"\n[listeners.control]\ntype = \"host\"\npath = {socket:?}\n"
+            ),
+        )
+        .expect("write removing candidate");
+
+        for result in [check_reload(&state), reload_generation(&state)] {
+            let err = result.expect_err("active host connection blocks the transition");
+            assert_eq!(err.audit_reason(), "listener_transition_blocked");
+            let ReloadError::ListenerTransitionBlocked(active) = err else {
+                panic!("expected the structured blocked variant");
+            };
+            let impacts = active.impacts();
+            assert_eq!(impacts.len(), 1, "{impacts:?}");
+            let blocking = impacts.first().expect("one blocking impact");
+            assert_eq!(blocking.name(), "host");
+            assert_eq!(blocking.kind(), ListenerChangeKind::Remove);
+            assert_eq!(blocking.active_connections(), 1);
+        }
+        assert_eq!(state.active_generation_id(), INITIAL_GENERATION_ID);
+
+        // Draining the connection unblocks the same candidate.
+        drop(tracked);
+        reload_generation(&state).expect("drained transition applies");
+    }
+
+    /// An applied same-name path change records a persistent rewire diagnostic;
+    /// returning the listener to the recorded previous path resolves it.
+    #[test]
+    fn applied_path_change_records_and_reverting_resolves_rewire_diagnostics() {
+        let (state, inputs) = state_with_files(&catalog_json(false), &policy_json(false));
+        assert!(state.connections().rewire().is_empty());
+        let socket = format!("/tmp/basil-reload-rewire-{}.sock", uuid::Uuid::new_v4());
+        std::fs::write(
+            &inputs.config_path,
+            format!(
+                "schema = \"agent\"\nschemaVersion = 3\n[import]\ncatalog = \"catalog.json\"\npolicy = \"policy.json\"\nbundle = \"bundle.age\"\n[listeners.host]\ntype = \"host\"\npath = {socket:?}\n"
+            ),
+        )
+        .expect("write repathed host candidate");
+
+        // The dry-run reports the reconfiguration but records NOTHING.
+        let dry = check_reload(&state).expect("repathed candidate validates");
+        assert!(
+            dry.listener_impacts
+                .iter()
+                .any(crate::transport::listener_manager::ListenerImpact::rewires_path),
+            "{:?}",
+            dry.listener_impacts
+        );
+        assert!(state.connections().rewire().is_empty());
+
+        let outcome = reload_generation(&state).expect("repathed candidate applies");
+        let diagnostics = state.connections().rewire().snapshot();
+        assert_eq!(diagnostics.len(), 1);
+        let diagnostic = diagnostics.first().expect("one rewire diagnostic");
+        assert_eq!(diagnostic.listener(), "host");
+        assert_eq!(
+            diagnostic.previous_path(),
+            std::path::Path::new(crate::DEFAULT_SOCKET_PATH)
+        );
+        assert_eq!(diagnostic.new_path(), std::path::Path::new(socket.as_str()));
+        assert_eq!(diagnostic.applied_generation(), outcome.new_generation);
+
+        // Reverting to the original path resolves the diagnostic.
+        std::fs::write(
+            &inputs.config_path,
+            "schema = \"agent\"\nschemaVersion = 3\n[import]\ncatalog = \"catalog.json\"\npolicy = \"policy.json\"\nbundle = \"bundle.age\"\n",
+        )
+        .expect("restore legacy default host listener");
+        reload_generation(&state).expect("reverting candidate applies");
+        assert!(state.connections().rewire().is_empty());
     }
 
     /// A broker with no configured paths fails the reload closed (no-op), never

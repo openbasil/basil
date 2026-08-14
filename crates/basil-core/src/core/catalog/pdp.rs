@@ -6,17 +6,15 @@
 //! `AuthenticatedActor` authorization. This is `vault-1l8`.
 //!
 //! The broker **is** the `PDP`. Local transports first resolve the connecting
-//! peer's kernel-trustworthy `SO_PEERCRED` identity into an
-//! [`AuthenticatedActor`]. The actor carries the configured subject that matched
-//! the peer's `uid`, primary `gid`, or supplementary group set. Ambiguous or
-//! missing subject resolution fails closed before operation-level policy is
-//! evaluated.
+//! peer's trusted evidence snapshot into an [`AuthenticatedActor`]. The actor
+//! carries the one domain-scoped subject selected by the recursive evidence
+//! evaluator. Ambiguous, unavailable, or missing subject resolution fails
+//! closed before operation-level policy is evaluated.
 //!
 //! The decision is **default-deny**: a request is allowed only if the resolved
 //! actor's subject has a matching grant, or a public-read rule applies to a
-//! resolved actor. Truly unauthenticated access is represented by the configured
-//! `unauthenticatedSubject`, not by falling through to all public reads. Denial is
-//! the absence of an allow; there are no explicit deny rules.
+//! resolved actor. Missing observed evidence never falls through to public
+//! reads. Denial is the absence of an allow; there are no explicit deny rules.
 //!
 //! # Decision algorithm
 //!
@@ -24,20 +22,23 @@
 //!
 //! 1. If `key` is not in the catalog → [`DenyReason::UnknownKey`] (don't leak
 //!    which other check would have failed).
-//! 2. **`writable` hard cap (§2.4.2):** if `op.is_write()` and the key's
+//! 2. **Nix cache identity hard cap:** a `nixCache` key exposes only its
+//!    purpose-specific operations. Pending permits only `enroll_nix_cache_key`;
+//!    enrolled permits compare-only enrollment and `sign_nix_cache_fingerprint`.
+//! 3. **`writable` hard cap (§2.4.2):** if `op.is_write()` and the key's
 //!    `writable == false` → [`DenyReason::NotWritable`], regardless of policy.
-//! 3. **Credential-issuer hard cap:** if `op` is `sign` and the key is a
+//! 4. **Credential-issuer hard cap:** if `op` is `sign` and the key is a
 //!    credential issuer (`nats_type=O`/`A`, or `svid_kind=jwt`/`x509`) →
 //!    [`DenyReason::IssuerRawSign`], regardless of policy. Raw `sign` on an
 //!    issuer key is unrestricted minting: the caller assembles the signing
 //!    input off-broker and none of the `sign_nats_jwt`/`mint` validation runs.
-//! 4. Allow if a `(op, glob)` grant for the actor's [`SubjectName`] matches
+//! 5. Allow if a `(op, glob)` grant for the actor's [`SubjectName`] matches
 //!    `key`.
-//! 5. Allow if `op` is [`Op::Get`] or [`Op::GetPublicKey`], the key's
+//! 6. Allow if `op` is [`Op::Get`] or [`Op::GetPublicKey`], the key's
 //!    `class == Public`, and the actor has a resolved subject. This preserves the
 //!    public-read rule without making missing local identity authorization
 //!    implicit.
-//! 6. Else [`DenyReason::NotPermitted`].
+//! 7. Else [`DenyReason::NotPermitted`].
 //!
 //! The decision carries enough for the audit log (`vault-vq5`): which subject
 //! matched on allow, or which check failed on deny. This module does **not** write
@@ -75,10 +76,12 @@
 //! a privilege-escalation gap. (See the canonical `sealer` role below: it grants
 //! `decrypt` + `encrypt` + `get_public_key`.)
 
+use super::evidence::EvidenceSnapshot;
 use super::policy::{ALL_OPS, Config, Grant, Op, ResolvedPolicy, SubjectName};
 use super::schema::{Catalog, Class};
 use crate::actor::{
-    AuthenticatedActor, PresenterInfo, SubjectResolutionError, TransportInfo, resolve_local_actor,
+    AuthenticatedActor, PresenterInfo, SubjectResolutionError, TransportInfo,
+    resolve_evidence_actor, resolve_local_actor,
     resolve_unix_actor as resolve_unix_authenticated_actor,
 };
 use crate::peer::PeerInfo;
@@ -98,7 +101,7 @@ pub struct Pdp<'a> {
 /// The outcome of a [`Pdp::decide`] call.
 ///
 /// Both variants carry enough context for the audit log (`vault-vq5`): an allow
-/// records *which* principal matched (so a denied-then-allowed key can be
+/// records *which* subject matched (so a denied-then-allowed key can be
 /// distinguished from a public read), and a deny records *which* check failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -143,6 +146,10 @@ pub enum DenyReason {
     /// The key is not in the catalog (step 1). Reported first so we don't leak
     /// which finer-grained check would otherwise have failed.
     UnknownKey,
+    /// A generic operation targeted a purpose-bound Nix cache identity, or an
+    /// enrolled-only operation targeted a pending identity. Policy grants cannot
+    /// bypass the typed enrollment/signing service boundary.
+    NixCachePurposeBound,
     /// A write op against a key whose `writable == false` (the §2.4.2 hard cap),
     /// denied regardless of policy.
     NotWritable,
@@ -253,6 +260,15 @@ impl<'a> Pdp<'a> {
         resolve_local_actor(self.policy, self.config, peer)
     }
 
+    /// Resolve a live actor from one immutable provider-independent evidence snapshot.
+    pub fn resolve_evidence_actor(
+        &self,
+        evidence: &EvidenceSnapshot,
+        peer: &PeerInfo,
+    ) -> Result<AuthenticatedActor, SubjectResolutionError> {
+        resolve_evidence_actor(self.policy, evidence, peer)
+    }
+
     /// Resolve an offline Unix actor for policy inspection.
     pub fn resolve_unix_actor(
         &self,
@@ -274,9 +290,11 @@ impl<'a> Pdp<'a> {
     pub fn resolve_subject_actor(&self, subject: &str) -> Option<AuthenticatedActor> {
         self.policy
             .subjects
-            .contains_key(subject)
-            .then(|| AuthenticatedActor {
+            .get(subject)
+            .map(|definition| AuthenticatedActor {
+                domain: definition.domain,
                 subject: subject.to_string(),
+                workload_identity: None,
                 authenticated_by: Vec::new(),
                 presenter: PresenterInfo {
                     pid: None,
@@ -287,6 +305,15 @@ impl<'a> Pdp<'a> {
                 },
                 transport: TransportInfo::default(),
             })
+    }
+
+    /// Declared domain for a configured subject.
+    #[must_use]
+    pub fn subject_domain(&self, subject: &str) -> Option<super::AuthorizationDomain> {
+        self.policy
+            .subjects
+            .get(subject)
+            .map(|definition| definition.domain)
     }
 
     /// Decide whether `actor` may perform `op` on `key` (§3, §4.1).
@@ -312,7 +339,7 @@ impl<'a> Pdp<'a> {
     /// membership, the `writable` hard cap, the §3.5 world-readable rule), an admin
     /// op has **no key**, so none of those apply. The decision is pure
     /// **default-deny grant matching**: allow iff some `(op, glob)` grant (under
-    /// the caller's resolved principal scope) matches that op's reserved admin
+    /// the caller's resolved subject) matches that op's reserved admin
     /// target, else deny [`DenyReason::NotPermitted`].
     ///
     /// Because [`Op::Reload`] is excluded from `ALL_OPS`, a `*` (any-op) action
@@ -327,6 +354,11 @@ impl<'a> Pdp<'a> {
                 reason: DenyReason::NotPermitted,
             };
         };
+        if !self.actor_is_registered(actor) {
+            return Decision::Deny {
+                reason: DenyReason::NotPermitted,
+            };
+        }
         for rule in &self.policy.rules {
             if let Some(subject) = matching_rule_subject(&rule.subjects, actor.subject.as_str())
                 && rule
@@ -375,6 +407,18 @@ impl<'a> Pdp<'a> {
             return Explanation::deny(DenyReason::UnknownKey);
         };
 
+        // A Nix cache key is a typed trust root, not a generic asymmetric key.
+        // Enforce the complete state-aware op surface before writable, grants,
+        // or public-read rules so neither explicit nor wildcard policy can route
+        // around validation, posture checks, local verification, and Nix audit.
+        if entry
+            .nix_cache
+            .as_ref()
+            .is_some_and(|identity| !nix_cache_op_allowed(identity.state, op))
+        {
+            return Explanation::deny(DenyReason::NixCachePurposeBound);
+        }
+
         // Step 2: the `writable` hard cap (§2.4.2): a write to a non-writable key
         // is denied regardless of any policy grant.
         if op.is_write() && !entry.writable {
@@ -388,6 +432,14 @@ impl<'a> Pdp<'a> {
         // dedicated `sign_nats_jwt`/`mint` ops enforce; issue through those.
         if op == Op::Sign && entry.is_credential_issuer() {
             return Explanation::deny(DenyReason::IssuerRawSign);
+        }
+
+        // Actor construction and policy evaluation are separate boundaries.
+        // Reject a stale or manually constructed actor whose subject/domain pair
+        // is not present in this exact policy generation before grants or the
+        // public-class rule are considered.
+        if !self.actor_is_registered(actor) {
+            return Explanation::deny(DenyReason::NotPermitted);
         }
 
         // Step 4: iterate rules in declaration order; first matching predicate + grant wins.
@@ -417,10 +469,24 @@ impl<'a> Pdp<'a> {
         Explanation::deny(DenyReason::NotPermitted)
     }
 
+    fn actor_is_registered(&self, actor: &AuthenticatedActor) -> bool {
+        self.policy
+            .subjects
+            .get(&actor.subject)
+            .is_some_and(|definition| definition.domain == actor.domain)
+    }
+
     fn evaluate_without_actor(&self, op: Op, key: &str) -> Explanation {
         let Some(entry) = self.catalog.keys.get(key) else {
             return Explanation::deny(DenyReason::UnknownKey);
         };
+        if entry
+            .nix_cache
+            .as_ref()
+            .is_some_and(|identity| !nix_cache_op_allowed(identity.state, op))
+        {
+            return Explanation::deny(DenyReason::NixCachePurposeBound);
+        }
         if op.is_write() && !entry.writable {
             return Explanation::deny(DenyReason::NotWritable);
         }
@@ -499,12 +565,20 @@ pub const ADMIN_REVOKE_TARGET: &str = "broker.revoke";
 /// `{ "action": ["op:watch"], "target": ["broker.watch"] }`.
 pub const ADMIN_WATCH_TARGET: &str = "broker.watch";
 
+/// The reserved policy target for accepted-connection inventory.
+pub const ADMIN_CONNECTION_STATUS_TARGET: &str = "broker.connections";
+
+/// The reserved policy target for deliberate accepted-connection termination.
+pub const ADMIN_CONNECTION_DROP_TARGET: &str = "broker.connections.drop";
+
 const fn admin_target(op: Op) -> Option<&'static str> {
     match op {
         Op::Reload => Some(ADMIN_RELOAD_TARGET),
         Op::Explain => Some(ADMIN_EXPLAIN_TARGET),
         Op::Revoke => Some(ADMIN_REVOKE_TARGET),
         Op::Watch => Some(ADMIN_WATCH_TARGET),
+        Op::ConnectionStatus => Some(ADMIN_CONNECTION_STATUS_TARGET),
+        Op::ConnectionDrop => Some(ADMIN_CONNECTION_DROP_TARGET),
         Op::Get
         | Op::List
         | Op::GetPublicKey
@@ -522,6 +596,8 @@ const fn admin_target(op: Op) -> Option<&'static str> {
         | Op::Rotate
         | Op::Import
         | Op::NewKey
+        | Op::EnrollNixCacheKey
+        | Op::SignNixCacheFingerprint
         // A key-scoped op (decided via `decide`, not `decide_admin`); it has no
         // reserved admin target.
         | Op::UseSoftwareCustody => None,
@@ -531,6 +607,15 @@ const fn admin_target(op: Op) -> Option<&'static str> {
 /// Whether `op` is one of the two world-readable ops for a `public`-class key (§3.5).
 const fn is_public_read(op: Op) -> bool {
     matches!(op, Op::Get | Op::GetPublicKey)
+}
+
+const fn nix_cache_op_allowed(state: super::NixCacheState, op: Op) -> bool {
+    match state {
+        super::NixCacheState::Pending => matches!(op, Op::EnrollNixCacheKey),
+        super::NixCacheState::Enrolled => {
+            matches!(op, Op::EnrollNixCacheKey | Op::SignNixCacheFingerprint)
+        }
+    }
 }
 
 fn matching_rule_subject<'a>(
@@ -546,7 +631,7 @@ fn matching_rule_subject<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::load;
+    use crate::catalog::{AuthorizationDomain, load};
 
     // ---- Fixtures: build the real types via the loader from JSON literals ----
 
@@ -584,6 +669,23 @@ mod tests {
           "path": "secret/data/enroll/x25519",
           "publicPath": "secret/data/enroll/x25519-public", "writable": true,
           "missing": "error", "description": "x25519 enrollment sealing key"
+        },
+        "nix.pending": {
+          "class": "asymmetric", "keyType": "ed25519", "backend": "bao",
+          "engine": "transit", "path": "nix-pending", "writable": true,
+          "nixCache": {
+            "keyName": "cache.pending-1", "state": "pending", "backendVersion": 1
+          },
+          "description": "pending Nix cache signing key"
+        },
+        "nix.enrolled": {
+          "class": "asymmetric", "keyType": "ed25519", "backend": "bao",
+          "engine": "transit", "path": "nix-enrolled", "writable": true,
+          "nixCache": {
+            "keyName": "cache.enrolled-1", "state": "enrolled", "backendVersion": 1,
+            "publicKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+          },
+          "description": "enrolled Nix cache signing key"
         }
       }
     }"#;
@@ -597,7 +699,7 @@ mod tests {
       "operator": ["set", "rotate", "import", "new_key"]
     "#;
 
-    // The principal/op/target matrix.
+    // The subject/op/target matrix.
     //
     //  uid 9002          : reader over grafana.admin_password (user: rule)
     //  uid 9003          : signer over nats.account           (user: rule; NO mint)
@@ -609,15 +711,15 @@ mod tests {
     //  uid 9008          : watch over broker.watch            (admin op)
     //  uid 0 (root)      : * over * (root any-target)
     const SUBJECTS: &str = r#"
-      "svc.grafana":     { "allOf": [ { "kind": "unix", "uid": 9002 } ] },
-      "svc.nats":        { "allOf": [ { "kind": "unix", "uid": 9003 } ] },
-      "svc.minter":      { "allOf": [ { "kind": "unix", "uid": 9004 } ] },
-      "svc.enroll":      { "allOf": [ { "kind": "unix", "uid": 9005 } ] },
-      "svc.reload":      { "allOf": [ { "kind": "unix", "uid": 9006 } ] },
-      "svc.revoke":      { "allOf": [ { "kind": "unix", "uid": 9007 } ] },
-      "svc.watch":       { "allOf": [ { "kind": "unix", "uid": 9008 } ] },
-      "ops.wheel":       { "allOf": [ { "kind": "unix", "gid": 10 } ] },
-      "breakglass.root": { "breakGlass": true, "allOf": [ { "kind": "unix", "uid": 0 } ] }
+      "svc.grafana":     { "domain": "host-process", "match": { "all": [ { "process.uid": 9002 } ] } },
+      "svc.nats":        { "domain": "host-process", "match": { "all": [ { "process.uid": 9003 } ] } },
+      "svc.minter":      { "domain": "host-process", "match": { "all": [ { "process.uid": 9004 } ] } },
+      "svc.enroll":      { "domain": "host-process", "match": { "all": [ { "process.uid": 9005 } ] } },
+      "svc.reload":      { "domain": "host-process", "match": { "all": [ { "process.uid": 9006 } ] } },
+      "svc.revoke":      { "domain": "host-process", "match": { "all": [ { "process.uid": 9007 } ] } },
+      "svc.watch":       { "domain": "host-process", "match": { "all": [ { "process.uid": 9008 } ] } },
+      "ops.wheel":       { "domain": "host-process", "match": { "all": [ { "process.gid.supplementary": 10 } ] } },
+      "breakglass.root": { "domain": "host-process", "breakGlass": true, "match": { "all": [ { "process.uid": 0 } ] } }
     "#;
 
     const RULES: &str = r#"
@@ -735,10 +837,10 @@ mod tests {
         const POL: &str = r#"{
           "schema": "policy",
           "subjects": {
-            "svc.compound": { "allOf": [
-              { "kind": "unix", "uid": 333 },
-              { "kind": "unix", "gid": 10 }
-            ] }
+            "svc.compound": { "domain": "host-process", "match": { "all": [
+              { "process.uid": 333 },
+              { "process.gid.supplementary": 10 }
+            ] } }
           },
           "roles": { "reader": ["get"] },
           "rules": [
@@ -760,7 +862,7 @@ mod tests {
         assert_eq!(matched.via, via("svc.compound"));
         assert_eq!(matched.subject, "svc.compound");
 
-        // The allOf subject denies a uid missing the group half.
+        // The `all` subject denies a uid missing the group half.
         assert!(explain(&pdp, 333, Op::Get, "grafana.admin_password").is_allow());
         assert!(decide(&pdp, 334, Op::Get, "grafana.admin_password").is_deny());
     }
@@ -795,6 +897,35 @@ mod tests {
             decide(&pdp, 9002, Op::GetPublicKey, "web.tls.ca_cert"),
             Decision::Allow {
                 via: AllowVia::PublicClass
+            }
+        );
+    }
+
+    #[test]
+    fn stale_or_inconsistent_actor_never_reaches_grants_or_public_class() {
+        let (c, r, cfg) = fixture();
+        let pdp = Pdp::new(&c, &r, &cfg);
+        let mut actor = pdp
+            .resolve_subject_actor("svc.grafana")
+            .expect("configured subject");
+        actor.domain = AuthorizationDomain::SystemdUnit;
+
+        assert_eq!(
+            pdp.decide(&actor, Op::Get, "grafana.admin_password"),
+            Decision::Deny {
+                reason: DenyReason::NotPermitted
+            }
+        );
+        assert_eq!(
+            pdp.decide(&actor, Op::Get, "web.tls.ca_cert"),
+            Decision::Deny {
+                reason: DenyReason::NotPermitted
+            }
+        );
+        assert_eq!(
+            pdp.decide_admin(&actor, Op::Reload),
+            Decision::Deny {
+                reason: DenyReason::NotPermitted
             }
         );
     }
@@ -1059,6 +1190,111 @@ mod tests {
     }
 
     #[test]
+    fn explicit_nix_cache_grants_are_honored() {
+        let (c, mut r, cfg) = fixture();
+        r.rules.push(crate::catalog::policy::ResolvedRule {
+            subjects: vec!["breakglass.root".into()],
+            grants: [Op::EnrollNixCacheKey, Op::SignNixCacheFingerprint]
+                .into_iter()
+                .map(|op| Grant {
+                    op,
+                    target: crate::catalog::glob::KeyGlob::parse("nix.enrolled")
+                        .expect("exact target"),
+                    rule_id: "explicit-nix".into(),
+                    action: format!("op:{}", op.token()),
+                })
+                .collect(),
+        });
+        let pdp = Pdp::new(&c, &r, &cfg);
+        let actor = pdp
+            .resolve_unix_actor(0)
+            .expect("root breakglass subject resolves");
+        for op in [Op::EnrollNixCacheKey, Op::SignNixCacheFingerprint] {
+            assert!(pdp.decide(&actor, op, "nix.enrolled").is_allow());
+        }
+    }
+
+    #[test]
+    fn nix_cache_hard_cap_is_state_aware_and_overrides_all_generic_grants() {
+        let (c, mut r, cfg) = fixture();
+        let exact = |target| crate::catalog::glob::KeyGlob::parse(target).expect("exact target");
+        r.rules.push(crate::catalog::policy::ResolvedRule {
+            subjects: vec!["svc.nats".into()],
+            grants: ["nix.pending", "nix.enrolled"]
+                .into_iter()
+                .flat_map(|target| {
+                    [
+                        Op::GetPublicKey,
+                        Op::Sign,
+                        Op::Import,
+                        Op::NewKey,
+                        Op::EnrollNixCacheKey,
+                        Op::SignNixCacheFingerprint,
+                    ]
+                    .into_iter()
+                    .map(move |op| Grant {
+                        op,
+                        target: exact(target),
+                        rule_id: "explicit-nix-matrix".into(),
+                        action: format!("op:{}", op.token()),
+                    })
+                })
+                .collect(),
+        });
+        let pdp = Pdp::new(&c, &r, &cfg);
+        let explicit_actor = pdp.resolve_unix_actor(9003).expect("explicit subject");
+        let wildcard_actor = pdp.resolve_unix_actor(0).expect("wildcard subject");
+
+        for actor in [&explicit_actor, &wildcard_actor] {
+            for key in ["nix.pending", "nix.enrolled"] {
+                for op in [
+                    Op::GetPublicKey,
+                    Op::Sign,
+                    Op::Import,
+                    Op::NewKey,
+                    Op::Rotate,
+                ] {
+                    assert_eq!(
+                        pdp.decide(actor, op, key),
+                        Decision::Deny {
+                            reason: DenyReason::NixCachePurposeBound
+                        },
+                        "generic {op:?} must be hard-denied on {key}"
+                    );
+                }
+            }
+        }
+
+        assert!(
+            pdp.decide(&explicit_actor, Op::EnrollNixCacheKey, "nix.pending")
+                .is_allow()
+        );
+        assert!(
+            pdp.decide(&explicit_actor, Op::EnrollNixCacheKey, "nix.enrolled")
+                .is_allow()
+        );
+        assert_eq!(
+            pdp.decide(&explicit_actor, Op::SignNixCacheFingerprint, "nix.pending"),
+            Decision::Deny {
+                reason: DenyReason::NixCachePurposeBound
+            }
+        );
+        assert!(
+            pdp.decide(&explicit_actor, Op::SignNixCacheFingerprint, "nix.enrolled")
+                .is_allow()
+        );
+
+        assert_eq!(
+            pdp.explain_subject("unknown.subject", Op::Sign, "nix.enrolled")
+                .decision,
+            Decision::Deny {
+                reason: DenyReason::NixCachePurposeBound
+            },
+            "offline evaluation must preserve the same hard cap"
+        );
+    }
+
+    #[test]
     fn sealing_key_default_denies_without_a_grant() {
         // INVARIANT 2 (default-deny): an arbitrary uid with no rule gets nothing on
         // a sealing key: not even get_public_key (it is NOT class:public).
@@ -1121,7 +1357,13 @@ mod tests {
             }
         );
         // The watch grant implies NO other admin op.
-        for op in [Op::Reload, Op::Explain, Op::Revoke] {
+        for op in [
+            Op::Reload,
+            Op::Explain,
+            Op::Revoke,
+            Op::ConnectionStatus,
+            Op::ConnectionDrop,
+        ] {
             assert_eq!(
                 decide_admin(&pdp, 9008, op),
                 Decision::Deny {
@@ -1159,7 +1401,14 @@ mod tests {
             9005, // enroll sealer
             0,    // root: `*` action over `*` target
         ] {
-            for op in [Op::Reload, Op::Explain, Op::Revoke, Op::Watch] {
+            for op in [
+                Op::Reload,
+                Op::Explain,
+                Op::Revoke,
+                Op::Watch,
+                Op::ConnectionStatus,
+                Op::ConnectionDrop,
+            ] {
                 assert_eq!(
                     decide_admin(&pdp, uid, op),
                     Decision::Deny {
@@ -1187,13 +1436,29 @@ mod tests {
                 via: via("breakglass.root")
             }
         );
-        for op in [Op::Reload, Op::Explain, Op::Revoke, Op::Watch] {
+        for op in [
+            Op::Reload,
+            Op::Explain,
+            Op::Revoke,
+            Op::Watch,
+            Op::ConnectionStatus,
+            Op::ConnectionDrop,
+        ] {
             assert_eq!(
                 pdp.decide_admin(&actor, op),
                 Decision::Deny {
                     reason: DenyReason::NotPermitted
                 },
                 "breakglass wildcard must not imply admin {op:?}"
+            );
+        }
+        for op in [Op::EnrollNixCacheKey, Op::SignNixCacheFingerprint] {
+            assert_eq!(
+                pdp.decide(&actor, op, "nats.account"),
+                Decision::Deny {
+                    reason: DenyReason::NotPermitted
+                },
+                "breakglass wildcard must not imply purpose-specific {op:?}"
             );
         }
     }
@@ -1340,7 +1605,7 @@ mod tests {
     fn explain_deny_is_default_deny_with_no_rule() {
         let (c, r, cfg) = fixture();
         let pdp = Pdp::new(&c, &r, &cfg);
-        // unmatched principal -> default-deny.
+        // Unmatched subject -> default-deny.
         let ex = explain(&pdp, 7777, Op::Get, "grafana.admin_password");
         assert_eq!(
             ex.decision,

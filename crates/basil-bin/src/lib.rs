@@ -11,7 +11,12 @@
 
 #![cfg_attr(test, allow(clippy::indexing_slicing))]
 
+pub mod ci_session;
 pub mod client_cli;
+pub mod nix_cache_cli;
+mod nix_cache_mutation_audit;
+pub mod nix_cli;
+pub mod nix_provider;
 
 #[cfg(feature = "keystore-backend")]
 use basil_core::demo;
@@ -68,6 +73,16 @@ pub enum Command {
     /// Create and manage a sealed credential bundle.
     #[command(subcommand)]
     Bundle(Box<bundle_cli::BundleCommand>),
+    /// Manage Nix binary-cache signing keys held in backend custody.
+    #[command(subcommand)]
+    Nix(nix_cli::NixCommand),
+    /// Run provider-neutral, job-scoped CI identity sessions.
+    #[command(subcommand)]
+    Ci(ci_session::CiCommand),
+    /// Run offline keystore maintenance and crash recovery.
+    #[cfg(feature = "db-keystore")]
+    #[command(subcommand)]
+    Keystore(Box<basil_core::keystore_cli::KeystoreCommand>),
     /// Explain a policy decision: why a subject would be allowed or denied an op
     /// on a key. By DEFAULT this is an offline dry-run: it builds the PDP from
     /// the catalog + policy FILES on disk and evaluates the tuple through the same
@@ -95,6 +110,17 @@ pub struct CompletionsArgs {
 #[must_use]
 pub fn cli() -> clap::Command {
     Cli::command()
+}
+
+/// Dispatch the offline keystore maintenance surface.
+///
+/// # Errors
+///
+/// Returns an error when configuration, bundle authentication, database
+/// quiescence, rotation, or explicit recovery fails closed.
+#[cfg(feature = "db-keystore")]
+pub fn run_keystore(command: basil_core::keystore_cli::KeystoreCommand) -> anyhow::Result<()> {
+    basil_core::keystore_cli::run(command)
 }
 
 /// Render the completion script for `shell` and write it to `out`.
@@ -130,6 +156,96 @@ mod tests {
             "passphrase:file=/run/pass",
         ]);
         assert!(matches!(cli.command, Command::Bundle(_)));
+    }
+
+    #[test]
+    fn ci_session_requires_pinned_executable_inputs() {
+        let cli = parse(&[
+            "basil",
+            "ci",
+            "session",
+            "--basil-executable",
+            "/opt/basil/bin/basil",
+            "--basil-executable-sha256",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--rule-max-token-age-seconds",
+            "300",
+        ]);
+        assert!(matches!(cli.command, Command::Ci(_)));
+        let error = Cli::try_parse_from([
+            "basil",
+            "ci",
+            "session",
+            "--basil-executable",
+            "/opt/basil/bin/basil",
+            "--basil-executable-sha256",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--rule-max-token-age-seconds",
+            "901",
+        ])
+        .expect_err("rule maximum token age is contract-bounded");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[cfg(feature = "db-keystore")]
+    #[test]
+    fn keystore_rekey_fresh_and_resume_arguments_are_disjoint() {
+        let fresh = Cli::try_parse_from([
+            "basil",
+            "keystore",
+            "rekey",
+            "--backend",
+            "local",
+            "--new-dek-file",
+            "/run/keys/new-dek",
+            "--open",
+            "passphrase:file=/run/keys/passphrase",
+        ])
+        .expect("fresh rekey requires a replacement DEK");
+        assert!(matches!(fresh.command, Command::Keystore(_)));
+
+        let resume = Cli::try_parse_from([
+            "basil",
+            "keystore",
+            "rekey",
+            "--backend",
+            "local",
+            "--resume",
+            "--open",
+            "passphrase:file=/run/keys/passphrase",
+        ])
+        .expect("resume never requires a replacement DEK");
+        assert!(matches!(resume.command, Command::Keystore(_)));
+
+        let missing = Cli::try_parse_from([
+            "basil",
+            "keystore",
+            "rekey",
+            "--backend",
+            "local",
+            "--open",
+            "passphrase:file=/run/keys/passphrase",
+        ])
+        .expect_err("fresh rekey without a replacement DEK must fail parsing");
+        assert_eq!(
+            missing.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+
+        let conflict = Cli::try_parse_from([
+            "basil",
+            "keystore",
+            "rekey",
+            "--backend",
+            "local",
+            "--resume",
+            "--new-dek-file",
+            "/run/keys/new-dek",
+            "--open",
+            "passphrase:file=/run/keys/passphrase",
+        ])
+        .expect_err("resume must reject a replacement DEK");
+        assert_eq!(conflict.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]

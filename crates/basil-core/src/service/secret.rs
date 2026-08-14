@@ -113,7 +113,6 @@ mod tests {
     use crate::catalog::load;
     use crate::event::BrokerEventKind;
     use crate::manager::BackendManager;
-    use crate::peer::PeerInfo;
     use crate::service::broker::BrokerGrpc;
     use crate::state::BrokerState;
 
@@ -173,7 +172,7 @@ mod tests {
         let policy = r#"{
           "schema": "policy",
           "subjects": {
-            "svc.ops": { "allOf": [ { "kind": "unix", "uid": 42 } ] }
+            "svc.ops": { "domain": "host-process", "match": { "all": [ { "process.uid": 42 } ] } }
           },
           "roles": { "rotator": ["rotate"] },
           "rules": [
@@ -204,12 +203,7 @@ mod tests {
     }
 
     fn authed_request<T>(body: T) -> Request<T> {
-        let mut request = Request::new(body);
-        request.extensions_mut().insert(PeerInfo {
-            uid: Some(42),
-            ..PeerInfo::default()
-        });
-        request
+        crate::service::shared::host_request(42, body)
     }
 
     /// The REAL `rotate_secret` RPC publishes a `KeyRotated` broker event carrying

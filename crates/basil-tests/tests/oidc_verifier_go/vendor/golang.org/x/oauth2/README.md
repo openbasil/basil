@@ -7,8 +7,8 @@ oauth2 package contains a client implementation for OAuth 2.0 spec.
 
 See pkg.go.dev for further documentation and examples.
 
-* [pkg.go.dev/golang.org/x/oauth2](https://pkg.go.dev/golang.org/x/oauth2)
-* [pkg.go.dev/golang.org/x/oauth2/google](https://pkg.go.dev/golang.org/x/oauth2/google)
+- [pkg.go.dev/golang.org/x/oauth2](https://pkg.go.dev/golang.org/x/oauth2)
+- [pkg.go.dev/golang.org/x/oauth2/google](https://pkg.go.dev/golang.org/x/oauth2/google)
 
 ## Policy for new endpoints
 
@@ -30,6 +30,6 @@ The git repository is https://go.googlesource.com/oauth2.
 
 Note:
 
-* Excluding trivial changes, all contributions should be connected to an existing issue.
-* API changes must go through the [change proposal process](https://go.dev/s/proposal-process) before they can be accepted.
-* The code owners are listed at [dev.golang.org/owners](https://dev.golang.org/owners#:~:text=x/oauth2).
+- Excluding trivial changes, all contributions should be connected to an existing issue.
+- API changes must go through the [change proposal process](https://go.dev/s/proposal-process) before they can be accepted.
+- The code owners are listed at [dev.golang.org/owners](https://dev.golang.org/owners#:~:text=x/oauth2).

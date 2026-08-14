@@ -111,7 +111,7 @@ write_policy() {
     }
   ],
   "subjects": {
-    "local.user": { "allOf": [{ "kind": "unix", "uid": $uid }] }
+    "local.user": { "domain": "host-process", "match": { "all": [{ "process.uid": $uid }] } }
   },
   "config": {
     "names": { "users": { "$uid": "$user" }, "groups": {} },

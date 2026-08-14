@@ -4,13 +4,13 @@
 
 [package]
 name = "xtask"
-description = "Basil workspace automation tasks (man-page generation)."
 version.workspace = true
+authors.workspace = true
 edition.workspace = true
 license.workspace = true
-authors.workspace = true
-repository.workspace = true
 publish = false
+repository.workspace = true
+description = "Basil workspace automation tasks (man-page generation)."
 
 [[bin]]
 name = "xtask"
@@ -18,6 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 basil-bin = { workspace = true }
+basil-https-courier = { workspace = true }
 basil-nats-bridge = { workspace = true }
 
 anyhow = { workspace = true }

@@ -10,4 +10,3 @@ xtask = "run --package xtask --"
 # install binaries
 install-basil = "install --path crates/basil-bin"
 install-bridge = "install --path crates/basil-nats-bridge"
-

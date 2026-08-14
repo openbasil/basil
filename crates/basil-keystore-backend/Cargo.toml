@@ -4,22 +4,27 @@
 
 [package]
 name = "basil-keystore-backend"
-description = "Optional Basil key-store backends over db-keystore and 1Password."
 version.workspace = true
-edition.workspace = true
-license.workspace = true
 authors.workspace = true
-homepage.workspace = true
-repository.workspace = true
-documentation = "https://docs.rs/basil-keystore-backend"
-keywords = ["basil", "keystore", "keyring", "onepassword", "secrets"]
 categories = ["cryptography", "authentication"]
-rust-version = "1.85"
+documentation = "https://docs.rs/basil-keystore-backend"
+edition.workspace = true
+homepage.workspace = true
+keywords = ["basil", "keystore", "keyring", "onepassword", "secrets"]
+license.workspace = true
 publish = true
+repository.workspace = true
+rust-version = "1.88"
+description = "Optional Basil key-store backends over db-keystore and 1Password."
 
 [features]
 default = []
-db-keystore = ["dep:db-keystore", "dep:keyring-core"]
+db-keystore = [
+  "dep:db-keystore",
+  "dep:keyring-core",
+  "dep:blake3",
+  "dep:rustix",
+]
 onepassword = ["dep:serde", "dep:serde_json", "dep:url", "dep:percent-encoding"]
 
 [dependencies]
@@ -28,18 +33,24 @@ basil = { workspace = true }
 # Direct dep only to enable `aes/zeroize` (round-key scrubbing) for aes-gcm.
 aes = { workspace = true }
 aes-gcm = { workspace = true }
+# Rekey intent-marker ciphertext hashing (BLAKE3 custody chain).
+blake3 = { version = "1.8", optional = true }
 chacha20poly1305 = { workspace = true }
 db-keystore = { workspace = true, optional = true }
 ed25519-dalek = { workspace = true }
 keyring-core = { workspace = true, optional = true }
 percent-encoding = { workspace = true, optional = true }
 rand = { workspace = true }
+rustix = { workspace = true, optional = true }
 serde = { workspace = true, optional = true, features = ["std"] }
 serde_json = { workspace = true, optional = true, features = ["std"] }
 thiserror = { workspace = true }
 url = { workspace = true, optional = true }
 zero-secrets = { workspace = true }
 zeroize = { workspace = true }
+
+[dev-dependencies]
+turso = { version = "=0.7.1", default-features = false, features = ["mimalloc"] }
 
 [lints]
 workspace = true

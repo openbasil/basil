@@ -241,11 +241,75 @@ message SealedResponse {
   optional string response_subject = 2;
 }
 
+// Request a single-use invocation freshness challenge. Issuance is
+// unauthenticated and reachable through the invocation courier; the
+// thumbprint is self-asserted here and grants nothing.
+message GetInvocationChallengeRequest {
+  // RFC 7638 SHA-256 thumbprint (exactly 32 bytes) of the Ed25519 proof key
+  // the caller intends to sign the sealed invocation with. Binds the issued
+  // challenge to one proof key and partitions issuance rate limits.
+  bytes jkt = 1;
+  // Opaque client source observed by a trusted local courier in front of the
+  // broker (for example a normalized client IP), used only to partition
+  // issuance rate limits. At most 128 bytes; never an identity or
+  // authorization input. Absent means the caller reached the broker
+  // locally/directly, not through a courier.
+  optional string courier_observed_source = 2;
+}
+
+// A single-use freshness challenge bound to the requested proof-key
+// thumbprint and the issuing serving generation.
+message GetInvocationChallengeResponse {
+  // Exactly 32 bytes: a 16-byte issuing-instance ID prefix followed by 16
+  // CSPRNG bytes. Carried verbatim in the sealed invocation's encrypted-layer
+  // freshness-challenge claim (COSE label -70008) and consumed exactly once.
+  bytes challenge = 1;
+  // Serving generation the challenge is bound to. Consumption requires the
+  // request's pinned serving generation to match.
+  uint64 generation = 2;
+  // Unix seconds when the challenge expires, at most 60 seconds out.
+  int64 expires_at_unix = 3;
+}
+
+// Closed service-surface profile of the Unix listener serving this RPC.
+enum ListenerProfile {
+  // Unset; never reported by a conforming broker.
+  UNSPECIFIED = 0;
+  // Host and operator listener.
+  HOST = 1;
+  reserved 2;
+  reserved "CONTAINER";
+  // Courier-only invocation listener.
+  COURIER = 3;
+}
+
+// Empty request for the effective local invocation-listener contract.
+message GetInvocationCapabilitiesRequest {}
+
+// Effective invocation behavior of the Unix listener serving this RPC.
+message GetInvocationCapabilitiesResponse {
+  // Closed service-surface profile of this listener.
+  ListenerProfile listener_profile = 1;
+  // Whether every invocation on this listener requires a freshness challenge.
+  bool require_challenge = 2;
+  // Frozen courier protocol contract version supported by this broker.
+  uint32 courier_protocol_version = 3;
+}
+
 // Disabled-by-default transport-neutral invocation service. Local clients keep
 // using the typed gRPC services over Unix sockets.
 service InvocationService {
   // Submit a sealed invocation message.
   rpc Invoke(SealedRequest) returns (SealedResponse);
+  // Issue a single-use freshness challenge for a sealed invocation. Declined
+  // issuance under capacity or rate-limit pressure fails with
+  // `RESOURCE_EXHAUSTED` and the stable reason token
+  // `CHALLENGE_ISSUANCE_DECLINED`; that denial is retryable with the same
+  // request after backoff.
+  rpc GetInvocationChallenge(GetInvocationChallengeRequest) returns (GetInvocationChallengeResponse);
+  // Report the effective local listener profile and courier safety contract.
+  // Couriers require COURIER, require_challenge=true, and protocol version 1.
+  rpc GetInvocationCapabilities(GetInvocationCapabilitiesRequest) returns (GetInvocationCapabilitiesResponse);
 }
 
 // Create, import, and use asymmetric signing keys. Private key material is
@@ -847,6 +911,13 @@ service AdminService {
   // implies it. The broker requires a configured `revocation_store=jwt-svid`
   // backing key so the revocation survives restart.
   rpc Revoke(RevokeRequest) returns (RevokeResponse);
+  // Return the stable-id ordered, globally bounded accepted-connection
+  // inventory. Requires `op:connection_status` over `broker.connections`.
+  rpc ListConnections(ListConnectionsRequest) returns (ListConnectionsResponse);
+  // Deliberately terminate accepted connections selected by exact id, broad UID,
+  // or typed attested workload identity. Requires `op:connection_drop` over
+  // `broker.connections.drop`.
+  rpc DropConnections(DropConnectionsRequest) returns (DropConnectionsResponse);
 }
 
 // Request to hot-reload the catalog/policy generation from disk.
@@ -886,15 +957,76 @@ message ReloadResponse {
   // Set only when the candidate was rejected (`applied = false` and not a clean
   // dry-run). Carries a stable non-secret reason token + a human message.
   ReloadRejection rejection = 7;
+  // Candidate-aware listener impact: every listener the candidate would add,
+  // remove, or reconfigure, with its exact active-transport count at assessment
+  // time. On an applied reload these are the changes that were committed; on a
+  // dry-run they are what a SIGHUP (or a real reload) would do right now; on a
+  // `listener_transition_blocked` rejection they are the blocking listeners.
+  // Empty when the candidate changes no listener.
+  repeated ListenerImpactInfo listener_impacts = 8;
+  // Persistent rewire diagnostics: listeners whose socket path changed in an
+  // earlier applied reload and whose externally generated wiring has not been
+  // regenerated. Reported until the listener is removed or its path returns to
+  // the recorded previous path. Advisory only: it never affects authorization.
+  repeated RewireDiagnostic rewire_required = 9;
 }
 
 // Why a `Reload` candidate was rejected (the previous generation keeps serving).
 message ReloadRejection {
   // A stable, non-secret reason token (e.g. `validation_failed`,
-  // `routing_shape_changed`, `catalog_read_failed`, `no_reload_inputs`).
+  // `routing_shape_changed`, `catalog_read_failed`, `no_reload_inputs`,
+  // `listener_transition_blocked`).
   string reason = 1;
   // A human-readable, non-secret message describing the rejection.
   string message = 2;
+}
+
+// Closed classification of one candidate listener change.
+enum ListenerChangeKind {
+  LISTENER_CHANGE_KIND_UNSPECIFIED = 0;
+  // A new listener would be added without affecting existing accepts.
+  LISTENER_CHANGE_KIND_ADD = 1;
+  // An existing listener would be removed.
+  LISTENER_CHANGE_KIND_REMOVE = 2;
+  // Type, path, mode, or group would change under an existing name.
+  LISTENER_CHANGE_KIND_RECONFIGURE = 3;
+}
+
+// Candidate-aware impact for one named listener in a reload candidate.
+// Paths are operator-authored configuration (never key material); this message
+// is only returned on the permission-gated `Reload` RPC.
+message ListenerImpactInfo {
+  // Stable listener name.
+  string name = 1;
+  // Change classification.
+  ListenerChangeKind kind = 2;
+  // Exact accepted-transport count on this listener at assessment time. A
+  // removal or reconfiguration applies only when this is zero; an addition
+  // never depends on existing connections.
+  uint32 active_connections = 3;
+  // Serving socket path (removal/reconfiguration); absent for an addition.
+  optional string previous_path = 4;
+  // Candidate socket path (addition/reconfiguration); absent for a removal.
+  optional string new_path = 5;
+}
+
+// One persistent listener rewire diagnostic: a same-name socket-path change
+// applied by an earlier reload. External wiring generated against the previous
+// resolved path keeps failing closed until it is regenerated and its services
+// are restarted. Structured
+// configuration-attention state: it never affects authorization, and unrelated
+// listeners keep serving.
+message RewireDiagnostic {
+  // Stable listener name whose path changed.
+  string listener = 1;
+  // The oldest resolved path external wiring may still record.
+  string previous_path = 2;
+  // The path the listener now serves on.
+  string new_path = 3;
+  // The generation whose reload applied the (latest) path change.
+  uint64 applied_generation = 4;
+  // Unix seconds when the (latest) path change was recorded.
+  uint64 recorded_at_unix = 5;
 }
 
 // Request for a live policy explanation against the broker's serving generation.
@@ -973,6 +1105,87 @@ message RevokeResponse {
   bool persisted = 4;
 }
 
+// Request the complete bounded accepted-connection inventory.
+message ListConnectionsRequest {}
+
+// Closed listener type captured when a connection was accepted.
+enum ConnectionListenerType {
+  CONNECTION_LISTENER_TYPE_UNSPECIFIED = 0;
+  CONNECTION_LISTENER_TYPE_HOST = 1;
+  reserved 2;
+  reserved "CONNECTION_LISTENER_TYPE_CONTAINER";
+  CONNECTION_LISTENER_TYPE_COURIER = 3;
+}
+
+// Independently resolved authorization domain for an active connection.
+enum ConnectionDomain {
+  CONNECTION_DOMAIN_UNSPECIFIED = 0;
+  CONNECTION_DOMAIN_HOST_PROCESS = 1;
+  CONNECTION_DOMAIN_SYSTEMD_UNIT = 2;
+  reserved 3;
+  reserved "CONNECTION_DOMAIN_CONTAINER";
+}
+
+// Trusted concrete systemd identity.
+message ConnectionSystemdIdentity {
+  string unit = 1;
+  // Present for a per-user manager; absent for the system manager.
+  optional uint32 manager_uid = 2;
+}
+
+// One accepted transport. Peer fields are kernel-derived; domain, subject, and
+// typed identity are populated after the transport first resolves successfully.
+message ConnectionInfo {
+  uint64 id = 1;
+  string listener_name = 2;
+  ConnectionListenerType listener_type = 3;
+  optional uint32 pid = 4;
+  optional uint32 uid = 5;
+  optional uint32 gid = 6;
+  ConnectionDomain domain = 7;
+  string subject = 8;
+  ConnectionSystemdIdentity systemd = 9;
+  reserved 10;
+  reserved "compose";
+  bool cancellation_requested = 11;
+  uint32 active_streams = 12;
+}
+
+message ListConnectionsResponse {
+  repeated ConnectionInfo connections = 1;
+}
+
+// Exact concrete systemd selector. Both fields must match.
+message ConnectionSystemdSelector {
+  string unit = 1;
+  optional uint32 manager_uid = 2;
+}
+
+// One selector in a bounded OR-set.
+message ConnectionSelector {
+  reserved 4;
+  reserved "compose";
+  oneof selector {
+    uint64 id = 1;
+    uint32 uid = 2;
+    ConnectionSystemdSelector systemd = 3;
+  }
+}
+
+message DropConnectionsRequest {
+  // At least one and at most 64 selectors. A connection matching any selector
+  // is targeted once. The caller's own transport is excluded so the RPC can
+  // return its audited result.
+  repeated ConnectionSelector selectors = 1;
+}
+
+message DropConnectionsResponse {
+  uint32 matched = 1;
+  uint32 cancelled = 2;
+  uint32 already_requested = 3;
+  uint32 caller_excluded = 4;
+}
+
 // Request for broker liveness.
 message HealthRequest {}
 
@@ -1026,6 +1239,15 @@ message ReadinessResponse {
   // Absent keys whose `missing` policy is `warn` or `generate` (reported for
   // visibility; they do not by themselves make the broker not ready).
   uint32 keys_optional_missing = 7;
+  reserved 8 to 11;
+  reserved "realms_total", "realms_ready", "realms_degraded", "realms_absent";
+  // Listeners whose socket path changed in an applied reload and whose
+  // externally generated wiring has not been regenerated (`rewire-required`).
+  // A COUNT only (bounded disclosure on this ungated probe): the named
+  // diagnostics are returned by the permission-gated `Reload` RPC. Non-zero is
+  // configuration-attention state; it does not by itself make the broker not
+  // ready and never affects authorization.
+  uint32 listeners_rewire_required = 12;
 }
 
 // Request for broker status.
@@ -1039,6 +1261,8 @@ message StatusResponse {
   string version = 2;
   // Wire protocol version number.
   uint32 protocol = 3;
+  reserved 4;
+  reserved "realms";
 }
 
 // Request to watch for change events, optionally filtered by kind.

@@ -25,6 +25,8 @@ use zeroize::Zeroizing;
 
 #[cfg(feature = "onepassword")]
 mod onepassword;
+#[cfg(all(feature = "db-keystore", target_os = "linux"))]
+pub mod rekey;
 pub mod store;
 
 pub use store::{SecretStore, StoreConfig, StoreError};

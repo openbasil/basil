@@ -29,9 +29,9 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::catalog::{
-    BackendKind, BackendRef, Catalog, CatalogSchema, Class, Config, Engine, KeyAlgorithm, KeyEntry,
-    Labels, MissingPolicy, NameTable, Op, PolicySchema, PrincipalSpec, RawPolicy, RawRule,
-    RawSubjectDefinition,
+    AuthorizationDomain, BackendKind, BackendRef, Catalog, CatalogSchema, Class, Config, Engine,
+    KeyAlgorithm, KeyEntry, Labels, MissingPolicy, NameTable, Op, PolicySchema,
+    RawEvidenceExpression, RawPolicy, RawRule, RawSubjectDefinition,
 };
 use anyhow::{Context, Result, bail};
 use clap::{Args, ValueEnum};
@@ -316,6 +316,7 @@ fn build_catalog(args: &InitArgs, layout: &Layout) -> Catalog {
             writable: true,
             // Created in place by startup reconcile on first run.
             missing: MissingPolicy::Generate,
+            nix_cache: None,
             generate: None,
             sealing_pin: None,
             labels: Labels::default(),
@@ -360,19 +361,17 @@ fn build_policy(uid: u32) -> RawPolicy {
     subjects.insert(
         "init.user".to_string(),
         RawSubjectDefinition {
+            domain: AuthorizationDomain::HostProcess,
             break_glass: false,
-            all_of: Some(vec![PrincipalSpec::Unix {
-                uid: Some(uid),
-                gid: None,
-            }]),
-            any_of: None,
+            match_: RawEvidenceExpression(serde_json::json!({
+                "all": [{ "process.uid": uid }]
+            })),
         },
     );
 
     RawPolicy {
         schema: PolicySchema::Policy,
         subjects,
-        unauthenticated_subject: None,
         roles,
         rules: vec![rule],
         config: Config { names, memberships },
@@ -395,6 +394,17 @@ fn build_config_toml(args: &InitArgs, layout: &Layout) -> String {
     out.push_str("# Socket mode defaults to 0600 (owner-only); widen deliberately if a peer\n");
     out.push_str("# group must connect, e.g. socket-mode = \"0660\" + socket-group = \"basil\".\n");
     out.push_str("socket-mode = \"0600\"\n");
+    out.push_str("# For a remote invocation courier, replace the legacy socket keys above with\n");
+    out.push_str(
+        "# named host and courier listeners. Courier exposes only InvocationService and\n",
+    );
+    out.push_str("# forces require-challenge=true regardless of the compatibility default.\n");
+    out.push_str("# [listeners.host]\n");
+    out.push_str("# type = \"host\"\n");
+    out.push_str("# path = \"/run/basil/host.sock\"\n");
+    out.push_str("# [listeners.courier]\n");
+    out.push_str("# type = \"courier\"\n");
+    out.push_str("# path = \"/run/basil/courier.sock\"\n");
 
     if args.backend == InitBackend::Keystore {
         out.push_str("\n# db-keystore backend: the local AEAD cipher for the at-rest DB.\n");
@@ -458,7 +468,9 @@ fn build_config_toml(args: &InitArgs, layout: &Layout) -> String {
     out.push_str("# request-encryption-key-id = \"broker.request_encryption.2026q3\"\n");
     out.push_str("# max-ttl-secs = 60\n");
     out.push_str("# clock-skew-secs = 30\n");
-    out.push_str("# replay-cache-capacity = 4096\n");
+    out.push('\n');
+    out.push_str("# [invocation.challenge]\n");
+    out.push_str("# capacity = 16384\n");
     out
 }
 
@@ -693,6 +705,7 @@ fn add_sops_entries(
                     public_path: None,
                     writable: true,
                     missing: MissingPolicy::Warn,
+                    nix_cache: None,
                     generate: None,
                     sealing_pin: None,
                     labels: Labels::default(),
@@ -952,7 +965,6 @@ mod tests {
         let overrides = crate::agent_cli::ConfigOverrides {
             config: Some(layout.config.clone()),
             values: Vec::new(),
-            ..crate::agent_cli::ConfigOverrides::default()
         };
         let file =
             crate::agent_cli::load_config_file(&overrides).expect("agent parses generated config");
@@ -966,6 +978,10 @@ mod tests {
         // Socket mode default is 0600 (owner-only).
         let mode = file.socket_mode.expect("socket-mode set");
         assert_eq!(mode.0, 0o600);
+        let rendered = std::fs::read_to_string(&layout.config).expect("read generated config");
+        assert!(rendered.contains("# [listeners.courier]"));
+        assert!(rendered.contains("# type = \"courier\""));
+        assert!(rendered.contains("# forces require-challenge=true"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -981,7 +997,6 @@ mod tests {
         let overrides = crate::agent_cli::ConfigOverrides {
             config: Some(layout.config),
             values: Vec::new(),
-            ..crate::agent_cli::ConfigOverrides::default()
         };
         crate::agent_cli::load_config_file(&overrides)
             .expect("agent parses generated keystore config (db-keystore-cipher key)");

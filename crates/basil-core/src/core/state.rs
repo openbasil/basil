@@ -28,8 +28,9 @@
 //! Today there is exactly one generation (id `1`); this iteration lands only the
 //! pinning plumbing: there is no reload trigger yet (`basil-y3e.2`).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use arc_swap::{ArcSwap, Guard};
@@ -38,12 +39,18 @@ use crate::audit::{AuditLog, ReloadActor};
 use crate::catalog::policy::{Config, ResolvedPolicy};
 use crate::catalog::{Catalog, Pdp};
 use crate::configuration::OverrideProvenance;
+use crate::core::ci_federation_audit::{
+    CiInvocationAuditEvent, CiTerminalOutcome, MAX_CI_INVOCATION_EVENT_BYTES,
+};
 use crate::core::crypto_provider::{ProviderAuditEvent, ProviderAuditOutcome};
+use crate::core::nix_cache_audit::{NixCacheAuditEvent, NixCacheAuditOutcome};
 use crate::decision::DecisionRecord;
 use crate::event::EventSource;
 use crate::manager::{BackendManager, ManagerError};
 use crate::reload::ReloadInputs;
 use crate::revocation::JwtRevocationStore;
+use crate::transport::connection::ConnectionRegistry;
+use crate::transport::listener::ListenerConfigSet;
 
 /// The generation id assigned to the broker's first (startup) generation.
 ///
@@ -58,8 +65,9 @@ pub const INITIAL_GENERATION_ID: u64 = 1;
 /// a monotonic [`id`](Generation::id) that names this snapshot in the audit trail.
 /// It is the unit that [`BrokerState`] swaps atomically on reload: an operation
 /// that pins one `Generation` sees an internally consistent
-/// `(catalog, policy, config)` triple for its entire lifetime, so a concurrent
-/// reload can never mix an old catalog with a new policy.
+/// `(catalog, policy, config, listeners)` snapshot for its entire lifetime, so a
+/// concurrent reload can never mix policy inputs or serving listener identity
+/// from different reloads.
 #[derive(Debug)]
 pub struct Generation {
     /// Monotonic generation id (starts at [`INITIAL_GENERATION_ID`], bumped on
@@ -69,6 +77,10 @@ pub struct Generation {
     policy: ResolvedPolicy,
     config: Config,
     overrides: Vec<OverrideProvenance>,
+    listeners: Arc<ListenerConfigSet>,
+    federation: Option<Arc<crate::core::ci_federation::ProviderCatalog>>,
+    jwks_caches: Arc<Mutex<BTreeMap<String, crate::core::ci_federation::GenerationJwksCache>>>,
+    provider_clients: BTreeMap<String, reqwest::Client>,
 }
 
 impl Generation {
@@ -92,13 +104,92 @@ impl Generation {
         config: Config,
         overrides: Vec<OverrideProvenance>,
     ) -> Self {
+        Self::new_with_overrides_and_listeners(
+            id,
+            catalog,
+            policy,
+            config,
+            overrides,
+            Arc::new(ListenerConfigSet::default()),
+        )
+    }
+
+    /// Bundle all reloadable authorization and listener inputs atomically.
+    #[must_use]
+    pub fn new_with_overrides_and_listeners(
+        id: u64,
+        catalog: impl Into<Arc<Catalog>>,
+        policy: ResolvedPolicy,
+        config: Config,
+        overrides: Vec<OverrideProvenance>,
+        listeners: impl Into<Arc<ListenerConfigSet>>,
+    ) -> Self {
         Self {
             id,
             catalog: catalog.into(),
             policy,
             config,
             overrides,
+            listeners: listeners.into(),
+            federation: None,
+            jwks_caches: Arc::new(Mutex::new(BTreeMap::new())),
+            provider_clients: BTreeMap::new(),
         }
+    }
+
+    /// Bundle a generation with its trusted CI federation catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when federation trust cannot be revalidated or a
+    /// generation-owned provider client or `JWKS` cache cannot be constructed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_overrides_listeners_and_federation(
+        id: u64,
+        catalog: impl Into<Arc<Catalog>>,
+        policy: ResolvedPolicy,
+        config: Config,
+        overrides: Vec<OverrideProvenance>,
+        listeners: impl Into<Arc<ListenerConfigSet>>,
+        federation: Option<Arc<crate::core::ci_federation::ProviderCatalog>>,
+    ) -> Result<Self, crate::core::ci_federation::FederationError> {
+        let catalog = catalog.into();
+        if let Some(federation) = &federation {
+            federation.validate_artifact_targets(&catalog)?;
+        }
+        let provider_clients = federation.as_ref().map_or_else(
+            || Ok(BTreeMap::new()),
+            |provider_catalog| provider_catalog.build_generation_clients(),
+        )?;
+        let jwks_caches = federation
+            .as_ref()
+            .map(|catalog| {
+                catalog
+                    .rules()
+                    .iter()
+                    .map(|rule| {
+                        crate::core::ci_federation::GenerationJwksCache::new(
+                            id,
+                            &rule.provider,
+                            crate::core::ci_federation::JwksCachePolicy::default(),
+                        )
+                        .map(|cache| (rule.id.clone(), cache))
+                    })
+                    .collect::<Result<BTreeMap<_, _>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        Ok(Self {
+            id,
+            catalog,
+            policy,
+            config,
+            overrides,
+            listeners: listeners.into(),
+            federation,
+            jwks_caches: Arc::new(Mutex::new(jwks_caches)),
+            provider_clients,
+        })
     }
 
     /// This generation's monotonic id (for the audit record / status probe).
@@ -143,6 +234,33 @@ impl Generation {
     #[must_use]
     pub fn override_provenance(&self) -> &[OverrideProvenance] {
         &self.overrides
+    }
+
+    /// Typed listener configuration captured with this generation.
+    #[must_use]
+    pub fn listeners(&self) -> &ListenerConfigSet {
+        &self.listeners
+    }
+
+    /// Trusted CI federation rules for this generation, when enabled.
+    #[must_use]
+    pub const fn federation(&self) -> Option<&Arc<crate::core::ci_federation::ProviderCatalog>> {
+        self.federation.as_ref()
+    }
+
+    /// Generation-isolated JWKS caches. The lock is held only while selecting
+    /// or updating cache state; network fetches are performed by the caller.
+    #[must_use]
+    pub const fn jwks_caches(
+        &self,
+    ) -> &Arc<Mutex<BTreeMap<String, crate::core::ci_federation::GenerationJwksCache>>> {
+        &self.jwks_caches
+    }
+
+    /// Return the generation-pinned HTTP client for one exact provider rule.
+    #[must_use]
+    pub fn provider_client(&self, rule_id: &str) -> Option<&reqwest::Client> {
+        self.provider_clients.get(rule_id)
     }
 }
 
@@ -325,6 +443,8 @@ pub struct BrokerState {
     /// The active policy generation, swapped atomically on reload (`basil-y3e`).
     /// Every RPC loads exactly one snapshot of this and pins the whole op to it.
     generation: ArcSwap<Generation>,
+    connections: ConnectionRegistry,
+    listener_runtime: OnceLock<Arc<crate::transport::grpc_server::ListenerRuntime>>,
     manager: BackendManager,
     /// A stable backend label reported in a `status` response. The manager does
     /// not expose its backend kinds, so the binary supplies one at construction
@@ -365,6 +485,13 @@ pub struct BrokerState {
     /// the newer one (a silent lost update). Holds no data: it only orders the
     /// two triggers. Reloads are rare, so contention is irrelevant.
     reload_lock: Mutex<()>,
+    live_reload_lock: tokio::sync::Mutex<()>,
+    /// Every Nix verifier identity enrolled during this process lifetime.
+    ///
+    /// The set is monotonic and deliberately outlives catalog generations. A
+    /// removed name therefore cannot be re-declared at another route or with
+    /// different material until the process restarts.
+    nix_cache_enrolled_tombstones: Mutex<BTreeSet<String>>,
 }
 
 impl BrokerState {
@@ -405,9 +532,21 @@ impl BrokerState {
         backend_label: impl Into<String>,
         limits: BrokerLimits,
     ) -> Self {
+        let catalog = catalog.into();
+        let nix_cache_enrolled_tombstones = catalog
+            .keys
+            .values()
+            .filter_map(|key| {
+                let identity = key.nix_cache.as_ref()?;
+                (identity.state == crate::catalog::NixCacheState::Enrolled)
+                    .then(|| identity.key_name.clone())
+            })
+            .collect();
         let generation = Generation::new(INITIAL_GENERATION_ID, catalog, policy, config);
         Self {
             generation: ArcSwap::from_pointee(generation),
+            connections: ConnectionRegistry::with_defaults(),
+            listener_runtime: OnceLock::new(),
             manager,
             backend_label: backend_label.into(),
             // Default to this crate's version; the binary overrides with its own
@@ -422,6 +561,8 @@ impl BrokerState {
             readiness_cache: Mutex::new(None),
             jwks_cache: Mutex::new(None),
             reload_lock: Mutex::new(()),
+            live_reload_lock: tokio::sync::Mutex::new(()),
+            nix_cache_enrolled_tombstones: Mutex::new(nix_cache_enrolled_tombstones),
         }
     }
 
@@ -429,12 +570,13 @@ impl BrokerState {
     #[must_use]
     pub fn with_override_provenance(self, overrides: Vec<OverrideProvenance>) -> Self {
         let current = self.generation.load_full();
-        let generation = Generation::new_with_overrides(
+        let generation = Generation::new_with_overrides_and_listeners(
             current.id,
             Arc::clone(&current.catalog),
             current.policy.clone(),
             current.config.clone(),
             overrides,
+            Arc::clone(&current.listeners),
         );
         self.generation.store(Arc::new(generation));
         self
@@ -482,6 +624,72 @@ impl BrokerState {
         self
     }
 
+    /// Attach the listener configuration installed at startup.
+    #[must_use]
+    pub fn with_listener_configs(self, listeners: ListenerConfigSet) -> Self {
+        let current = self.generation.load_full();
+        let generation = Generation::new_with_overrides_and_listeners(
+            current.id,
+            Arc::clone(&current.catalog),
+            current.policy.clone(),
+            current.config.clone(),
+            current.overrides.clone(),
+            Arc::new(listeners),
+        );
+        self.generation.store(Arc::new(generation));
+        self
+    }
+
+    /// Broker-wide connection inventory and listener admission gate.
+    #[must_use]
+    pub const fn connections(&self) -> &ConnectionRegistry {
+        &self.connections
+    }
+
+    /// Install the live accept-loop owner exactly once at agent startup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a runtime was already installed.
+    pub fn install_listener_runtime(
+        &self,
+        runtime: Arc<crate::transport::grpc_server::ListenerRuntime>,
+    ) -> Result<(), &'static str> {
+        self.listener_runtime
+            .set(runtime)
+            .map_err(|_| "listener runtime already installed")
+    }
+
+    /// Live accept-loop owner, once agent startup has published its listeners.
+    #[must_use]
+    pub fn listener_runtime(&self) -> Option<&Arc<crate::transport::grpc_server::ListenerRuntime>> {
+        self.listener_runtime.get()
+    }
+
+    /// Serialize asynchronous listener-aware reload transitions.
+    pub(crate) const fn live_reload_lock(&self) -> &tokio::sync::Mutex<()> {
+        &self.live_reload_lock
+    }
+
+    /// Attach the trusted CI federation catalog to the active generation.
+    pub fn with_federation_catalog(
+        self,
+        federation: Option<Arc<crate::core::ci_federation::ProviderCatalog>>,
+    ) -> Result<Self, crate::core::ci_federation::FederationError> {
+        let current = self.generation.load_full();
+        let generation = Generation::new_with_overrides_listeners_and_federation(
+            current.id,
+            Arc::clone(&current.catalog),
+            current.policy.clone(),
+            current.config.clone(),
+            current.overrides.clone(),
+            Arc::clone(&current.listeners),
+            federation,
+        )?;
+        self.generation.store(Arc::new(generation));
+        Ok(self)
+    }
+
     /// The configured catalog/policy paths the reload engine re-reads, if any.
     #[must_use]
     pub const fn reload_inputs(&self) -> Option<&ReloadInputs> {
@@ -494,6 +702,29 @@ impl BrokerState {
     #[must_use]
     pub const fn reload_lock(&self) -> &Mutex<()> {
         &self.reload_lock
+    }
+
+    /// Snapshot the process-lifetime enrolled Nix identity tombstones.
+    #[must_use]
+    pub(crate) fn nix_cache_enrolled_tombstones(&self) -> BTreeSet<String> {
+        self.nix_cache_enrolled_tombstones
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Extend the process-lifetime Nix identity tombstones after a successful
+    /// generation swap. Existing entries are never removed.
+    pub(crate) fn record_nix_cache_enrollments(&self, catalog: &Catalog) {
+        let mut tombstones = self
+            .nix_cache_enrolled_tombstones
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tombstones.extend(catalog.keys.values().filter_map(|key| {
+            let identity = key.nix_cache.as_ref()?;
+            (identity.state == crate::catalog::NixCacheState::Enrolled)
+                .then(|| identity.key_name.clone())
+        }));
     }
 
     /// The id of the **currently serving** generation (observable for the status
@@ -640,6 +871,99 @@ impl BrokerState {
                 outcome = ?event.outcome,
                 reason = event.reason,
                 "software-custody provider operation",
+            ),
+        }
+        if let Some(audit) = &self.audit {
+            audit.append_value(&event.to_json_value());
+        }
+    }
+
+    /// Record one terminal federated CI invocation summary without affecting
+    /// the invocation result when audit serialization or delivery fails.
+    pub(crate) fn record_ci_invocation_event(&self, event: &CiInvocationAuditEvent) {
+        let Ok(value) = event.json_value() else {
+            tracing::error!(
+                event_kind = "basil.audit.ci_invocation",
+                event_version = 1,
+                invocation_id = event.invocation_id(),
+                "CI invocation audit serialization failed"
+            );
+            return;
+        };
+        let Ok(serialized) = serde_json::to_string(&value) else {
+            tracing::error!(
+                event_kind = "basil.audit.ci_invocation",
+                event_version = 1,
+                invocation_id = event.invocation_id(),
+                "CI invocation audit rendering failed"
+            );
+            return;
+        };
+        if serialized.len() > MAX_CI_INVOCATION_EVENT_BYTES {
+            tracing::error!(
+                event_kind = "basil.audit.ci_invocation",
+                event_version = 1,
+                invocation_id = event.invocation_id(),
+                size = serialized.len(),
+                "bounded CI invocation audit event exceeded its invariant"
+            );
+            return;
+        }
+        let provider = event
+            .provider()
+            .map(crate::core::ci_federation::ProviderKind::config_name);
+        let rule_id = event.rule_id();
+        let target = event.accepted_target();
+        match event.outcome {
+            CiTerminalOutcome::Success => tracing::info!(
+                event_kind = "basil.audit.ci_invocation",
+                event_version = 1,
+                invocation_id = event.invocation_id(),
+                provider,
+                rule_id,
+                target,
+                event_json = serialized,
+                "federated CI invocation",
+            ),
+            CiTerminalOutcome::Denied | CiTerminalOutcome::Failure | CiTerminalOutcome::Aborted => {
+                tracing::warn!(
+                    event_kind = "basil.audit.ci_invocation",
+                    event_version = 1,
+                    invocation_id = event.invocation_id(),
+                    provider,
+                    rule_id,
+                    target,
+                    event_json = serialized,
+                    "federated CI invocation",
+                );
+            }
+        }
+        if let Some(audit) = &self.audit {
+            audit.append_value(&value);
+        }
+    }
+
+    /// Record one purpose-specific Nix cache operation without payload,
+    /// signature, private material, or installation claims.
+    pub fn record_nix_cache_event(&self, event: &NixCacheAuditEvent<'_>) {
+        match event.outcome {
+            NixCacheAuditOutcome::Deny | NixCacheAuditOutcome::Failure => tracing::warn!(
+                event = "basil.audit.nix_cache_operation",
+                op = event.op.token(),
+                key = event.key_id,
+                generation = event.generation,
+                outcome = event.outcome.token(),
+                reason = event.reason,
+                "Nix cache operation",
+            ),
+            NixCacheAuditOutcome::Success => tracing::info!(
+                event = "basil.audit.nix_cache_operation",
+                op = event.op.token(),
+                key = event.key_id,
+                generation = event.generation,
+                outcome = event.outcome.token(),
+                reason = event.reason,
+                "Nix cache operation",
             ),
         }
         if let Some(audit) = &self.audit {

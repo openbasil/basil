@@ -36,8 +36,9 @@
 //! ## Claims
 //!
 //! Claims ride in the protected header as a CWT map (header 15) plus basil
-//! private labels (`-70001..=-70005`, see [`label`]). [`ValidationParams`]
-//! parameterizes skew/TTL/audience bounds; `now` is injected, never sampled.
+//! private labels (`-70001..=-70005` and `-70008..=-70010`, see [`label`]).
+//! [`ValidationParams`] parameterizes skew/TTL/audience bounds; `now` is
+//! injected, never sampled.
 //!
 //! The crate is `no_std` + `alloc` and obtains production randomness through
 //! `getrandom`.
@@ -91,15 +92,18 @@ pub use keys::{
 };
 #[cfg(feature = "fixtures")]
 pub use seal::build_sealed_with_parts;
-pub use seal::{SealParams, VerifiedSealed, VerifySealedParams, build_sealed, verify_sealed};
+pub use seal::{
+    SealParams, VerifiedSealed, VerifySealedParams, build_sealed, build_sealed_with_headers,
+    verify_sealed,
+};
 pub use sign::{
     SignParams, VerifiedSigned, VerifySignedParams, build_signed, build_signed_with_headers,
     verify_signed,
 };
 pub use traits::{OpenRequest, Recipient, Signer, Verifier};
 pub use types::{
-    ContentType, CoseBytes, ExternalAad, KeyId, MessageId, ResponseSubject, SealedAad, Signature,
-    Subject, UnixTime,
+    ContentType, CoseBytes, ExternalAad, FreshnessChallenge, KeyId, MessageId, ResponseSubject,
+    SealedAad, Signature, Subject, UnixTime, X25519ResponsePublicKey,
 };
 
 // Re-exported so trait implementors and callers name the same zeroizing

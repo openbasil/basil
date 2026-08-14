@@ -9,9 +9,11 @@ use tokio::runtime::Runtime;
 
 use crate::Client;
 use crate::client::{
-    AgentExplanation, AgentHealth, AgentReadiness, AgentReload, AgentRevocation, AgentStatus,
-    AllowedNatsSigner, ImportEntry, IssuedCertificate, KeyHandle, MintedJwt, NatsJwtValidation,
-    NatsUserPermissions, SecretValue, SignNatsJwtOptions,
+    AgentConnection, AgentConnectionDrop, AgentConnectionSelector, AgentExplanation, AgentHealth,
+    AgentReadiness, AgentReload, AgentRevocation, AgentStatus, AllowedNatsSigner, ImportEntry,
+    InvocationChallenge, IssuedCertificate, KeyHandle, MintedJwt, NatsJwtValidation,
+    NatsUserPermissions, NixCacheEnrollment, NixCacheKey, NixCacheSignature, SecretValue,
+    SignNatsJwtOptions,
 };
 use crate::constants::DEFAULT_CONN_TIMEOUT;
 use crate::error::Result;
@@ -65,10 +67,65 @@ impl BlockingClient {
         self.runtime.block_on(self.inner.sign(key_id, message))
     }
 
+    /// Describe one enrolled Nix binary-cache key.
+    pub fn describe_nix_cache_key(
+        &mut self,
+        key_id: &str,
+        batch_id: [u8; 16],
+        request_id: [u8; 16],
+    ) -> Result<NixCacheKey> {
+        self.runtime.block_on(
+            self.inner
+                .describe_nix_cache_key(key_id, batch_id, request_id),
+        )
+    }
+
+    /// Ensure and enroll one pending Nix binary-cache key.
+    pub fn enroll_nix_cache_key(
+        &mut self,
+        key_id: &str,
+        batch_id: [u8; 16],
+        request_id: [u8; 16],
+    ) -> Result<NixCacheEnrollment> {
+        self.runtime.block_on(
+            self.inner
+                .enroll_nix_cache_key(key_id, batch_id, request_id),
+        )
+    }
+
+    /// Sign one canonical `PATH_INFO_V1` fingerprint.
+    pub fn sign_nix_cache_fingerprint(
+        &mut self,
+        key_id: &str,
+        fingerprint: &[u8],
+        batch_id: [u8; 16],
+        request_id: [u8; 16],
+    ) -> Result<NixCacheSignature> {
+        self.runtime.block_on(self.inner.sign_nix_cache_fingerprint(
+            key_id,
+            fingerprint,
+            batch_id,
+            request_id,
+        ))
+    }
+
     /// Verify `signature` over `message` with `key_id`.
     pub fn verify(&mut self, key_id: &str, message: &[u8], signature: &[u8]) -> Result<bool> {
         self.runtime
             .block_on(self.inner.verify(key_id, message, signature))
+    }
+
+    /// Fetch a single-use invocation freshness challenge bound to `jkt`. See
+    /// [`Client::get_invocation_challenge`].
+    pub fn get_invocation_challenge(
+        &mut self,
+        jkt: &[u8; 32],
+        courier_observed_source: Option<&str>,
+    ) -> Result<InvocationChallenge> {
+        self.runtime.block_on(
+            self.inner
+                .get_invocation_challenge(jkt, courier_observed_source),
+        )
     }
 
     /// Fetch a public key by catalog name and optional version.
@@ -396,6 +453,20 @@ impl BlockingClient {
     /// config is read from the broker's on-disk paths only, never the wire.
     pub fn reload(&mut self, check: bool) -> Result<AgentReload> {
         self.runtime.block_on(self.inner.reload(check))
+    }
+
+    /// Return the permission-gated bounded accepted-connection inventory.
+    pub fn connections(&mut self) -> Result<Vec<AgentConnection>> {
+        self.runtime.block_on(self.inner.connections())
+    }
+
+    /// Deliberately terminate exact or typed selected accepted connections.
+    pub fn drop_connections(
+        &mut self,
+        selectors: &[AgentConnectionSelector],
+    ) -> Result<AgentConnectionDrop> {
+        self.runtime
+            .block_on(self.inner.drop_connections(selectors))
     }
 
     /// Explain a policy decision against the broker's serving generation.

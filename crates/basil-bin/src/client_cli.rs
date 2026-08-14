@@ -15,8 +15,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use basil::{
-    AeadAlgorithm, CiphertextEnvelope, Client, ImportEntry, KeyMaterial, KeyType, NatsJwtType,
-    NatsUserPermissions, SignNatsJwtOptions,
+    AeadAlgorithm, AgentConnection, AgentConnectionDomain, AgentConnectionListener,
+    AgentConnectionSelector, CiphertextEnvelope, Client, ImportEntry, KeyMaterial, KeyType,
+    NatsJwtType, NatsUserPermissions, SignNatsJwtOptions,
 };
 use basil_core::agent_cli::ExplainArgs;
 use clap::{Subcommand, ValueEnum};
@@ -453,6 +454,29 @@ pub enum Command {
         json: bool,
     },
 
+    /// Inspect or deliberately terminate accepted broker connections.
+    Connections {
+        #[command(subcommand)]
+        command: ConnectionsCommand,
+    },
+
+    /// Fetch a single-use sealed-invocation freshness challenge bound to a
+    /// proof-key thumbprint (CI federation). The thumbprint is self-asserted
+    /// and grants nothing; the broker binds the issued challenge to it and to
+    /// the serving generation. Prints the 32 challenge bytes as hex plus the
+    /// generation and expiry. The courier-observed source stays absent here:
+    /// this CLI is a direct local caller, and only a trusted courier may
+    /// assert a client source.
+    InvocationChallenge {
+        /// Proof-key thumbprint (RFC 7638 SHA-256, 32 bytes) as 64 hex chars
+        /// or unpadded base64url.
+        #[arg(long)]
+        jkt: String,
+        /// Emit a machine-readable JSON object instead of human lines.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Revoke a JWT-SVID by trust-domain and jti. Requires the dedicated
     /// `revoke` admin permission over `broker.revoke` and a configured
     /// persistent `revocation_store=jwt-svid` value key.
@@ -467,6 +491,31 @@ pub enum Command {
         #[arg(long)]
         expires_at_unix: u64,
         /// Emit a machine-readable JSON object instead of human lines.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConnectionsCommand {
+    /// List the stable-id ordered bounded accepted-connection inventory.
+    List {
+        /// Emit a machine-readable JSON object.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Terminate connections selected by exact id, broad UID, or typed identity.
+    Drop {
+        /// Exact process-lifetime connection id; repeatable.
+        #[arg(long = "id")]
+        ids: Vec<u64>,
+        /// Broad Unix UID selector; repeatable.
+        #[arg(long = "uid")]
+        uids: Vec<u32>,
+        /// Typed systemd selector as `UNIT` (system manager) or `UID:UNIT`.
+        #[arg(long = "systemd")]
+        systemd: Vec<String>,
+        /// Emit a machine-readable JSON object.
         #[arg(long)]
         json: bool,
     },
@@ -660,6 +709,10 @@ async fn dispatch(client: &mut Client, command: Command) -> Result<()> {
         Command::Health { json } => health(client, json).await,
         Command::Ready { json } => ready(client, json).await,
         Command::Reload { check, json } => reload(client, check, json).await,
+        Command::Connections { command } => connections(client, command).await,
+        Command::InvocationChallenge { jkt, json } => {
+            invocation_challenge(client, &jkt, json).await
+        }
         Command::Revoke {
             trust_domain,
             jti,
@@ -1203,6 +1256,7 @@ async fn ready(client: &mut Client, json: bool) -> Result<()> {
         println!("keys_present: {}", r.keys_present);
         println!("keys_required_missing: {}", r.keys_required_missing);
         println!("keys_optional_missing: {}", r.keys_optional_missing);
+        println!("listeners_rewire_required: {}", r.listeners_rewire_required);
     }
     if ready_exit_code(&r) != 0 {
         // Exit 1 = "not ready" so a probe can gate on the code, distinct from a
@@ -1224,6 +1278,7 @@ fn ready_json(r: &basil::AgentReadiness) -> serde_json::Value {
         "keys_present": r.keys_present,
         "keys_required_missing": r.keys_required_missing,
         "keys_optional_missing": r.keys_optional_missing,
+        "listeners_rewire_required": r.listeners_rewire_required,
     })
 }
 
@@ -1254,18 +1309,23 @@ async fn reload(client: &mut Client, check: bool, json: bool) -> Result<()> {
             "previous_generation: {} (still serving)",
             r.previous_generation
         );
+        print_listener_impacts(&r, "blocking listener");
     } else if check {
         println!("checked: ok (no swap)");
         println!("previous_generation: {}", r.previous_generation);
         println!("would_be_generation: {}", r.new_generation);
         println!("key_count: {}", r.key_count);
         println!("grant_count: {}", r.grant_count);
+        print_listener_impacts(&r, "listener change");
+        print_rewire_required(&r);
     } else {
         println!("applied: {}", r.applied);
         println!("previous_generation: {}", r.previous_generation);
         println!("new_generation: {}", r.new_generation);
         println!("key_count: {}", r.key_count);
         println!("grant_count: {}", r.grant_count);
+        print_listener_impacts(&r, "listener change");
+        print_rewire_required(&r);
     }
     if reload_exit_code(&r) != 0 {
         // Exit 1 = "rejected" (the candidate did not validate / changed a
@@ -1274,6 +1334,158 @@ async fn reload(client: &mut Client, check: bool, json: bool) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+async fn connections(client: &mut Client, command: ConnectionsCommand) -> Result<()> {
+    match command {
+        ConnectionsCommand::List { json } => list_connections(client, json).await,
+        ConnectionsCommand::Drop {
+            ids,
+            uids,
+            systemd,
+            json,
+        } => drop_connections(client, ids, uids, systemd, json).await,
+    }
+}
+
+async fn list_connections(client: &mut Client, json: bool) -> Result<()> {
+    let connections = client.connections().await?;
+    if json {
+        let values = connections.iter().map(connection_json).collect::<Vec<_>>();
+        println!("{}", serde_json::json!({ "connections": values }));
+        return Ok(());
+    }
+    for connection in &connections {
+        println!(
+            "id={} listener={} type={} pid={} uid={} gid={} domain={} subject={} identity={} cancelling={} streams={}",
+            connection.id,
+            connection.listener_name,
+            connection_listener_token(connection.listener_type),
+            optional_number(connection.pid),
+            optional_number(connection.uid),
+            optional_number(connection.gid),
+            connection_domain_token(connection.domain),
+            if connection.subject.is_empty() {
+                "-"
+            } else {
+                &connection.subject
+            },
+            connection_identity_token(connection),
+            connection.cancellation_requested,
+            connection.active_streams,
+        );
+    }
+    Ok(())
+}
+
+async fn drop_connections(
+    client: &mut Client,
+    ids: Vec<u64>,
+    uids: Vec<u32>,
+    systemd: Vec<String>,
+    json: bool,
+) -> Result<()> {
+    let mut selectors = ids
+        .into_iter()
+        .map(AgentConnectionSelector::Id)
+        .chain(uids.into_iter().map(AgentConnectionSelector::Uid))
+        .collect::<Vec<_>>();
+    selectors.extend(
+        systemd
+            .iter()
+            .map(|value| parse_systemd_selector(value))
+            .collect::<Result<Vec<_>>>()?,
+    );
+    if selectors.is_empty() {
+        bail!("at least one --id, --uid, or --systemd selector is required");
+    }
+    let result = client.drop_connections(&selectors).await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "matched": result.matched,
+                "cancelled": result.cancelled,
+                "already_requested": result.already_requested,
+                "caller_excluded": result.caller_excluded,
+            })
+        );
+    } else {
+        println!("matched: {}", result.matched);
+        println!("cancelled: {}", result.cancelled);
+        println!("already_requested: {}", result.already_requested);
+        println!("caller_excluded: {}", result.caller_excluded);
+    }
+    Ok(())
+}
+
+fn parse_systemd_selector(value: &str) -> Result<AgentConnectionSelector> {
+    if let Some((uid, unit)) = value.split_once(':') {
+        if unit.is_empty() {
+            bail!("systemd selector unit must not be empty");
+        }
+        return Ok(AgentConnectionSelector::Systemd {
+            unit: unit.to_string(),
+            manager_uid: Some(uid.parse().context("invalid systemd manager UID")?),
+        });
+    }
+    if value.is_empty() {
+        bail!("systemd selector unit must not be empty");
+    }
+    Ok(AgentConnectionSelector::Systemd {
+        unit: value.to_string(),
+        manager_uid: None,
+    })
+}
+
+fn connection_json(connection: &AgentConnection) -> serde_json::Value {
+    serde_json::json!({
+        "id": connection.id,
+        "listener_name": connection.listener_name,
+        "listener_type": connection_listener_token(connection.listener_type),
+        "pid": connection.pid,
+        "uid": connection.uid,
+        "gid": connection.gid,
+        "domain": connection_domain_token(connection.domain),
+        "subject": connection.subject,
+        "systemd": connection.systemd.as_ref().map(|identity| serde_json::json!({
+            "unit": identity.unit,
+            "manager_uid": identity.manager_uid,
+        })),
+        "cancellation_requested": connection.cancellation_requested,
+        "active_streams": connection.active_streams,
+    })
+}
+
+const fn connection_listener_token(listener: AgentConnectionListener) -> &'static str {
+    match listener {
+        AgentConnectionListener::Host => "host",
+        AgentConnectionListener::Courier => "courier",
+        _ => "unknown",
+    }
+}
+
+const fn connection_domain_token(domain: AgentConnectionDomain) -> &'static str {
+    match domain {
+        AgentConnectionDomain::Unresolved => "unresolved",
+        AgentConnectionDomain::HostProcess => "host-process",
+        AgentConnectionDomain::SystemdUnit => "systemd-unit",
+        _ => "unknown",
+    }
+}
+
+fn connection_identity_token(connection: &AgentConnection) -> String {
+    if let Some(systemd) = &connection.systemd {
+        return systemd.manager_uid.map_or_else(
+            || format!("systemd:system:{}", systemd.unit),
+            |uid| format!("systemd:{uid}:{}", systemd.unit),
+        );
+    }
+    "-".to_string()
+}
+
+fn optional_number(value: Option<u32>) -> String {
+    value.map_or_else(|| "-".to_string(), |value| value.to_string())
 }
 
 /// The stable one-line `--json` object for `basil reload [--check]` (the
@@ -1292,7 +1504,59 @@ fn reload_json(r: &basil::AgentReload) -> serde_json::Value {
             "reason": rej.reason,
             "message": rej.message,
         })),
+        "listener_impacts": r.listener_impacts.iter().map(|impact| serde_json::json!({
+            "name": impact.name,
+            "kind": listener_change_token(impact.kind),
+            "active_connections": impact.active_connections,
+            "previous_path": impact.previous_path,
+            "new_path": impact.new_path,
+        })).collect::<Vec<_>>(),
+        "rewire_required": r.rewire_required.iter().map(|entry| serde_json::json!({
+            "listener": entry.listener,
+            "previous_path": entry.previous_path,
+            "new_path": entry.new_path,
+            "applied_generation": entry.applied_generation,
+            "recorded_at_unix": entry.recorded_at_unix,
+        })).collect::<Vec<_>>(),
     })
+}
+
+/// Stable scriptable token for a listener change kind.
+const fn listener_change_token(kind: basil::AgentListenerChange) -> &'static str {
+    match kind {
+        basil::AgentListenerChange::Add => "add",
+        basil::AgentListenerChange::Remove => "remove",
+        basil::AgentListenerChange::Reconfigure => "reconfigure",
+        _ => "unknown",
+    }
+}
+
+/// Human-readable candidate-aware listener impact lines (one per change).
+fn print_listener_impacts(r: &basil::AgentReload, label: &str) {
+    for impact in &r.listener_impacts {
+        let path = match (impact.previous_path.as_deref(), impact.new_path.as_deref()) {
+            (Some(previous), Some(new)) if previous != new => format!("{previous} -> {new}"),
+            (_, Some(new)) => new.to_string(),
+            (Some(previous), None) => previous.to_string(),
+            (None, None) => "-".to_string(),
+        };
+        println!(
+            "{label}: {} {} ({path}, active_connections: {})",
+            listener_change_token(impact.kind),
+            impact.name,
+            impact.active_connections,
+        );
+    }
+}
+
+/// Human-readable persistent rewire diagnostics (one line per listener).
+fn print_rewire_required(r: &basil::AgentReload) {
+    for entry in &r.rewire_required {
+        println!(
+            "rewire_required: {} ({} -> {}, since generation {})",
+            entry.listener, entry.previous_path, entry.new_path, entry.applied_generation,
+        );
+    }
 }
 
 /// Map a reload outcome to the process exit code automation gates on: `0` when
@@ -1392,6 +1656,44 @@ fn explain_json(explanation: &basil::AgentExplanation) -> serde_json::Value {
 }
 
 /// Live JWT-SVID revocation against the running broker's deny-list.
+/// Decode a proof-key thumbprint argument: 64 hex chars or unpadded
+/// base64url, 32 bytes either way.
+fn parse_jkt(jkt: &str) -> Result<[u8; 32]> {
+    let bytes = if jkt.len() == 64 && jkt.bytes().all(|b| b.is_ascii_hexdigit()) {
+        hex::decode(jkt).context("decoding --jkt hex")?
+    } else {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(jkt)
+            .context("decoding --jkt (expected 64 hex chars or unpadded base64url)")?
+    };
+    match bytes.as_slice().try_into() {
+        Ok(jkt) => Ok(jkt),
+        Err(_) => bail!("--jkt must decode to exactly 32 bytes, got {}", bytes.len()),
+    }
+}
+
+async fn invocation_challenge(client: &mut Client, jkt: &str, json: bool) -> Result<()> {
+    let jkt = parse_jkt(jkt)?;
+    let issued = client.get_invocation_challenge(&jkt, None).await?;
+    if json {
+        println!("{}", invocation_challenge_json(&issued));
+        return Ok(());
+    }
+    println!("challenge: {}", hex::encode(issued.challenge));
+    println!("generation: {}", issued.generation);
+    println!("expires_at_unix: {}", issued.expires_at_unix);
+    Ok(())
+}
+
+/// Stable JSON shape for `basil invocation-challenge --json`.
+fn invocation_challenge_json(issued: &basil::InvocationChallenge) -> serde_json::Value {
+    serde_json::json!({
+        "challenge": hex::encode(issued.challenge),
+        "generation": issued.generation,
+        "expires_at_unix": issued.expires_at_unix,
+    })
+}
+
 async fn revoke(
     client: &mut Client,
     trust_domain: &str,
@@ -1443,17 +1745,26 @@ const fn aead_name(value: AeadAlgorithm) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        Command as ClientCommand, KeyMaterial, ManifestEntry, check_import_set, explain_json,
-        health_json, key_material, ready_exit_code, ready_json, reload_exit_code, reload_json,
-        revoke_json, status_json,
+        Command as ClientCommand, KeyMaterial, ManifestEntry, check_import_set,
+        connection_listener_token, explain_json, health_json, key_material, parse_systemd_selector,
+        ready_exit_code, ready_json, reload_exit_code, reload_json, revoke_json, status_json,
     };
     use crate::Cli;
     use basil::{
-        AgentDecision, AgentExplanation, AgentHealth, AgentReadiness, AgentReload, AgentRevocation,
-        MatchedRule, ReadinessReason, ReloadRejection,
+        AgentConnectionListener, AgentConnectionSelector, AgentDecision, AgentExplanation,
+        AgentHealth, AgentReadiness, AgentReload, AgentRevocation, MatchedRule, ReadinessReason,
+        ReloadRejection,
     };
     use clap::Parser;
     use std::path::Path;
+
+    #[test]
+    fn courier_connection_listener_uses_stable_token() {
+        assert_eq!(
+            connection_listener_token(AgentConnectionListener::Courier),
+            "courier"
+        );
+    }
 
     #[test]
     #[allow(clippy::too_many_lines)]
@@ -1466,6 +1777,19 @@ mod tests {
         Cli::parse_from(["basil", "reload"]);
         Cli::parse_from(["basil", "reload", "--check"]);
         Cli::parse_from(["basil", "reload", "--check", "--json"]);
+        Cli::parse_from(["basil", "connections", "list", "--json"]);
+        Cli::parse_from([
+            "basil",
+            "connections",
+            "drop",
+            "--id",
+            "7",
+            "--uid",
+            "1000",
+            "--systemd",
+            "1000:api.service",
+            "--json",
+        ]);
         Cli::parse_from([
             "basil",
             "new-key",
@@ -2173,12 +2497,12 @@ mod tests {
     fn status_json_shape_is_backend_version_protocol() {
         let s = basil::AgentStatus {
             backend: "keystore".to_string(),
-            version: "0.7.1".to_string(),
+            version: "0.7.2".to_string(),
             protocol: 1,
         };
         let v = status_json(&s);
         assert_eq!(v["backend"], serde_json::json!("keystore"));
-        assert_eq!(v["version"], serde_json::json!("0.7.1"));
+        assert_eq!(v["version"], serde_json::json!("0.7.2"));
         assert_eq!(v["protocol"], serde_json::json!(1));
         let obj = v.as_object().expect("status --json is a JSON object");
         assert_eq!(
@@ -2198,6 +2522,7 @@ mod tests {
             keys_present: present,
             keys_required_missing: total - present,
             keys_optional_missing: 0,
+            listeners_rewire_required: 0,
         }
     }
 
@@ -2213,11 +2538,12 @@ mod tests {
         assert_eq!(v["keys_present"], serde_json::json!(4));
         assert_eq!(v["keys_required_missing"], serde_json::json!(0));
         assert_eq!(v["keys_optional_missing"], serde_json::json!(0));
+        assert_eq!(v["listeners_rewire_required"], serde_json::json!(0));
         let obj = v.as_object().expect("ready --json is a JSON object");
         assert_eq!(
             obj.len(),
-            7,
-            "ready --json carries the full 7-field summary"
+            8,
+            "ready --json carries the complete key and rewire summary"
         );
 
         // The coarse reason tokens automation matches on are stable.
@@ -2260,6 +2586,20 @@ mod tests {
             key_count: 12,
             grant_count: 9,
             rejection: None,
+            listener_impacts: vec![basil::AgentListenerImpact {
+                name: "workloads".to_string(),
+                kind: basil::AgentListenerChange::Add,
+                active_connections: 0,
+                previous_path: None,
+                new_path: Some("/run/basil/workloads.sock".to_string()),
+            }],
+            rewire_required: vec![basil::AgentRewireDiagnostic {
+                listener: "workloads".to_string(),
+                previous_path: "/run/basil/old.sock".to_string(),
+                new_path: "/run/basil/workloads.sock".to_string(),
+                applied_generation: 5,
+                recorded_at_unix: 1_700_000_000,
+            }],
         }
     }
 
@@ -2276,6 +2616,8 @@ mod tests {
                 reason: "routing_shape_changed".to_string(),
                 message: "a key's backend locator changed (restart-only)".to_string(),
             }),
+            listener_impacts: Vec::new(),
+            rewire_required: Vec::new(),
         }
     }
 
@@ -2292,7 +2634,27 @@ mod tests {
         // always present so automation can test for it unconditionally).
         assert_eq!(v["rejection"], serde_json::Value::Null);
         let obj = v.as_object().expect("reload --json is a JSON object");
-        assert_eq!(obj.len(), 7, "reload --json carries 7 keys incl. rejection");
+        assert_eq!(obj.len(), 9, "reload --json carries 9 keys incl. rejection");
+        let impacts = v["listener_impacts"]
+            .as_array()
+            .expect("listener_impacts is an array");
+        assert_eq!(impacts[0]["name"], serde_json::json!("workloads"));
+        assert_eq!(impacts[0]["kind"], serde_json::json!("add"));
+        assert_eq!(impacts[0]["active_connections"], serde_json::json!(0));
+        assert_eq!(impacts[0]["previous_path"], serde_json::Value::Null);
+        assert_eq!(
+            impacts[0]["new_path"],
+            serde_json::json!("/run/basil/workloads.sock")
+        );
+        let rewire = v["rewire_required"]
+            .as_array()
+            .expect("rewire_required is an array");
+        assert_eq!(rewire[0]["listener"], serde_json::json!("workloads"));
+        assert_eq!(
+            rewire[0]["previous_path"],
+            serde_json::json!("/run/basil/old.sock")
+        );
+        assert_eq!(rewire[0]["applied_generation"], serde_json::json!(5));
     }
 
     #[test]
@@ -2344,5 +2706,23 @@ mod tests {
         assert_eq!(v["persisted"], serde_json::json!(true));
         let obj = v.as_object().expect("revoke --json is a JSON object");
         assert_eq!(obj.len(), 4, "revoke --json carries exactly four fields");
+    }
+
+    #[test]
+    fn typed_systemd_connection_selectors_parse() {
+        assert_eq!(
+            parse_systemd_selector("api.service").expect("system unit selector"),
+            AgentConnectionSelector::Systemd {
+                unit: "api.service".to_string(),
+                manager_uid: None,
+            }
+        );
+        assert_eq!(
+            parse_systemd_selector("1000:api.service").expect("user unit selector"),
+            AgentConnectionSelector::Systemd {
+                unit: "api.service".to_string(),
+                manager_uid: Some(1000),
+            }
+        );
     }
 }

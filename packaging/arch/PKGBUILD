@@ -14,36 +14,49 @@
 # `updpkgsums` then `makepkg --printsrcinfo > .SRCINFO`, and push both files.
 
 pkgname=basil-bin
-pkgver=0.7.1
+pkgver=0.8.0-pre.1
 pkgrel=1
-pkgdesc="Basil, a host-local secrets broker: your app never touches the key (broker/CLI + NATS bridge, prebuilt binaries)"
+pkgdesc="Basil, a host-local secrets broker: your app never touches the key (broker/CLI + couriers, prebuilt binaries)"
 arch=('x86_64' 'aarch64')
 url="https://github.com/openbasil/basil"
 license=('Apache-2.0')
 provides=('basil')
 conflicts=('basil')
+makedepends=('dpkg')
 # The payloads are already-built, already-stripped binaries; do not re-strip them.
 options=('!strip' '!debug')
+source=("extract-man-pages.sh")
+sha256sums=('08bf37009d401e36d5ab41c1bdf2097260424b5e9fddd9369fed0524e94b84d2')
 # Per-architecture release archives produced by dist. `makepkg` selects the
 # `source_<CARCH>` / `sha256sums_<CARCH>` arrays for the building host's arch, so
 # x86_64 and aarch64 packages each pull only their own tarballs. cargo-dist emits
 # one archive per dist-able package, so this binary package combines the basil
-# CLI archive and the basil-nats-bridge archive for the same target.
+# CLI archive plus the basil-nats-bridge and basil-https-courier archives for
+# the same target. The matching Debian package supplies the generated man
+# pages, which are not present in the binary archives.
 source_x86_64=(
   "basil-${pkgver}-x86_64.tar.xz::${url}/releases/download/v${pkgver}/basil-bin-x86_64-unknown-linux-gnu.tar.xz"
+  "basil-https-courier-${pkgver}-x86_64.tar.xz::${url}/releases/download/v${pkgver}/basil-https-courier-x86_64-unknown-linux-gnu.tar.xz"
   "basil-nats-bridge-${pkgver}-x86_64.tar.xz::${url}/releases/download/v${pkgver}/basil-nats-bridge-x86_64-unknown-linux-gnu.tar.xz"
+  "basil-${pkgver}-amd64.deb::${url}/releases/download/v${pkgver}/basil_${pkgver}-1_amd64.deb"
 )
 source_aarch64=(
   "basil-${pkgver}-aarch64.tar.xz::${url}/releases/download/v${pkgver}/basil-bin-aarch64-unknown-linux-gnu.tar.xz"
+  "basil-https-courier-${pkgver}-aarch64.tar.xz::${url}/releases/download/v${pkgver}/basil-https-courier-aarch64-unknown-linux-gnu.tar.xz"
   "basil-nats-bridge-${pkgver}-aarch64.tar.xz::${url}/releases/download/v${pkgver}/basil-nats-bridge-aarch64-unknown-linux-gnu.tar.xz"
+  "basil-${pkgver}-arm64.deb::${url}/releases/download/v${pkgver}/basil_${pkgver}-1_arm64.deb"
 )
 # Placeholders: replaced per-arch by `updpkgsums` in CI and before every AUR push.
 # 'SKIP' is intentionally NOT used, so releases are checksum-verified.
 sha256sums_x86_64=(
   '0000000000000000000000000000000000000000000000000000000000000000'
   '0000000000000000000000000000000000000000000000000000000000000000'
+  '0000000000000000000000000000000000000000000000000000000000000000'
+  '0000000000000000000000000000000000000000000000000000000000000000'
 )
 sha256sums_aarch64=(
+  '0000000000000000000000000000000000000000000000000000000000000000'
+  '0000000000000000000000000000000000000000000000000000000000000000'
   '0000000000000000000000000000000000000000000000000000000000000000'
   '0000000000000000000000000000000000000000000000000000000000000000'
 )
@@ -51,11 +64,16 @@ sha256sums_aarch64=(
 package() {
   # dist archives may unpack either flat or under a versioned directory, so
   # locate the executable rather than assuming a fixed path.
-  local basil_bin bridge_bin
+  local basil_bin https_courier_bin bridge_bin
   basil_bin="$(find "${srcdir}" -type f -name basil -perm -u+x -print -quit)"
+  https_courier_bin="$(find "${srcdir}" -type f -name basil-https-courier -perm -u+x -print -quit)"
   bridge_bin="$(find "${srcdir}" -type f -name basil-nats-bridge -perm -u+x -print -quit)"
   if [ -z "${basil_bin}" ]; then
     echo "could not find the 'basil' binary in the release archive" >&2
+    return 1
+  fi
+  if [ -z "${https_courier_bin}" ]; then
+    echo "could not find the 'basil-https-courier' binary in the release archive" >&2
     return 1
   fi
   if [ -z "${bridge_bin}" ]; then
@@ -63,7 +81,37 @@ package() {
     return 1
   fi
   install -Dm755 "${basil_bin}" "${pkgdir}/usr/bin/basil"
+  install -Dm755 "${https_courier_bin}" "${pkgdir}/usr/bin/basil-https-courier"
   install -Dm755 "${bridge_bin}" "${pkgdir}/usr/bin/basil-nats-bridge"
+
+  # cargo-dist's binary archives contain no man pages. The release workflow
+  # generates them with `xtask` while assembling the same-release Debian
+  # package, so extract that verified package's generated pages instead of
+  # assuming a nonexistent path in the binary archives.
+  local deb_arch man_deb man_root man_pages required_man
+  case "${CARCH}" in
+    x86_64) deb_arch=amd64 ;;
+    aarch64) deb_arch=arm64 ;;
+    *)
+      echo "unsupported architecture for Basil man pages: ${CARCH}" >&2
+      return 1
+      ;;
+  esac
+  man_deb="${srcdir}/basil-${pkgver}-${deb_arch}.deb"
+  man_root="$(mktemp -d "${srcdir}/basil-man-pages.XXXXXX")"
+  if ! "${srcdir}/extract-man-pages.sh" "${man_deb}" "${man_root}"; then
+    echo "could not extract generated man pages from ${man_deb}" >&2
+    return 1
+  fi
+  man_pages="${man_root}/usr/share/man/man1"
+  for required_man in basil basil-https-courier basil-nats-bridge; do
+    if [ ! -f "${man_pages}/${required_man}.1.gz" ]; then
+      echo "missing generated man page for '${required_man}' in ${man_deb}" >&2
+      return 1
+    fi
+  done
+  install -d "${pkgdir}/usr/share/man/man1"
+  install -m644 "${man_pages}"/*.1.gz "${pkgdir}/usr/share/man/man1/"
 
   # Shell completions, generated by the packaged binary itself (`makepkg` runs
   # on the package's own architecture, so the prebuilt binary is executable).

@@ -7,12 +7,12 @@
 [package]
 name = "basil-cose-nats-telemetry"
 version = "0.1.0"
-edition = "2024"
-license = "Apache-2.0"
 authors = ["info@openbasil.org"]
-repository = "https://github.com/openbasil/basil"
+edition = "2024"
 homepage = "https://github.com/openbasil/basil"
+license = "Apache-2.0"
 publish = false
+repository = "https://github.com/openbasil/basil"
 
 [[bin]]
 name = "cose-nats-telemetry"
@@ -24,7 +24,7 @@ basil-cose = { path = "../../crates/basil-cose" }
 basil-nats = { path = "../../crates/basil-nats" }
 
 anyhow = "1"
-async-nats = { version = "0.49", default-features = false, features = ["ring", "nkeys"] }
+async-nats = { version = "0.50.0", default-features = false, features = ["ring", "nkeys"] }
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
 serde_json = "1"

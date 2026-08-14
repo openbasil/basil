@@ -4,18 +4,18 @@
 
 [package]
 name = "basil-bin"
-description = "Basil is a host-local secrets broker: your app never touches the key. Unified broker daemon, operator tool, and client CLI."
 version.workspace = true
-edition.workspace = true
-license.workspace = true
 authors.workspace = true
-repository.workspace = true
-homepage.workspace = true
-documentation = "https://docs.openbasil.org"
-keywords = ["basil", "vault", "secrets", "cryptography", "cli"]
 categories = ["cryptography", "command-line-utilities"]
-rust-version = "1.88"
+documentation = "https://docs.openbasil.org"
+edition.workspace = true
+homepage.workspace = true
+keywords = ["basil", "vault", "secrets", "cryptography", "cli"]
+license.workspace = true
 publish = true
+repository.workspace = true
+rust-version = "1.88"
+description = "Basil is a host-local secrets broker: your app never touches the key. Unified broker daemon, operator tool, and client CLI."
 
 [package.metadata.dist]
 # Name the Homebrew formula `basil` (not the crate name `basil-bin`) so the
@@ -27,12 +27,7 @@ name = "basil"
 path = "src/main.rs"
 
 [features]
-default = [
-  "db-keystore",
-  "onepassword",
-  "unlock-age-yubikey",
-  "unlock-bip39",
-]
+default = ["db-keystore", "onepassword", "unlock-age-yubikey", "unlock-bip39"]
 http = ["basil-core/http"]
 http-tls = ["http", "basil-core/http-tls"]
 keystore-backend = ["basil-core/keystore-backend"]
@@ -54,19 +49,36 @@ secure-alloc = ["mimalloc/secure"]
 [dependencies]
 basil = { workspace = true }
 basil-core = { workspace = true }
+basil-cose = { workspace = true }
 basil-nats = { workspace = true }
+basil-proto = { workspace = true }
 
 anyhow = { workspace = true }
 base64 = { workspace = true, features = ["std"] }
 clap = { workspace = true }
 clap_complete = { workspace = true }
+ed25519-dalek = { workspace = true }
+getrandom = { workspace = true }
 hex = { workspace = true }
 mimalloc = { workspace = true }
+prost = { workspace = true }
+reqwest = { workspace = true }
+rustix = { workspace = true }
+rustls = { workspace = true }
 serde = { workspace = true, features = ["std"] }
 serde_json = { workspace = true, features = ["std"] }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+x25519-dalek = { workspace = true }
+x509-parser = { workspace = true }
 zeroize = { workspace = true }
+
+[dev-dependencies]
+tokio-stream = { workspace = true }
 
 [lints]
 workspace = true

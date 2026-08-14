@@ -483,27 +483,8 @@ impl PinnedPath {
         Ok(Self { parent, file_name })
     }
 
-    pub(crate) fn open_lock(&self, suffix: &str) -> Result<std::fs::File, SealError> {
-        let name = suffixed_name(&self.file_name, suffix);
-        rustix::fs::openat(
-            &self.parent,
-            name,
-            rustix::fs::OFlags::RDWR
-                | rustix::fs::OFlags::CREATE
-                | rustix::fs::OFlags::CLOEXEC
-                | rustix::fs::OFlags::NOFOLLOW,
-            rustix::fs::Mode::from_raw_mode(0o600),
-        )
-        .map(std::fs::File::from)
-        .map_err(|error| io_format("opening descriptor-relative lock", error))
-    }
-
     pub(crate) fn write_0600(&self, bytes: &[u8]) -> Result<(), SealError> {
         self.write_name(&self.file_name, bytes)
-    }
-
-    pub(crate) fn write_sibling_0600(&self, suffix: &str, bytes: &[u8]) -> Result<(), SealError> {
-        self.write_name(&suffixed_name(&self.file_name, suffix), bytes)
     }
 
     fn write_name(&self, destination: &OsStr, bytes: &[u8]) -> Result<(), SealError> {

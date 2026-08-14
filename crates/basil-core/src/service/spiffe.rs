@@ -30,7 +30,10 @@ use crate::catalog::{Class, Decision, DenyReason, KeyAlgorithm, KeyEntry};
 use crate::decision::DecisionRecord;
 use crate::event::BrokerEventKind;
 use crate::state::{BrokerState, Generation};
-use crate::transport::peer_from_request;
+use crate::transport::connection::ListenerConnectInfo;
+use crate::transport::{
+    begin_long_lived_stream, enforce_listener_domain_info, listener_context, peer_from_request,
+};
 
 type WorkloadResult<T> = Result<Response<T>, Status>;
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -55,27 +58,56 @@ impl SpiffeWorkloadApi for SpiffeWorkloadGrpc {
     type FetchX509BundlesStream = BoxStream<X509BundlesResponse>;
     type FetchJWTBundlesStream = BoxStream<JwtBundlesResponse>;
 
+    #[allow(clippy::too_many_lines)]
     async fn fetch_x509svid(
         &self,
         request: Request<X509svidRequest>,
     ) -> WorkloadResult<Self::FetchX509SVIDStream> {
         require_workload_header(&request)?;
         let peer = peer_from_request(&request);
-        let uid = peer.uid.ok_or_else(|| {
-            Status::new(
-                Code::Unauthenticated,
-                "missing peer credentials for FetchX509SVID",
-            )
-        })?;
-        let plan = self.x509_issue_plan(uid)?;
+        let listener = listener_context(&request, Op::Mint)?;
+        let plan = self.x509_issue_plan(&peer, &listener)?;
+        let lease = begin_long_lived_stream(&self.state, &listener, Op::Mint)?;
         let state = Arc::clone(&self.state);
         let rx = state.events().subscribe();
         let stream = futures::stream::unfold(
-            (state, rx, plan, uid, false),
-            |(state, mut rx, plan, uid, emitted)| async move {
+            (state, rx, plan, peer, listener, lease, false, false),
+            |(state, mut rx, mut plan, peer, listener, lease, emitted, ended)| async move {
+                if ended {
+                    return None;
+                }
                 if !emitted {
-                    let response = issue_x509_response(&state, uid, &plan).await;
-                    return Some((response, (state, rx, plan, uid, true)));
+                    loop {
+                        let response = issue_x509_response(&state, &plan).await;
+                        let reload_guard = state.live_reload_lock().lock().await;
+                        if state.active_generation_id() == plan.generation {
+                            return Some((
+                                response,
+                                (
+                                    Arc::clone(&state),
+                                    rx,
+                                    plan,
+                                    peer,
+                                    listener,
+                                    lease,
+                                    true,
+                                    false,
+                                ),
+                            ));
+                        }
+                        drop(response);
+                        match Self::new(Arc::clone(&state)).x509_issue_plan(&peer, &listener) {
+                            Ok(current) => plan = current,
+                            Err(status) => {
+                                drop(reload_guard);
+                                return Some((
+                                    Err(status),
+                                    (state, rx, plan, peer, listener, lease, true, true),
+                                ));
+                            }
+                        }
+                        drop(reload_guard);
+                    }
                 }
 
                 let refresh =
@@ -85,47 +117,172 @@ impl SpiffeWorkloadApi for SpiffeWorkloadGrpc {
                     tokio::select! {
                         () = &mut refresh => break,
                         event = rx.recv() => match event {
-                            Ok(event) if x509_refresh_event(&plan, &event.kind) => break,
-                            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                            Ok(event) => {
+                                if state.active_generation_id() != plan.generation {
+                                    match Self::new(Arc::clone(&state))
+                                        .x509_issue_plan(&peer, &listener)
+                                    {
+                                        Ok(current) => plan = current,
+                                        Err(status) => return Some((
+                                            Err(status),
+                                            (state, rx, plan, peer, listener, lease, true, true),
+                                        )),
+                                    }
+                                }
+                                if x509_refresh_event(&plan, &event.kind) {
+                                    break;
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
                         }
                     }
                 }
 
-                let response = issue_x509_response(&state, uid, &plan).await;
-                Some((response, (state, rx, plan, uid, true)))
+                loop {
+                    let response = issue_x509_response(&state, &plan).await;
+                    let reload_guard = state.live_reload_lock().lock().await;
+                    if state.active_generation_id() == plan.generation {
+                        return Some((
+                            response,
+                            (
+                                Arc::clone(&state),
+                                rx,
+                                plan,
+                                peer,
+                                listener,
+                                lease,
+                                true,
+                                false,
+                            ),
+                        ));
+                    }
+                    drop(response);
+                    match Self::new(Arc::clone(&state)).x509_issue_plan(&peer, &listener) {
+                        Ok(current) => plan = current,
+                        Err(status) => {
+                            drop(reload_guard);
+                            return Some((
+                                Err(status),
+                                (state, rx, plan, peer, listener, lease, true, true),
+                            ));
+                        }
+                    }
+                    drop(reload_guard);
+                }
             },
         );
         Ok(Response::new(Box::pin(stream)))
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn fetch_x509_bundles(
         &self,
         request: Request<X509BundlesRequest>,
     ) -> WorkloadResult<Self::FetchX509BundlesStream> {
         require_workload_header(&request)?;
-        let plan = self.x509_bundle_plan()?;
+        let peer = peer_from_request(&request);
+        let listener = listener_context(&request, Op::GetPublicKey)?;
+        let plan = self.x509_bundle_plan(&peer, &listener)?;
+        let lease = begin_long_lived_stream(&self.state, &listener, Op::GetPublicKey)?;
         let state = Arc::clone(&self.state);
         let rx = state.events().subscribe();
         let stream = futures::stream::unfold(
-            (state, rx, plan, false),
-            |(state, mut rx, plan, emitted)| async move {
+            (state, rx, plan, peer, listener, lease, false, false),
+            |(state, mut rx, mut plan, peer, listener, lease, emitted, ended)| async move {
+                if ended {
+                    return None;
+                }
                 if !emitted {
-                    let response = x509_bundles_response(&state, &plan).await;
-                    return Some((response, (state, rx, plan, true)));
+                    loop {
+                        let response = x509_bundles_response(&state, &plan).await;
+                        let reload_guard = state.live_reload_lock().lock().await;
+                        if plans_generation(&plan) == Some(state.active_generation_id()) {
+                            return Some((
+                                response,
+                                (
+                                    Arc::clone(&state),
+                                    rx,
+                                    plan,
+                                    peer,
+                                    listener,
+                                    lease,
+                                    true,
+                                    false,
+                                ),
+                            ));
+                        }
+                        drop(response);
+                        match Self::new(Arc::clone(&state)).x509_bundle_plan(&peer, &listener) {
+                            Ok(current) => plan = current,
+                            Err(status) => {
+                                drop(reload_guard);
+                                return Some((
+                                    Err(status),
+                                    (state, rx, plan, peer, listener, lease, true, true),
+                                ));
+                            }
+                        }
+                        drop(reload_guard);
+                    }
                 }
 
                 loop {
                     match rx.recv().await {
-                        Ok(event) if x509_bundle_refresh_event(&plan, &event.kind) => break,
+                        Ok(event) => {
+                            if plans_generation(&plan) != Some(state.active_generation_id()) {
+                                match Self::new(Arc::clone(&state))
+                                    .x509_bundle_plan(&peer, &listener)
+                                {
+                                    Ok(current) => plan = current,
+                                    Err(status) => {
+                                        return Some((
+                                            Err(status),
+                                            (state, rx, plan, peer, listener, lease, true, true),
+                                        ));
+                                    }
+                                }
+                            }
+                            if x509_bundle_refresh_event(&plan, &event.kind) {
+                                break;
+                            }
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break,
-                        Ok(_) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
                     }
                 }
 
-                let response = x509_bundles_response(&state, &plan).await;
-                Some((response, (state, rx, plan, true)))
+                loop {
+                    let response = x509_bundles_response(&state, &plan).await;
+                    let reload_guard = state.live_reload_lock().lock().await;
+                    if plans_generation(&plan) == Some(state.active_generation_id()) {
+                        return Some((
+                            response,
+                            (
+                                Arc::clone(&state),
+                                rx,
+                                plan,
+                                peer,
+                                listener,
+                                lease,
+                                true,
+                                false,
+                            ),
+                        ));
+                    }
+                    drop(response);
+                    match Self::new(Arc::clone(&state)).x509_bundle_plan(&peer, &listener) {
+                        Ok(current) => plan = current,
+                        Err(status) => {
+                            drop(reload_guard);
+                            return Some((
+                                Err(status),
+                                (state, rx, plan, peer, listener, lease, true, true),
+                            ));
+                        }
+                    }
+                    drop(reload_guard);
+                }
             },
         );
         Ok(Response::new(Box::pin(stream)))
@@ -196,33 +353,114 @@ impl SpiffeWorkloadApi for SpiffeWorkloadGrpc {
         Ok(Response::new(JwtsvidResponse { svids }))
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn fetch_jwt_bundles(
         &self,
         request: Request<JwtBundlesRequest>,
     ) -> WorkloadResult<Self::FetchJWTBundlesStream> {
         require_workload_header(&request)?;
-        let plan = self.jwt_bundle_plan()?;
+        let peer = peer_from_request(&request);
+        let listener = listener_context(&request, Op::GetPublicKey)?;
+        let plan = self.jwt_bundle_plan(&peer, &listener)?;
+        let lease = begin_long_lived_stream(&self.state, &listener, Op::GetPublicKey)?;
         let state = Arc::clone(&self.state);
         let rx = state.events().subscribe();
         let stream = futures::stream::unfold(
-            (state, rx, plan, false),
-            |(state, mut rx, plan, emitted)| async move {
+            (state, rx, plan, peer, listener, lease, false, false),
+            |(state, mut rx, mut plan, peer, listener, lease, emitted, ended)| async move {
+                if ended {
+                    return None;
+                }
                 if !emitted {
-                    let response = jwt_bundles_response(&state, &plan).await;
-                    return Some((response, (state, rx, plan, true)));
+                    loop {
+                        let response = jwt_bundles_response(&state, &plan).await;
+                        let reload_guard = state.live_reload_lock().lock().await;
+                        if plans_generation(&plan) == Some(state.active_generation_id()) {
+                            return Some((
+                                response,
+                                (
+                                    Arc::clone(&state),
+                                    rx,
+                                    plan,
+                                    peer,
+                                    listener,
+                                    lease,
+                                    true,
+                                    false,
+                                ),
+                            ));
+                        }
+                        drop(response);
+                        match Self::new(Arc::clone(&state)).jwt_bundle_plan(&peer, &listener) {
+                            Ok(current) => plan = current,
+                            Err(status) => {
+                                drop(reload_guard);
+                                return Some((
+                                    Err(status),
+                                    (state, rx, plan, peer, listener, lease, true, true),
+                                ));
+                            }
+                        }
+                        drop(reload_guard);
+                    }
                 }
 
                 loop {
                     match rx.recv().await {
-                        Ok(event) if jwt_bundle_refresh_event(&plan, &event.kind) => break,
+                        Ok(event) => {
+                            if plans_generation(&plan) != Some(state.active_generation_id()) {
+                                match Self::new(Arc::clone(&state))
+                                    .jwt_bundle_plan(&peer, &listener)
+                                {
+                                    Ok(current) => plan = current,
+                                    Err(status) => {
+                                        return Some((
+                                            Err(status),
+                                            (state, rx, plan, peer, listener, lease, true, true),
+                                        ));
+                                    }
+                                }
+                            }
+                            if jwt_bundle_refresh_event(&plan, &event.kind) {
+                                break;
+                            }
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break,
-                        Ok(_) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
                     }
                 }
 
-                let response = jwt_bundles_response(&state, &plan).await;
-                Some((response, (state, rx, plan, true)))
+                loop {
+                    let response = jwt_bundles_response(&state, &plan).await;
+                    let reload_guard = state.live_reload_lock().lock().await;
+                    if plans_generation(&plan) == Some(state.active_generation_id()) {
+                        return Some((
+                            response,
+                            (
+                                Arc::clone(&state),
+                                rx,
+                                plan,
+                                peer,
+                                listener,
+                                lease,
+                                true,
+                                false,
+                            ),
+                        ));
+                    }
+                    drop(response);
+                    match Self::new(Arc::clone(&state)).jwt_bundle_plan(&peer, &listener) {
+                        Ok(current) => plan = current,
+                        Err(status) => {
+                            drop(reload_guard);
+                            return Some((
+                                Err(status),
+                                (state, rx, plan, peer, listener, lease, true, true),
+                            ));
+                        }
+                    }
+                    drop(reload_guard);
+                }
             },
         );
         Ok(Response::new(Box::pin(stream)))
@@ -316,6 +554,7 @@ struct ValidJwtSvid {
 
 #[derive(Debug, Clone)]
 struct X509IssuePlan {
+    generation: u64,
     key_name: String,
     spiffe_id: String,
     trust_domain: String,
@@ -324,25 +563,65 @@ struct X509IssuePlan {
 
 #[derive(Debug, Clone)]
 struct X509BundlePlan {
+    generation: u64,
     key_name: String,
     trust_domain: String,
 }
 
 #[derive(Debug, Clone)]
 struct JwtBundlePlan {
+    generation: u64,
     key_name: String,
     trust_domain: String,
 }
 
+trait GenerationPlan {
+    fn generation(&self) -> u64;
+}
+
+impl GenerationPlan for X509BundlePlan {
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+impl GenerationPlan for JwtBundlePlan {
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+fn plans_generation<T: GenerationPlan>(plans: &[T]) -> Option<u64> {
+    plans.first().map(GenerationPlan::generation)
+}
+
 impl SpiffeWorkloadGrpc {
-    fn x509_issue_plan(&self, uid: u32) -> Result<X509IssuePlan, Status> {
+    fn x509_issue_plan(
+        &self,
+        peer: &crate::peer::PeerInfo,
+        listener: &ListenerConnectInfo,
+    ) -> Result<X509IssuePlan, Status> {
         // Pin one generation for the whole plan: every PDP decision and the
         // templated SPIFFE-ID rendering draw from the same coherent snapshot.
         let generation = self.state.load_generation();
-        let actor = generation.pdp().resolve_unix_actor(uid).map_err(|_| {
+        let actor = generation.pdp().resolve_local_actor(peer).map_err(|_| {
             Status::new(
                 Code::PermissionDenied,
                 "no configured subject for FetchX509SVID caller",
+            )
+        })?;
+        enforce_listener_domain_info(
+            &self.state,
+            generation.id(),
+            listener,
+            &actor,
+            Op::Mint,
+            "spiffe.x509_svid",
+        )?;
+        let uid = actor.unix_uid().ok_or_else(|| {
+            Status::new(
+                Code::Unauthenticated,
+                "FetchX509SVID requires local peer credentials",
             )
         })?;
         let mut saw_candidate = false;
@@ -375,6 +654,7 @@ impl SpiffeWorkloadGrpc {
                 })?
                 .to_string();
             return Ok(X509IssuePlan {
+                generation: generation.id(),
                 key_name: name.clone(),
                 spiffe_id,
                 trust_domain,
@@ -542,8 +822,26 @@ impl SpiffeWorkloadGrpc {
         Err(validation_failed())
     }
 
-    fn x509_bundle_plan(&self) -> Result<Vec<X509BundlePlan>, Status> {
+    fn x509_bundle_plan(
+        &self,
+        peer: &crate::peer::PeerInfo,
+        listener: &ListenerConnectInfo,
+    ) -> Result<Vec<X509BundlePlan>, Status> {
         let generation = self.state.load_generation();
+        let actor = generation.pdp().resolve_local_actor(peer).map_err(|_| {
+            Status::new(
+                Code::PermissionDenied,
+                "no configured subject for FetchX509Bundles caller",
+            )
+        })?;
+        enforce_listener_domain_info(
+            &self.state,
+            generation.id(),
+            listener,
+            &actor,
+            Op::GetPublicKey,
+            "spiffe.x509_bundles",
+        )?;
         let plans: Vec<_> = generation
             .catalog()
             .keys
@@ -554,6 +852,7 @@ impl SpiffeWorkloadGrpc {
                     .labels
                     .get("trust_domain")
                     .map(|trust_domain| X509BundlePlan {
+                        generation: generation.id(),
                         key_name: name.clone(),
                         trust_domain: trust_domain.to_string(),
                     })
@@ -569,8 +868,26 @@ impl SpiffeWorkloadGrpc {
         }
     }
 
-    fn jwt_bundle_plan(&self) -> Result<Vec<JwtBundlePlan>, Status> {
+    fn jwt_bundle_plan(
+        &self,
+        peer: &crate::peer::PeerInfo,
+        listener: &ListenerConnectInfo,
+    ) -> Result<Vec<JwtBundlePlan>, Status> {
         let generation = self.state.load_generation();
+        let actor = generation.pdp().resolve_local_actor(peer).map_err(|_| {
+            Status::new(
+                Code::PermissionDenied,
+                "no configured subject for FetchJWTBundles caller",
+            )
+        })?;
+        enforce_listener_domain_info(
+            &self.state,
+            generation.id(),
+            listener,
+            &actor,
+            Op::GetPublicKey,
+            "spiffe.jwt_bundles",
+        )?;
         let plans: Vec<_> = generation
             .catalog()
             .keys
@@ -581,6 +898,7 @@ impl SpiffeWorkloadGrpc {
                     .labels
                     .get("trust_domain")
                     .map(|trust_domain| JwtBundlePlan {
+                        generation: generation.id(),
                         key_name: name.clone(),
                         trust_domain: trust_domain.to_string(),
                     })
@@ -599,7 +917,6 @@ impl SpiffeWorkloadGrpc {
 
 async fn issue_x509_response(
     state: &BrokerState,
-    _uid: u32,
     plan: &X509IssuePlan,
 ) -> Result<X509svidResponse, Status> {
     let mut issued = state
@@ -1019,6 +1336,8 @@ fn x509_issue_status(err: &crate::manager::ManagerError) -> Status {
         | crate::manager::ManagerError::AlgorithmMismatch { .. }
         | crate::manager::ManagerError::KemAlgorithmMismatch { .. }
         | crate::manager::ManagerError::ValueRotateNeedsSet(_)
+        | crate::manager::ManagerError::NixCacheEnrollment { .. }
+        | crate::manager::ManagerError::NixCacheRotationForbidden(_)
         // Neither a sealing nor a materialize-to-sign error (nor a missing
         // public_path, nor a provider-dispatch ML-DSA error) can arise on the
         // X.509 issuance path (a PKI issuer is asymmetric+pki, not sealing, kv2,
@@ -1048,6 +1367,7 @@ mod tests {
     use crate::manager::BackendManager;
     use crate::peer::PeerInfo;
     use crate::state::{BrokerLimits, DEFAULT_SVID_TTL_SECS};
+    use crate::transport::grpc_server::ListenerType;
 
     const CATALOG: &str = r#"{
       "schema": "catalog",
@@ -1071,7 +1391,7 @@ mod tests {
     const POLICY: &str = r#"{
       "schema": "policy",
       "subjects": {
-        "svc.api": { "allOf": [ { "kind": "unix", "uid": 9100 } ] }
+        "svc.api": { "domain": "host-process", "match": { "all": [ { "process.uid": 9100 } ] } }
       },
       "roles": { "minter": ["mint"], "validator": ["validate"] },
       "rules": [
@@ -1266,10 +1586,18 @@ mod tests {
         request
             .metadata_mut()
             .insert("workload.spiffe.io", "true".parse().expect("metadata"));
-        request.extensions_mut().insert(PeerInfo {
+        let peer = PeerInfo {
             uid: Some(uid),
             ..PeerInfo::default()
-        });
+        };
+        request.extensions_mut().insert(peer.clone());
+        request
+            .extensions_mut()
+            .insert(ListenerConnectInfo::for_test(
+                "test-host",
+                ListenerType::Host,
+                peer,
+            ));
         request
     }
 
@@ -1278,6 +1606,18 @@ mod tests {
         request
             .metadata_mut()
             .insert("workload.spiffe.io", "true".parse().expect("metadata"));
+        let peer = PeerInfo {
+            uid: Some(9100),
+            ..PeerInfo::default()
+        };
+        request.extensions_mut().insert(peer.clone());
+        request
+            .extensions_mut()
+            .insert(ListenerConnectInfo::for_test(
+                "test-host",
+                ListenerType::Host,
+                peer,
+            ));
         request
     }
 
@@ -1286,6 +1626,18 @@ mod tests {
         request
             .metadata_mut()
             .insert("workload.spiffe.io", "true".parse().expect("metadata"));
+        let peer = PeerInfo {
+            uid: Some(9100),
+            ..PeerInfo::default()
+        };
+        request.extensions_mut().insert(peer.clone());
+        request
+            .extensions_mut()
+            .insert(ListenerConnectInfo::for_test(
+                "test-host",
+                ListenerType::Host,
+                peer,
+            ));
         request
     }
 
@@ -1524,7 +1876,7 @@ mod tests {
         const RENAMED_POLICY: &str = r#"{
           "schema": "policy",
           "subjects": {
-            "svc.api": { "allOf": [ { "kind": "unix", "uid": 9100 } ] }
+            "svc.api": { "domain": "host-process", "match": { "all": [ { "process.uid": 9100 } ] } }
           },
           "roles": { "minter": ["mint"], "validator": ["validate"] },
           "rules": [
@@ -1636,6 +1988,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_x509svid_reauthorizes_before_post_reload_renewal() {
+        use futures::StreamExt as _;
+
+        let (service, _backend) = service();
+        let mut stream = service
+            .fetch_x509svid(x509_request(9100))
+            .await
+            .expect("fetch x509-svid")
+            .into_inner();
+        stream
+            .next()
+            .await
+            .expect("initial response")
+            .expect("initial response authorized");
+
+        let denied_policy = POLICY.replace(
+            "        { \"id\": \"allow-svc-x509\", \"subjects\": [\"svc.api\"], \"action\": [\"role:minter\"], \"target\": [\"spire.x509\"] },\n",
+            "",
+        );
+        assert_ne!(denied_policy, POLICY);
+        let (catalog, policy, config, warnings) =
+            load(CATALOG, &denied_policy).expect("denied reload fixture loads");
+        assert!(warnings.is_empty());
+        let next = crate::state::Generation::new(2, Arc::new(catalog), policy, config);
+        let reload_guard = service.state.live_reload_lock().lock().await;
+        service.state.swap_generation(Arc::new(next));
+        drop(reload_guard);
+        service.state.events().key_rotated("spire.x509", 2);
+
+        let status = stream
+            .next()
+            .await
+            .expect("reauthorization result")
+            .expect_err("revoked stream cannot emit a renewed SVID");
+        assert_eq!(status.code(), Code::PermissionDenied);
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
     async fn fetch_x509svid_honors_configured_ttl() {
         use futures::StreamExt as _;
 
@@ -1665,6 +2056,7 @@ mod tests {
     #[test]
     fn x509_refresh_interval_is_half_ttl_with_floor() {
         let plan = X509IssuePlan {
+            generation: 1,
             key_name: "pki/issue/workload".to_string(),
             spiffe_id: "spiffe://example.org/svc-api".to_string(),
             trust_domain: "example.org".to_string(),

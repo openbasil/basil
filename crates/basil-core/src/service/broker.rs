@@ -51,8 +51,23 @@ pub struct InvocationRuntimeConfig {
     pub max_ttl_secs: u32,
     /// Allowed clock skew in seconds for issue and expiry timestamps.
     pub clock_skew_secs: u32,
-    /// Maximum replay-cache entries retained in memory.
-    pub replay_cache_capacity: usize,
+    /// Freshness-challenge table shape (`[invocation.challenge]`): global
+    /// capacity of outstanding challenges (SPEC default 16,384), issuance
+    /// rate buckets, and the tracked rate-limit partition bound. The per-key
+    /// outstanding cap and the challenge TTL are spec-fixed and clamped by
+    /// the table itself.
+    pub challenge_table: crate::core::challenge::ChallengeTableConfig,
+    /// Maximum distinct tracked per-run quota buckets **per federation
+    /// rule** (`invocation.run-quota-buckets-per-rule`). The bound is per
+    /// rule so one federated tenant's runs can never exhaust another
+    /// tenant's tracking allowance.
+    pub run_quota_buckets_per_rule: usize,
+    /// Require a single-use freshness challenge on every sealed invocation,
+    /// including subject-key requests. Proof-bound requests always require
+    /// one. Deployments that accept courier-borne traffic (for example the
+    /// NATS bridge) must enable this: without it a captured subject-key
+    /// envelope replays until claims expiry.
+    pub require_challenge: bool,
     /// Fixed current time override for deterministic tests. Leave unset in
     /// production.
     pub now_unix_override: Option<u32>,
@@ -67,7 +82,10 @@ impl Default for InvocationRuntimeConfig {
             request_encryption_key_id: None,
             max_ttl_secs: basil_proto::invocation::DEFAULT_EXPIRES_AFTER_SECS,
             clock_skew_secs: 30,
-            replay_cache_capacity: 4096,
+            challenge_table: crate::core::challenge::ChallengeTableConfig::default(),
+            run_quota_buckets_per_rule:
+                crate::core::ci_federation::DEFAULT_MAX_TRACKED_RUN_BUCKETS_PER_RULE,
+            require_challenge: false,
             now_unix_override: None,
         }
     }
@@ -78,8 +96,11 @@ impl Default for InvocationRuntimeConfig {
 pub struct BrokerGrpc {
     pub(super) state: Arc<BrokerState>,
     pub(super) invocation: InvocationRuntimeConfig,
-    pub(super) invocation_replay_cache:
-        Arc<Mutex<crate::service::invocation::InvocationReplayCache>>,
+    pub(super) listener_name: Arc<str>,
+    pub(super) listener_type: crate::transport::grpc_server::ListenerType,
+    pub(super) challenge_table: Arc<tokio::sync::Mutex<crate::core::challenge::ChallengeTable>>,
+    pub(super) challenge_issuance_gate: Arc<Mutex<()>>,
+    pub(super) run_quota: Arc<Mutex<crate::ci_federation::RunQuotaTable>>,
 }
 
 impl BrokerGrpc {
@@ -107,13 +128,55 @@ impl BrokerGrpc {
         state: Arc<BrokerState>,
         invocation: InvocationRuntimeConfig,
     ) -> Self {
-        let capacity = invocation.replay_cache_capacity;
+        Self::new_with_invocation_config_for_listener(
+            state,
+            invocation,
+            crate::transport::grpc_server::ListenerType::Host,
+        )
+    }
+
+    /// Build a gRPC service adapter with this listener's effective invocation settings.
+    ///
+    /// Courier listeners force freshness challenges independently of the
+    /// broker-wide compatibility default.
+    #[must_use]
+    pub fn new_with_invocation_config_for_listener(
+        state: Arc<BrokerState>,
+        invocation: InvocationRuntimeConfig,
+        listener_type: crate::transport::grpc_server::ListenerType,
+    ) -> Self {
+        Self::new_with_invocation_config_for_named_listener(
+            state,
+            invocation,
+            listener_type.to_string(),
+            listener_type,
+        )
+    }
+
+    /// Build a service adapter bound to one exact configured listener.
+    pub(crate) fn new_with_invocation_config_for_named_listener(
+        state: Arc<BrokerState>,
+        mut invocation: InvocationRuntimeConfig,
+        listener_name: impl Into<Arc<str>>,
+        listener_type: crate::transport::grpc_server::ListenerType,
+    ) -> Self {
+        if listener_type == crate::transport::grpc_server::ListenerType::Courier {
+            invocation.require_challenge = true;
+        }
+        let challenge_table = invocation.challenge_table;
+        let run_quota_buckets_per_rule = invocation.run_quota_buckets_per_rule;
         Self {
             state,
             invocation,
-            invocation_replay_cache: Arc::new(Mutex::new(
-                crate::service::invocation::InvocationReplayCache::new(capacity),
+            listener_name: listener_name.into(),
+            listener_type,
+            challenge_table: Arc::new(tokio::sync::Mutex::new(
+                crate::core::challenge::ChallengeTable::with_config(challenge_table),
             )),
+            challenge_issuance_gate: Arc::new(Mutex::new(())),
+            run_quota: Arc::new(Mutex::new(crate::ci_federation::RunQuotaTable::new(
+                run_quota_buckets_per_rule,
+            ))),
         }
     }
 
@@ -195,7 +258,6 @@ mod tests {
     use crate::backend::{Backend, BackendError, KvValue, NewKey, PublicKey};
     use crate::catalog::load;
     use crate::manager::{BackendManager, ManagerError};
-    use crate::peer::PeerInfo;
     use crate::service::minting::nats_mint_status;
     use crate::service::shared::*;
     use crate::state::BrokerState;
@@ -545,7 +607,7 @@ mod tests {
         let policy = r#"{
           "schema": "policy",
           "subjects": {
-            "svc.mint": { "allOf": [ { "kind": "unix", "uid": 42 } ] }
+            "svc.mint": { "domain": "host-process", "match": { "all": [ { "process.uid": 42 } ] } }
           },
           "roles": {
             "minter": ["mint", "sign_nats_jwt", "validate_nats_jwt"],
@@ -582,12 +644,7 @@ mod tests {
     }
 
     fn authed_request<T>(body: T) -> Request<T> {
-        let mut request = Request::new(body);
-        request.extensions_mut().insert(PeerInfo {
-            uid: Some(42),
-            ..PeerInfo::default()
-        });
-        request
+        crate::service::shared::host_request(42, body)
     }
 
     fn ttl() -> Duration {
@@ -1156,19 +1213,18 @@ mod tests {
         let service = BrokerGrpc::new(mint_state());
         // uid 7 resolves to no policy subject: the RPC must fail closed at
         // entry, before the caller-supplied-nkey arm can run (finding 16).
-        let mut request = Request::new(pb::ValidateNatsJwtRequest {
-            jwt: "not-a-jwt".to_string(),
-            allowed_signers: vec![pb::AllowedNatsSigner {
-                signer: Some(pb::allowed_nats_signer::Signer::NatsPublicKey(
-                    KeyPair::new_account().public_key(),
-                )),
-            }],
-            expected_type: pb::NatsJwtType::Unspecified.into(),
-        });
-        request.extensions_mut().insert(PeerInfo {
-            uid: Some(7),
-            ..PeerInfo::default()
-        });
+        let request = crate::service::shared::host_request(
+            7,
+            pb::ValidateNatsJwtRequest {
+                jwt: "not-a-jwt".to_string(),
+                allowed_signers: vec![pb::AllowedNatsSigner {
+                    signer: Some(pb::allowed_nats_signer::Signer::NatsPublicKey(
+                        KeyPair::new_account().public_key(),
+                    )),
+                }],
+                expected_type: pb::NatsJwtType::Unspecified.into(),
+            },
+        );
         let status = service
             .validate_nats_jwt(request)
             .await

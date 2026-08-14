@@ -103,6 +103,7 @@ write_kv_value() {
 write_catalog() {
   cat >"$CATALOG" <<JSON
 {
+  "schema": "policy",
   "schemaVersion": 1,
   "backends": {
     "bao": {
@@ -181,13 +182,22 @@ write_policy() {
   },
   "subjects": {
     "local.user": {
-      "allOf": [{ "kind": "unix", "uid": $uid }]
+      "domain": "host-process",
+      "match": { "all": [{ "process.uid": $uid }] }
     },
     "svc.alice": {
-      "allOf": [{ "kind": "signature-key", "algorithm": "ed25519", "public": "$ALICE_INVOKE_PUBLIC" }]
+      "domain": "host-process",
+      "match": { "all": [
+        { "process.uid": $uid },
+        { "invocation.signature-key": { "algorithm": "ed25519", "public": "$ALICE_INVOKE_PUBLIC" } }
+      ] }
     },
     "svc.bob": {
-      "allOf": [{ "kind": "signature-key", "algorithm": "ed25519", "public": "$BOB_INVOKE_PUBLIC" }]
+      "domain": "host-process",
+      "match": { "all": [
+        { "process.uid": $uid },
+        { "invocation.signature-key": { "algorithm": "ed25519", "public": "$BOB_INVOKE_PUBLIC" } }
+      ] }
     }
   },
   "rules": [
@@ -244,7 +254,9 @@ audience = ["basil://example/cose-nats-demo"]
 request-encryption-key-id = "broker.request"
 max-ttl-secs = 60
 clock-skew-secs = 30
-replay-cache-capacity = 128
+
+[invocation.challenge]
+capacity = 128
 TOML
 }
 

@@ -20,6 +20,17 @@ pub const RESPONSE_KEY_ID: i64 = -70004;
 pub const RESPONSE_SUBJECT: i64 = -70005;
 /// Compact signer certificate JWT chain (array of tstr).
 pub const SIGNER_CERTIFICATES_JWT: i64 = -70006;
+/// Deterministic public Ed25519 proof `COSE_Key` (bstr).
+pub const SIGNER_PUBLIC_KEY_COSE: i64 = -70007;
+/// Server-issued single-use freshness challenge (bstr, 32 bytes). Requests
+/// only, optional; required by the remote CI sealed-invocation profile.
+pub const FRESHNESS_CHALLENGE: i64 = -70008;
+/// Deterministic public X25519 response `COSE_Key` (bstr, 40 bytes). Requests
+/// only, optional; required by the remote CI sealed-invocation profile.
+pub const RESPONSE_PUBLIC_KEY_COSE: i64 = -70009;
+/// Provider operation target key id (bstr). Signed requests only, optional;
+/// required by provider-proof invocation profiles.
+pub const OPERATION_TARGET_KEY_ID: i64 = -70010;
 
 /// COSE header parameter: algorithm.
 pub(crate) const HDR_ALG: i64 = 1;

@@ -24,13 +24,16 @@ pub use basil_proto::broker::v1::{
     CatalogKind as GrpcCatalogKind, CiphertextEnvelope as GrpcCiphertextEnvelope,
     EnvelopeAlgorithm, Event, EventKind, KemAlgorithm, KemEnvelope, KeyMaterial as GrpcKeyMaterial,
     NatsJtiMode, NatsJwtType, NatsJwtValidationReason as GrpcNatsJwtValidationReason,
-    SigningAlgorithm,
+    NixCacheEnrollmentDisposition, SigningAlgorithm,
 };
 pub use client::{
-    AgentDecision, AgentExplanation, AgentHealth, AgentReadiness, AgentReload, AgentRevocation,
-    AgentStatus, AllowedNatsSigner, Client, ImportEntry, IssuedCertificate, KeyHandle, MatchedRule,
-    MintedJwt, NatsJwtValidation, NatsJwtValidationReason, NatsUserPermissions, ReadinessReason,
-    ReloadRejection, SecretValue, SignNatsJwtOptions,
+    AgentConnection, AgentConnectionDomain, AgentConnectionDrop, AgentConnectionListener,
+    AgentConnectionSelector, AgentDecision, AgentExplanation, AgentHealth, AgentListenerChange,
+    AgentListenerImpact, AgentReadiness, AgentReload, AgentRevocation, AgentRewireDiagnostic,
+    AgentStatus, AgentSystemdIdentity, AllowedNatsSigner, Client, ImportEntry, InvocationChallenge,
+    IssuedCertificate, KeyHandle, MatchedRule, MintedJwt, NatsJwtValidation,
+    NatsJwtValidationReason, NatsUserPermissions, NixCacheEnrollment, NixCacheKey,
+    NixCacheSignature, ReadinessReason, ReloadRejection, SecretValue, SignNatsJwtOptions,
 };
 pub use client_sync::BlockingClient;
 pub use error::{Error, Result};
@@ -38,11 +41,12 @@ pub use proto::{
     AeadAlgorithm, CatalogEntry, CatalogKind, CiphertextEnvelope, KeyMaterial, KeyType,
 };
 pub use sealed_invocation::{
-    BrokerRecipient, BrokerSigner, CarrierSigner, CarrierSignerConfig, LocalCarrierSigner,
-    LocalSealedInvocationRecipient, LocalSealedInvocationSigner, PreparedSealedInvocation,
+    BrokerRecipient, BrokerSigner, CarrierSigner, CarrierSignerConfig,
+    EphemeralSealedInvocationOptions, LocalCarrierSigner, LocalSealedInvocationRecipient,
+    LocalSealedInvocationSigner, PreparedEphemeralSealedInvocation, PreparedSealedInvocation,
     SealedInvocationCarrier, SealedInvocationError, SealedInvocationOptions,
-    SealedInvocationResponseError, prepare_sealed_invocation, verify_and_decrypt_sign_response,
-    verify_and_open_sign_response,
+    SealedInvocationResponseError, prepare_ephemeral_sealed_invocation, prepare_sealed_invocation,
+    verify_and_decrypt_sign_response, verify_and_open_sign_response,
 };
 pub use stream::{
     AeadSuite, BrokerCekRecovery, CekRecovery, CekSource, DEFAULT_CHUNK_SIZE, LocalSeedCekRecovery,

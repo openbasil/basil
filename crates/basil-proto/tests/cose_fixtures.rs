@@ -258,6 +258,8 @@ fn request_claims(message_id: [u8; 16], sender: KeyRef, response_subject: Option
         response_subject: response_subject.map(|s| ResponseSubject::new(s.to_string()).unwrap()),
         in_reply_to: None,
         request_hash: None,
+        freshness_challenge: None,
+        response_public_key_cose: None,
     }
 }
 
@@ -273,6 +275,8 @@ fn response_claims(message_id: [u8; 16], in_reply_to: [u8; 16], request: &[u8]) 
         response_subject: None,
         in_reply_to: Some(MessageId::from_bytes(in_reply_to.to_vec()).unwrap()),
         request_hash: Some(request_hash(request)),
+        freshness_challenge: None,
+        response_public_key_cose: None,
     }
 }
 

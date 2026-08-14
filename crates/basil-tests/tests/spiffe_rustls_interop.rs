@@ -27,6 +27,14 @@
 //!      spiffe-rustls' internal `MaterialWatcher` subscribes to: i.e. new
 //!      handshakes pick up rotated Basil material with NO Basil-specific adapter.
 //!
+//! spiffe-rustls 0.8 hardening this test now also covers implicitly: the 0.8
+//! verifier rejects peer leaves missing `digitalSignature` `KeyUsage`
+//! (`Error::InvalidLeaf`), so every successful handshake here re-proves
+//! Basil-issued leaves carry it (asserted structurally by
+//! `spiffe_x509_svid_e2e`); and 0.8 verifies key/leaf alignment at
+//! material-build time, so the `build()` calls below would fail fast on
+//! mismatched Basil material instead of erroring mid-handshake.
+//!
 //! Live test: it reuses the shared boot harness (`tests/common/mod.rs`), which
 //! shells out to `scripts/prefill-test-store.sh` (boots a dev `bao`, writes
 //! fixtures + a sealed `AppRole` bundle) and runs `target/debug/basil run`
@@ -250,6 +258,12 @@ fn tls_pair(source: &X509Source, case: &Case<'_>) -> (TlsAcceptor, TlsConnector)
         .expect("client allow-list parses as SPIFFE IDs");
 
     let mut server_builder = mtls_server(source.clone()).authorize(server_auth);
+    // spiffe-rustls 0.8 disables TLS session resumption by default on both
+    // builders (a resumed session could outlive SVID expiry / rotation). Keep
+    // the explicit disable anyway: the rotation-watcher case REQUIRES full
+    // handshakes to observe the rotated leaf, so pin the invariant here rather
+    // than depend on the upstream default (this also exercises
+    // `with_config_customizer` as a real consumer would).
     let mut client_builder = mtls_client(source.clone())
         .authorize(client_auth)
         .with_config_customizer(|cfg| {

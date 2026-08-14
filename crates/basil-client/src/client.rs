@@ -9,8 +9,10 @@ use std::time::Duration;
 use basil_proto::broker::v1 as pb;
 use basil_proto::broker::v1::admin_service_client::AdminServiceClient;
 use basil_proto::broker::v1::aead_service_client::AeadServiceClient;
+use basil_proto::broker::v1::invocation_service_client::InvocationServiceClient;
 use basil_proto::broker::v1::minting_service_client::MintingServiceClient;
 use basil_proto::broker::v1::nats_service_client::NatsServiceClient;
+use basil_proto::broker::v1::nix_cache_service_client::NixCacheServiceClient;
 use basil_proto::broker::v1::secret_service_client::SecretServiceClient;
 use basil_proto::broker::v1::signing_service_client::SigningServiceClient;
 use hyper_util::rt::TokioIo;
@@ -35,6 +37,35 @@ pub struct KeyHandle {
     pub key_id: String,
     /// The key's public half (raw bytes; empty for value/symmetric keys).
     pub public_key: Vec<u8>,
+}
+
+/// Enrolled public identity of a Nix binary-cache signing key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NixCacheKey {
+    /// Nix verifier key name.
+    pub key_name: String,
+    /// Raw 32-byte Ed25519 public key.
+    pub public_key: [u8; 32],
+    /// Immutable backend version. V1 requires this to be `1`.
+    pub backend_version: u32,
+}
+
+/// Public-only result of a Nix binary-cache key enrollment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NixCacheEnrollment {
+    /// Enrolled verifier identity.
+    pub key: NixCacheKey,
+    /// Whether this request created or found identical backend material.
+    pub disposition: pb::NixCacheEnrollmentDisposition,
+}
+
+/// Purpose-specific signature over a canonical Nix path-info fingerprint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NixCacheSignature {
+    /// Enrolled verifier identity used for the signature.
+    pub key: NixCacheKey,
+    /// Raw 64-byte Ed25519 signature.
+    pub signature: [u8; 64],
 }
 
 /// One key to import in an [`Client::import_set`] batch.
@@ -286,6 +317,12 @@ pub struct AgentReadiness {
     pub keys_required_missing: u32,
     /// Absent `warn`/`generate` keys (reported, do not block readiness).
     pub keys_optional_missing: u32,
+    /// Listeners whose socket path changed in an applied reload and whose
+    /// externally generated wiring has not been regenerated (`rewire-required`).
+    /// A count only on this ungated probe; the named diagnostics are returned by
+    /// the permission-gated [`Client::reload`]. Configuration-attention state:
+    /// it never blocks readiness and never affects authorization.
+    pub listeners_rewire_required: u32,
 }
 
 /// Why an admin [`Client::reload`] candidate was rejected. On a rejection the
@@ -293,10 +330,66 @@ pub struct AgentReadiness {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReloadRejection {
     /// A stable, non-secret reason token (e.g. `validation_failed`,
-    /// `routing_shape_changed`, `catalog_read_failed`, `no_reload_inputs`).
+    /// `routing_shape_changed`, `catalog_read_failed`, `no_reload_inputs`,
+    /// `listener_transition_blocked`).
     pub reason: String,
     /// A human-readable, non-secret message describing the rejection.
     pub message: String,
+}
+
+/// Closed classification of one candidate listener change reported by
+/// [`Client::reload`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AgentListenerChange {
+    /// A new listener would be added without affecting existing accepts.
+    Add,
+    /// An existing listener would be removed.
+    Remove,
+    /// Type, path, mode, or group would change under an existing name.
+    Reconfigure,
+    /// A future change kind unknown to this client version.
+    Unknown,
+}
+
+/// Candidate-aware impact for one named listener in a reload candidate.
+///
+/// On an applied reload these are the committed changes; on a dry-run they are
+/// what a `SIGHUP` (or a real reload) would do right now; on a
+/// `listener_transition_blocked` rejection they are the blocking listeners.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentListenerImpact {
+    /// Stable listener name.
+    pub name: String,
+    /// Change classification.
+    pub kind: AgentListenerChange,
+    /// Exact accepted-transport count on this listener at assessment time. A
+    /// removal or reconfiguration applies only when this is zero.
+    pub active_connections: u32,
+    /// Serving socket path (removal/reconfiguration); absent for an addition.
+    pub previous_path: Option<String>,
+    /// Candidate socket path (addition/reconfiguration); absent for a removal.
+    pub new_path: Option<String>,
+}
+
+/// One persistent listener rewire diagnostic: a same-name socket-path change
+/// applied by an earlier reload.
+///
+/// External wiring generated against the previous resolved path keeps failing
+/// closed until it is regenerated and its workloads are recreated. Advisory
+/// only: it never affects authorization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRewireDiagnostic {
+    /// Stable listener name whose path changed.
+    pub listener: String,
+    /// The oldest resolved path external wiring may still record.
+    pub previous_path: String,
+    /// The path the listener now serves on.
+    pub new_path: String,
+    /// The generation whose reload applied the (latest) path change.
+    pub applied_generation: u64,
+    /// Unix seconds when the (latest) path change was recorded.
+    pub recorded_at_unix: u64,
 }
 
 /// The outcome of an admin [`Client::reload`].
@@ -324,6 +417,12 @@ pub struct AgentReload {
     pub grant_count: u32,
     /// Set only when the candidate was rejected (the previous generation serves on).
     pub rejection: Option<ReloadRejection>,
+    /// Candidate-aware listener impact (adds/removals/reconfigurations with
+    /// exact active-transport counts). Empty when no listener changes.
+    pub listener_impacts: Vec<AgentListenerImpact>,
+    /// Persistent rewire diagnostics still awaiting external wiring
+    /// regeneration, in stable listener-name order.
+    pub rewire_required: Vec<AgentRewireDiagnostic>,
 }
 
 /// Result of a live JWT-SVID revocation, returned by [`Client::revoke`].
@@ -339,12 +438,177 @@ pub struct AgentRevocation {
     pub persisted: bool,
 }
 
+/// Closed listener type captured when a connection was accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AgentConnectionListener {
+    /// Host/operator listener.
+    Host,
+    /// Courier listener exposing the sealed invocation surface.
+    Courier,
+    /// A future listener type unknown to this client version.
+    Unknown,
+}
+
+/// Independently resolved authorization domain for a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AgentConnectionDomain {
+    /// The connection has not resolved an actor yet.
+    Unresolved,
+    /// Ordinary host process.
+    HostProcess,
+    /// Concrete `systemd` service.
+    SystemdUnit,
+    /// A future domain unknown to this client version.
+    Unknown,
+}
+
+/// Typed concrete `systemd` identity for a connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSystemdIdentity {
+    /// Canonical concrete `.service` unit name.
+    pub unit: String,
+    /// Per-user manager owner. Absence identifies the system manager.
+    pub manager_uid: Option<u32>,
+}
+
+/// One entry in the broker's bounded accepted-connection inventory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentConnection {
+    /// Stable process-lifetime connection identifier.
+    pub id: u64,
+    /// Listener name captured at accept time.
+    pub listener_name: String,
+    /// Closed listener type captured at accept time.
+    pub listener_type: AgentConnectionListener,
+    /// Kernel peer PID.
+    pub pid: Option<u32>,
+    /// Kernel peer UID.
+    pub uid: Option<u32>,
+    /// Kernel peer primary GID.
+    pub gid: Option<u32>,
+    /// Independently resolved domain.
+    pub domain: AgentConnectionDomain,
+    /// Uniquely selected policy subject; empty until actor resolution.
+    pub subject: String,
+    /// Concrete `systemd` identity, when applicable.
+    pub systemd: Option<AgentSystemdIdentity>,
+    /// Whether cancellation was already requested.
+    pub cancellation_requested: bool,
+    /// Active long-lived streams owned by this connection.
+    pub active_streams: u32,
+}
+
+/// Exact typed selector for [`Client::drop_connections`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AgentConnectionSelector {
+    /// One stable connection id.
+    Id(u64),
+    /// Every connection presented by this UID. Intentionally broad.
+    Uid(u32),
+    /// One concrete `systemd` identity.
+    Systemd {
+        /// Canonical concrete `.service` unit.
+        unit: String,
+        /// Per-user manager owner. Absence selects the system manager.
+        manager_uid: Option<u32>,
+    },
+}
+
+/// Aggregate result of a deliberate connection-drop operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentConnectionDrop {
+    /// Active entries matched by at least one selector.
+    pub matched: u32,
+    /// Cancellation signals delivered by this call.
+    pub cancelled: u32,
+    /// Matching entries already cancelling.
+    pub already_requested: u32,
+    /// Matching caller entry excluded so the RPC could reply.
+    pub caller_excluded: u32,
+}
+
+fn agent_connection(connection: pb::ConnectionInfo) -> AgentConnection {
+    let listener_type = match pb::ConnectionListenerType::try_from(connection.listener_type) {
+        Ok(pb::ConnectionListenerType::Host) => AgentConnectionListener::Host,
+        Ok(pb::ConnectionListenerType::Courier) => AgentConnectionListener::Courier,
+        Ok(pb::ConnectionListenerType::Unspecified) | Err(_) => AgentConnectionListener::Unknown,
+    };
+    let domain = match pb::ConnectionDomain::try_from(connection.domain) {
+        Ok(pb::ConnectionDomain::Unspecified) => AgentConnectionDomain::Unresolved,
+        Ok(pb::ConnectionDomain::HostProcess) => AgentConnectionDomain::HostProcess,
+        Ok(pb::ConnectionDomain::SystemdUnit) => AgentConnectionDomain::SystemdUnit,
+        Err(_) => AgentConnectionDomain::Unknown,
+    };
+    AgentConnection {
+        id: connection.id,
+        listener_name: connection.listener_name,
+        listener_type,
+        pid: connection.pid,
+        uid: connection.uid,
+        gid: connection.gid,
+        domain,
+        subject: connection.subject,
+        systemd: connection.systemd.map(|identity| AgentSystemdIdentity {
+            unit: identity.unit,
+            manager_uid: identity.manager_uid,
+        }),
+        cancellation_requested: connection.cancellation_requested,
+        active_streams: connection.active_streams,
+    }
+}
+
+fn connection_selector(selector: &AgentConnectionSelector) -> pb::ConnectionSelector {
+    use pb::connection_selector::Selector;
+    let selector = match selector {
+        AgentConnectionSelector::Id(id) => Selector::Id(*id),
+        AgentConnectionSelector::Uid(uid) => Selector::Uid(*uid),
+        AgentConnectionSelector::Systemd { unit, manager_uid } => {
+            Selector::Systemd(pb::ConnectionSystemdSelector {
+                unit: unit.clone(),
+                manager_uid: *manager_uid,
+            })
+        }
+    };
+    pb::ConnectionSelector {
+        selector: Some(selector),
+    }
+}
+
 impl AgentReload {
     /// Whether the broker accepted the candidate: an applied reload, or a dry-run
     /// that validated cleanly. `false` iff a [`ReloadRejection`] is present.
     #[must_use]
     pub const fn succeeded(&self) -> bool {
         self.rejection.is_none()
+    }
+}
+
+fn agent_listener_impact(info: pb::ListenerImpactInfo) -> AgentListenerImpact {
+    let kind = match info.kind() {
+        pb::ListenerChangeKind::Add => AgentListenerChange::Add,
+        pb::ListenerChangeKind::Remove => AgentListenerChange::Remove,
+        pb::ListenerChangeKind::Reconfigure => AgentListenerChange::Reconfigure,
+        pb::ListenerChangeKind::Unspecified => AgentListenerChange::Unknown,
+    };
+    AgentListenerImpact {
+        name: info.name,
+        kind,
+        active_connections: info.active_connections,
+        previous_path: info.previous_path,
+        new_path: info.new_path,
+    }
+}
+
+fn agent_rewire_diagnostic(info: pb::RewireDiagnostic) -> AgentRewireDiagnostic {
+    AgentRewireDiagnostic {
+        listener: info.listener,
+        previous_path: info.previous_path,
+        new_path: info.new_path,
+        applied_generation: info.applied_generation,
+        recorded_at_unix: info.recorded_at_unix,
     }
 }
 
@@ -426,6 +690,22 @@ pub struct AgentExplanation {
     pub matched_rule: Option<MatchedRule>,
 }
 
+/// A single-use invocation freshness challenge issued by the broker.
+///
+/// Issued by `InvocationService.GetInvocationChallenge` for one self-asserted
+/// proof-key thumbprint, embedded verbatim in the sealed invocation's
+/// encrypted-layer claim `-70008`, and consumed exactly once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvocationChallenge {
+    /// The 32 challenge bytes: a 16-byte issuing-instance ID prefix followed
+    /// by 16 CSPRNG bytes.
+    pub challenge: [u8; 32],
+    /// Serving generation the challenge is bound to.
+    pub generation: u64,
+    /// Unix seconds when the challenge expires (at most 60 seconds out).
+    pub expires_at_unix: i64,
+}
+
 /// An async client for Basil's broker gRPC services over a Unix socket.
 #[derive(Clone)]
 pub struct Client {
@@ -434,6 +714,8 @@ pub struct Client {
     secrets: SecretServiceClient<Channel>,
     minting: MintingServiceClient<Channel>,
     nats: NatsServiceClient<Channel>,
+    nix_cache: NixCacheServiceClient<Channel>,
+    invocation: InvocationServiceClient<Channel>,
     admin: AdminServiceClient<Channel>,
     default_timeout: u64,
 }
@@ -454,6 +736,8 @@ impl Client {
             secrets: SecretServiceClient::new(channel.clone()),
             minting: MintingServiceClient::new(channel.clone()),
             nats: NatsServiceClient::new(channel.clone()),
+            nix_cache: NixCacheServiceClient::new(channel.clone()),
+            invocation: InvocationServiceClient::new(channel.clone()),
             admin: AdminServiceClient::new(channel),
             default_timeout,
         })
@@ -557,6 +841,121 @@ impl Client {
     pub async fn sign(&mut self, key_id: &str, message: &[u8]) -> Result<Vec<u8>> {
         self.sign_with_algorithm(key_id, message, pb::SigningAlgorithm::Unspecified)
             .await
+    }
+
+    /// Describe one enrolled Nix binary-cache key.
+    pub async fn describe_nix_cache_key(
+        &mut self,
+        key_id: &str,
+        batch_id: [u8; 16],
+        request_id: [u8; 16],
+    ) -> Result<NixCacheKey> {
+        validate_nix_cache_key_id(key_id)?;
+        validate_correlation_ids(&batch_id, &request_id)?;
+        let response = Self::bounded(
+            self.default_timeout,
+            self.nix_cache
+                .describe_nix_cache_key(pb::DescribeNixCacheKeyRequest {
+                    key_id: key_id.to_string(),
+                    batch_id: batch_id.to_vec(),
+                    request_id: request_id.to_vec(),
+                }),
+        )
+        .await?
+        .into_inner();
+        validate_echoes(
+            &response.batch_id,
+            &response.request_id,
+            &batch_id,
+            &request_id,
+        )?;
+        nix_cache_key(
+            response.key_name,
+            response.public_key,
+            response.backend_version,
+        )
+    }
+
+    /// Ensure and enroll one pending Nix binary-cache key.
+    pub async fn enroll_nix_cache_key(
+        &mut self,
+        key_id: &str,
+        batch_id: [u8; 16],
+        request_id: [u8; 16],
+    ) -> Result<NixCacheEnrollment> {
+        validate_nix_cache_key_id(key_id)?;
+        validate_correlation_ids(&batch_id, &request_id)?;
+        let response = Self::bounded(
+            self.default_timeout,
+            self.nix_cache
+                .enroll_nix_cache_key(pb::EnrollNixCacheKeyRequest {
+                    key_id: key_id.to_string(),
+                    batch_id: batch_id.to_vec(),
+                    request_id: request_id.to_vec(),
+                }),
+        )
+        .await?
+        .into_inner();
+        validate_echoes(
+            &response.batch_id,
+            &response.request_id,
+            &batch_id,
+            &request_id,
+        )?;
+        let disposition = pb::NixCacheEnrollmentDisposition::try_from(response.disposition)
+            .map_err(|_| Error::Protocol("invalid Nix cache enrollment disposition".to_string()))?;
+        Ok(NixCacheEnrollment {
+            key: nix_cache_key(
+                response.key_name,
+                response.public_key,
+                response.backend_version,
+            )?,
+            disposition,
+        })
+    }
+
+    /// Sign one canonical `PATH_INFO_V1` fingerprint.
+    pub async fn sign_nix_cache_fingerprint(
+        &mut self,
+        key_id: &str,
+        fingerprint: &[u8],
+        batch_id: [u8; 16],
+        request_id: [u8; 16],
+    ) -> Result<NixCacheSignature> {
+        validate_nix_cache_key_id(key_id)?;
+        validate_nix_cache_fingerprint(fingerprint)?;
+        validate_correlation_ids(&batch_id, &request_id)?;
+        let response = Self::bounded(
+            self.default_timeout,
+            self.nix_cache
+                .sign_nix_cache_fingerprint(pb::SignNixCacheFingerprintRequest {
+                    key_id: key_id.to_string(),
+                    profile: "PATH_INFO_V1".to_string(),
+                    fingerprint: fingerprint.to_vec(),
+                    batch_id: batch_id.to_vec(),
+                    request_id: request_id.to_vec(),
+                }),
+        )
+        .await?
+        .into_inner();
+        validate_echoes(
+            &response.batch_id,
+            &response.request_id,
+            &batch_id,
+            &request_id,
+        )?;
+        let signature = response
+            .signature
+            .try_into()
+            .map_err(|_| Error::Protocol("Nix cache signature is not 64 bytes".to_string()))?;
+        Ok(NixCacheSignature {
+            key: nix_cache_key(
+                response.key_name,
+                response.public_key,
+                response.backend_version,
+            )?,
+            signature,
+        })
     }
 
     /// Sign with an explicit gRPC signing algorithm. Use
@@ -1140,6 +1539,44 @@ impl Client {
         })
     }
 
+    /// Fetch a single-use invocation freshness challenge bound to `jkt`, the
+    /// self-asserted RFC 7638 SHA-256 proof-key thumbprint.
+    ///
+    /// `courier_observed_source` is set only by a trusted courier in front of
+    /// the broker; Host callers pass `None`. On a Courier
+    /// listener the broker places this value beneath the immutable listener
+    /// name and kernel-reported peer UID before partitioning issuance rate
+    /// limits. Declined issuance under capacity or rate-limit pressure surfaces
+    /// as a `ResourceExhausted` status with the stable reason token
+    /// `CHALLENGE_ISSUANCE_DECLINED` and may be retried unchanged after backoff.
+    pub async fn get_invocation_challenge(
+        &mut self,
+        jkt: &[u8; 32],
+        courier_observed_source: Option<&str>,
+    ) -> Result<InvocationChallenge> {
+        let response = Self::bounded(
+            self.default_timeout,
+            self.invocation
+                .get_invocation_challenge(pb::GetInvocationChallengeRequest {
+                    jkt: jkt.to_vec(),
+                    courier_observed_source: courier_observed_source.map(str::to_string),
+                }),
+        )
+        .await?;
+        let body = response.into_inner();
+        let challenge: [u8; 32] = body.challenge.as_slice().try_into().map_err(|_| {
+            Error::Protocol(format!(
+                "freshness challenge must be exactly 32 bytes, got {}",
+                body.challenge.len()
+            ))
+        })?;
+        Ok(InvocationChallenge {
+            challenge,
+            generation: body.generation,
+            expires_at_unix: body.expires_at_unix,
+        })
+    }
+
     /// The broker's backend identifier, build version, and wire protocol version.
     ///
     /// The broker answers only callers that resolve to a policy subject (no
@@ -1194,6 +1631,7 @@ impl Client {
             keys_present: body.keys_present,
             keys_required_missing: body.keys_required_missing,
             keys_optional_missing: body.keys_optional_missing,
+            listeners_rewire_required: body.listeners_rewire_required,
         })
     }
 
@@ -1226,6 +1664,52 @@ impl Client {
                 reason: r.reason,
                 message: r.message,
             }),
+            listener_impacts: body
+                .listener_impacts
+                .into_iter()
+                .map(agent_listener_impact)
+                .collect(),
+            rewire_required: body
+                .rewire_required
+                .into_iter()
+                .map(agent_rewire_diagnostic)
+                .collect(),
+        })
+    }
+
+    /// Return the permission-gated, globally bounded active connection inventory.
+    pub async fn connections(&mut self) -> Result<Vec<AgentConnection>> {
+        let response = Self::bounded(
+            self.default_timeout,
+            self.admin.list_connections(pb::ListConnectionsRequest {}),
+        )
+        .await?;
+        Ok(response
+            .into_inner()
+            .connections
+            .into_iter()
+            .map(agent_connection)
+            .collect())
+    }
+
+    /// Deliberately terminate connections matching a bounded typed selector set.
+    pub async fn drop_connections(
+        &mut self,
+        selectors: &[AgentConnectionSelector],
+    ) -> Result<AgentConnectionDrop> {
+        let selectors = selectors.iter().map(connection_selector).collect();
+        let response = Self::bounded(
+            self.default_timeout,
+            self.admin
+                .drop_connections(pb::DropConnectionsRequest { selectors }),
+        )
+        .await?
+        .into_inner();
+        Ok(AgentConnectionDrop {
+            matched: response.matched,
+            cancelled: response.cancelled,
+            already_requested: response.already_requested,
+            caller_excluded: response.caller_excluded,
         })
     }
 
@@ -1295,6 +1779,84 @@ impl Client {
             persisted: body.persisted,
         })
     }
+}
+
+fn validate_correlation_ids(batch_id: &[u8; 16], request_id: &[u8; 16]) -> Result<()> {
+    if batch_id.iter().all(|byte| *byte == 0) {
+        return Err(Error::Protocol(
+            "Nix cache batch ID must not be all zero".to_string(),
+        ));
+    }
+    if request_id.iter().all(|byte| *byte == 0) {
+        return Err(Error::Protocol(
+            "Nix cache request ID must not be all zero".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_nix_cache_key_id(key_id: &str) -> Result<()> {
+    if !(1..=256).contains(&key_id.len()) {
+        return Err(Error::Protocol(format!(
+            "Nix cache key ID is {} bytes; expected 1..=256",
+            key_id.len()
+        )));
+    }
+    if key_id.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
+        return Err(Error::Protocol(
+            "Nix cache key ID contains a control byte".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_nix_cache_fingerprint(fingerprint: &[u8]) -> Result<()> {
+    if !(1..=524_626).contains(&fingerprint.len()) {
+        return Err(Error::Protocol(format!(
+            "Nix cache fingerprint is {} bytes; expected 1..=524626",
+            fingerprint.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_echoes(
+    actual_batch: &[u8],
+    actual_request: &[u8],
+    expected_batch: &[u8; 16],
+    expected_request: &[u8; 16],
+) -> Result<()> {
+    if actual_batch != expected_batch {
+        return Err(Error::Protocol(
+            "Nix cache response changed the batch ID".to_string(),
+        ));
+    }
+    if actual_request != expected_request {
+        return Err(Error::Protocol(
+            "Nix cache response changed the request ID".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn nix_cache_key(
+    key_name: String,
+    public_key: Vec<u8>,
+    backend_version: u32,
+) -> Result<NixCacheKey> {
+    let public_key = public_key
+        .try_into()
+        .map_err(|_| Error::Protocol("Nix cache public key is not 32 bytes".to_string()))?;
+    if backend_version != 1 {
+        return Err(Error::Protocol(format!(
+            "Nix cache backend version is {backend_version}; expected 1"
+        )));
+    }
+    Ok(NixCacheKey {
+        key_name,
+        public_key,
+        backend_version,
+    })
 }
 
 async fn uds_channel(path: &str, timeout_secs: u64) -> Result<Channel> {
@@ -1441,6 +2003,7 @@ fn non_zero(value: u64) -> Option<u64> {
 
 #[cfg(test)]
 mod nats_client_tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1452,6 +2015,8 @@ mod nats_client_tests {
 
     use super::*;
     use basil_proto::broker::v1::nats_service_server::{NatsService, NatsServiceServer};
+
+    static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
 
     #[derive(Clone, Default)]
     struct FakeNatsService {
@@ -1730,14 +2295,21 @@ mod nats_client_tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
-        std::env::temp_dir().join(format!("basil-client-{nanos}.sock"))
+        let sequence = NEXT_SOCKET.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "basil-client-{}-{nanos}-{sequence}.sock",
+            std::process::id()
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{broker_error_info, status_error};
-    use basil_proto::broker::v1::BrokerErrorInfo;
+    use super::{
+        AgentConnectionListener, agent_connection, broker_error_info, status_error,
+        validate_nix_cache_fingerprint, validate_nix_cache_key_id,
+    };
+    use basil_proto::broker::v1::{BrokerErrorInfo, ConnectionInfo, ConnectionListenerType};
     use prost::Message;
     use tonic::Code;
 
@@ -1804,5 +2376,29 @@ mod tests {
         ] {
             assert_eq!(proto_key_type(domain), wire as i32);
         }
+    }
+
+    #[test]
+    fn courier_connection_inventory_remains_distinct() {
+        let connection = agent_connection(ConnectionInfo {
+            listener_type: ConnectionListenerType::Courier.into(),
+            ..ConnectionInfo::default()
+        });
+        assert_eq!(connection.listener_type, AgentConnectionListener::Courier);
+    }
+
+    #[test]
+    fn nix_cache_inputs_enforce_frozen_bounds_before_transport() {
+        assert!(validate_nix_cache_key_id("k").is_ok());
+        assert!(validate_nix_cache_key_id(&"k".repeat(256)).is_ok());
+        assert!(validate_nix_cache_key_id("").is_err());
+        assert!(validate_nix_cache_key_id(&"k".repeat(257)).is_err());
+        assert!(validate_nix_cache_key_id("key\0name").is_err());
+        assert!(validate_nix_cache_key_id("key\u{7f}name").is_err());
+
+        assert!(validate_nix_cache_fingerprint(b"x").is_ok());
+        assert!(validate_nix_cache_fingerprint(&vec![b'x'; 524_626]).is_ok());
+        assert!(validate_nix_cache_fingerprint(&[]).is_err());
+        assert!(validate_nix_cache_fingerprint(&vec![b'x'; 524_627]).is_err());
     }
 }

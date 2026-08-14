@@ -39,10 +39,13 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::backend::{
-    Backend, BackendError, KvSecret, NativeAlgorithm, NewKey, PublicKey, SignOptions,
-    X509CertRequest, X509Svid,
+    Backend, BackendError, KvSecret, NativeAlgorithm, NewKey, NixCacheKeyPosture, PublicKey,
+    SignOptions, X509CertRequest, X509Svid,
 };
-use crate::catalog::{BackendRef, Catalog, Class, Engine, GenerateSpec, KeyAlgorithm, KeyEntry};
+use crate::catalog::{
+    BackendKind, BackendRef, Catalog, Class, Engine, GenerateSpec, KeyAlgorithm, KeyEntry,
+    NixCacheIdentity, NixCachePublicKey, NixCacheState,
+};
 use crate::core::crypto_provider::LocalSoftwareProvider;
 use crate::core::crypto_provider::{
     BackendCryptoProvider, CryptoProvider, CryptoProviderId, CustodyMode,
@@ -156,6 +159,20 @@ pub enum ManagerError {
     /// out-of-band material instead (§7 / `vault-a2p`).
     #[error("value key `{0}` has no generate recipe; rotate via `set` instead")]
     ValueRotateNeedsSet(String),
+
+    /// A Nix binary-cache identity or its backend key violates the immutable
+    /// enrollment contract.
+    #[error("Nix cache key `{key}` cannot be enrolled: {reason}")]
+    NixCacheEnrollment {
+        /// Catalog key being enrolled.
+        key: String,
+        /// Stable fail-closed reason; contains no key material.
+        reason: &'static str,
+    },
+
+    /// A Nix binary-cache key was requested through the generic rotation path.
+    #[error("Nix cache key `{0}` is immutable; provision a new catalog key and Nix key name")]
+    NixCacheRotationForbidden(String),
 
     /// A sealing op (wrap/unwrap/`get_public_key`) failed: a malformed
     /// materialized private key, a malformed envelope, or an AEAD authentication
@@ -443,6 +460,50 @@ impl Routed<'_> {
 pub struct BackendManager {
     catalog: Arc<Catalog>,
     backends: BTreeMap<String, Box<dyn Backend>>,
+    /// Serializes rare read/create/read enrollment sequences within this broker.
+    nix_cache_enrollment: tokio::sync::Mutex<()>,
+}
+
+/// Whether enrollment created backend material or validated compatible material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NixCacheEnrollmentDisposition {
+    /// The key was absent and the named-create path established it.
+    Created,
+    /// Compatible backend material already existed and was not mutated.
+    Existing,
+}
+
+/// Public-only result of ensuring a purpose-bound Nix binary-cache key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NixCacheEnrollment {
+    /// Nix verifier identity pinned by the catalog.
+    pub key_name: String,
+    /// Exact Ed25519 public bytes; private material never crosses this API.
+    pub public_key: NixCachePublicKey,
+    /// Immutable backend version, currently always one.
+    pub backend_version: u32,
+    /// Whether this call created or only validated material.
+    pub disposition: NixCacheEnrollmentDisposition,
+}
+
+/// Public-only description of an enrolled Nix binary-cache signing key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NixCacheDescription {
+    /// Stable Nix verifier key name.
+    pub key_name: String,
+    /// Catalog-pinned Ed25519 public key.
+    pub public_key: NixCachePublicKey,
+    /// Exact backend key version observed during the operation.
+    pub backend_version: u32,
+}
+
+/// Locally verified result of a purpose-specific Nix fingerprint signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NixCacheSignature {
+    /// Enrolled verifier identity used to validate the signature.
+    pub identity: NixCacheDescription,
+    /// Exact 64-byte Ed25519 signature.
+    pub signature: [u8; 64],
 }
 
 // `Box<dyn Backend>` is not `Debug`; report the routing table by name only.
@@ -451,6 +512,7 @@ impl std::fmt::Debug for BackendManager {
         f.debug_struct("BackendManager")
             .field("backends", &self.backends.keys().collect::<Vec<_>>())
             .field("keys", &self.catalog.keys.keys().collect::<Vec<_>>())
+            .field("nix_cache_enrollment", &"<mutex>")
             .finish()
     }
 }
@@ -480,6 +542,7 @@ impl BackendManager {
         Ok(Self {
             catalog: Arc::new(catalog),
             backends,
+            nix_cache_enrollment: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -522,6 +585,208 @@ impl BackendManager {
             backend_ref,
             engine: effective_engine(entry),
         })
+    }
+
+    /// Ensure or compare-only validate a backend-custodied Nix cache key.
+    ///
+    /// `active_identity` must be cloned from the one generation the caller pinned
+    /// for the whole operation. The manager's catalog contains restart-only
+    /// routing state and can be older after a hot reload; it is deliberately not
+    /// authoritative for the reloadable pending/enrolled state or public-key pin.
+    /// Only an active `pending` identity may take the idempotent named-create path.
+    /// An active `enrolled` identity is compare-only: missing material is never
+    /// recreated, and its public bytes must equal the active immutable catalog pin.
+    /// Success always requires exact version-one Ed25519 posture with every escape
+    /// hatch and automatic rotation disabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManagerError::NixCacheEnrollment`] for an invalid catalog shape,
+    /// incompatible posture, or missing enrolled key, and
+    /// [`ManagerError::Backend`] for backend failures.
+    pub async fn enroll_nix_cache_key(
+        &self,
+        key_id: &str,
+        active_identity: NixCacheIdentity,
+    ) -> Result<NixCacheEnrollment, ManagerError> {
+        let routed = self.resolve(key_id)?;
+        let routed_identity = routed.entry.nix_cache.as_ref().ok_or_else(|| {
+            nix_cache_enrollment_error(key_id, "catalog key has no nixCache identity")
+        })?;
+        if active_identity.key_name != routed_identity.key_name
+            || active_identity.backend_version != routed_identity.backend_version
+        {
+            return Err(nix_cache_enrollment_error(
+                key_id,
+                "active-generation identity does not match the immutable routed identity",
+            ));
+        }
+        match (active_identity.state, active_identity.public_key) {
+            (NixCacheState::Pending, None) | (NixCacheState::Enrolled, Some(_)) => {}
+            (NixCacheState::Pending, Some(_)) => {
+                return Err(nix_cache_enrollment_error(
+                    key_id,
+                    "pending identity unexpectedly carries a public-key pin",
+                ));
+            }
+            (NixCacheState::Enrolled, None) => {
+                return Err(nix_cache_enrollment_error(
+                    key_id,
+                    "enrolled identity has no public-key pin",
+                ));
+            }
+        }
+        validate_nix_cache_route(key_id, &routed, active_identity.backend_version)?;
+
+        // This guard intentionally spans backend awaits: enrollment is rare and
+        // the whole read/create/read sequence is the critical section that makes
+        // concurrent ensures deterministic within one broker process.
+        let _guard = self.nix_cache_enrollment.lock().await;
+        let (posture, disposition) = match routed.backend.nix_cache_key_posture(routed.path()).await
+        {
+            Ok(posture) => (posture, NixCacheEnrollmentDisposition::Existing),
+            Err(BackendError::KeyNotFound(_))
+                if active_identity.state == NixCacheState::Pending =>
+            {
+                routed.backend.create_nix_cache_key(routed.path()).await?;
+                let posture = routed.backend.nix_cache_key_posture(routed.path()).await?;
+                (posture, NixCacheEnrollmentDisposition::Created)
+            }
+            Err(BackendError::KeyNotFound(_)) => {
+                return Err(nix_cache_enrollment_error(
+                    key_id,
+                    "enrolled backend material is missing and must not be recreated",
+                ));
+            }
+            Err(error) => return Err(ManagerError::Backend(error)),
+        };
+        validate_nix_cache_posture(key_id, &posture)?;
+
+        let public_key = NixCachePublicKey::from_bytes(posture.public_key);
+        if active_identity.state == NixCacheState::Enrolled
+            && active_identity.public_key.as_ref() != Some(&public_key)
+        {
+            return Err(nix_cache_enrollment_error(
+                key_id,
+                "backend public key does not match the enrolled catalog pin",
+            ));
+        }
+
+        Ok(NixCacheEnrollment {
+            key_name: active_identity.key_name,
+            public_key,
+            backend_version: posture.latest_version,
+            disposition,
+        })
+    }
+
+    /// Describe an enrolled Nix cache key after rechecking backend posture.
+    pub async fn describe_nix_cache_key(
+        &self,
+        key_id: &str,
+        active_identity: NixCacheIdentity,
+    ) -> Result<NixCacheDescription, ManagerError> {
+        let routed = self.resolve_enrolled_nix_cache_key(key_id, &active_identity)?;
+        let posture = routed.backend.nix_cache_key_posture(routed.path()).await?;
+        validate_nix_cache_posture(key_id, &posture)?;
+        validate_nix_cache_pin(key_id, &active_identity, &posture)?;
+        Ok(NixCacheDescription {
+            key_name: active_identity.key_name,
+            public_key: NixCachePublicKey::from_bytes(posture.public_key),
+            backend_version: posture.latest_version,
+        })
+    }
+
+    /// Sign an exact canonical Nix fingerprint and verify the result locally.
+    ///
+    /// The backend posture and immutable public pin are checked both before and
+    /// after signing. This closes the replacement/rotation window around the
+    /// backend await. The returned signature is then verified against the same
+    /// active-generation public pin before it may cross the service boundary.
+    pub async fn sign_nix_cache_fingerprint(
+        &self,
+        key_id: &str,
+        active_identity: NixCacheIdentity,
+        fingerprint: &[u8],
+    ) -> Result<NixCacheSignature, ManagerError> {
+        let routed = self.resolve_enrolled_nix_cache_key(key_id, &active_identity)?;
+        let before = routed.backend.nix_cache_key_posture(routed.path()).await?;
+        validate_nix_cache_posture(key_id, &before)?;
+        validate_nix_cache_pin(key_id, &active_identity, &before)?;
+
+        let backend_signature = routed
+            .backend
+            .sign_nix_cache_fingerprint(routed.path(), fingerprint)
+            .await?;
+        if backend_signature.backend_version != active_identity.backend_version {
+            return Err(nix_cache_enrollment_error(
+                key_id,
+                "signature backend version does not match the enrolled catalog pin",
+            ));
+        }
+
+        let after = routed.backend.nix_cache_key_posture(routed.path()).await?;
+        validate_nix_cache_posture(key_id, &after)?;
+        validate_nix_cache_pin(key_id, &active_identity, &after)?;
+        if before != after {
+            return Err(nix_cache_enrollment_error(
+                key_id,
+                "backend posture changed while signing",
+            ));
+        }
+
+        let public_key = active_identity.public_key.ok_or_else(|| {
+            nix_cache_enrollment_error(key_id, "enrolled identity has no public-key pin")
+        })?;
+        let verified = ed25519_sign::verify(
+            public_key.as_bytes(),
+            fingerprint,
+            &backend_signature.signature,
+        )
+        .map_err(|_| nix_cache_enrollment_error(key_id, "returned signature is malformed"))?;
+        if !verified {
+            return Err(nix_cache_enrollment_error(
+                key_id,
+                "returned signature does not verify against the enrolled public key",
+            ));
+        }
+
+        Ok(NixCacheSignature {
+            identity: NixCacheDescription {
+                key_name: active_identity.key_name,
+                public_key,
+                backend_version: after.latest_version,
+            },
+            signature: backend_signature.signature,
+        })
+    }
+
+    fn resolve_enrolled_nix_cache_key<'a>(
+        &'a self,
+        key_id: &str,
+        active_identity: &NixCacheIdentity,
+    ) -> Result<Routed<'a>, ManagerError> {
+        if active_identity.state != NixCacheState::Enrolled || active_identity.public_key.is_none()
+        {
+            return Err(nix_cache_enrollment_error(
+                key_id,
+                "operation requires an enrolled identity with a public-key pin",
+            ));
+        }
+        let routed = self.resolve(key_id)?;
+        let routed_identity = routed.entry.nix_cache.as_ref().ok_or_else(|| {
+            nix_cache_enrollment_error(key_id, "catalog key has no nixCache identity")
+        })?;
+        if active_identity.key_name != routed_identity.key_name
+            || active_identity.backend_version != routed_identity.backend_version
+        {
+            return Err(nix_cache_enrollment_error(
+                key_id,
+                "active-generation identity does not match the immutable routed identity",
+            ));
+        }
+        validate_nix_cache_route(key_id, &routed, active_identity.backend_version)?;
+        Ok(routed)
     }
 
     /// Iterate the catalog's `(dotted name, entry)` pairs, in name order.
@@ -1606,6 +1871,10 @@ impl BackendManager {
             &[Class::Asymmetric, Class::Symmetric, Class::Value],
         )?;
 
+        if routed.entry.nix_cache.is_some() {
+            return Err(ManagerError::NixCacheRotationForbidden(key_id.to_string()));
+        }
+
         // A value-store (`engine=kv2`) crypto key holds its private as raw KV
         // bytes provisioned out-of-band; it is never transit-rotated (mirrors a
         // sealing key, which has no `rotate`). Refuse explicitly rather than let
@@ -2256,6 +2525,106 @@ const fn wire_key_type(entry: &KeyEntry) -> Option<KeyType> {
 /// the key's [`Class`] when the catalog omits it (crypto → transit, stored → kv2).
 fn effective_engine(entry: &KeyEntry) -> Engine {
     entry.effective_engine()
+}
+
+fn nix_cache_enrollment_error(key: &str, reason: &'static str) -> ManagerError {
+    ManagerError::NixCacheEnrollment {
+        key: key.to_string(),
+        reason,
+    }
+}
+
+fn validate_nix_cache_route(
+    key_id: &str,
+    routed: &Routed<'_>,
+    backend_version: u32,
+) -> Result<(), ManagerError> {
+    if routed.backend_ref.kind != BackendKind::Vault {
+        return Err(nix_cache_enrollment_error(
+            key_id,
+            "v1 supports only Vault-compatible custody, not KMS or local key stores",
+        ));
+    }
+    if routed.class() != Class::Asymmetric {
+        return Err(nix_cache_enrollment_error(
+            key_id,
+            "catalog key is not asymmetric",
+        ));
+    }
+    if routed.engine != Engine::Transit {
+        return Err(nix_cache_enrollment_error(
+            key_id,
+            "catalog key does not use the transit engine",
+        ));
+    }
+    if routed.key_type() != Some(KeyAlgorithm::Ed25519) {
+        return Err(nix_cache_enrollment_error(
+            key_id,
+            "catalog key type is not Ed25519",
+        ));
+    }
+    if backend_version != 1 {
+        return Err(nix_cache_enrollment_error(
+            key_id,
+            "catalog backend version is not one",
+        ));
+    }
+    if routed.path().is_empty() {
+        return Err(nix_cache_enrollment_error(
+            key_id,
+            "catalog transit path is empty",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_nix_cache_posture(
+    key_id: &str,
+    posture: &NixCacheKeyPosture,
+) -> Result<(), ManagerError> {
+    let reason = if posture.key_type != KeyType::Ed25519 {
+        Some("backend key type is not Ed25519")
+    } else if posture.latest_version != 1 {
+        Some("backend latest version is not one; in-place rotation is forbidden")
+    } else if posture.min_decryption_version != 1 {
+        Some("backend minimum version is not one")
+    } else if posture.derived {
+        Some("backend key derivation is enabled")
+    } else if posture.exportable {
+        Some("backend private-key export is enabled")
+    } else if posture.allow_plaintext_backup {
+        Some("backend plaintext backup is enabled")
+    } else if posture.deletion_allowed {
+        Some("backend key deletion is enabled")
+    } else if !posture.auto_rotation_disabled {
+        Some("backend automatic rotation is enabled")
+    } else {
+        None
+    };
+    reason.map_or(Ok(()), |reason| {
+        Err(nix_cache_enrollment_error(key_id, reason))
+    })
+}
+
+fn validate_nix_cache_pin(
+    key_id: &str,
+    active_identity: &NixCacheIdentity,
+    posture: &NixCacheKeyPosture,
+) -> Result<(), ManagerError> {
+    if posture.latest_version != active_identity.backend_version {
+        return Err(nix_cache_enrollment_error(
+            key_id,
+            "backend version does not match the enrolled catalog pin",
+        ));
+    }
+    let public_key = NixCachePublicKey::from_bytes(posture.public_key);
+    if active_identity.public_key.as_ref() != Some(&public_key) {
+        return Err(nix_cache_enrollment_error(
+            key_id,
+            "backend public key does not match the enrolled catalog pin",
+        ));
+    }
+    Ok(())
 }
 
 /// Check that `op` is valid for `class`, returning [`ManagerError::OpNotValidForClass`]
@@ -5221,5 +5590,511 @@ mod pqc_dispatch_tests {
             classical.describe_provider("does.not.exist"),
             Err(ManagerError::UnknownKey(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod nix_cache_enrollment_tests {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use serde_json::json;
+
+    use super::{
+        BackendManager, ManagerError, NixCacheEnrollmentDisposition, NixCacheKeyPosture,
+        validate_nix_cache_posture,
+    };
+    use crate::backend::{Backend, BackendError, NewKey, NixCacheBackendSignature};
+    use crate::catalog::{BackendKind, Catalog, NixCacheIdentity, NixCacheState};
+    use crate::state::BrokerLimits;
+    use basil_proto::KeyType;
+    use zeroize::Zeroizing;
+
+    struct EnrollmentBackend {
+        posture: Mutex<Option<NixCacheKeyPosture>>,
+        create_calls: AtomicUsize,
+        paths: Mutex<Vec<String>>,
+        signature_version: AtomicUsize,
+        invalid_signature: AtomicBool,
+        replace_after_sign: AtomicBool,
+    }
+
+    impl EnrollmentBackend {
+        fn new(posture: Option<NixCacheKeyPosture>) -> Arc<Self> {
+            Arc::new(Self {
+                posture: Mutex::new(posture),
+                create_calls: AtomicUsize::new(0),
+                paths: Mutex::new(Vec::new()),
+                signature_version: AtomicUsize::new(1),
+                invalid_signature: AtomicBool::new(false),
+                replace_after_sign: AtomicBool::new(false),
+            })
+        }
+    }
+
+    struct EnrollmentHandle(Arc<EnrollmentBackend>);
+
+    #[async_trait]
+    impl Backend for EnrollmentHandle {
+        fn kind(&self) -> &'static str {
+            "vault-enrollment-test"
+        }
+
+        async fn new_key(&self, _key_type: KeyType) -> Result<NewKey, BackendError> {
+            Err(BackendError::Unsupported("new_key"))
+        }
+
+        async fn create_nix_cache_key(&self, key_id: &str) -> Result<(), BackendError> {
+            self.0.create_calls.fetch_add(1, Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            self.0
+                .paths
+                .lock()
+                .expect("paths lock")
+                .push(key_id.to_string());
+            let mut posture = self.0.posture.lock().expect("posture lock");
+            if posture.is_none() {
+                *posture = Some(compatible_posture());
+            }
+            drop(posture);
+            Ok(())
+        }
+
+        async fn nix_cache_key_posture(
+            &self,
+            key_id: &str,
+        ) -> Result<NixCacheKeyPosture, BackendError> {
+            self.0
+                .paths
+                .lock()
+                .expect("paths lock")
+                .push(key_id.to_string());
+            self.0
+                .posture
+                .lock()
+                .expect("posture lock")
+                .clone()
+                .ok_or_else(|| BackendError::KeyNotFound(key_id.to_string()))
+        }
+
+        async fn sign_nix_cache_fingerprint(
+            &self,
+            _key_id: &str,
+            fingerprint: &[u8],
+        ) -> Result<NixCacheBackendSignature, BackendError> {
+            let seed = Zeroizing::new([7u8; 32]);
+            let mut signature = crate::ed25519_sign::sign(&seed, fingerprint);
+            if self.0.invalid_signature.load(Ordering::SeqCst)
+                && let Some(first) = signature.first_mut()
+            {
+                *first ^= 1;
+            }
+            if self.0.replace_after_sign.load(Ordering::SeqCst) {
+                let mut replacement = compatible_posture();
+                replacement.public_key = [8; 32];
+                *self.0.posture.lock().expect("posture lock") = Some(replacement);
+            }
+            Ok(NixCacheBackendSignature {
+                backend_version: u32::try_from(self.0.signature_version.load(Ordering::SeqCst))
+                    .unwrap_or(u32::MAX),
+                signature,
+            })
+        }
+
+        async fn public_key(&self, _key_id: &str) -> Result<Vec<u8>, BackendError> {
+            Err(BackendError::Unsupported("public_key"))
+        }
+
+        async fn sign(&self, _key_id: &str, _message: &[u8]) -> Result<Vec<u8>, BackendError> {
+            Err(BackendError::Unsupported("sign"))
+        }
+
+        async fn verify(
+            &self,
+            _key_id: &str,
+            _message: &[u8],
+            _signature: &[u8],
+        ) -> Result<bool, BackendError> {
+            Err(BackendError::Unsupported("verify"))
+        }
+    }
+
+    fn compatible_posture() -> NixCacheKeyPosture {
+        let seed = Zeroizing::new([7u8; 32]);
+        NixCacheKeyPosture {
+            public_key: crate::ed25519_sign::public_from_seed(&seed),
+            key_type: KeyType::Ed25519,
+            latest_version: 1,
+            min_decryption_version: 1,
+            derived: false,
+            exportable: false,
+            allow_plaintext_backup: false,
+            deletion_allowed: false,
+            auto_rotation_disabled: true,
+        }
+    }
+
+    fn catalog(state: NixCacheState, backend_kind: BackendKind) -> Catalog {
+        let mut identity = json!({
+            "keyName": "cache.example.org-1",
+            "state": match state {
+                NixCacheState::Pending => "pending",
+                NixCacheState::Enrolled => "enrolled",
+            },
+            "backendVersion": 1,
+        });
+        if state == NixCacheState::Enrolled {
+            identity["publicKey"] = json!(crate::catalog::NixCachePublicKey::from_bytes(
+                compatible_posture().public_key
+            ));
+        }
+        serde_json::from_value(json!({
+            "schema": "catalog",
+            "backends": {
+                "primary": {
+                    "kind": backend_kind,
+                    "addr": "https://127.0.0.1:8200"
+                }
+            },
+            "keys": {
+                "cache.signer": {
+                    "class": "asymmetric",
+                    "keyType": "ed25519",
+                    "backend": "primary",
+                    "engine": "transit",
+                    "path": "cache-key",
+                    "writable": false,
+                    "nixCache": identity,
+                    "description": "Nix cache signer"
+                }
+            }
+        }))
+        .expect("catalog fixture")
+    }
+
+    fn manager(
+        state: NixCacheState,
+        backend_kind: BackendKind,
+        posture: Option<NixCacheKeyPosture>,
+    ) -> (BackendManager, Arc<EnrollmentBackend>) {
+        let backend = EnrollmentBackend::new(posture);
+        let mut backends: BTreeMap<String, Box<dyn Backend>> = BTreeMap::new();
+        backends.insert(
+            "primary".to_string(),
+            Box::new(EnrollmentHandle(Arc::clone(&backend))),
+        );
+        (
+            BackendManager::new(catalog(state, backend_kind), backends).expect("manager"),
+            backend,
+        )
+    }
+
+    fn active_identity(state: NixCacheState) -> NixCacheIdentity {
+        catalog(state, BackendKind::Vault)
+            .keys
+            .get("cache.signer")
+            .and_then(|entry| entry.nix_cache.clone())
+            .expect("active Nix cache identity")
+    }
+
+    #[tokio::test]
+    async fn concurrent_pending_ensure_creates_once_then_compares() {
+        let (manager, backend) = manager(NixCacheState::Pending, BackendKind::Vault, None);
+        let manager = Arc::new(manager);
+        let active_identity = active_identity(NixCacheState::Pending);
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let manager = Arc::clone(&manager);
+            let active_identity = active_identity.clone();
+            tasks.push(tokio::spawn(async move {
+                manager
+                    .enroll_nix_cache_key("cache.signer", active_identity)
+                    .await
+            }));
+        }
+
+        let mut created = 0;
+        let mut existing = 0;
+        for task in tasks {
+            let enrollment = task.await.expect("task joins").expect("enrollment");
+            assert_eq!(
+                enrollment.public_key.as_bytes(),
+                &compatible_posture().public_key
+            );
+            match enrollment.disposition {
+                NixCacheEnrollmentDisposition::Created => created += 1,
+                NixCacheEnrollmentDisposition::Existing => existing += 1,
+            }
+        }
+        assert_eq!(created, 1);
+        assert_eq!(existing, 15);
+        assert_eq!(backend.create_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            backend
+                .paths
+                .lock()
+                .expect("paths lock")
+                .iter()
+                .all(|path| path == "cache-key")
+        );
+    }
+
+    #[tokio::test]
+    async fn compatible_existing_pending_key_is_not_mutated() {
+        let (manager, backend) = manager(
+            NixCacheState::Pending,
+            BackendKind::Vault,
+            Some(compatible_posture()),
+        );
+        let enrollment = manager
+            .enroll_nix_cache_key("cache.signer", active_identity(NixCacheState::Pending))
+            .await
+            .expect("compatible existing key");
+        assert_eq!(
+            enrollment.disposition,
+            NixCacheEnrollmentDisposition::Existing
+        );
+        assert_eq!(backend.create_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn compatible_existing_enrolled_key_is_compare_only_existing() {
+        let (manager, backend) = manager(
+            NixCacheState::Enrolled,
+            BackendKind::Vault,
+            Some(compatible_posture()),
+        );
+        let enrollment = manager
+            .enroll_nix_cache_key("cache.signer", active_identity(NixCacheState::Enrolled))
+            .await
+            .expect("compatible enrolled key");
+        assert_eq!(
+            enrollment.disposition,
+            NixCacheEnrollmentDisposition::Existing
+        );
+        assert_eq!(backend.create_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn missing_enrolled_key_is_compare_only_and_never_recreated() {
+        let (manager, backend) = manager(NixCacheState::Enrolled, BackendKind::Vault, None);
+        assert!(matches!(
+            manager
+                .enroll_nix_cache_key("cache.signer", active_identity(NixCacheState::Enrolled),)
+                .await,
+            Err(ManagerError::NixCacheEnrollment { .. })
+        ));
+        assert_eq!(backend.create_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn enrolled_public_key_must_equal_the_catalog_pin() {
+        let mut posture = compatible_posture();
+        posture.public_key = [8; 32];
+        let (manager, backend) =
+            manager(NixCacheState::Enrolled, BackendKind::Vault, Some(posture));
+        assert!(matches!(
+            manager
+                .enroll_nix_cache_key("cache.signer", active_identity(NixCacheState::Enrolled),)
+                .await,
+            Err(ManagerError::NixCacheEnrollment { .. })
+        ));
+        assert_eq!(backend.create_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn stale_pending_manager_does_not_recreate_after_enrolled_reload() {
+        // The manager retains the startup routing catalog, whose identity is
+        // pending. The caller has pinned the post-reload generation and passes
+        // its enrolled identity; that active state must control the operation.
+        let (stale_manager, backend) = manager(NixCacheState::Pending, BackendKind::Vault, None);
+        assert!(matches!(
+            stale_manager
+                .enroll_nix_cache_key("cache.signer", active_identity(NixCacheState::Enrolled),)
+                .await,
+            Err(ManagerError::NixCacheEnrollment { .. })
+        ));
+        assert_eq!(backend.create_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn stale_pending_manager_compares_replacement_to_active_enrolled_pin() {
+        // Simulate backend material disappearing after enrollment and a different
+        // compatible-posture key appearing at the same path. The stale startup
+        // manager still says pending, but the active generation's enrolled pin
+        // must reject the replacement without mutation.
+        let mut replacement = compatible_posture();
+        replacement.public_key = [8; 32];
+        let (stale_manager, backend) = manager(
+            NixCacheState::Pending,
+            BackendKind::Vault,
+            Some(replacement),
+        );
+        assert!(matches!(
+            stale_manager
+                .enroll_nix_cache_key("cache.signer", active_identity(NixCacheState::Enrolled),)
+                .await,
+            Err(ManagerError::NixCacheEnrollment { .. })
+        ));
+        assert_eq!(backend.create_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn nix_signature_is_locally_verified_and_preserves_backend_version() {
+        let (manager, _) = manager(
+            NixCacheState::Enrolled,
+            BackendKind::Vault,
+            Some(compatible_posture()),
+        );
+        let fingerprint = b"canonical-fingerprint";
+        let signed = manager
+            .sign_nix_cache_fingerprint(
+                "cache.signer",
+                active_identity(NixCacheState::Enrolled),
+                fingerprint,
+            )
+            .await
+            .expect("locally verified signature");
+        assert_eq!(signed.identity.backend_version, 1);
+        assert!(
+            crate::ed25519_sign::verify(
+                signed.identity.public_key.as_bytes(),
+                fingerprint,
+                &signed.signature,
+            )
+            .expect("well-formed signature")
+        );
+    }
+
+    #[tokio::test]
+    async fn signature_version_mismatch_fails_closed() {
+        let (manager, backend) = manager(
+            NixCacheState::Enrolled,
+            BackendKind::Vault,
+            Some(compatible_posture()),
+        );
+        backend.signature_version.store(2, Ordering::SeqCst);
+        assert!(matches!(
+            manager
+                .sign_nix_cache_fingerprint(
+                    "cache.signer",
+                    active_identity(NixCacheState::Enrolled),
+                    b"fingerprint",
+                )
+                .await,
+            Err(ManagerError::NixCacheEnrollment { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_returned_signature_fails_local_verification() {
+        let (manager, backend) = manager(
+            NixCacheState::Enrolled,
+            BackendKind::Vault,
+            Some(compatible_posture()),
+        );
+        backend.invalid_signature.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            manager
+                .sign_nix_cache_fingerprint(
+                    "cache.signer",
+                    active_identity(NixCacheState::Enrolled),
+                    b"fingerprint",
+                )
+                .await,
+            Err(ManagerError::NixCacheEnrollment { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn backend_replacement_during_sign_is_detected_by_posture_recheck() {
+        let (manager, backend) = manager(
+            NixCacheState::Enrolled,
+            BackendKind::Vault,
+            Some(compatible_posture()),
+        );
+        backend.replace_after_sign.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            manager
+                .sign_nix_cache_fingerprint(
+                    "cache.signer",
+                    active_identity(NixCacheState::Enrolled),
+                    b"fingerprint",
+                )
+                .await,
+            Err(ManagerError::NixCacheEnrollment { .. })
+        ));
+    }
+
+    #[test]
+    fn every_incompatible_backend_posture_fails_closed() {
+        let mut cases = Vec::new();
+
+        let mut wrong_type = compatible_posture();
+        wrong_type.key_type = KeyType::Rsa2048;
+        cases.push(wrong_type);
+        let mut rotated = compatible_posture();
+        rotated.latest_version = 2;
+        cases.push(rotated);
+        let mut wrong_minimum = compatible_posture();
+        wrong_minimum.min_decryption_version = 0;
+        cases.push(wrong_minimum);
+        let mut derived = compatible_posture();
+        derived.derived = true;
+        cases.push(derived);
+        let mut exportable = compatible_posture();
+        exportable.exportable = true;
+        cases.push(exportable);
+        let mut backup = compatible_posture();
+        backup.allow_plaintext_backup = true;
+        cases.push(backup);
+        let mut deletable = compatible_posture();
+        deletable.deletion_allowed = true;
+        cases.push(deletable);
+        let mut auto_rotated = compatible_posture();
+        auto_rotated.auto_rotation_disabled = false;
+        cases.push(auto_rotated);
+
+        for posture in cases {
+            assert!(matches!(
+                validate_nix_cache_posture("cache.signer", &posture),
+                Err(ManagerError::NixCacheEnrollment { .. })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn kms_catalog_route_is_rejected_before_backend_access() {
+        let (manager, backend) = manager(
+            NixCacheState::Pending,
+            BackendKind::AwsKms,
+            Some(compatible_posture()),
+        );
+        assert!(matches!(
+            manager
+                .enroll_nix_cache_key("cache.signer", active_identity(NixCacheState::Pending),)
+                .await,
+            Err(ManagerError::NixCacheEnrollment { .. })
+        ));
+        assert!(backend.paths.lock().expect("paths lock").is_empty());
+        assert_eq!(backend.create_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn generic_rotation_is_forbidden_for_nix_cache_keys() {
+        let (manager, backend) = manager(
+            NixCacheState::Enrolled,
+            BackendKind::Vault,
+            Some(compatible_posture()),
+        );
+        assert!(matches!(
+            manager
+                .rotate("cache.signer", BrokerLimits::default())
+                .await,
+            Err(ManagerError::NixCacheRotationForbidden(key)) if key == "cache.signer"
+        ));
+        assert!(backend.paths.lock().expect("paths lock").is_empty());
     }
 }

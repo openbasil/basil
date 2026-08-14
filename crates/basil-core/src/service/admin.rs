@@ -11,19 +11,27 @@ use basil_proto::broker::v1 as pb;
 use basil_proto::broker::v1::admin_service_server::AdminService;
 use tonic::{Code, Request, Response};
 
-use crate::actor::SubjectResolutionError;
+use crate::actor::{AuthenticatedActor, SubjectResolutionError, WorkloadIdentity};
 use crate::audit::ReloadActor;
 use crate::catalog::policy::Op;
 use crate::catalog::{
-    ADMIN_EXPLAIN_TARGET, ADMIN_RELOAD_TARGET, ADMIN_REVOKE_TARGET, ADMIN_WATCH_TARGET, AllowVia,
+    ADMIN_CONNECTION_DROP_TARGET, ADMIN_CONNECTION_STATUS_TARGET, ADMIN_EXPLAIN_TARGET,
+    ADMIN_RELOAD_TARGET, ADMIN_REVOKE_TARGET, ADMIN_WATCH_TARGET, AllowVia, AuthorizationDomain,
     Decision, DenyReason, Explanation, MatchedRule, MissingPolicy,
 };
 use crate::decision::DecisionRecord;
-use crate::reload::{ReloadError, check_reload, reload_generation};
+use crate::reload::{ReloadError, check_reload, reload_generation_live};
 use crate::service::broker::{BoxStream, BrokerGrpc, GrpcResult};
 use crate::service::shared::{event_allowed, payload_too_large, proto_event};
-use crate::state::{ReadinessOutcome, ReadinessState};
-use crate::transport::{broker_status, peer_from_request};
+use crate::state::{BrokerState, Generation, ReadinessOutcome, ReadinessState};
+use crate::transport::connection::{
+    ConnectionId, ConnectionRecord, ConnectionSelector, ListenerConnectInfo,
+};
+use crate::transport::grpc_server::ListenerType;
+use crate::transport::{
+    begin_long_lived_stream, broker_status, enforce_listener_domain, enforce_listener_domain_info,
+    listener_context, peer_from_request,
+};
 use tracing::warn;
 
 /// The reload op's stable wire token, used in the `BrokerErrorInfo.op` field of a
@@ -33,6 +41,10 @@ const EXPLAIN_OP_TOKEN: &str = "explain";
 const REVOKE_OP_TOKEN: &str = "revoke";
 const WATCH_OP_TOKEN: &str = "watch";
 const STATUS_OP_TOKEN: &str = "status";
+const CONNECTION_STATUS_OP_TOKEN: &str = "connection_status";
+const CONNECTION_DROP_OP_TOKEN: &str = "connection_drop";
+const MAX_CONNECTION_SELECTORS: usize = 64;
+const MAX_CONNECTION_SELECTOR_TEXT_BYTES: usize = 253;
 
 fn admin_resolution_status(op: &'static str, err: &SubjectResolutionError) -> tonic::Status {
     match err {
@@ -42,12 +54,37 @@ fn admin_resolution_status(op: &'static str, err: &SubjectResolutionError) -> to
             op,
             "missing peer credentials",
         ),
+        SubjectResolutionError::DomainUnavailable
+        | SubjectResolutionError::EvidenceUnavailable { .. } => broker_status(
+            Code::Unavailable,
+            "ATTESTATION_UNAVAILABLE",
+            op,
+            "caller evidence unavailable",
+        ),
         SubjectResolutionError::NoSubject { .. }
-        | SubjectResolutionError::AmbiguousSubject { .. }
-        | SubjectResolutionError::InvalidUnauthenticatedSubject { .. } => {
+        | SubjectResolutionError::AmbiguousSubject { .. } => {
             broker_status(Code::PermissionDenied, "UNAUTHORIZED", op, "not authorized")
         }
     }
+}
+
+fn enforce_admin_listener<T>(
+    state: &BrokerState,
+    generation: &Generation,
+    request: &Request<T>,
+    actor: &crate::actor::AuthenticatedActor,
+    op: Op,
+) -> Result<(), tonic::Status> {
+    let target = match op {
+        Op::Watch => ADMIN_WATCH_TARGET,
+        Op::Reload => ADMIN_RELOAD_TARGET,
+        Op::Explain => ADMIN_EXPLAIN_TARGET,
+        Op::Revoke => ADMIN_REVOKE_TARGET,
+        Op::ConnectionStatus => ADMIN_CONNECTION_STATUS_TARGET,
+        Op::ConnectionDrop => ADMIN_CONNECTION_DROP_TARGET,
+        _ => "admin",
+    };
+    enforce_listener_domain(state, generation.id(), request, actor, op, target)
 }
 
 #[tonic::async_trait]
@@ -69,10 +106,18 @@ impl AdminService for BrokerGrpc {
     async fn status(&self, request: Request<pb::StatusRequest>) -> GrpcResult<pb::StatusResponse> {
         let peer = peer_from_request(&request);
         let generation = self.state.load_generation();
-        generation
+        let actor = generation
             .pdp()
             .resolve_local_actor(&peer)
             .map_err(|err| admin_resolution_status(STATUS_OP_TOKEN, &err))?;
+        enforce_listener_domain(
+            &self.state,
+            generation.id(),
+            &request,
+            &actor,
+            Op::ConnectionStatus,
+            "broker.status",
+        )?;
         drop(generation);
         Ok(Response::new(pb::StatusResponse {
             backend: self.state.backend_label().to_string(),
@@ -136,6 +181,7 @@ impl AdminService for BrokerGrpc {
         Ok(Response::new(readiness_response(
             outcome,
             self.state.active_generation_id(),
+            self.state.connections().rewire().len(),
         )))
     }
 
@@ -155,6 +201,7 @@ impl AdminService for BrokerGrpc {
     /// missed `Revoked` must never be invisible). On `DATA_LOSS` the watcher
     /// reconnects and re-fetches whatever state it mirrors (bundles,
     /// revocation lists) from scratch.
+    #[allow(clippy::too_many_lines)]
     async fn watch(&self, request: Request<pb::WatchRequest>) -> GrpcResult<Self::WatchStream> {
         let peer = peer_from_request(&request);
         let generation = self.state.load_generation();
@@ -162,6 +209,7 @@ impl AdminService for BrokerGrpc {
             .pdp()
             .resolve_local_actor(&peer)
             .map_err(|err| admin_resolution_status(WATCH_OP_TOKEN, &err))?;
+        enforce_admin_listener(&self.state, &generation, &request, &actor, Op::Watch)?;
 
         let decision = generation.pdp().decide_admin(&actor, Op::Watch);
         self.state
@@ -172,8 +220,6 @@ impl AdminService for BrokerGrpc {
                 ADMIN_WATCH_TARGET,
                 &decision,
             ));
-        drop(generation);
-
         if matches!(decision, Decision::Deny { .. }) {
             return Err(broker_status(
                 Code::PermissionDenied,
@@ -183,24 +229,81 @@ impl AdminService for BrokerGrpc {
             ));
         }
 
+        let authorized_generation = generation.id();
+        let listener = listener_context(&request, Op::Watch)?;
+        let lease = begin_long_lived_stream(&self.state, &listener, Op::Watch)?;
+        drop(generation);
         let kinds = request.get_ref().kinds.clone();
         let state = Arc::clone(&self.state);
         let rx = state.events().subscribe();
         let stream = futures::stream::unfold(
-            (state, rx, kinds, actor, false),
-            |(state, mut rx, kinds, actor, lost)| async move {
-                if lost {
+            (
+                state,
+                rx,
+                kinds,
+                actor,
+                listener,
+                lease,
+                authorized_generation,
+                false,
+            ),
+            |(
+                state,
+                mut rx,
+                kinds,
+                mut actor,
+                listener,
+                lease,
+                mut authorized_generation,
+                ended,
+            )| async move {
+                if ended {
                     return None;
                 }
                 loop {
                     match rx.recv().await {
                         Ok(event) => {
+                            let reload_guard = state.live_reload_lock().lock().await;
+                            if state.active_generation_id() != authorized_generation {
+                                match reauthorize_watch(&state, &listener) {
+                                    Ok((generation, refreshed_actor)) => {
+                                        authorized_generation = generation;
+                                        actor = refreshed_actor;
+                                    }
+                                    Err(status) => {
+                                        return Some((
+                                            Err(status),
+                                            (
+                                                Arc::clone(&state),
+                                                rx,
+                                                kinds,
+                                                actor,
+                                                listener,
+                                                lease,
+                                                authorized_generation,
+                                                true,
+                                            ),
+                                        ));
+                                    }
+                                }
+                            }
                             if event_allowed(&state, &actor, &kinds, &event) {
+                                let response = proto_event(event);
                                 return Some((
-                                    Ok(proto_event(event)),
-                                    (state, rx, kinds, actor, false),
+                                    Ok(response),
+                                    (
+                                        Arc::clone(&state),
+                                        rx,
+                                        kinds,
+                                        actor,
+                                        listener,
+                                        lease,
+                                        authorized_generation,
+                                        false,
+                                    ),
                                 ));
                             }
+                            drop(reload_guard);
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                             // The buffer overflowed and this watcher missed
@@ -214,7 +317,16 @@ impl AdminService for BrokerGrpc {
                                     WATCH_OP_TOKEN,
                                     "watcher lagged and events were dropped; reconnect and resync",
                                 )),
-                                (state, rx, kinds, actor, true),
+                                (
+                                    state,
+                                    rx,
+                                    kinds,
+                                    actor,
+                                    listener,
+                                    lease,
+                                    authorized_generation,
+                                    true,
+                                ),
                             ));
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
@@ -237,7 +349,7 @@ impl AdminService for BrokerGrpc {
     /// [`BrokerState::record_reload`].
     ///
     /// On `check = true` this is a **dry-run**: it runs the identical validation a
-    /// real reload runs ([`check_reload`] and [`reload_generation`] share one
+    /// real reload runs ([`check_reload`] and [`reload_generation_live`] share one
     /// `validate_candidate`) and reports the would-be outcome **without** swapping.
     /// On a validation/routing rejection the previous generation keeps serving and
     /// the RPC returns `OK` with a [`pb::ReloadRejection`]. The trust boundary holds
@@ -253,6 +365,7 @@ impl AdminService for BrokerGrpc {
             .pdp()
             .resolve_local_actor(&peer)
             .map_err(|err| admin_resolution_status(RELOAD_OP_TOKEN, &err))?;
+        enforce_admin_listener(&self.state, &generation, &request, &actor, Op::Reload)?;
         let uid = Self::require_unix_uid(&actor, RELOAD_OP_TOKEN)?;
 
         let decision = generation.pdp().decide_admin(&actor, Op::Reload);
@@ -281,7 +394,7 @@ impl AdminService for BrokerGrpc {
         let result = if check {
             check_reload(&self.state)
         } else {
-            reload_generation(&self.state)
+            reload_generation_live(&self.state).await
         };
 
         match result {
@@ -319,17 +432,11 @@ impl AdminService for BrokerGrpc {
                         );
                     }
                 }
-                let key_count = u32::try_from(outcome.key_count).unwrap_or(u32::MAX);
-                let grant_count = u32::try_from(outcome.grant_count).unwrap_or(u32::MAX);
-                Ok(Response::new(pb::ReloadResponse {
-                    applied: !check,
-                    checked: check,
-                    previous_generation: outcome.previous_generation,
-                    new_generation: outcome.new_generation,
-                    key_count,
-                    grant_count,
-                    rejection: None,
-                }))
+                Ok(Response::new(reload_success_body(
+                    &self.state,
+                    check,
+                    &outcome,
+                )))
             }
             Err(err) => {
                 // A rejection is NOT a wire error: the previous generation keeps
@@ -342,15 +449,12 @@ impl AdminService for BrokerGrpc {
                     err.audit_reason(),
                     ReloadActor::Caller(uid),
                 );
-                Ok(Response::new(pb::ReloadResponse {
-                    applied: false,
-                    checked: check,
-                    previous_generation: active,
-                    new_generation: active,
-                    key_count: 0,
-                    grant_count: 0,
-                    rejection: Some(reload_rejection(&err)),
-                }))
+                Ok(Response::new(reload_rejected_body(
+                    &self.state,
+                    check,
+                    active,
+                    &err,
+                )))
             }
         }
     }
@@ -383,6 +487,7 @@ impl AdminService for BrokerGrpc {
             .pdp()
             .resolve_local_actor(&peer)
             .map_err(|err| admin_resolution_status(EXPLAIN_OP_TOKEN, &err))?;
+        enforce_admin_listener(&self.state, &generation, &request, &actor, Op::Explain)?;
 
         let decision = generation.pdp().decide_admin(&actor, Op::Explain);
         self.state
@@ -433,6 +538,7 @@ impl AdminService for BrokerGrpc {
             .pdp()
             .resolve_local_actor(&peer)
             .map_err(|err| admin_resolution_status(REVOKE_OP_TOKEN, &err))?;
+        enforce_admin_listener(&self.state, &generation, &request, &actor, Op::Revoke)?;
 
         let decision = generation.pdp().decide_admin(&actor, Op::Revoke);
         self.state
@@ -489,6 +595,220 @@ impl AdminService for BrokerGrpc {
             persisted: true,
         }))
     }
+
+    /// Return the stable-id ordered, globally bounded accepted-connection inventory.
+    async fn list_connections(
+        &self,
+        request: Request<pb::ListConnectionsRequest>,
+    ) -> GrpcResult<pb::ListConnectionsResponse> {
+        authorize_connection_admin(
+            &self.state,
+            &request,
+            Op::ConnectionStatus,
+            ADMIN_CONNECTION_STATUS_TARGET,
+            CONNECTION_STATUS_OP_TOKEN,
+        )?;
+        let connections = self
+            .state
+            .connections()
+            .snapshot()
+            .iter()
+            .map(connection_info)
+            .collect();
+        Ok(Response::new(pb::ListConnectionsResponse { connections }))
+    }
+
+    /// Deliberately terminate a bounded OR-set of exact or typed connections.
+    async fn drop_connections(
+        &self,
+        request: Request<pb::DropConnectionsRequest>,
+    ) -> GrpcResult<pb::DropConnectionsResponse> {
+        authorize_connection_admin(
+            &self.state,
+            &request,
+            Op::ConnectionDrop,
+            ADMIN_CONNECTION_DROP_TARGET,
+            CONNECTION_DROP_OP_TOKEN,
+        )?;
+        let selectors = connection_selectors(request.get_ref())?;
+        let caller = request
+            .extensions()
+            .get::<ListenerConnectInfo>()
+            .map(ListenerConnectInfo::connection_id);
+        let outcome = self.state.connections().cancel_matching(&selectors, caller);
+        Ok(Response::new(pb::DropConnectionsResponse {
+            matched: bounded_u32(outcome.matched),
+            cancelled: bounded_u32(outcome.cancelled),
+            already_requested: bounded_u32(outcome.already_requested),
+            caller_excluded: bounded_u32(outcome.caller_excluded),
+        }))
+    }
+}
+
+fn authorize_connection_admin<T>(
+    state: &BrokerState,
+    request: &Request<T>,
+    op: Op,
+    target: &'static str,
+    token: &'static str,
+) -> Result<(), tonic::Status> {
+    let peer = peer_from_request(request);
+    let generation = state.load_generation();
+    let actor = generation
+        .pdp()
+        .resolve_local_actor(&peer)
+        .map_err(|error| admin_resolution_status(token, &error))?;
+    enforce_admin_listener(state, &generation, request, &actor, op)?;
+    let decision = generation.pdp().decide_admin(&actor, op);
+    state.record_decision(&DecisionRecord::from_actor_decision(
+        generation.id(),
+        &actor,
+        op,
+        target,
+        &decision,
+    ));
+    if matches!(decision, Decision::Deny { .. }) {
+        return Err(broker_status(
+            Code::PermissionDenied,
+            "UNAUTHORIZED",
+            token,
+            "not authorized",
+        ));
+    }
+    Ok(())
+}
+
+fn reauthorize_watch(
+    state: &BrokerState,
+    listener: &ListenerConnectInfo,
+) -> Result<(u64, AuthenticatedActor), tonic::Status> {
+    let generation = state.load_generation();
+    let actor = generation
+        .pdp()
+        .resolve_local_actor(listener.peer())
+        .map_err(|error| admin_resolution_status(WATCH_OP_TOKEN, &error))?;
+    enforce_listener_domain_info(
+        state,
+        generation.id(),
+        listener,
+        &actor,
+        Op::Watch,
+        ADMIN_WATCH_TARGET,
+    )?;
+    let decision = generation.pdp().decide_admin(&actor, Op::Watch);
+    state.record_decision(&DecisionRecord::from_actor_decision(
+        generation.id(),
+        &actor,
+        Op::Watch,
+        ADMIN_WATCH_TARGET,
+        &decision,
+    ));
+    if matches!(decision, Decision::Deny { .. }) {
+        return Err(broker_status(
+            Code::PermissionDenied,
+            "UNAUTHORIZED",
+            WATCH_OP_TOKEN,
+            "watch authorization changed after reload",
+        ));
+    }
+    Ok((generation.id(), actor))
+}
+
+fn connection_info(record: &ConnectionRecord) -> pb::ConnectionInfo {
+    let context = record.context();
+    let peer = context.peer();
+    let (domain, subject, systemd) = record.identity().map_or_else(
+        || (pb::ConnectionDomain::Unspecified, String::new(), None),
+        |identity| {
+            let domain = match identity.domain() {
+                AuthorizationDomain::HostProcess => pb::ConnectionDomain::HostProcess,
+                AuthorizationDomain::SystemdUnit => pb::ConnectionDomain::SystemdUnit,
+            };
+            let systemd =
+                identity
+                    .workload()
+                    .map(|WorkloadIdentity::Systemd { unit, manager_user }| {
+                        pb::ConnectionSystemdIdentity {
+                            unit: unit.clone(),
+                            manager_uid: *manager_user,
+                        }
+                    });
+            (domain, identity.subject().to_string(), systemd)
+        },
+    );
+    pb::ConnectionInfo {
+        id: context.connection_id().get(),
+        listener_name: context.listener_name().to_string(),
+        listener_type: connection_listener_type(context.listener_type()).into(),
+        pid: peer.pid,
+        uid: peer.uid,
+        gid: peer.gid,
+        domain: domain.into(),
+        subject,
+        systemd,
+        cancellation_requested: record.cancellation_requested(),
+        active_streams: bounded_u32(record.active_streams()),
+    }
+}
+
+const fn connection_listener_type(listener_type: ListenerType) -> pb::ConnectionListenerType {
+    match listener_type {
+        ListenerType::Host => pb::ConnectionListenerType::Host,
+        ListenerType::Courier => pb::ConnectionListenerType::Courier,
+    }
+}
+
+fn connection_selectors(
+    request: &pb::DropConnectionsRequest,
+) -> Result<Vec<ConnectionSelector>, tonic::Status> {
+    if request.selectors.is_empty() || request.selectors.len() > MAX_CONNECTION_SELECTORS {
+        return Err(connection_drop_invalid(
+            "selectors must contain between 1 and 64 entries",
+        ));
+    }
+    request.selectors.iter().map(connection_selector).collect()
+}
+
+fn connection_selector(
+    selector: &pb::ConnectionSelector,
+) -> Result<ConnectionSelector, tonic::Status> {
+    use pb::connection_selector::Selector;
+    match selector.selector.as_ref() {
+        Some(Selector::Id(id)) => ConnectionId::from_u64(*id)
+            .map(ConnectionSelector::Id)
+            .ok_or_else(|| connection_drop_invalid("connection id must be nonzero")),
+        Some(Selector::Uid(uid)) => Ok(ConnectionSelector::Uid(*uid)),
+        Some(Selector::Systemd(systemd)) => {
+            validate_selector_text("systemd unit", &systemd.unit)?;
+            Ok(ConnectionSelector::Systemd {
+                unit: systemd.unit.clone(),
+                manager_user: systemd.manager_uid,
+            })
+        }
+        None => Err(connection_drop_invalid("selector variant is required")),
+    }
+}
+
+fn validate_selector_text(label: &str, value: &str) -> Result<(), tonic::Status> {
+    if value.is_empty() || value.len() > MAX_CONNECTION_SELECTOR_TEXT_BYTES {
+        return Err(connection_drop_invalid(format!(
+            "{label} must contain between 1 and 253 bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn connection_drop_invalid(message: impl Into<String>) -> tonic::Status {
+    broker_status(
+        Code::InvalidArgument,
+        "INVALID_ARGUMENT",
+        CONNECTION_DROP_OP_TOKEN,
+        message,
+    )
+}
+
+fn bounded_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 impl BrokerGrpc {
@@ -565,7 +885,11 @@ impl BrokerGrpc {
 /// across calls within the TTL and reused only while the serving generation still
 /// matches; the generation id is always stamped fresh so a hot reload's id is
 /// reflected immediately.
-fn readiness_response(outcome: ReadinessOutcome, generation: u64) -> pb::ReadinessResponse {
+fn readiness_response(
+    outcome: ReadinessOutcome,
+    generation: u64,
+    listeners_rewire_required: usize,
+) -> pb::ReadinessResponse {
     let reason = match outcome.state {
         ReadinessState::Ready => pb::ReadinessReason::Ready,
         ReadinessState::RequiredKeyMissing => pb::ReadinessReason::RequiredKeyMissing,
@@ -579,6 +903,107 @@ fn readiness_response(outcome: ReadinessOutcome, generation: u64) -> pb::Readine
         keys_present: outcome.keys_present,
         keys_required_missing: outcome.keys_required_missing,
         keys_optional_missing: outcome.keys_optional_missing,
+        listeners_rewire_required: u32::try_from(listeners_rewire_required).unwrap_or(u32::MAX),
+    }
+}
+
+/// Map one candidate-aware listener impact onto the wire. Paths are
+/// operator-authored configuration returned only on the gated `Reload` RPC.
+fn listener_impact_info(
+    impact: &crate::transport::listener_manager::ListenerImpact,
+) -> pb::ListenerImpactInfo {
+    use crate::transport::listener_manager::ListenerChangeKind;
+    let kind = match impact.kind() {
+        ListenerChangeKind::Add => pb::ListenerChangeKind::Add,
+        ListenerChangeKind::Remove => pb::ListenerChangeKind::Remove,
+        ListenerChangeKind::Reconfigure => pb::ListenerChangeKind::Reconfigure,
+    };
+    pb::ListenerImpactInfo {
+        name: impact.name().to_string(),
+        kind: kind.into(),
+        active_connections: u32::try_from(impact.active_connections()).unwrap_or(u32::MAX),
+        previous_path: impact
+            .previous_path()
+            .map(|path| path.display().to_string()),
+        new_path: impact.new_path().map(|path| path.display().to_string()),
+    }
+}
+
+/// Map one persistent rewire diagnostic onto the wire.
+fn rewire_diagnostic(
+    diagnostic: &crate::transport::rewire::RewireDiagnostic,
+) -> pb::RewireDiagnostic {
+    pb::RewireDiagnostic {
+        listener: diagnostic.listener().to_string(),
+        previous_path: diagnostic.previous_path().display().to_string(),
+        new_path: diagnostic.new_path().display().to_string(),
+        applied_generation: diagnostic.applied_generation(),
+        recorded_at_unix: diagnostic.recorded_at_unix(),
+    }
+}
+
+/// Snapshot the persistent rewire diagnostics for a gated `Reload` response.
+fn rewire_required(state: &BrokerState) -> Vec<pb::RewireDiagnostic> {
+    state
+        .connections()
+        .rewire()
+        .snapshot()
+        .iter()
+        .map(rewire_diagnostic)
+        .collect()
+}
+
+/// The gated `Reload` body for an accepted candidate (applied, or a clean
+/// dry-run): the outcome counts, the candidate-aware listener impact, and the
+/// persistent rewire diagnostics.
+fn reload_success_body(
+    state: &BrokerState,
+    check: bool,
+    outcome: &crate::reload::ReloadOutcome,
+) -> pb::ReloadResponse {
+    pb::ReloadResponse {
+        applied: !check,
+        checked: check,
+        previous_generation: outcome.previous_generation,
+        new_generation: outcome.new_generation,
+        key_count: u32::try_from(outcome.key_count).unwrap_or(u32::MAX),
+        grant_count: u32::try_from(outcome.grant_count).unwrap_or(u32::MAX),
+        rejection: None,
+        listener_impacts: outcome
+            .listener_impacts
+            .iter()
+            .map(listener_impact_info)
+            .collect(),
+        rewire_required: rewire_required(state),
+    }
+}
+
+/// The gated `Reload` body for a rejected candidate: the previous generation
+/// keeps serving. On a blocked listener transition the impacts name exactly
+/// the listeners an operator must drain before retrying.
+fn reload_rejected_body(
+    state: &BrokerState,
+    check: bool,
+    active: u64,
+    err: &ReloadError,
+) -> pb::ReloadResponse {
+    pb::ReloadResponse {
+        applied: false,
+        checked: check,
+        previous_generation: active,
+        new_generation: active,
+        key_count: 0,
+        grant_count: 0,
+        rejection: Some(reload_rejection(err)),
+        listener_impacts: match err {
+            ReloadError::ListenerTransitionBlocked(active_transition) => active_transition
+                .impacts()
+                .iter()
+                .map(listener_impact_info)
+                .collect(),
+            _ => Vec::new(),
+        },
+        rewire_required: rewire_required(state),
     }
 }
 
@@ -704,6 +1129,7 @@ fn allow_via_token(via: &AllowVia) -> String {
 fn deny_reason_token(reason: DenyReason) -> String {
     match reason {
         DenyReason::UnknownKey => "unknown_key",
+        DenyReason::NixCachePurposeBound => "nix_cache_purpose_bound",
         DenyReason::NotWritable => "not_writable",
         DenyReason::IssuerRawSign => "issuer_raw_sign",
         DenyReason::NotPermitted => "not_permitted",
@@ -727,6 +1153,8 @@ mod tests {
     use crate::event::BrokerEventKind;
     use crate::manager::BackendManager;
     use crate::state::BrokerState;
+    use crate::transport::connection::ListenerConnectInfo;
+    use crate::transport::grpc_server::ListenerType;
 
     /// How the mock backend answers an existence probe.
     #[derive(Clone, Copy)]
@@ -741,6 +1169,19 @@ mod tests {
 
     const SECRET_PROBE_ERROR: &str =
         "Authorization: Bearer vault-token-s.123 /run/credentials/basil/passphrase";
+
+    #[test]
+    fn connection_listener_types_map_exactly() {
+        assert_eq!(
+            connection_listener_type(ListenerType::Host),
+            pb::ConnectionListenerType::Host
+        );
+        assert_eq!(
+            connection_listener_type(ListenerType::Courier),
+            pb::ConnectionListenerType::Courier
+        );
+        assert_eq!(pb::ConnectionListenerType::Courier as i32, 3);
+    }
 
     /// A minimal probe-only backend: every existence probe answers per `probe` and
     /// bumps `probes` (so a test can count the per-key backend reads a readiness
@@ -1224,26 +1665,33 @@ mod tests {
     }
 
     /// Policy: uid 4242 may `reload`, uid 4243 may `explain`, uid 4244 may
-    /// `revoke`, and uid 7 is a data-plane signer over web.signer with NO admin
-    /// grants.
+    /// `revoke`, uid 4246 may read connections,
+    /// uid 4247 may drop connections, uid 4248 may watch, and uid 7 is a
+    /// data-plane signer over web.signer with no admin grants.
     const RELOAD_POLICY: &str = r#"{
       "schema": "policy",
       "subjects": {
-        "svc.admin": { "allOf": [ { "kind": "unix", "uid": 4242 } ] },
-        "svc.explain": { "allOf": [ { "kind": "unix", "uid": 4243 } ] },
-        "svc.revoke": { "allOf": [ { "kind": "unix", "uid": 4244 } ] },
-        "svc.app": { "allOf": [ { "kind": "unix", "uid": 7 } ] }
+        "svc.admin": { "domain": "host-process", "match": { "all": [ { "process.uid": 4242 } ] } },
+        "svc.explain": { "domain": "host-process", "match": { "all": [ { "process.uid": 4243 } ] } },
+        "svc.revoke": { "domain": "host-process", "match": { "all": [ { "process.uid": 4244 } ] } },
+        "svc.connections": { "domain": "host-process", "match": { "all": [ { "process.uid": 4246 } ] } },
+        "svc.connection-drop": { "domain": "host-process", "match": { "all": [ { "process.uid": 4247 } ] } },
+        "svc.watch": { "domain": "host-process", "match": { "all": [ { "process.uid": 4248 } ] } },
+        "svc.app": { "domain": "host-process", "match": { "all": [ { "process.uid": 7 } ] } }
       },
       "roles": { "signer": ["sign", "verify", "get_public_key"] },
       "rules": [
         { "id": "admin-reload", "subjects": ["svc.admin"],   "action": ["op:reload"], "target": ["broker.reload"] },
         { "id": "admin-explain", "subjects": ["svc.explain"], "action": ["op:explain"], "target": ["broker.explain"] },
         { "id": "admin-revoke", "subjects": ["svc.revoke"],   "action": ["op:revoke"], "target": ["broker.revoke"] },
+        { "id": "admin-connections", "subjects": ["svc.connections"], "action": ["op:connection_status"], "target": ["broker.connections"] },
+        { "id": "admin-connection-drop", "subjects": ["svc.connection-drop"], "action": ["op:connection_drop"], "target": ["broker.connections.drop"] },
+        { "id": "admin-watch", "subjects": ["svc.watch"], "action": ["op:watch"], "target": ["broker.watch"] },
         { "id": "data-signer",  "subjects": ["svc.app"],      "action": ["role:signer"], "target": ["web.signer"] }
       ],
       "config": {
-        "names": { "users": { "4242": "svc-admin", "4243": "svc-explain", "4244": "svc-revoke", "7": "svc-app" }, "groups": {} },
-        "memberships": { "4242": [4242], "4243": [4243], "4244": [4244], "7": [7] }
+        "names": { "users": { "4242": "svc-admin", "4243": "svc-explain", "4244": "svc-revoke", "4246": "svc-connections", "4247": "svc-connection-drop", "4248": "svc-watch", "7": "svc-app" }, "groups": {} },
+        "memberships": { "4242": [4242], "4243": [4243], "4244": [4244], "4246": [4246], "4247": [4247], "4248": [4248], "7": [7] }
       }
     }"#;
 
@@ -1283,7 +1731,7 @@ mod tests {
             }),
         );
         let manager = BackendManager::new(catalog.clone(), backends).expect("manager builds");
-        let inputs = ReloadInputs::Corpus {
+        let inputs = ReloadInputs {
             config_path,
             overrides: Vec::new(),
         };
@@ -1293,13 +1741,19 @@ mod tests {
     }
 
     fn reload_catalog_path(inputs: &ReloadInputs) -> std::path::PathBuf {
-        let ReloadInputs::Corpus { config_path, .. } = inputs else {
-            panic!("fixture uses corpus reload inputs");
-        };
-        config_path
+        inputs
+            .config_path
             .parent()
             .expect("config parent")
             .join("catalog.json")
+    }
+
+    fn reload_policy_path(inputs: &ReloadInputs) -> std::path::PathBuf {
+        inputs
+            .config_path
+            .parent()
+            .expect("reload fixture config has a parent")
+            .join("policy.json")
     }
 
     async fn revoke_grpc() -> BrokerGrpc {
@@ -1318,7 +1772,7 @@ mod tests {
         let policy_json = r#"{
           "schema": "policy",
           "subjects": {
-            "svc.revoke": { "allOf": [ { "kind": "unix", "uid": 4244 } ] }
+            "svc.revoke": { "domain": "host-process", "match": { "all": [ { "process.uid": 4244 } ] } }
           },
           "roles": {},
           "rules": [
@@ -1348,12 +1802,22 @@ mod tests {
         BrokerGrpc::new(Arc::new(state))
     }
 
+    fn attach_host_peer<T>(request: &mut Request<T>, uid: u32) {
+        request
+            .extensions_mut()
+            .insert(ListenerConnectInfo::for_test(
+                "host",
+                ListenerType::Host,
+                PeerInfo {
+                    uid: Some(uid),
+                    ..PeerInfo::default()
+                },
+            ));
+    }
+
     fn reload_request(uid: u32, check: bool) -> Request<pb::ReloadRequest> {
         let mut req = Request::new(pb::ReloadRequest { check });
-        req.extensions_mut().insert(PeerInfo {
-            uid: Some(uid),
-            ..PeerInfo::default()
-        });
+        attach_host_peer(&mut req, uid);
         req
     }
 
@@ -1368,10 +1832,7 @@ mod tests {
             op: op.to_string(),
             key: key.to_string(),
         });
-        req.extensions_mut().insert(PeerInfo {
-            uid: Some(caller_uid),
-            ..PeerInfo::default()
-        });
+        attach_host_peer(&mut req, caller_uid);
         req
     }
 
@@ -1386,10 +1847,7 @@ mod tests {
             jti: jti.to_string(),
             expires_at_unix,
         });
-        req.extensions_mut().insert(PeerInfo {
-            uid: Some(uid),
-            ..PeerInfo::default()
-        });
+        attach_host_peer(&mut req, uid);
         req
     }
 
@@ -1671,20 +2129,14 @@ mod tests {
 
         // A uid that resolves to no policy subject is denied.
         let mut req = Request::new(pb::StatusRequest {});
-        req.extensions_mut().insert(PeerInfo {
-            uid: Some(9999),
-            ..PeerInfo::default()
-        });
+        attach_host_peer(&mut req, 9999);
         let status = grpc.status(req).await.expect_err("unresolved subject");
         assert_eq!(status.code(), Code::PermissionDenied);
         assert_status_omits_admin_canaries(&status);
 
         // Any resolved subject (a plain data-plane one, uid 7) may read it.
         let mut req = Request::new(pb::StatusRequest {});
-        req.extensions_mut().insert(PeerInfo {
-            uid: Some(7),
-            ..PeerInfo::default()
-        });
+        attach_host_peer(&mut req, 7);
         let resp = grpc
             .status(req)
             .await
@@ -1692,6 +2144,132 @@ mod tests {
             .into_inner();
         assert_eq!(resp.backend, "vault");
         assert_eq!(resp.protocol, 1);
+    }
+
+    #[tokio::test]
+    async fn connection_inventory_and_drop_require_separate_exact_admin_grants() {
+        let (grpc, _inputs) = reload_grpc();
+
+        let mut inventory = Request::new(pb::ListConnectionsRequest {});
+        attach_host_peer(&mut inventory, 4246);
+        let response = grpc
+            .list_connections(inventory)
+            .await
+            .expect("exact inventory grant")
+            .into_inner();
+        assert!(response.connections.is_empty());
+
+        let mut denied_drop = Request::new(pb::DropConnectionsRequest {
+            selectors: vec![pb::ConnectionSelector {
+                selector: Some(pb::connection_selector::Selector::Id(10)),
+            }],
+        });
+        attach_host_peer(&mut denied_drop, 4246);
+        assert_eq!(
+            grpc.drop_connections(denied_drop)
+                .await
+                .expect_err("inventory grant must not imply drop")
+                .code(),
+            Code::PermissionDenied
+        );
+
+        let mut denied_inventory = Request::new(pb::ListConnectionsRequest {});
+        attach_host_peer(&mut denied_inventory, 4247);
+        assert_eq!(
+            grpc.list_connections(denied_inventory)
+                .await
+                .expect_err("drop grant must not imply inventory")
+                .code(),
+            Code::PermissionDenied
+        );
+
+        let mut allowed_drop = Request::new(pb::DropConnectionsRequest {
+            selectors: vec![pb::ConnectionSelector {
+                selector: Some(pb::connection_selector::Selector::Id(10)),
+            }],
+        });
+        attach_host_peer(&mut allowed_drop, 4247);
+        let response = grpc
+            .drop_connections(allowed_drop)
+            .await
+            .expect("exact drop grant")
+            .into_inner();
+        assert_eq!(response.matched, 0);
+        assert_eq!(response.cancelled, 0);
+    }
+
+    #[tokio::test]
+    async fn connection_drop_rejects_empty_untyped_and_oversized_selectors() {
+        let (grpc, _inputs) = reload_grpc();
+        for selectors in [
+            Vec::new(),
+            vec![pb::ConnectionSelector { selector: None }],
+            vec![pb::ConnectionSelector {
+                selector: Some(pb::connection_selector::Selector::Id(0)),
+            }],
+        ] {
+            let mut request = Request::new(pb::DropConnectionsRequest { selectors });
+            attach_host_peer(&mut request, 4247);
+            assert_eq!(
+                grpc.drop_connections(request)
+                    .await
+                    .expect_err("invalid selector rejected")
+                    .code(),
+                Code::InvalidArgument
+            );
+        }
+
+        let mut request = Request::new(pb::DropConnectionsRequest {
+            selectors: (0..=MAX_CONNECTION_SELECTORS)
+                .map(|id| pb::ConnectionSelector {
+                    selector: Some(pb::connection_selector::Selector::Id(
+                        u64::try_from(id).unwrap_or(1).saturating_add(1),
+                    )),
+                })
+                .collect(),
+        });
+        attach_host_peer(&mut request, 4247);
+        assert_eq!(
+            grpc.drop_connections(request)
+                .await
+                .expect_err("selector count cap")
+                .code(),
+            Code::InvalidArgument
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_reauthorizes_before_first_post_reload_event() {
+        use futures::StreamExt as _;
+
+        let (grpc, inputs) = reload_grpc();
+        let mut watch = grpc
+            .watch(reload_request(4248, false).map(|_| pb::WatchRequest { kinds: vec![] }))
+            .await
+            .expect("watch grant opens the stream")
+            .into_inner();
+
+        let denied_policy = RELOAD_POLICY.replace(
+            "        { \"id\": \"admin-watch\", \"subjects\": [\"svc.watch\"], \"action\": [\"op:watch\"], \"target\": [\"broker.watch\"] },\n",
+            "",
+        );
+        assert_ne!(denied_policy, RELOAD_POLICY);
+        std::fs::write(reload_policy_path(&inputs), denied_policy).expect("rewrite policy");
+        let reload = grpc
+            .reload(reload_request(4242, false))
+            .await
+            .expect("policy reload applies")
+            .into_inner();
+        assert!(reload.applied);
+
+        grpc.state.events().bundle_changed("example.org");
+        let status = watch
+            .next()
+            .await
+            .expect("reauthorization result")
+            .expect_err("revoked watch cannot emit the event");
+        assert_eq!(status.code(), Code::PermissionDenied);
+        assert!(watch.next().await.is_none());
     }
 
     /// No data-plane grant and no *other* admin grant implies watch: the

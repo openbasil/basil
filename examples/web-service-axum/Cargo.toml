@@ -7,12 +7,12 @@
 [package]
 name = "basil-web-service-axum"
 version = "0.1.0"
-edition = "2024"
-license = "Apache-2.0"
 authors = ["info@openbasil.org"]
-repository = "https://github.com/openbasil/basil"
+edition = "2024"
 homepage = "https://github.com/openbasil/basil"
+license = "Apache-2.0"
 publish = false
+repository = "https://github.com/openbasil/basil"
 
 [[bin]]
 name = "web-service-axum"

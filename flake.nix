@@ -6,6 +6,19 @@
   description = "Basil, a host-local secrets broker: your app never touches the key";
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    # This source exists only for the opt-in patched Nix pilot. The revision and
+    # source NAR hash are repeated in nix/patched-nix/pins.json and checked at
+    # evaluation time.
+    nix-pilot-upstream = {
+      url = "github:NixOS/nix/00c341b4f746dadd5947c3aa4673d5231226a028?narHash=sha256-lzFOjvHKYqHYBa1PigllKqXtQzoU9Lt26M5Hm7rSdpM=";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    # Compatibility evidence is independently rebased to this exact reachable
+    # official-master revision. It is never selected by a package output.
+    nix-pilot-master-compat = {
+      url = "github:NixOS/nix/b1939e7d1abec240fb16a0ffa92fb4c28a24e4f0?narHash=sha256-jBCkvlSdCoMIMzEx6TYHlVgsEC0zZiB45t9YOg3mjA0=";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     flake-utils.url = "github:numtide/flake-utils";
     fenix = {
       url = "github:nix-community/fenix";
@@ -26,6 +39,15 @@
         let
           pkgs = inputs.nixpkgs.legacyPackages.${system};
           lib = pkgs.lib;
+          nixPilotPkgs = import inputs.nixpkgs {
+            inherit system;
+            overlays = [ inputs.nix-pilot-upstream.overlays.internal ];
+          };
+          nixPilot = import ./nix/patched-nix {
+            pkgs = nixPilotPkgs;
+            upstream = inputs.nix-pilot-upstream;
+            masterUpstream = inputs.nix-pilot-master-compat;
+          };
           workspace_version = (fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
 
           # Docker/OCI architecture name for the single-arch image tag. Basil
@@ -165,14 +187,17 @@
           tpm-unlock-test = import ./nix/tests/tpm-unlock-test.nix {
             inherit pkgs basilTpm;
           };
+          rootless-keyring-quota-test = import ./nix/tests/rootless-keyring-quota-test.nix {
+            inherit pkgs basil;
+          };
           basil-agent-schema3-test = import ./nix/tests/basil-agent-schema3-test.nix {
             inherit pkgs basil;
             nixosSystem = inputs.nixpkgs.lib.nixosSystem;
           };
 
-          # Distribution build for the `.deb`: the two shipped binaries plus the
+          # Distribution build for the `.deb`: the three shipped binaries plus the
           # roff man pages the `xtask` crate emits (via `clap_mangen`). Scoped to
-          # the two packages so no test suite runs and no example binaries leak
+          # the three packages so no test suite runs and no example binaries leak
           # in. Pages land gzipped under `share/man/man1`, ready to drop into
           # `/usr/share/man/man1`.
           basilDist = mkBasil {
@@ -180,6 +205,8 @@
             cargoBuildFlags = [
               "-p"
               "basil-bin"
+              "-p"
+              "basil-https-courier"
               "-p"
               "basil-nats-bridge"
               "-p"
@@ -195,6 +222,11 @@
             default = basil;
             basil = basil;
             basil-tpm = basilTpm;
+            # Explicit pilot outputs: neither replaces `packages.default` nor
+            # enters a development shell or a release artifact.
+            nix-pilot-cli = nixPilot.cli;
+            nix-pilot-full = nixPilot.full;
+            nix-pilot-manifest = nixPilot.manifest;
             # Per-architecture release target. `${system}` is already the arch
             # name CI selects on (`x86_64-linux`, `aarch64-linux`,
             # `aarch64-darwin`), so this exposes `nix build .#basil-x86_64-linux`
@@ -296,7 +328,7 @@
                 };
               };
 
-            # A Debian package assembled with `dpkg-deb` (no ruby/fpm): the two
+            # A Debian package assembled with `dpkg-deb` (no ruby/fpm): the three
             # binaries under `/usr/bin` and the gzipped man pages under
             # `/usr/share/man/man1`, from the single `basilDist` build. The arch
             # is carried in the filename (`basil_<version>_<arch>.deb`) since we
@@ -310,7 +342,7 @@
                 {
                   nativeBuildInputs = [ pkgs.dpkg ];
                   meta = {
-                    description = "Debian package for the Basil broker and NATS bridge (${dockerArch}).";
+                    description = "Debian package for the Basil broker and couriers (${dockerArch}).";
                   };
                 }
                 ''
@@ -318,6 +350,7 @@
                   mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/usr/share/man/man1"
 
                   install -Dm755 ${basilDist}/bin/basil "$root/usr/bin/basil"
+                  install -Dm755 ${basilDist}/bin/basil-https-courier "$root/usr/bin/basil-https-courier"
                   install -Dm755 ${basilDist}/bin/basil-nats-bridge "$root/usr/bin/basil-nats-bridge"
                   cp ${basilDist}/share/man/man1/*.1.gz "$root/usr/share/man/man1/"
 
@@ -333,8 +366,8 @@
                     echo "Description: Basil, a host-local secrets broker: your app never touches the key"
                     echo " Basil brokers cryptographic operations, workload identity (SPIFFE),"
                     echo " and short-lived leases, with keys kept in the backend and used in"
-                    echo " place. Ships the unified basil broker/CLI and the basil-nats-bridge"
-                    echo " NATS courier, plus their man pages."
+                    echo " place. Ships the unified basil broker/CLI, the basil-nats-bridge"
+                    echo " NATS courier, and the basil-https-courier HTTPS courier, plus their man pages."
                   } > "$root/DEBIAN/control"
 
                   mkdir -p "$out"
@@ -348,13 +381,23 @@
           devShells.nightly = pkgs.mkShell {
             nativeBuildInputs = shellTools ++ [ toolchainNightly ];
           };
+          checks = {
+            basil-agent-schema3 = basil-agent-schema3-test;
+            nix-pilot-master-compatibility = nixPilot.masterCompatibility;
+            nix-pilot-provenance = nixPilot.provenance;
+          };
         }
-        # Linux-only: nixosTest builds a NixOS guest VM, which only makes sense on
-        # linux systems. Keep it outside `checks` so `nix flake check` remains
-        # lightweight; run it explicitly as `nix build .#tests.<sys>.tpm-unlock`.
+        # Linux-only: nixosTest builds NixOS guest VMs, which only make sense on
+        # Linux systems. Keep them outside `checks` so `nix flake check` remains
+        # lightweight. The rootless-keyring-quota lane is x86_64-only; build it as
+        # `nix build .#tests.x86_64-linux.rootless-keyring-quota`.
         // lib.optionalAttrs (lib.hasSuffix "linux" system) {
-          checks.basil-agent-schema3 = basil-agent-schema3-test;
-          tests.tpm-unlock = tpm-unlock-test;
+          tests = {
+            tpm-unlock = tpm-unlock-test;
+          }
+          // lib.optionalAttrs (system == "x86_64-linux") {
+            rootless-keyring-quota = rootless-keyring-quota-test;
+          };
         }
       );
 }

@@ -25,6 +25,64 @@ precedence = "override"
 SPDX-FileCopyrightText = "The SPIFFE Project & Scytale, Inc"
 SPDX-License-Identifier = "Apache-2.0"
 
+# Cachix external-signer proposal: the patch contains upstream context from
+# Cachix 1.11.1 alongside the OpenBasil integration.
+[[annotations]]
+path = "packaging/cachix/cachix-1.11.1-nxsg.patch"
+precedence = "override"
+SPDX-FileCopyrightText = ["2018 Domen Kozar", "2026 OpenBasil Contributors"]
+SPDX-License-Identifier = "Apache-2.0"
+
+# Exact upstream Sigstore conformance evidence. Licensing is declared here so
+# the signed payload, bundle, and trust snapshot remain byte-identical to their
+# pinned upstream sources.
+[[annotations]]
+path = [
+  "crates/basil-tests/fixtures/release-manifest/v1/cosign-3.1.1-conformance/a.txt",
+  "crates/basil-tests/fixtures/release-manifest/v1/cosign-3.1.1-conformance/bundle.sigstore.json",
+  "crates/basil-tests/fixtures/release-manifest/v1/cosign-3.1.1-conformance/trusted-root.json",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "The Sigstore Authors"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = "crates/basil-tests/fixtures/release-manifest/v1/cosign-3.1.1-conformance/index.json"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 OpenBasil Contributors"
+SPDX-License-Identifier = "Apache-2.0"
+
+# Synthetic CI qualification evidence. Keep the JSON bytes free of comments so
+# the offline contract test can bind their exact sizes and SHA-256 digests.
+[[annotations]]
+path = [
+  "crates/basil-tests/fixtures/ci-qualification-evidence/v1/broker-audit.json",
+  "crates/basil-tests/fixtures/ci-qualification-evidence/v1/client.json",
+  "crates/basil-tests/fixtures/ci-qualification-evidence/v1/manifest.json",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 OpenBasil Contributors"
+SPDX-License-Identifier = "Apache-2.0"
+
+# The canonical external-signer patch series modifies LGPL-licensed Nix
+# sources. Licensing is declared here so provenance checks can pin the exact
+# patch bytes.
+[[annotations]]
+path = [
+  "nix/patched-nix/nix-components-packaging.patch",
+  "nix/patched-nix/nix-external-signer.patch",
+  "nix/patched-nix/nix-master-compat.patch",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "The Nix Authors"
+SPDX-License-Identifier = "LGPL-2.1-or-later"
+
+[[annotations]]
+path = "nix/patched-nix/pins.json"
+precedence = "override"
+SPDX-FileCopyrightText = "NONE"
+SPDX-License-Identifier = "CC0-1.0"
+
 # Code and other first-party project files.
 [[annotations]]
 path = [
@@ -33,6 +91,7 @@ path = [
   "**/*.nix",
   "**/justfile",
   "clippy.toml",
+  ".node-version",
   "packaging/**",
   ".github/workflows/ci.yml",
   ".github/workflows/build.yml",
@@ -44,6 +103,7 @@ path = [
   "interop-tests/**/*.md",
   "examples/**/*.md",
   "examples/**/*.sh",
+  "nix/patched-nix/README.md",
   "README.md",
 ]
 precedence = "aggregate"

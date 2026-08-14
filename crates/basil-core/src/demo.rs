@@ -34,8 +34,9 @@ use clap::Args;
 use rand::RngCore as _;
 
 use crate::catalog::{
-    BackendKind, BackendRef, Catalog, Class, Config, Engine, KeyAlgorithm, KeyEntry, Labels,
-    MissingPolicy, NameTable, Op, PrincipalSpec, RawPolicy, RawRule, RawSubjectDefinition,
+    AuthorizationDomain, BackendKind, BackendRef, Catalog, Class, Config, Engine, KeyAlgorithm,
+    KeyEntry, Labels, MissingPolicy, NameTable, Op, RawEvidenceExpression, RawPolicy, RawRule,
+    RawSubjectDefinition,
 };
 
 /// The catalog backend name the demo routes everything to.
@@ -806,6 +807,7 @@ fn build_catalog(layout: &Layout) -> Catalog {
             public_path: None,
             writable: true,
             missing: MissingPolicy::Generate,
+            nix_cache: None,
             generate: None,
             sealing_pin: None,
             labels: Labels::default(),
@@ -823,6 +825,7 @@ fn build_catalog(layout: &Layout) -> Catalog {
             public_path: None,
             writable: true,
             missing: MissingPolicy::Generate,
+            nix_cache: None,
             generate: None,
             sealing_pin: None,
             labels: Labels::default(),
@@ -875,19 +878,17 @@ fn build_policy(uid: u32) -> RawPolicy {
     subjects.insert(
         SUBJECT.to_string(),
         RawSubjectDefinition {
+            domain: AuthorizationDomain::HostProcess,
             break_glass: false,
-            all_of: Some(vec![PrincipalSpec::Unix {
-                uid: Some(uid),
-                gid: None,
-            }]),
-            any_of: None,
+            match_: RawEvidenceExpression(serde_json::json!({
+                "all": [{ "process.uid": uid }]
+            })),
         },
     );
 
     RawPolicy {
         schema: crate::catalog::PolicySchema::Policy,
         subjects,
-        unauthenticated_subject: None,
         roles,
         rules: vec![rule],
         config: Config { names, memberships },
@@ -1036,7 +1037,6 @@ mod tests {
         let overrides = crate::agent_cli::ConfigOverrides {
             config: Some(layout.config.clone()),
             values: Vec::new(),
-            ..crate::agent_cli::ConfigOverrides::default()
         };
         let file =
             crate::agent_cli::load_config_file(&overrides).expect("agent parses demo config");

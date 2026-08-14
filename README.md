@@ -75,10 +75,21 @@ covers writing your own catalog and policy.
 
 Release artifacts are built in CI and carry GitHub artifact attestations;
 verify a download with `gh attestation verify <file> --repo openbasil/basil`.
-The deb, Arch, and Nix packages ship man pages and bash/zsh/fish completions
-(`basil completions <shell>` generates them anywhere else). A NixOS module is
-included under `nix/`, and `nix build .#basil-oci-thin` builds a
+The release archives, deb, Arch, and Nix packages ship `basil`,
+`basil-nats-bridge`, and `basil-https-courier`; packages also ship their man
+pages and bash/zsh/fish completions (`basil completions <shell>` generates them
+anywhere else). A NixOS module is included under `nix/`, and `nix build .#basil-oci-thin` builds a
 `docker load`-ready container image.
+
+The [Cachix external-custody proposal](packaging/cachix/README.md) is a pinned,
+opt-in Cachix `1.11.1` package for self-managed cache uploads. It signs through
+Basil without giving Cachix private key material and does not replace the host
+Cachix installation.
+
+The patched Nix external-signer pilot is available through the explicit
+`nix-pilot-cli` and `nix-pilot-full` flake outputs. The default package and
+development shells keep the repository's standard Nix. See the
+[pilot provenance and build guide](nix/patched-nix/README.md).
 
 See [installation](https://docs.openbasil.org/getting-started/installation/)
 for details and backend prerequisites.

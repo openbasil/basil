@@ -81,6 +81,10 @@ let
     "rotate"
     "import"
     "new_key"
+    # Purpose-specific Nix cache trust-root enrollment; `*` never implies it.
+    "enroll_nix_cache_key"
+    # Purpose-specific canonical PATH_INFO_V1 signing; `*` never implies it.
+    "sign_nix_cache_fingerprint"
     # Explicit opt-in for a key's software-custody (materialize-to-use) arm; never
     # implied by another grant.
     "use_software_custody"
@@ -554,8 +558,11 @@ let
           Operations are the policy operation enum: get, list, get_public_key,
           verify, sign, encrypt, decrypt, mint, sign_nats_jwt, validate_nats_jwt,
           encrypt_nats_curve, decrypt_nats_curve, validate, set, rotate, import,
-          new_key, and use_software_custody. Broker-wide admin ops (reload,
-          explain, revoke) are granted over their reserved broker.* targets.
+          new_key, enroll_nix_cache_key, sign_nix_cache_fingerprint, and
+          use_software_custody. The Nix cache operations and
+          use_software_custody are explicit-only: wildcard actions never imply
+          them. Broker-wide admin ops (reload, explain, revoke) are granted over
+          their reserved broker.* targets.
         '';
       };
 
@@ -1098,10 +1105,27 @@ in
                   default = 30;
                   description = "Allowed sealed invocation clock skew in seconds.";
                 };
-                replayCacheCapacity = mkOption {
-                  type = types.ints.positive;
-                  default = 4096;
-                  description = "Maximum in-memory sealed invocation replay-cache entries.";
+                challenge = mkOption {
+                  type = types.submodule {
+                    options = {
+                      capacity = mkOption {
+                        type = types.ints.positive;
+                        default = 16384;
+                        description = ''
+                          Global maximum of outstanding freshness challenges,
+                          written as [invocation.challenge] capacity in the
+                          generated agent TOML config. Bounds the in-memory
+                          challenge table; issuance beyond it is declined.
+                        '';
+                      };
+                    };
+                  };
+                  default = { };
+                  description = ''
+                    Freshness-challenge table shape ([invocation.challenge] in
+                    the generated agent TOML config). Replaces the removed
+                    replay-cache-capacity knob.
+                  '';
                 };
               };
             };

@@ -1,0 +1,18 @@
+# graphify.yaml
+version: "1.0"
+ontology:
+  # # Define explicitly allowed type categories, forcing core primitives out
+  # allowed_node_types:
+  #   - struct
+  #   - enum
+  #   - trait
+  #   - function
+  #   - module
+  #   - trait
+
+  # Filter out specific global identifiers during compilation passes
+  ignore_identifiers:
+    - "String"
+    - "Option"
+    - "Result"
+    - "Vec"

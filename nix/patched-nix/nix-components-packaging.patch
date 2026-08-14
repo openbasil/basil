@@ -1,0 +1,11 @@
+diff --git a/src/libutil/include/nix/util/meson.build b/src/libutil/include/nix/util/meson.build
+--- a/src/libutil/include/nix/util/meson.build
++++ b/src/libutil/include/nix/util/meson.build
+@@ -79,6 +79,7 @@ headers = [ config_pub_h ] + files(
+   'repair-flag.hh',
+   'serialise.hh',
+   'signals.hh',
++  'signature/external-signer.hh',
+   'signature/local-keys.hh',
+   'signature/signer.hh',
+   'socket.hh',

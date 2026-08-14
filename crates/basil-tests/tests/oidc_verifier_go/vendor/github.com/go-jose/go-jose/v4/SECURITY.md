@@ -1,12 +1,14 @@
 # Security Policy
+
 This document explains how to contact the Let's Encrypt security team to report security vulnerabilities.
 
 ## Supported Versions
+
 | Version | Supported |
-| ------- | ----------|
-| >= v3   | &check; |
-| v2      | &cross; |
-| v1      | &cross; |
+| ------- | --------- |
+| >= v3   | &check;   |
+| v2      | &cross;   |
+| v1      | &cross;   |
 
 ## Reporting a vulnerability
 

@@ -7,10 +7,27 @@
 //! `broker` is Basil's own broker API. `spiffe` is generated from the vendored
 //! upstream SPIFFE Workload API proto.
 
+/// Compiled protobuf `FileDescriptorSet` covering every service and message
+/// this crate generates code for.
+///
+/// This is the same descriptor input tonic generated its routing from, so a
+/// registry keyed on the service and method names decoded from these bytes is
+/// exactly as exhaustive as the compiled routing surface — no hand-typed
+/// request-path strings are needed to enumerate it.
+pub const FILE_DESCRIPTOR_SET: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/basil_descriptor.bin"));
+
+pub mod codec;
+
 pub mod broker {
     pub mod v1 {
         #![allow(clippy::all, clippy::nursery, clippy::pedantic)]
         tonic::include_proto!("basil.broker.v1");
+        include!(concat!(env!("OUT_DIR"), "/nix_cache/basil.broker.v1.rs"));
+        include!(concat!(
+            env!("OUT_DIR"),
+            "/basil.broker.v1.NixCacheService.rs"
+        ));
     }
 }
 

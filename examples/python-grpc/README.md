@@ -80,7 +80,7 @@ python3 main.py /path/to/agent.sock   # stubs land in ./gen by default
 
 ```
 == python example ==
-PASS status backend=keystore version=0.7.1 protocol=1
+PASS status backend=keystore version=0.8.0-pre.1 protocol=1
 PASS sign demo.signing_key signature_len=64
 PASS verify valid=true
 PASS verify tampered=rejected

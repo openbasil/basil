@@ -27,7 +27,10 @@ use crate::error::DecodeError;
 use crate::hash::RequestHash;
 use crate::kdf::{KdfParties, PartyIdentity};
 use crate::label::{self, canonical_sort_key};
-use crate::types::{ContentType, KeyId, MessageId, ResponseSubject, Subject, UnixTime};
+use crate::types::{
+    ContentType, FreshnessChallenge, KeyId, MessageId, ResponseSubject, Subject, UnixTime,
+    X25519ResponsePublicKey,
+};
 
 /// Internal encode failure. Statically unreachable for profile-valid input
 /// (encoding into a `Vec` cannot fail); kept so no build path can panic.
@@ -46,16 +49,25 @@ pub const X25519_LEN: usize = 32;
 
 /// Labels that constitute claims; finding one in an unprotected header is
 /// [`DecodeError::ClaimsInUnprotected`].
-const CLAIM_LABELS: [i64; 6] = [
+const CLAIM_LABELS: [i64; 8] = [
     label::HDR_CWT_CLAIMS,
     label::IN_REPLY_TO,
     label::REQUEST_HASH,
     label::SENDER_KEY_ID,
     label::RESPONSE_KEY_ID,
     label::RESPONSE_SUBJECT,
+    label::FRESHNESS_CHALLENGE,
+    label::RESPONSE_PUBLIC_KEY_COSE,
 ];
 
 type EncResult = Result<(), minicbor::encode::Error<core::convert::Infallible>>;
+
+fn response_key_binding_matches(claims: &Claims) -> bool {
+    match (&claims.response_key_id, claims.response_public_key_cose) {
+        (Some(key_id), Some(public)) => key_id.as_bytes() == public.thumbprint().as_bytes(),
+        _ => true,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Encoding (canonical by construction)
@@ -88,6 +100,12 @@ fn basil_labels(claims: &Claims) -> Vec<i64> {
     if claims.response_subject.is_some() {
         labels.push(label::RESPONSE_SUBJECT);
     }
+    if claims.freshness_challenge.is_some() {
+        labels.push(label::FRESHNESS_CHALLENGE);
+    }
+    if claims.response_public_key_cose.is_some() {
+        labels.push(label::RESPONSE_PUBLIC_KEY_COSE);
+    }
     labels
 }
 
@@ -100,10 +118,24 @@ fn crit_labels(claims: Option<&Claims>, protected_headers: Option<&ProtectedHead
         crit.push(label::HDR_CWT_CLAIMS);
         crit.extend(basil_labels(c));
     }
-    if protected_headers.is_some_and(|headers| !headers.signer_certificates_jwt.is_empty()) {
-        crit.push(label::SIGNER_CERTIFICATES_JWT);
-    }
+    crit.extend(protected_header_crit_labels(protected_headers));
+    crit.sort_by_key(|value| label::canonical_sort_key(*value));
     crit
+}
+
+fn protected_header_crit_labels(protected_headers: Option<&ProtectedHeaders>) -> Vec<i64> {
+    let mut labels = Vec::new();
+    if protected_headers.is_some_and(|headers| !headers.signer_certificates_jwt.is_empty()) {
+        labels.push(label::SIGNER_CERTIFICATES_JWT);
+    }
+    if protected_headers.is_some_and(|headers| headers.signer_public_key_cose.is_some()) {
+        labels.push(label::SIGNER_PUBLIC_KEY_COSE);
+    }
+    if protected_headers.is_some_and(|headers| headers.operation_target_key_id.is_some()) {
+        labels.push(label::OPERATION_TARGET_KEY_ID);
+    }
+    labels.sort_by_key(|value| label::canonical_sort_key(*value));
+    labels
 }
 
 /// Write the CWT claims map (header 15 value).
@@ -179,6 +211,28 @@ fn write_claims_capable_tail(
             e.str(jwt)?;
         }
     }
+    if let Some(headers) = protected_headers
+        && let Some(key) = &headers.signer_public_key_cose
+    {
+        e.i64(label::SIGNER_PUBLIC_KEY_COSE)?.bytes(key)?;
+    }
+    // `-70008` sorts after the `-70006`/`-70007` protected headers, so the
+    // freshness challenge is written last to keep the map canonical.
+    if let Some(v) = claims.and_then(|c| c.freshness_challenge.as_ref()) {
+        e.i64(label::FRESHNESS_CHALLENGE)?.bytes(v.as_bytes())?;
+    }
+    // `-70009` sorts immediately after `-70008`.
+    if let Some(v) = claims.and_then(|c| c.response_public_key_cose) {
+        e.i64(label::RESPONSE_PUBLIC_KEY_COSE)?
+            .bytes(&v.to_cose_key_bytes())?;
+    }
+    // `-70010` sorts after `-70009`.
+    if let Some(headers) = protected_headers
+        && let Some(target) = &headers.operation_target_key_id
+    {
+        e.i64(label::OPERATION_TARGET_KEY_ID)?
+            .bytes(target.as_bytes())?;
+    }
     Ok(())
 }
 
@@ -192,6 +246,12 @@ fn claims_capable_tail_len(
         + u64::from(
             protected_headers.is_some_and(|headers| !headers.signer_certificates_jwt.is_empty()),
         )
+        + u64::from(
+            protected_headers.is_some_and(|headers| headers.signer_public_key_cose.is_some()),
+        )
+        + u64::from(
+            protected_headers.is_some_and(|headers| headers.operation_target_key_id.is_some()),
+        )
 }
 
 /// Serialize the protected header of a bare (signed) `COSE_Sign1` with
@@ -204,6 +264,9 @@ pub fn encode_sign1_protected_bare_with_headers(
     claims: Option<&Claims>,
     protected_headers: Option<&ProtectedHeaders>,
 ) -> Result<Vec<u8>, CodecError> {
+    if claims.is_some_and(|claims| !response_key_binding_matches(claims)) {
+        return Err(CodecError);
+    }
     encode_with(|e| {
         e.map(2 + claims_capable_tail_len(claims, protected_headers))?;
         e.i64(label::HDR_ALG)?.i64(algorithm.codepoint())?;
@@ -217,10 +280,58 @@ pub fn encode_sign1_protected_sealed_outer(
     algorithm: SignatureAlgorithm,
     kid: &KeyId,
 ) -> Result<Vec<u8>, CodecError> {
+    encode_sign1_protected_sealed_outer_with_headers(algorithm, kid, None)
+}
+
+/// Serialize a sealed outer header with optional critical proof headers.
+pub fn encode_sign1_protected_sealed_outer_with_headers(
+    algorithm: SignatureAlgorithm,
+    kid: &KeyId,
+    protected_headers: Option<&ProtectedHeaders>,
+) -> Result<Vec<u8>, CodecError> {
     encode_with(|e| {
-        e.map(2)?;
+        let has_crit = protected_headers.is_some_and(|h| !h.is_empty());
+        let has_jwt = protected_headers.is_some_and(|h| !h.signer_certificates_jwt.is_empty());
+        let has_key = protected_headers.is_some_and(|h| h.signer_public_key_cose.is_some());
+        let has_target = protected_headers.is_some_and(|h| h.operation_target_key_id.is_some());
+        e.map(
+            2 + u64::from(has_crit)
+                + u64::from(has_jwt)
+                + u64::from(has_key)
+                + u64::from(has_target),
+        )?;
         e.i64(label::HDR_ALG)?.i64(algorithm.codepoint())?;
+        if let Some(headers) = protected_headers
+            && has_crit
+        {
+            let crit = protected_header_crit_labels(Some(headers));
+            e.i64(label::HDR_CRIT)?.array(crit.len() as u64)?;
+            for value in crit {
+                e.i64(value)?;
+            }
+        }
         e.i64(label::HDR_KID)?.bytes(kid.as_bytes())?;
+        if let Some(headers) = protected_headers {
+            if has_jwt {
+                e.i64(label::SIGNER_CERTIFICATES_JWT)?
+                    .array(headers.signer_certificates_jwt.len() as u64)?;
+                for jwt in &headers.signer_certificates_jwt {
+                    e.str(jwt)?;
+                }
+            }
+            if has_key {
+                e.i64(label::SIGNER_PUBLIC_KEY_COSE)?.bytes(
+                    headers
+                        .signer_public_key_cose
+                        .as_deref()
+                        .unwrap_or_default(),
+                )?;
+            }
+            if let Some(target) = &headers.operation_target_key_id {
+                e.i64(label::OPERATION_TARGET_KEY_ID)?
+                    .bytes(target.as_bytes())?;
+            }
+        }
         Ok(())
     })
 }
@@ -231,6 +342,9 @@ pub fn encode_encrypt_protected(
     content_type: &ContentType,
     claims: Option<&Claims>,
 ) -> Result<Vec<u8>, CodecError> {
+    if claims.is_some_and(|claims| !response_key_binding_matches(claims)) {
+        return Err(CodecError);
+    }
     encode_with(|e| {
         e.map(1 + claims_capable_tail_len(claims, None))?;
         e.i64(label::HDR_ALG)?.i64(content_algorithm.codepoint())?;
@@ -580,6 +694,8 @@ struct ClaimsParts {
     sender_key_id: Option<KeyId>,
     response_key_id: Option<KeyId>,
     response_subject: Option<ResponseSubject>,
+    freshness_challenge: Option<FreshnessChallenge>,
+    response_public_key_cose: Option<X25519ResponsePublicKey>,
     cwt_present: bool,
     basil_present: bool,
 }
@@ -601,7 +717,7 @@ impl ClaimsParts {
         let message_id = self.message_id.ok_or(DecodeError::MissingClaim {
             claim: label::CWT_CTI,
         })?;
-        Ok(Some(Claims {
+        let claims = Claims {
             issuer: self.issuer,
             audience: self.audience,
             expires_at: self.expires_at,
@@ -612,7 +728,13 @@ impl ClaimsParts {
             response_subject: self.response_subject,
             in_reply_to: self.in_reply_to,
             request_hash: self.request_hash,
-        }))
+            freshness_challenge: self.freshness_challenge,
+            response_public_key_cose: self.response_public_key_cose,
+        };
+        if !response_key_binding_matches(&claims) {
+            return Err(DecodeError::ResponseKeyIdMismatch);
+        }
+        Ok(Some(claims))
     }
 }
 
@@ -678,6 +800,21 @@ fn parse_basil_label(
         }
         label::RESPONSE_SUBJECT => {
             parts.response_subject = Some(ResponseSubject::new(read_str(d, l)?)?);
+        }
+        label::FRESHNESS_CHALLENGE => {
+            let raw = read_bytes(d, l)?;
+            let challenge =
+                FreshnessChallenge::from_bytes(&raw).map_err(|_| DecodeError::InvalidLength {
+                    label: l,
+                    expected: 32,
+                    actual: raw.len(),
+                })?;
+            parts.freshness_challenge = Some(challenge);
+        }
+        label::RESPONSE_PUBLIC_KEY_COSE => {
+            parts.response_public_key_cose = Some(X25519ResponsePublicKey::from_cose_key_bytes(
+                &read_bytes(d, l)?,
+            )?);
         }
         _ => return Ok(false),
     }
@@ -775,6 +912,13 @@ fn parse_claims_capable_header(
             label::SIGNER_CERTIFICATES_JWT if allow_kid => {
                 protected_headers.signer_certificates_jwt = read_string_array(&mut d, l)?;
             }
+            label::SIGNER_PUBLIC_KEY_COSE if allow_kid => {
+                protected_headers.signer_public_key_cose = Some(read_bytes(&mut d, l)?);
+            }
+            label::OPERATION_TARGET_KEY_ID if allow_kid => {
+                protected_headers.operation_target_key_id =
+                    Some(KeyId::from_bytes(read_bytes(&mut d, l)?)?);
+            }
             other => {
                 if !parse_basil_label(&mut d, other, &mut parts)? {
                     return Err(DecodeError::UnknownLabel { label: other });
@@ -786,6 +930,15 @@ fn parse_claims_capable_header(
         label: label::HDR_ALG,
     })?;
     let claims = parts.into_claims()?;
+    if allow_kid
+        && claims
+            .as_ref()
+            .is_some_and(|claims| claims.response_public_key_cose.is_some())
+    {
+        return Err(DecodeError::UnknownLabel {
+            label: label::RESPONSE_PUBLIC_KEY_COSE,
+        });
+    }
     Ok(ClaimsCapableHeader {
         alg,
         crit,
@@ -920,17 +1073,11 @@ pub fn decode_sign1_strict(bytes: &[u8], layer: Sign1Layer) -> Result<DecodedSig
             )
         }
         Sign1Layer::SealedOuter => {
-            let (algorithm, kid) = parse_sealed_outer_protected(&protected)?;
-            let rebuilt = encode_sign1_protected_sealed_outer(algorithm, &kid)
-                .map_err(|CodecError| DecodeError::NonDeterministicEncoding)?;
-            (
-                algorithm,
-                kid,
-                None,
-                None,
-                ProtectedHeaders::default(),
-                rebuilt,
-            )
+            let (algorithm, kid, headers) = parse_sealed_outer_protected(&protected)?;
+            let rebuilt =
+                encode_sign1_protected_sealed_outer_with_headers(algorithm, &kid, Some(&headers))
+                    .map_err(|CodecError| DecodeError::NonDeterministicEncoding)?;
+            (algorithm, kid, None, None, headers, rebuilt)
         }
     };
 
@@ -954,7 +1101,9 @@ pub fn decode_sign1_strict(bytes: &[u8], layer: Sign1Layer) -> Result<DecodedSig
 
 /// Parse the sealed-outer protected header: exactly `{1: alg, 4: kid}`, where
 /// `alg` is a profile signature algorithm. Returns the algorithm and key id.
-fn parse_sealed_outer_protected(bytes: &[u8]) -> Result<(SignatureAlgorithm, KeyId), DecodeError> {
+fn parse_sealed_outer_protected(
+    bytes: &[u8],
+) -> Result<(SignatureAlgorithm, KeyId, ProtectedHeaders), DecodeError> {
     if bytes.is_empty() {
         return Err(DecodeError::MissingHeader {
             label: label::HDR_ALG,
@@ -966,6 +1115,8 @@ fn parse_sealed_outer_protected(bytes: &[u8]) -> Result<(SignatureAlgorithm, Key
     let mut prev = None;
     let mut alg = None;
     let mut kid = None;
+    let mut crit = None;
+    let mut headers = ProtectedHeaders::default();
     for _ in 0..n {
         let l = read_label(&mut d)?;
         check_order(prev, l)?;
@@ -973,6 +1124,16 @@ fn parse_sealed_outer_protected(bytes: &[u8]) -> Result<(SignatureAlgorithm, Key
         match l {
             label::HDR_ALG => alg = Some(read_int(&mut d, l)?),
             label::HDR_KID => kid = Some(KeyId::from_bytes(read_bytes(&mut d, l)?)?),
+            label::HDR_CRIT => crit = Some(parse_crit(&mut d)?),
+            label::SIGNER_CERTIFICATES_JWT => {
+                headers.signer_certificates_jwt = read_string_array(&mut d, l)?;
+            }
+            label::SIGNER_PUBLIC_KEY_COSE => {
+                headers.signer_public_key_cose = Some(read_bytes(&mut d, l)?);
+            }
+            label::OPERATION_TARGET_KEY_ID => {
+                headers.operation_target_key_id = Some(KeyId::from_bytes(read_bytes(&mut d, l)?)?);
+            }
             other => return Err(DecodeError::UnknownLabel { label: other }),
         }
     }
@@ -984,7 +1145,16 @@ fn parse_sealed_outer_protected(bytes: &[u8]) -> Result<(SignatureAlgorithm, Key
     let kid = kid.ok_or(DecodeError::MissingHeader {
         label: label::HDR_KID,
     })?;
-    Ok((algorithm, kid))
+    if headers.is_empty() {
+        if crit.is_some() {
+            return Err(DecodeError::CritIncomplete {
+                label: label::HDR_CRIT,
+            });
+        }
+    } else {
+        check_crit(crit.as_ref(), &protected_header_crit_labels(Some(&headers)))?;
+    }
+    Ok((algorithm, kid, headers))
 }
 
 /// Parse the recipient protected header:

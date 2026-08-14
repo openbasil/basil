@@ -1,0 +1,10 @@
+{
+  "schema": "basil.ci.qualification.broker-audit",
+  "version": 1,
+  "fixture_only": true,
+  "provider": "github",
+  "profile": "artifact-sign",
+  "target_key": "ci.qualification.artifact-sign",
+  "invocation_id": "wDCICmc4kiZM703GRgSLywl8oAtFK40VjZQWlJUsHNY",
+  "result": "success"
+}

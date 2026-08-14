@@ -8,8 +8,11 @@
 //! Every step is fallible-by-`Result` and **fails closed** (clean non-zero exit,
 //! no panic, §1.3 / §5 of `designs/unlock-and-bundle.html`).
 
+#[cfg(test)]
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
 use crate::seal::{CredBundle, MethodRegistry, format};
 use anyhow::{Context, Result, bail};
@@ -56,11 +59,49 @@ pub struct UnlockArgs {
     pub strict_bundle_perms: bool,
 }
 
-/// Read + check perms of the bundle file, then unlock it into a [`CredBundle`].
+/// An opened credential bundle that keeps bundle maintenance excluded.
+///
+/// The credentials are declared before the guard so Rust destroys and zeroizes
+/// them before releasing the shared maintenance lock.
+pub(crate) struct GuardedCredBundle {
+    creds: CredBundle,
+    guard: crate::bundle_cli::BundleStartupGuard,
+}
+
+impl GuardedCredBundle {
+    pub(crate) const fn creds(&self) -> &CredBundle {
+        &self.creds
+    }
+
+    pub(crate) fn validate_guard(&self) -> Result<()> {
+        self.guard.validate()
+    }
+}
+
+impl std::fmt::Debug for GuardedCredBundle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardedCredBundle")
+            .field("backend_count", &self.creds.backends.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Read + check perms of the bundle file, then unlock it under a shared guard.
 ///
 /// The master KEK is recovered and zeroized inside `seal::open_bundle`; only the
-/// decrypted [`CredBundle`] is returned. Fails closed if no slot opens.
-pub fn open_bundle_at_startup(bundle_path: &Path, args: &UnlockArgs) -> Result<CredBundle> {
+/// decrypted [`CredBundle`] and its maintenance guard are returned. Fails closed
+/// if no slot opens or exclusive bundle maintenance is active.
+///
+/// # Errors
+///
+/// Returns an error when the bundle, its maintenance lock, or an enabled unlock
+/// method is invalid.
+#[cfg(test)]
+pub(crate) fn open_bundle_at_startup(
+    bundle_path: &Path,
+    args: &UnlockArgs,
+) -> Result<GuardedCredBundle> {
     open_bundle_at_startup_with_context(
         bundle_path,
         args,
@@ -72,32 +113,42 @@ pub fn open_bundle_at_startup(bundle_path: &Path, args: &UnlockArgs) -> Result<C
 ///
 /// # Errors
 ///
-/// Returns an error when the bundle or an enabled unlock method is invalid.
-pub fn open_bundle_at_startup_with_context(
+/// Returns an error when the bundle, its maintenance lock, or an enabled unlock
+/// method is invalid.
+pub(crate) fn open_bundle_at_startup_with_context(
     bundle_path: &Path,
     args: &UnlockArgs,
     context: crate::ConfigurationTraceContext,
-) -> Result<CredBundle> {
-    check_bundle_perms(bundle_path, args.strict_bundle_perms)?;
-
-    let (bytes, trace) =
-        crate::configuration::read_configuration_source("bundle", None, bundle_path)
-            .with_context(|| format!("reading sealed bundle from {}", bundle_path.display()))?;
-    let result = open_bundle_bytes(bundle_path, args, &bytes);
+) -> Result<GuardedCredBundle> {
+    let guard = crate::bundle_cli::acquire_bundle_startup_guard(bundle_path)
+        .context("acquiring sealed-bundle startup guard")?;
+    let (bytes, modified, mode) = guard
+        .read_bundle_for_startup()
+        .with_context(|| format!("reading sealed bundle from {}", bundle_path.display()))?;
+    check_bundle_perms(bundle_path, mode, args.strict_bundle_perms)?;
+    let trace = crate::configuration::configuration_source_trace_from_bytes(
+        "bundle",
+        None,
+        bundle_path,
+        &bytes,
+        modified,
+    );
+    let result = (|| {
+        let parsed = format::decode(&bytes).context("parsing sealed bundle")?;
+        guard
+            .verify_and_advance_epoch(parsed.body.header.epoch)
+            .context("checking sealed-bundle epoch sidecar")?;
+        let creds = open_parsed_bundle(args, &parsed)?;
+        guard
+            .validate()
+            .context("revalidating sealed-bundle startup guard")?;
+        Ok(GuardedCredBundle { creds, guard })
+    })();
     crate::configuration::emit_configuration_source_trace(&trace, context, result.is_ok());
     result
 }
 
-fn open_bundle_bytes(bundle_path: &Path, args: &UnlockArgs, bytes: &[u8]) -> Result<CredBundle> {
-    let parsed = format::decode(bytes).context("parsing sealed bundle")?;
-
-    // Best-effort logical anti-rollback, checked BEFORE any unlock slot is
-    // tried: a stale bundle is refused without decrypting its payload or
-    // applying its deposit log. This is not a boundary against a local writer
-    // (see `seal::verify_epoch_sidecar`).
-    crate::seal::verify_epoch_sidecar(&parsed, &epoch_sidecar_path(bundle_path))
-        .context("checking sealed-bundle epoch sidecar")?;
-
+fn open_parsed_bundle(args: &UnlockArgs, parsed: &format::ParsedBundle) -> Result<CredBundle> {
     // Build the registry from the enabled+configured methods. We keep the
     // method values alive for the duration of the open call.
     #[cfg(feature = "unlock-age-yubikey")]
@@ -129,9 +180,9 @@ fn open_bundle_bytes(bundle_path: &Path, args: &UnlockArgs, bytes: &[u8]) -> Res
         registry = registry.with(m);
     }
 
-    let mut creds = crate::seal::open_bundle(&parsed, &registry)
+    let mut creds = crate::seal::open_bundle(parsed, &registry)
         .context("no unlock slot opened the bundle (fail closed)")?;
-    let reviews = crate::seal::apply_authorized_deposits(&parsed, &mut creds);
+    let reviews = crate::seal::apply_authorized_deposits(parsed, &mut creds);
     for review in reviews {
         if review.status == crate::seal::DepositStatus::Effective {
             info!(
@@ -153,6 +204,7 @@ fn open_bundle_bytes(bundle_path: &Path, args: &UnlockArgs, bytes: &[u8]) -> Res
     Ok(creds)
 }
 
+#[cfg(test)]
 fn epoch_sidecar_path(bundle_path: &Path) -> PathBuf {
     let mut path = OsString::from(bundle_path.as_os_str());
     path.push(".epoch");
@@ -277,27 +329,20 @@ fn wipe_secret_file(path: &Path) -> Result<()> {
 }
 
 /// Warn (or, with `strict-bundle-perms`, refuse) if the bundle is not `0600`.
-fn check_bundle_perms(path: &Path, strict: bool) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let meta = std::fs::metadata(path)
-            .with_context(|| format!("stat sealed bundle {}", path.display()))?;
-        let mode = meta.permissions().mode() & 0o777;
-        if mode != 0o600 {
-            if strict {
-                bail!(
-                    "sealed bundle {} has mode {:o}, expected 0600 (strict-bundle-perms)",
-                    path.display(),
-                    mode
-                );
-            }
-            warn!(
-                path = %path.display(),
-                mode = format!("{mode:o}"),
-                "sealed bundle is not 0600 (continuing; set strict-bundle-perms to refuse)"
+fn check_bundle_perms(path: &Path, mode: u32, strict: bool) -> Result<()> {
+    if mode != 0o600 {
+        if strict {
+            bail!(
+                "sealed bundle {} has mode {:o}, expected 0600 (strict-bundle-perms)",
+                path.display(),
+                mode
             );
         }
+        warn!(
+            path = %path.display(),
+            mode = format!("{mode:o}"),
+            "sealed bundle is not 0600 (continuing; set strict-bundle-perms to refuse)"
+        );
     }
     Ok(())
 }
@@ -408,6 +453,31 @@ mod tests {
         }
     }
 
+    fn sealed_bundle_fixture(tag: &str) -> (PathBuf, PathBuf, UnlockArgs) {
+        let bundle = temp_path(&format!("{tag}-bundle"));
+        let passphrase_file = temp_path(&format!("{tag}-passphrase"));
+        write_secret(&passphrase_file, b"guarded passphrase\n");
+        let passphrase = PassphraseMethod::with_params(
+            Zeroizing::new(b"guarded passphrase".to_vec()),
+            crate::seal::Argon2Params {
+                m_cost_kib: 256,
+                t_cost: 1,
+                p_cost: 1,
+            },
+        );
+        let bytes = crate::seal::seal(
+            &CredBundle::empty(),
+            &[crate::seal::SlotSpec {
+                method: &passphrase,
+                label: "guarded startup".to_string(),
+            }],
+        )
+        .expect("seal startup bundle");
+        write_secret(&bundle, &bytes);
+        let unlock_args = args(passphrase_file.clone(), true);
+        (bundle, passphrase_file, unlock_args)
+    }
+
     fn bip39_args(path: PathBuf) -> UnlockArgs {
         UnlockArgs {
             age_yubikey: false,
@@ -444,6 +514,154 @@ mod tests {
         assert!(method.available());
         assert!(path.exists());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn startup_bundle_wrapper_holds_shared_guard_for_plaintext_lifetime() {
+        let bundle = temp_path("guarded-bundle");
+        let passphrase_file = temp_path("guarded-passphrase");
+        write_secret(&passphrase_file, b"guarded passphrase\n");
+        let passphrase = PassphraseMethod::with_params(
+            Zeroizing::new(b"guarded passphrase".to_vec()),
+            crate::seal::Argon2Params {
+                m_cost_kib: 256,
+                t_cost: 1,
+                p_cost: 1,
+            },
+        );
+        let bytes = crate::seal::seal(
+            &CredBundle::empty(),
+            &[crate::seal::SlotSpec {
+                method: &passphrase,
+                label: "guarded startup".to_string(),
+            }],
+        )
+        .expect("seal startup bundle");
+        write_secret(&bundle, &bytes);
+        let unlock_args = args(passphrase_file.clone(), true);
+
+        let maintenance = crate::bundle_cli::acquire_bundle_maintenance_lock(&bundle)
+            .expect("exclusive bundle maintenance lock");
+        let blocked = open_bundle_at_startup(&bundle, &unlock_args)
+            .expect_err("public startup reader must fail during maintenance");
+        assert!(blocked.to_string().contains("startup guard"));
+        drop(maintenance);
+
+        let guarded =
+            open_bundle_at_startup(&bundle, &unlock_args).expect("guarded startup bundle");
+        assert!(guarded.creds().backends.is_empty());
+        assert!(crate::bundle_cli::acquire_bundle_maintenance_lock(&bundle).is_err());
+        drop(guarded);
+        let maintenance = crate::bundle_cli::acquire_bundle_maintenance_lock(&bundle)
+            .expect("maintenance lock after guarded credentials drop");
+        drop(maintenance);
+
+        let mut lock_path = OsString::from(bundle.as_os_str());
+        lock_path.push(".basil-lock");
+        let _ = std::fs::remove_file(&bundle);
+        let _ = std::fs::remove_file(epoch_sidecar_path(&bundle));
+        let _ = std::fs::remove_file(PathBuf::from(lock_path));
+        let _ = std::fs::remove_file(passphrase_file);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_bundle_permission_policy_uses_pinned_inode_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (bundle, passphrase_file, mut unlock_args) =
+            sealed_bundle_fixture("pinned-permissions");
+        std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o644))
+            .expect("set loose bundle mode");
+        let guarded = open_bundle_at_startup(&bundle, &unlock_args)
+            .expect("non-strict startup warns and continues");
+        drop(guarded);
+
+        unlock_args.strict_bundle_perms = true;
+        let error = open_bundle_at_startup(&bundle, &unlock_args)
+            .expect_err("strict startup rejects the pinned loose mode");
+        assert!(error.to_string().contains("strict-bundle-perms"));
+
+        std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o400))
+            .expect("set read-only bundle mode");
+        let error = open_bundle_at_startup(&bundle, &unlock_args)
+            .expect_err("strict startup requires exact 0600 on the pinned inode");
+        assert!(error.to_string().contains("mode 400"));
+
+        let mut lock_path = OsString::from(bundle.as_os_str());
+        lock_path.push(".basil-lock");
+        let _ = std::fs::remove_file(&bundle);
+        let _ = std::fs::remove_file(epoch_sidecar_path(&bundle));
+        let _ = std::fs::remove_file(PathBuf::from(lock_path));
+        let _ = std::fs::remove_file(passphrase_file);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_bundle_rejects_symlinked_bundle_and_epoch_inputs() {
+        use std::os::unix::fs::symlink;
+
+        let (real_bundle, passphrase_file, unlock_args) = sealed_bundle_fixture("symlink-input");
+        let linked_bundle = temp_path("symlink-input-link");
+        symlink(&real_bundle, &linked_bundle).expect("symlink bundle");
+        let error = open_bundle_at_startup(&linked_bundle, &unlock_args)
+            .expect_err("startup must reject a symlinked bundle");
+        assert!(error.to_string().contains("reading sealed bundle"));
+
+        let epoch = epoch_sidecar_path(&real_bundle);
+        let epoch_target = temp_path("symlink-epoch-target");
+        write_secret(&epoch_target, b"1\n");
+        symlink(&epoch_target, &epoch).expect("symlink epoch sidecar");
+        let error = open_bundle_at_startup(&real_bundle, &unlock_args)
+            .expect_err("startup must reject a symlinked epoch sidecar");
+        assert!(error.to_string().contains("epoch sidecar"));
+
+        let _ = std::fs::remove_file(linked_bundle);
+        let _ = std::fs::remove_file(epoch);
+        let _ = std::fs::remove_file(epoch_target);
+        let _ = std::fs::remove_file(real_bundle);
+        let _ = std::fs::remove_file(passphrase_file);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_bundle_rejects_symlinked_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let real_directory = temp_path("ancestor-real");
+        let linked_directory = temp_path("ancestor-link");
+        std::fs::create_dir(&real_directory).expect("create real bundle directory");
+        let real_bundle = real_directory.join("bundle.sealed");
+        let passphrase_file = real_directory.join("passphrase");
+        write_secret(&passphrase_file, b"guarded passphrase\n");
+        let passphrase = PassphraseMethod::with_params(
+            Zeroizing::new(b"guarded passphrase".to_vec()),
+            crate::seal::Argon2Params {
+                m_cost_kib: 256,
+                t_cost: 1,
+                p_cost: 1,
+            },
+        );
+        let bytes = crate::seal::seal(
+            &CredBundle::empty(),
+            &[crate::seal::SlotSpec {
+                method: &passphrase,
+                label: "ancestor startup".to_string(),
+            }],
+        )
+        .expect("seal ancestor bundle");
+        write_secret(&real_bundle, &bytes);
+        symlink(&real_directory, &linked_directory).expect("symlink bundle ancestor");
+
+        let error = open_bundle_at_startup(
+            &linked_directory.join("bundle.sealed"),
+            &args(passphrase_file, true),
+        )
+        .expect_err("startup must reject a symlinked ancestor");
+        assert!(error.to_string().contains("startup guard"));
+
+        let _ = std::fs::remove_file(linked_directory);
+        let _ = std::fs::remove_dir_all(real_directory);
     }
 
     #[cfg(feature = "unlock-bip39")]

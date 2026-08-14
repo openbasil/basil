@@ -215,6 +215,7 @@ fn assert_healthy_doctor(run: &DoctorRun, name: &str) {
         "bundle_perms",
         "bundle_freshness",
         "catalog_policy",
+        "socket",
     ] {
         assert_eq!(
             check_status(&run.report, arm),

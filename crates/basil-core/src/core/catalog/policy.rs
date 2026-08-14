@@ -5,15 +5,15 @@
 //! Policy schema: the authorization allow-list and the export-resolved config
 //! tables.
 //!
-//! Rules grant to named subjects. Subject definitions hold typed principal specs
-//! such as numeric Unix uid/gid selectors, while rules carry only subject names,
-//! action terms, and target globs. The export tool has already resolved symbolic
-//! user/group names to numeric uid/gid values before this module sees them.
+//! Rules grant to named subjects. Each subject declares a disjoint workload
+//! domain and a monotonic recursive evidence expression. Rules carry only
+//! subject names, action terms, and target globs.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use super::evidence::{AuthorizationDomain, EvidenceExpression};
 use super::glob::KeyGlob;
 
 /// A stable subject name from the policy subject registry.
@@ -57,6 +57,18 @@ pub enum Op {
     Import,
     /// Create a new key (operator-only).
     NewKey,
+    /// Enroll a backend-custodied Nix binary-cache signing key.
+    ///
+    /// This purpose-specific, key-scoped operation is deliberately absent from
+    /// [`ALL_OPS`]. Generic key-creation or wildcard grants must not imply
+    /// authority to establish a Nix cache trust root.
+    EnrollNixCacheKey,
+    /// Sign a canonical Nix `PATH_INFO_V1` fingerprint.
+    ///
+    /// This purpose-specific, key-scoped operation is deliberately absent from
+    /// [`ALL_OPS`]. Generic signing or wildcard grants must not imply authority
+    /// to publish paths into a trusted Nix binary cache.
+    SignNixCacheFingerprint,
     /// Hot-reload the catalog/policy generation from disk (broker-admin only).
     ///
     /// A privileged, **broker-wide** admin op: not key-scoped like the others.
@@ -88,6 +100,18 @@ pub enum Op {
     /// explicitly over `broker.watch`. `KeyRotated` events additionally stay
     /// filtered per key by the watcher's data-plane grants.
     Watch,
+    /// Read the bounded accepted-connection inventory.
+    ///
+    /// This broker-wide admin op exposes peer and attested workload metadata.
+    /// Wildcard grants never imply it; grant it explicitly over
+    /// `broker.connections`.
+    ConnectionStatus,
+    /// Deliberately terminate selected accepted connections.
+    ///
+    /// This mutation is separate from inventory access for least privilege.
+    /// Wildcard grants never imply it; grant it explicitly over
+    /// `broker.connections.drop`.
+    ConnectionDrop,
     /// Permit a caller to use the **local-software** crypto provider for a key
     /// (the software-custodied PQC arm: ML-DSA signing, ML-KEM unwrap).
     ///
@@ -136,7 +160,10 @@ impl Op {
     /// Writes live in the `operator` role and are never implied (§2.4.2).
     #[must_use]
     pub const fn is_write(self) -> bool {
-        matches!(self, Self::Set | Self::Rotate | Self::Import | Self::NewKey)
+        matches!(
+            self,
+            Self::Set | Self::Rotate | Self::Import | Self::NewKey | Self::EnrollNixCacheKey
+        )
     }
 
     /// The bare wire token for this op (the part after `op:`), e.g.
@@ -161,10 +188,14 @@ impl Op {
             Self::Rotate => "rotate",
             Self::Import => "import",
             Self::NewKey => "new_key",
+            Self::EnrollNixCacheKey => "enroll_nix_cache_key",
+            Self::SignNixCacheFingerprint => "sign_nix_cache_fingerprint",
             Self::Reload => "reload",
             Self::Explain => "explain",
             Self::Revoke => "revoke",
             Self::Watch => "watch",
+            Self::ConnectionStatus => "connection_status",
+            Self::ConnectionDrop => "connection_drop",
             Self::UseSoftwareCustody => "use_software_custody",
         }
     }
@@ -189,10 +220,14 @@ impl Op {
             "rotate" => Self::Rotate,
             "import" => Self::Import,
             "new_key" => Self::NewKey,
+            "enroll_nix_cache_key" => Self::EnrollNixCacheKey,
+            "sign_nix_cache_fingerprint" => Self::SignNixCacheFingerprint,
             "reload" => Self::Reload,
             "explain" => Self::Explain,
             "revoke" => Self::Revoke,
             "watch" => Self::Watch,
+            "connection_status" => Self::ConnectionStatus,
+            "connection_drop" => Self::ConnectionDrop,
             "use_software_custody" => Self::UseSoftwareCustody,
             other => return Err(ActionTermError::UnknownOp(other.to_string())),
         };
@@ -200,7 +235,7 @@ impl Op {
     }
 }
 
-/// The supported public-key families for first-cut signature principals.
+/// The supported public-key families for invocation-signature evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SignatureKeyAlgorithm {
@@ -210,95 +245,15 @@ pub enum SignatureKeyAlgorithm {
     NatsNkey,
 }
 
-/// A typed principal selector inside a subject definition.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum PrincipalSpec {
-    /// Unix peer-credential selector. At least one of `uid` or `gid` must be set.
-    Unix {
-        /// Numeric uid to match.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        uid: Option<u32>,
-        /// Numeric gid to match against the full configured group set.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        gid: Option<u32>,
-    },
-    /// Explicit unauthenticated actor selector.
-    Unauthenticated,
-    /// Signed invocation key selector.
-    SignatureKey {
-        /// Signature algorithm family.
-        algorithm: SignatureKeyAlgorithm,
-        /// Public key material in the algorithm's canonical policy encoding.
-        public: String,
-    },
-}
-
-impl PrincipalSpec {
-    /// Whether this principal matches an authenticated Unix actor.
-    #[must_use]
-    pub fn matches_unix(&self, uid: u32, gids: &[u32]) -> bool {
-        match self {
-            Self::Unix { uid: want_uid, gid } => {
-                let uid_matches = want_uid.is_none_or(|want| want == uid);
-                let gid_matches = gid.is_none_or(|want| gids.contains(&want));
-                uid_matches && gid_matches
-            }
-            Self::Unauthenticated | Self::SignatureKey { .. } => false,
-        }
-    }
-
-    /// Whether this principal matches the explicit unauthenticated actor.
-    #[must_use]
-    pub const fn matches_unauthenticated(&self) -> bool {
-        matches!(self, Self::Unauthenticated)
-    }
-}
-
-/// The boolean shape of a subject definition.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SubjectMatch {
-    /// Every listed principal spec must match.
-    AllOf(Vec<PrincipalSpec>),
-    /// At least one listed principal spec must match.
-    AnyOf(Vec<PrincipalSpec>),
-}
-
-impl SubjectMatch {
-    /// Whether this subject expression matches an authenticated Unix actor.
-    #[must_use]
-    pub fn matches_unix(&self, uid: u32, gids: &[u32]) -> bool {
-        match self {
-            Self::AllOf(specs) => specs.iter().all(|spec| spec.matches_unix(uid, gids)),
-            Self::AnyOf(specs) => specs.iter().any(|spec| spec.matches_unix(uid, gids)),
-        }
-    }
-
-    /// Whether this expression matches the explicit unauthenticated actor.
-    #[must_use]
-    pub fn matches_unauthenticated(&self) -> bool {
-        match self {
-            Self::AllOf(specs) => specs.iter().all(PrincipalSpec::matches_unauthenticated),
-            Self::AnyOf(specs) => specs.iter().any(PrincipalSpec::matches_unauthenticated),
-        }
-    }
-
-    /// Principal specs carried by this subject expression.
-    #[must_use]
-    pub fn specs(&self) -> &[PrincipalSpec] {
-        match self {
-            Self::AllOf(specs) | Self::AnyOf(specs) => specs,
-        }
-    }
-}
-
 /// A named subject definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubjectDefinition {
+    /// Mandatory disjoint local workload domain.
+    pub domain: AuthorizationDomain,
     /// Whether this subject may appear on a global `*` target rule.
     pub break_glass: bool,
-    /// The typed principal selectors for this subject.
-    pub match_: SubjectMatch,
+    /// Monotonic recursive evidence expression.
+    pub match_: EvidenceExpression,
 }
 
 /// A rule action term (§3.3): a role reference, an inline op, or `*`.
@@ -453,8 +408,6 @@ pub struct ResolvedRule {
 pub struct ResolvedPolicy {
     /// Validated subject registry.
     pub subjects: BTreeMap<SubjectName, SubjectDefinition>,
-    /// Explicit subject used for unauthenticated requests, when configured.
-    pub unauthenticated_subject: Option<SubjectName>,
     /// Resolved rules in declaration order.
     pub rules: Vec<ResolvedRule>,
 }
@@ -475,7 +428,13 @@ mod tests {
 
     #[test]
     fn op_is_write_only_for_write_ops() {
-        for op in [Op::Set, Op::Rotate, Op::Import, Op::NewKey] {
+        for op in [
+            Op::Set,
+            Op::Rotate,
+            Op::Import,
+            Op::NewKey,
+            Op::EnrollNixCacheKey,
+        ] {
             assert!(op.is_write(), "{op:?} should be a write");
         }
         for op in [
@@ -492,6 +451,7 @@ mod tests {
             Op::EncryptNatsCurve,
             Op::DecryptNatsCurve,
             Op::Validate,
+            Op::SignNixCacheFingerprint,
         ] {
             assert!(!op.is_write(), "{op:?} should not be a write");
         }
@@ -513,10 +473,23 @@ mod tests {
             Op::DecryptNatsCurve
         );
         assert_eq!(Op::parse("validate").unwrap(), Op::Validate);
+        assert_eq!(
+            Op::parse("enroll_nix_cache_key").unwrap(),
+            Op::EnrollNixCacheKey
+        );
+        assert_eq!(
+            Op::parse("sign_nix_cache_fingerprint").unwrap(),
+            Op::SignNixCacheFingerprint
+        );
         assert_eq!(Op::parse("reload").unwrap(), Op::Reload);
         assert_eq!(Op::parse("explain").unwrap(), Op::Explain);
         assert_eq!(Op::parse("revoke").unwrap(), Op::Revoke);
         assert_eq!(Op::parse("watch").unwrap(), Op::Watch);
+        assert_eq!(
+            Op::parse("connection_status").unwrap(),
+            Op::ConnectionStatus
+        );
+        assert_eq!(Op::parse("connection_drop").unwrap(), Op::ConnectionDrop);
         assert_eq!(Op::Reload.token(), "reload");
         assert_eq!(Op::Explain.token(), "explain");
         assert_eq!(Op::Revoke.token(), "revoke");
@@ -539,6 +512,18 @@ mod tests {
     }
 
     #[test]
+    fn purpose_specific_nix_ops_are_excluded_from_wildcards() {
+        for op in [Op::EnrollNixCacheKey, Op::SignNixCacheFingerprint] {
+            assert!(
+                !ALL_OPS.contains(&op),
+                "{op:?} must require an explicit policy grant"
+            );
+        }
+        assert!(Op::EnrollNixCacheKey.is_write());
+        assert!(!Op::SignNixCacheFingerprint.is_write());
+    }
+
+    #[test]
     fn action_parses_role_op_and_any() {
         assert_eq!(
             ActionTerm::parse("role:minter").unwrap(),
@@ -557,13 +542,6 @@ mod tests {
             ActionTerm::parse("op:bogus"),
             Err(ActionTermError::UnknownOp(_))
         ));
-    }
-
-    #[test]
-    fn unauthenticated_principal_matches_only_unauthenticated_actor() {
-        let subject = SubjectMatch::AnyOf(vec![PrincipalSpec::Unauthenticated]);
-        assert!(subject.matches_unauthenticated());
-        assert!(!subject.matches_unix(42, &[42]));
     }
 
     #[test]

@@ -11,6 +11,7 @@ mod invocation;
 #[cfg(feature = "http")]
 pub mod jwks;
 mod minting;
+mod nix_cache;
 pub mod sds;
 mod secret;
 mod shared;

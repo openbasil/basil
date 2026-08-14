@@ -32,6 +32,18 @@ pub enum ProfileError {
     EmptyPartyIdentity,
     /// A signature must be non-empty.
     EmptySignature,
+    /// A freshness challenge must be exactly 32 bytes.
+    FreshnessChallengeLength {
+        /// The length actually supplied.
+        actual: usize,
+    },
+    /// A response public key was not the exact 40-byte deterministic X25519
+    /// `COSE_Key` encoding.
+    ResponsePublicKeyCoseShape,
+    /// An X25519 response public key used the forbidden high-bit alias.
+    ResponsePublicKeyHighBitAlias,
+    /// An X25519 response public key is non-contributory (low order).
+    ResponsePublicKeyNonContributory,
 }
 
 impl fmt::Display for ProfileError {
@@ -50,6 +62,27 @@ impl fmt::Display for ProfileError {
             ),
             Self::EmptyPartyIdentity => write!(f, "party identity must be non-empty when present"),
             Self::EmptySignature => write!(f, "signature must be non-empty"),
+            Self::FreshnessChallengeLength { actual } => {
+                write!(
+                    f,
+                    "freshness challenge must be exactly 32 bytes, got {actual}"
+                )
+            }
+            Self::ResponsePublicKeyCoseShape => {
+                write!(
+                    f,
+                    "response public key is not the deterministic X25519 COSE_Key shape"
+                )
+            }
+            Self::ResponsePublicKeyHighBitAlias => {
+                write!(
+                    f,
+                    "response public key uses a noncanonical high-bit X25519 alias"
+                )
+            }
+            Self::ResponsePublicKeyNonContributory => {
+                write!(f, "response public key is non-contributory")
+            }
         }
     }
 }
@@ -163,6 +196,9 @@ pub enum DecodeError {
     },
     /// An identifier failed its newtype validation while decoding.
     Identifier(ProfileError),
+    /// The response key id is not the RFC 7638 thumbprint of the protected
+    /// response public key.
+    ResponseKeyIdMismatch,
 }
 
 impl fmt::Display for DecodeError {
@@ -212,6 +248,12 @@ impl fmt::Display for DecodeError {
                 actual,
             } => write!(f, "field {label} must be {expected} bytes, got {actual}"),
             Self::Identifier(e) => write!(f, "invalid identifier: {e}"),
+            Self::ResponseKeyIdMismatch => {
+                write!(
+                    f,
+                    "response key id does not match response public key thumbprint"
+                )
+            }
         }
     }
 }
@@ -257,6 +299,9 @@ pub enum ClaimsError {
         /// The offending label.
         label: i64,
     },
+    /// The response key id is not the RFC 7638 thumbprint of the response
+    /// public key.
+    ResponseKeyIdMismatch,
 }
 
 impl fmt::Display for ClaimsError {
@@ -271,6 +316,12 @@ impl fmt::Display for ClaimsError {
             Self::AudienceRejected => write!(f, "audience not allowed"),
             Self::MissingClaim { label } => write!(f, "role requires claim {label}"),
             Self::ForbiddenClaim { label } => write!(f, "role forbids claim {label}"),
+            Self::ResponseKeyIdMismatch => {
+                write!(
+                    f,
+                    "response key id does not match response public key thumbprint"
+                )
+            }
         }
     }
 }
@@ -313,6 +364,8 @@ pub enum BuildError {
     RoleShape(ClaimsError),
     /// A `response_key_id` must be UTF-8: the `-70004` header is a tstr.
     ResponseKeyNotText,
+    /// The response public key label is valid only on an encrypted layer.
+    ResponsePublicKeyRequiresEncryption,
     /// Randomness was unavailable (nonce / ephemeral generation).
     Rng,
     /// The AEAD seal operation failed (crypto-internal; should not occur for
@@ -333,6 +386,12 @@ impl fmt::Display for BuildError {
             }
             Self::RoleShape(e) => write!(f, "claims do not fit the message role: {e}"),
             Self::ResponseKeyNotText => write!(f, "response key id must be UTF-8"),
+            Self::ResponsePublicKeyRequiresEncryption => {
+                write!(
+                    f,
+                    "response public key requires an encrypted protected layer"
+                )
+            }
             Self::Rng => write!(f, "randomness unavailable"),
             Self::SealFailed => write!(f, "seal failed"),
             Self::Sign(e) => write!(f, "signing failed: {e}"),
