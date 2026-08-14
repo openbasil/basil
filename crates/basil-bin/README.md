@@ -93,6 +93,7 @@ the cancellation is observed. Forced termination can leave no terminal record.
 ## Feature flags
 
 Features forward to `basil-core` and select which backends and unlock methods are compiled in.
+
 | Feature               | Default | Adds                                                                       |
 | --------------------- | ------- | -------------------------------------------------------------------------- |
 | `db-keystore`         | yes     | Built-in encrypted keystore backend (SQLite via turso).                    |

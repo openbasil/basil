@@ -66,9 +66,9 @@ prost = { workspace = true }
 # provider document-fetcher seam for `ci_trust_reload_matrix` (no key blobs in
 # source; `url` must be the workspace version so the fetcher trait types unify).
 rand = { workspace = true }
-reqwest = { workspace = true }
 # Hermetic, test-only CA/server rotation for `ci_trust_reload_matrix`.
 rcgen = "=0.13.2"
+reqwest = { workspace = true }
 rsa = { workspace = true }
 sha2 = { workspace = true }
 spiffe-rustls = { workspace = true }

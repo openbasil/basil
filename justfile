@@ -1,7 +1,7 @@
 
 _default:
     @just --list
-   
+
 rust-docs:
     cargo doc -p basil  -p basil-nats -p basil-proto -p basil-cose --all-features --no-deps
 
@@ -10,7 +10,7 @@ rust-docs:
 # `target/man` (override with `just man-pages <dir>`). Pages are named
 # `basil.1`, `basil-agent.1`, ... one per (nested) subcommand.
 man-pages out="target/man":
-    cargo xtask -o {{out}}
+    cargo xtask -o {{ out }}
 
 # Regenerate .github/workflows/release.yml from the cargo-dist config, then
 # re-append the hand-written jobs (debian-packages + arch-package) that dist
@@ -208,7 +208,7 @@ format-go:
 # python-grpc; python-grpc SKIPs cleanly when grpcio is not installed).
 # before running, either
 #    set BASIL_BIN and BASIL_NATS_BRIDGE_BIN
-#    or ensure `basil` and `basil-nats-bridge` are in your PATH
+# or ensure `basil` and `basil-nats-bridge` are in your PATH
 run-examples:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -225,7 +225,7 @@ st:
 
 clean:
     rm -rf target examples/*/target
-    
+
 # Run the full default Rust test suite.
 test-rust:
     cargo test --workspace
@@ -282,8 +282,8 @@ test-tpm:
 test-e2e engine="both":
     #!/usr/bin/env bash
     set -uo pipefail
-    case "{{engine}}" in
-      openbao|vault) engines=("{{engine}}") ;;
+    case "{{ engine }}" in
+      openbao|vault) engines=("{{ engine }}") ;;
       both)          engines=(openbao vault) ;;
       *) echo "usage: just test-e2e [openbao|vault|both]" >&2; exit 2 ;;
     esac

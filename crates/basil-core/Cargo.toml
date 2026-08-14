@@ -4,18 +4,18 @@
 
 [package]
 name = "basil-core"
-description = "Basil daemon core, broker services, transport, and offline admin command implementations."
 version.workspace = true
-edition.workspace = true
-license.workspace = true
 authors.workspace = true
-homepage.workspace = true
-repository.workspace = true
-documentation = "https://docs.rs/basil-core"
-keywords = ["basil", "vault", "broker", "cryptography", "kms"]
 categories = ["cryptography", "network-programming", "authentication"]
-rust-version = "1.88"
+documentation = "https://docs.rs/basil-core"
+edition.workspace = true
+homepage.workspace = true
+keywords = ["basil", "vault", "broker", "cryptography", "kms"]
+license.workspace = true
 publish = true
+repository.workspace = true
+rust-version = "1.88"
+description = "Basil daemon core, broker services, transport, and offline admin command implementations."
 
 [features]
 default = ["http", "unlock-age-yubikey", "unlock-bip39"]
@@ -41,10 +41,10 @@ otlp = [
 http-tls = ["http", "dep:hyper", "dep:hyper-util", "dep:tokio-rustls"]
 
 [dependencies]
-basil-proto = { workspace = true }
 basil-cose = { workspace = true }
-basil-nats = { workspace = true }
 basil-keystore-backend = { workspace = true, optional = true }
+basil-nats = { workspace = true }
+basil-proto = { workspace = true }
 
 # Direct dep only to enable `aes/zeroize` (round-key scrubbing) for aes-gcm.
 aes = { workspace = true }
