@@ -97,4 +97,8 @@ unknown-git = "deny"
 # Temporary, revision-pinned upstream dependency for basil-ik7x. Revert this
 # allowlist together with the `age` Git pin when the successor release lands.
 required-git-spec = "rev"
-allow-git = ["https://github.com/str4d/rage"]
+allow-git = [
+  "https://github.com/str4d/rage",
+  "https://github.com/str4d/RustCrypto-KEMs",
+  "https://github.com/str4d/rust-hpke",
+]

@@ -175,6 +175,10 @@ impl UnlockMethod for AgeYubikeyMethod {
 }
 
 #[cfg(test)]
+#[allow(
+    deprecated,
+    reason = "these tests exercise the YubiKey plugin path with X25519 fixtures"
+)]
 mod tests {
     use super::*;
     use crate::seal::format::Header;

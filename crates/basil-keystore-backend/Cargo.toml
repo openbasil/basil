@@ -50,7 +50,7 @@ zero-secrets = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
-turso = { version = "=0.7.1", default-features = false, features = ["mimalloc"] }
+turso = { version = "=0.7.2", default-features = false, features = ["mimalloc"] }
 
 [lints]
 workspace = true
