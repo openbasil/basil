@@ -6,6 +6,15 @@ SPDX-License-Identifier: Apache-2.0
 
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- 2026-08-22 clean under Rust 1.98 clippy: allow `unused_async_trait_impl`
+  workspace-wide (the AFIT signing/verify/transport traits keep synchronous
+  local implementations by design), adopt `is_ok_and`/`as_chunks`/`const fn`
+  where the new lints asked, and drop unused test imports. No behavior change.
+
 ## 0.7.2 2026-07-31
 
 ### Configuration and policy

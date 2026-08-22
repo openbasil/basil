@@ -1086,13 +1086,13 @@ fn hex_decode<const N: usize>(text: &str) -> Option<[u8; N]> {
         return None;
     }
     let mut out = [0u8; N];
-    for (slot, pair) in out.iter_mut().zip(text.as_bytes().chunks_exact(2)) {
+    for (slot, pair) in out.iter_mut().zip(text.as_bytes().as_chunks::<2>().0) {
         let nibble = |byte| match byte {
             b'0'..=b'9' => Some(byte - b'0'),
             b'a'..=b'f' => Some(byte - b'a' + 10),
             _ => None,
         };
-        *slot = (nibble(*pair.first()?)? << 4) | nibble(*pair.get(1)?)?;
+        *slot = (nibble(pair[0])? << 4) | nibble(pair[1])?;
     }
     Some(out)
 }
@@ -1103,13 +1103,13 @@ fn decode_backend_id(text: &str) -> Option<String> {
         return None;
     }
     let mut bytes = Vec::with_capacity(text.len() / 2);
-    for pair in text.as_bytes().chunks_exact(2) {
+    for pair in text.as_bytes().as_chunks::<2>().0 {
         let nibble = |byte| match byte {
             b'0'..=b'9' => Some(byte - b'0'),
             b'a'..=b'f' => Some(byte - b'a' + 10),
             _ => None,
         };
-        bytes.push((nibble(*pair.first()?)? << 4) | nibble(*pair.get(1)?)?);
+        bytes.push((nibble(pair[0])? << 4) | nibble(pair[1])?);
     }
     String::from_utf8(bytes).ok()
 }

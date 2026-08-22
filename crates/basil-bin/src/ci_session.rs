@@ -1606,7 +1606,7 @@ fn open_directory_without_symlinks(path: &Path) -> Result<OwnedFd> {
 #[allow(clippy::indexing_slicing, clippy::unwrap_used)]
 mod tests {
     use std::collections::VecDeque;
-    use std::io::{BufRead as _, Write as _};
+    use std::io::BufRead as _;
     use std::os::unix::fs::PermissionsExt as _;
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicBool, Ordering};

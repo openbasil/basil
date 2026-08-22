@@ -202,7 +202,7 @@ impl KeyGlob {
     /// so `**` cannot be used to sidestep the `*` guardrail while granting the
     /// same reach.
     #[must_use]
-    pub fn matches_all(&self) -> bool {
+    pub const fn matches_all(&self) -> bool {
         match self {
             Self::AnyKey => true,
             Self::Pattern(segs) => matches!(segs.as_slice(), [GlobSeg::DoubleStar]),

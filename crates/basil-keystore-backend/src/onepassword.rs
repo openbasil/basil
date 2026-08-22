@@ -163,8 +163,7 @@ fn decode(raw: &str) -> String {
 #[cfg(target_os = "linux")]
 fn is_wsl2() -> bool {
     std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        .ok()
-        .is_some_and(|content| content.trim().ends_with("-microsoft-standard-WSL2"))
+        .is_ok_and(|content| content.trim().ends_with("-microsoft-standard-WSL2"))
 }
 
 #[cfg(not(target_os = "linux"))]

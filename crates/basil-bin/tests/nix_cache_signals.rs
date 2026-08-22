@@ -200,8 +200,7 @@ impl RunningCommand {
 
 fn has_event_phase(line: &str, expected: &str) -> bool {
     serde_json::from_str::<Value>(line)
-        .ok()
-        .is_some_and(|value| value.get("phase").and_then(Value::as_str) == Some(expected))
+        .is_ok_and(|value| value.get("phase").and_then(Value::as_str) == Some(expected))
 }
 
 fn audit_events(lines: &[String]) -> Vec<Value> {

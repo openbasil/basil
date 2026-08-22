@@ -55,6 +55,8 @@
 // entry-point futures are generic over unbounded `Signer`/`Verifier`/
 // `Recipient` implementations, and imposing `Send` here would forbid
 // legitimate single-threaded (e.g. WASM) implementors.
+// `unused_async_trait_impl` is allowed workspace-wide for the same reason:
+// local impls of these traits have no awaits by design.
 #![allow(async_fn_in_trait)]
 #![allow(clippy::future_not_send)]
 

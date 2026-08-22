@@ -110,7 +110,7 @@ fn base_claims() -> Value {
     json!({
         "iss": ISSUER,
         "aud": proof_audience(&PROOF_KEY),
-        "sub": format!("repo:openbasil/basil:ref:refs/heads/main"),
+        "sub": "repo:openbasil/basil:ref:refs/heads/main",
         "repository": "openbasil/basil",
         "repository_id": "42",
         "repository_owner_id": "7",

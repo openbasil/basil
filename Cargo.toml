@@ -213,6 +213,10 @@ unsafe_code = { level = "forbid", priority = 1 }
 pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }
 missing_errors_doc = { level = "allow", priority = 0 }
+# AFIT traits (Signer/Verifier/Recipient, invocation transports) are async for
+# remote-implementation symmetry; local implementations are synchronous by
+# design and legitimately contain no awaits.
+unused_async_trait_impl = { level = "allow", priority = 0 }
 # No-panic hardening (vault-g9n): the broker is an UNRESTARTABLE service. Any
 # runtime panic halts everything. These are `restriction`-group lints, set
 # individually at default priority so they coexist with the pedantic/nursery

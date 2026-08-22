@@ -534,7 +534,6 @@ mod tests {
     use async_trait::async_trait;
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
-    use basil_proto::broker::v1::nix_cache_service_server::NixCacheService as _;
     use basil_proto::broker::v1::signing_service_server::SigningService as _;
     use basil_proto::broker::v1::{BrokerErrorInfo, SignNixCacheFingerprintRequest};
     use basil_proto::google::rpc::Status as RpcStatus;
