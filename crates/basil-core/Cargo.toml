@@ -47,7 +47,7 @@ basil-nats = { workspace = true }
 basil-proto = { workspace = true }
 
 # Direct dep only to enable `aes/zeroize` (round-key scrubbing) for aes-gcm.
-aes = { workspace = true }
+# aes = { workspace = true }
 aes-gcm = { workspace = true }
 aes-kw = { workspace = true }
 age = { workspace = true }

@@ -31,7 +31,7 @@ onepassword = ["dep:serde", "dep:serde_json", "dep:url", "dep:percent-encoding"]
 basil = { workspace = true }
 
 # Direct dep only to enable `aes/zeroize` (round-key scrubbing) for aes-gcm.
-aes = { workspace = true }
+# aes = { workspace = true }
 aes-gcm = { workspace = true }
 # Rekey intent-marker ciphertext hashing (BLAKE3 custody chain).
 blake3 = { version = "1.8", optional = true }

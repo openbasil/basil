@@ -28,7 +28,7 @@ fixtures = []
 # collapses these to single copies in a workspace build.
 [dependencies]
 # Direct dep only to enable `aes/zeroize` (round-key scrubbing) for aes-gcm.
-aes = { workspace = true }
+# aes = { workspace = true }
 aes-gcm = { workspace = true }
 chacha20poly1305 = { workspace = true, features = ["alloc"] }
 ed25519-dalek = { workspace = true }

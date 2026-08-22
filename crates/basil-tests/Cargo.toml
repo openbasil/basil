@@ -29,18 +29,13 @@ unlock-bip39 = ["basil-core/unlock-bip39"]
 # halves an invocation boot provisions into the dev engine.
 base64 = { workspace = true, features = ["std"] }
 basil-core = { workspace = true, features = ["http", "unlock-age-yubikey", "unlock-bip39"] }
-basil-proto = { workspace = true, optional = true }
-hyper-util = { workspace = true, optional = true }
 rustix = { workspace = true }
 # Not a dev-dep: the shared harness (`src/lib.rs`) installs the pure-Rust `ring`
 # rustls `CryptoProvider` before any test builds a `reqwest` client (see
 # `ensure_crypto_provider`). `reqwest` itself stays test-only below.
 rustls = { workspace = true }
-serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true, features = ["std"] }
 spiffe = { workspace = true }
-tokio = { workspace = true, features = ["process"] }
-tonic = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
 zero-secrets = { workspace = true }
 zeroize = { workspace = true }
