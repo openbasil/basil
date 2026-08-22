@@ -286,17 +286,15 @@ fn base64url_no_pad(bytes: &[u8]) -> String {
     }
 
     let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    let mut chunks = bytes.chunks_exact(3);
-    for chunk in &mut chunks {
-        let &[a, b, c] = chunk else {
-            continue;
-        };
+    let chunks = bytes.as_chunks::<3>();
+    for chunk in chunks.0 {
+        let &[a, b, c] = chunk;
         output.push(alphabet(a >> 2));
         output.push(alphabet(((a & 0x03) << 4) | (b >> 4)));
         output.push(alphabet(((b & 0x0f) << 2) | (c >> 6)));
         output.push(alphabet(c & 0x3f));
     }
-    match chunks.remainder() {
+    match chunks.1 {
         [a] => {
             output.push(alphabet(a >> 2));
             output.push(alphabet((a & 0x03) << 4));

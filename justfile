@@ -190,7 +190,7 @@ check-go:
 check-sh:
     fd -e sh -0 | xargs -0 shellcheck
 
-check: (check-rust) (check-go) (check-sh)
+check: check-rust check-go check-sh
     typos
 
 # Validate the pinned source, patch, corpora, version, and platform manifest
