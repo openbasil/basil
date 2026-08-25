@@ -44,7 +44,7 @@ basil-proto = { version = "0.7.2", path = "crates/basil-proto" }
 # only scrubs the GHASH key) so its `zeroize` feature zeroizes AES round-key
 # schedules on drop; `aes-gcm` does not forward it.
 aes = { version = "0.9.2", default-features = false, features = ["zeroize"] }
-aes-gcm = { version = "0.11.0", default-features = false, features = ["aes", "alloc", "zeroize"] }
+aes-gcm = { version = "0.11.1", default-features = false, features = ["aes", "alloc", "zeroize"] }
 aes-kw = "0.3"
 # Temporary upstream pin for the post-0.12.1 PQ recipient work. Replace this
 # with the next crates.io release once it contains the same changes. The Rage
@@ -60,8 +60,8 @@ async-trait = "0.1.92"
 # `aws-smithy-http-client/rustls-aws-lc`). The `rustls` feature instead routes to
 # `legacy-rustls-ring` (pure-Rust ring). Pinned to the version pair known to
 # resolve this way; older 1.x differ.
-aws-config = { version = "=1.10.1", default-features = false, features = ["rt-tokio"] }
-aws-sdk-kms = { version = "=1.115.0", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
+aws-config = { version = "=1.11.0", default-features = false, features = ["rt-tokio"] }
+aws-sdk-kms = { version = "=1.117.0", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 base64 = { version = "0.23.1", default-features = false, features = ["alloc"] }
 bip39 = "2"
@@ -92,10 +92,10 @@ http-body-util = "0.1.5"
 httparse = "1.10.1"
 hyper = { version = "1.11.0", default-features = false, features = ["http1", "server"] }
 hyper-util = { version = "0.1.20", default-features = false, features = ["http1", "server-auto", "service", "tokio"] }
-# jsonwebtoken 10 requires selecting a crypto backend; `rust_crypto` uses the
+# jsonwebtoken 10&11 requires selecting a crypto backend; `rust_crypto` uses the
 # pure-Rust RustCrypto stack (no C toolchain), matching this workspace. Without
 # it the crate cannot determine a provider and panics at sign/verify time.
-jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
+jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
 keyring-core = "1.0.0"
 mimalloc = { version = "0.1.52", default-features = false }
 minicbor = { version = "2.3.0", default-features = false, features = ["alloc"] }
