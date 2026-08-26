@@ -54,7 +54,7 @@ const REQUEST_SUBJECT: &str = "basil.qualify.invoke";
 const CHALLENGE_SUBJECT: &str = "basil.qualify.challenge";
 const SOURCE_PARTITION: &str = "qualification-runner";
 const MAX_MESSAGE_BYTES: usize = 4 * 1024;
-const REQUIRED_NATS_VERSION: &str = "nats-server: v2.14.4";
+const REQUIRED_NATS_VERSION: &str = "nats-server: v2.14.5";
 const ASYNC_BOUND: Duration = Duration::from_secs(5);
 const PROCESS_REAP_BOUND: Duration = Duration::from_secs(2);
 const HEARTBEAT_EXCLUSION_BOUND: Duration = Duration::from_secs(4);
@@ -389,7 +389,7 @@ const fn federation_capabilities() -> GetInvocationCapabilitiesResponse {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn federation_qualifies_freshness_fidelity_replay_reorder_and_failures() {
     let _serial_guard = QUALIFICATION_SERIAL.lock().await;
-    require_nats_server_2_14_4();
+    require_nats_server_2_14_5();
 
     let port = port_from(&alloc_addr());
     let (mut nats_server, nats_url) = start_nats_server(port).await;
@@ -654,7 +654,7 @@ async fn federation_qualifies_freshness_fidelity_replay_reorder_and_failures() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn challenge_workers_are_partition_bounded_and_preserve_invoke_capacity() {
     let _serial_guard = QUALIFICATION_SERIAL.lock().await;
-    require_nats_server_2_14_4();
+    require_nats_server_2_14_5();
 
     let port = port_from(&alloc_addr());
     let (mut nats_server, nats_url) = start_nats_server(port).await;
@@ -752,7 +752,7 @@ async fn challenge_workers_are_partition_bounded_and_preserve_invoke_capacity() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn jetstream_lease_is_exclusive_renewed_before_forward_and_stops_intake_on_loss() {
     let _serial_guard = QUALIFICATION_SERIAL.lock().await;
-    require_nats_server_2_14_4();
+    require_nats_server_2_14_5();
 
     let port = port_from(&alloc_addr());
     let (mut nats_server, nats_url) = start_nats_server(port).await;
@@ -858,7 +858,7 @@ async fn jetstream_lease_is_exclusive_renewed_before_forward_and_stops_intake_on
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn jetstream_graceful_shutdown_deletes_only_the_owned_revision() {
     let _serial_guard = QUALIFICATION_SERIAL.lock().await;
-    require_nats_server_2_14_4();
+    require_nats_server_2_14_5();
 
     let port = port_from(&alloc_addr());
     let (mut nats_server, nats_url) = start_nats_server(port).await;
@@ -971,7 +971,7 @@ async fn jetstream_graceful_shutdown_deletes_only_the_owned_revision() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn jetstream_real_bucket_bounds_expiry_and_distinct_subject_pairs() {
     let _serial_guard = QUALIFICATION_SERIAL.lock().await;
-    require_nats_server_2_14_4();
+    require_nats_server_2_14_5();
 
     let port = port_from(&alloc_addr());
     let (mut nats_server, nats_url) = start_nats_server(port).await;
@@ -1076,7 +1076,7 @@ async fn jetstream_real_bucket_bounds_expiry_and_distinct_subject_pairs() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn legacy_mode_rejects_a_listener_that_claims_remote_freshness() {
     let _serial_guard = QUALIFICATION_SERIAL.lock().await;
-    require_nats_server_2_14_4();
+    require_nats_server_2_14_5();
 
     let port = port_from(&alloc_addr());
     let (mut nats_server, nats_url) = start_nats_server(port).await;
@@ -1208,7 +1208,7 @@ fn push_varint(output: &mut Vec<u8>, mut value: usize) {
     output.push(u8::try_from(value).expect("final varint byte fits u8"));
 }
 
-fn require_nats_server_2_14_4() {
+fn require_nats_server_2_14_5() {
     let mut child = Command::new("nats-server")
         .arg("--version")
         .stdout(Stdio::piped())

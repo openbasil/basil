@@ -71,6 +71,7 @@
             actionlint
             jq
             just
+            nats-server
             protobuf
             python3
           ];
