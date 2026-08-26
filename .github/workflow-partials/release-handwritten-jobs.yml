@@ -1,14 +1,14 @@
-# release-handwritten-jobs.yaml -- GitHub Actions jobs appended to release.yml.
+# release-handwritten-jobs.yml -- GitHub Actions jobs appended to release.yml.
 #
 # cargo-dist OWNS ../release.yml: `dist generate` rewrites it from
 # dist-workspace.toml and DROPS anything hand-added. dist 0.32.0 has no native
 # `.deb` or Arch packaging, so the two jobs below live here and are re-appended
 # to release.yml by `just gen-release-workflow` after every regeneration.
 #
-# This is NOT a runnable workflow. It sits in a subdirectory of
-# .github/workflows/, which GitHub Actions never scans (only files directly in
-# .github/workflows/ are loaded), so GitHub will not try to execute this partial.
+# This is NOT a runnable workflow. It lives outside .github/workflows/, so
+# GitHub Actions and actionlint will not try to execute or validate this partial.
 #
+# Keep this header at 16 lines; the generator verifies the anchor position.
 # INDENTATION ANCHOR: the `jobs:` key on line 16 exists ONLY so a YAML
 # auto-formatter keeps every job at its correct 2-space indent instead of
 # flushing it to column 0. `just gen-release-workflow` skips this 16-line header

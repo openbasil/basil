@@ -34,8 +34,8 @@ if ! gh auth status >/dev/null 2>&1 && [ -z "${GH_TOKEN:-}" ]; then
   exit 1
 fi
 
-# Default target set: the runnable workflows (NOT partials/, which GitHub never
-# executes and which are re-appended and pinned via the assembled release.yml).
+# Default target set: the runnable top-level workflows. Hand-written fragments
+# live outside this directory and are pinned via the assembled release.yml.
 if [ "$#" -gt 0 ]; then
   files=("$@")
 else

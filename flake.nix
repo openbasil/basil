@@ -68,9 +68,11 @@
           };
           toolchainNightly = inputs.fenix.packages.${system}.latest.toolchain;
           shellTools = with pkgs; [
+            actionlint
             jq
             just
             protobuf
+            python3
           ];
 
           # Build Basil package and check derivations. Package builds omit the

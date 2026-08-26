@@ -10,6 +10,9 @@ SPDX-License-Identifier: Apache-2.0
 
 ### Changed
 
+- GitHub Actions now pass actionlint and its embedded ShellCheck analysis.
+  Release workflow regeneration preserves the shell fixes, and non-runnable
+  release job fragments live outside GitHub's workflow discovery directory.
 - 2026-08-22 clean under Rust 1.98 clippy: allow `unused_async_trait_impl`
   workspace-wide (the AFIT signing/verify/transport traits keep synchronous
   local implementations by design), adopt `is_ok_and`/`as_chunks`/`const fn`

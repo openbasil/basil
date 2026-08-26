@@ -14,14 +14,14 @@ man-pages out="target/man":
 
 # Regenerate .github/workflows/release.yml from the cargo-dist config, then
 # re-append the hand-written jobs (debian-packages + arch-package) that dist
-# 0.32.0 cannot emit. The jobs live in .github/workflows/partials/release-handwritten-jobs.yml
-# under a `jobs:` indentation anchor (a subdir, so GitHub Actions ignores it).
+# 0.32.0 cannot emit. The jobs live in .github/workflow-partials/release-handwritten-jobs.yml
+# under a `jobs:` indentation anchor, outside GitHub's workflow discovery path.
 # Run this after bumping cargo-dist-version or editing the hand-written jobs.
 gen-release-workflow:
     #!/usr/bin/env bash
     set -euo pipefail
     workflow=.github/workflows/release.yml
-    fragment=.github/workflows/partials/release-handwritten-jobs.yml
+    fragment=.github/workflow-partials/release-handwritten-jobs.yml
     # Lines to skip in the fragment: its header through the `jobs:` anchor. The
     # header exists only to keep a YAML auto-formatter from de-indenting the jobs.
     header_lines=16
@@ -119,6 +119,9 @@ gen-release-workflow:
       -e 's|^      - '\''\*\*\[0-9\]+\.\[0-9\]+\.\[0-9\]+\*'\''$|      - "v[0-9]+.[0-9]+.[0-9]+*"|' \
       -e 's|^      - '\''v\[0-9\]+\.\[0-9\]+\.\[0-9\]+\*'\''$|      - "v[0-9]+.[0-9]+.[0-9]+*"|' \
       "$workflow"
+    # cargo-dist 0.32.0 emits shell constructs that shellcheck rejects. Keep the
+    # generated portion safe and actionlint-clean without hand-editing it later.
+    scripts/normalize-release-workflow.py "$workflow"
     # ... then re-append the hand-written jobs, minus the anchor header.
     tail -n +"$((header_lines + 1))" "$fragment" >> "$workflow"
     # dist emits actions pinned to moving tags (`@v4`); dist 0.32 has no config
@@ -190,7 +193,12 @@ check-go:
 check-sh:
     fd -e sh -0 | xargs -0 shellcheck
 
-check: check-rust check-go check-sh
+# GitHub Actions syntax and embedded-shell gates.
+check-actions:
+    scripts/normalize-release-workflow.py --check .github/workflows/release.yml
+    actionlint
+
+check: check-rust check-go check-sh check-actions
     typos
 
 # Validate the pinned source, patch, corpora, version, and platform manifest
