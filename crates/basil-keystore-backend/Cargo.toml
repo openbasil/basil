@@ -24,6 +24,13 @@ db-keystore = [
   "dep:keyring-core",
   "dep:blake3",
   "dep:rustix",
+  "dep:turso_ext",
+  "dep:turso_macros",
+  "dep:turso_parser",
+  "dep:turso_sdk_kit",
+  "dep:turso_sdk_kit_macros",
+  "dep:turso_sync_engine",
+  "dep:turso_sync_sdk_kit",
 ]
 onepassword = ["dep:serde", "dep:serde_json", "dep:url", "dep:percent-encoding"]
 
@@ -45,6 +52,16 @@ rustix = { workspace = true, optional = true }
 serde = { workspace = true, optional = true, features = ["std"] }
 serde_json = { workspace = true, optional = true, features = ["std"] }
 thiserror = { workspace = true }
+# Constraint-only dependencies keep the complete reviewed Turso family exact
+# for published consumers. The runtime code reaches these crates through
+# `db-keystore`; listing them here adds no new implementation dependency.
+turso_ext = { version = "=0.7.2", default-features = false, optional = true }
+turso_macros = { version = "=0.7.2", default-features = false, optional = true }
+turso_parser = { version = "=0.7.2", default-features = false, optional = true }
+turso_sdk_kit = { version = "=0.7.2", default-features = false, optional = true }
+turso_sdk_kit_macros = { version = "=0.7.2", default-features = false, optional = true }
+turso_sync_engine = { version = "=0.7.2", default-features = false, optional = true }
+turso_sync_sdk_kit = { version = "=0.7.2", default-features = false, optional = true }
 url = { workspace = true, optional = true }
 zero-secrets = { workspace = true }
 zeroize = { workspace = true }

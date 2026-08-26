@@ -357,8 +357,14 @@ fn recovery_files(dir: &TestDir) -> RecoveryFiles {
 #[test]
 fn sidecar_suffix_set_is_pinned_to_the_turso_family() {
     assert_eq!(SIDECAR_SUFFIXES, ["-wal", "-tshm"]);
-    let lock = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"))
-        .expect("read workspace Cargo.lock");
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let lock = [
+        manifest_dir.join("../../Cargo.lock"),
+        manifest_dir.join("Cargo.lock"),
+    ]
+    .into_iter()
+    .find_map(|path| std::fs::read_to_string(path).ok())
+    .expect("read workspace or packaged-crate Cargo.lock");
 
     let mut package = None;
     let mut found_turso = false;
