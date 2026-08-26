@@ -2295,18 +2295,6 @@ const fn kem_provider_dispatch(
 /// (the 94 visible, non-space ASCII characters).
 const ASCII_PRINTABLE: &[u8] = b"!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
 
-#[allow(
-    deprecated,
-    reason = "the age-x25519 catalog format explicitly provisions an X25519 identity"
-)]
-fn generate_age_x25519_identity() -> Vec<u8> {
-    age::x25519::Identity::generate()
-        .to_string()
-        .expose_secret()
-        .as_bytes()
-        .to_vec()
-}
-
 /// Generate a fresh `value` from its catalog `generate` recipe (`vault-a2p`
 /// rotation path). Implements byte-string formats and in-process age identities.
 pub(crate) fn generate_value(spec: &GenerateSpec) -> Result<Vec<u8>, ManagerError> {
@@ -2341,7 +2329,11 @@ pub(crate) fn generate_value(spec: &GenerateSpec) -> Result<Vec<u8>, ManagerErro
             }
             Ok(out.into_bytes())
         }
-        GenerateSpec::AgeX25519 => Ok(generate_age_x25519_identity()),
+        GenerateSpec::AgeX25519 => Ok(age::x25519::Identity::generate()
+            .to_string()
+            .expose_secret()
+            .as_bytes()
+            .to_vec()),
         GenerateSpec::SelfSignedTls {
             common_name,
             validity,

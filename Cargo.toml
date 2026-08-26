@@ -46,11 +46,7 @@ basil-proto = { version = "0.7.2", path = "crates/basil-proto" }
 aes = { version = "0.9.2", default-features = false, features = ["zeroize"] }
 aes-gcm = { version = "0.11.1", default-features = false, features = ["aes", "alloc", "zeroize"] }
 aes-kw = "0.3"
-# Temporary upstream pin for the post-0.12.1 PQ recipient work. Replace this
-# with the next crates.io release once it contains the same changes. The Rage
-# workspace patches required by this revision are mirrored below because Cargo
-# does not inherit patches from dependencies.
-age = { version = "0.12.1", features = ["plugin"], git = "https://github.com/str4d/rage", rev = "35396472a34e48d0a7e6634c60f5c9f804bcb871" }
+age = { version = "=0.11.5", features = ["plugin"] }
 anyhow = "1"
 argon2 = "0.5"
 async-nats = { version = "0.50.0", default-features = false, features = ["nkeys", "ring", "server_2_10", "server_2_11", "server_2_12", "server_2_14"] }
@@ -181,10 +177,6 @@ zeroize = { version = "1.9.0", default-features = false, features = ["derive", "
 # which would violate the no-C-toolchain constraint. Pinned exact so a
 # wire-format bump can't silently change the on-disk slot.
 tpm2-protocol = "=1.0.0"
-
-[patch.crates-io]
-hpke = { git = "https://github.com/str4d/rust-hpke.git", rev = "1268205e6bf8080e8139da466fe834a23e954260" }
-x-wing = { git = "https://github.com/str4d/RustCrypto-KEMs.git", rev = "f5dd74e238bfebc0b36754923ccc6157d75641e6" }
 
 # INVARIANT (C2, basil-eds8/basil-gq77): no basil profile may set
 # panic = "abort". The db-keystore rekey path relies on `catch_unwind`

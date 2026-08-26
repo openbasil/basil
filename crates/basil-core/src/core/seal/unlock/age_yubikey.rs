@@ -60,8 +60,12 @@ impl AgeYubikeyMethod {
         recipient: impl Into<String>,
         plugin_name: &str,
     ) -> Result<Self, UnlockError> {
-        let identity = age::plugin::Identity::default_for_plugin(plugin_name)
-            .map_err(|e| UnlockError::Unavailable(format!("age plugin {plugin_name}: {e}")))?;
+        if !valid_default_plugin_name(plugin_name) {
+            return Err(UnlockError::Unavailable(
+                "invalid age plugin name".to_string(),
+            ));
+        }
+        let identity = age::plugin::Identity::default_for_plugin(plugin_name);
         let plugin = age::plugin::IdentityPluginV1::new(plugin_name, &[identity], NoCallbacks)
             .map_err(|e| UnlockError::Unavailable(format!("age plugin {plugin_name}: {e}")))?;
         Ok(Self {
@@ -90,6 +94,21 @@ impl AgeYubikeyMethod {
                 .map_err(|e| UnlockError::Unavailable(format!("age plugin {plugin_name}: {e}")))?;
         Ok(Box::new(recip))
     }
+}
+
+fn valid_default_plugin_name(plugin_name: &str) -> bool {
+    // `age` 0.11.5 validates only the plugin-name character set before its
+    // infallible constructor encodes `age-plugin-{name}-` as a Bech32 HRP.
+    // Enforce the remaining Bech32 and round-trip constraints here so that
+    // upstream `expect`/`unwrap` paths are unreachable.
+    !plugin_name.is_empty()
+        && plugin_name.len() <= 71
+        && !plugin_name.ends_with('-')
+        && plugin_name.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'+' | b'-' | b'.' | b'_')
+        })
 }
 
 impl UnlockMethod for AgeYubikeyMethod {
@@ -175,10 +194,6 @@ impl UnlockMethod for AgeYubikeyMethod {
 }
 
 #[cfg(test)]
-#[allow(
-    deprecated,
-    reason = "these tests exercise the YubiKey plugin path with X25519 fixtures"
-)]
 mod tests {
     use super::*;
     use crate::seal::format::Header;
@@ -263,6 +278,36 @@ mod tests {
             .with_identity(Box::new(identity));
 
         assert!(method.available());
+    }
+
+    #[test]
+    fn plugin_name_validation_prevents_age_constructor_panics() {
+        let maximum_length_name = "a".repeat(71);
+        for name in ["yubikey", "vendor.plugin+v2", "-leading"] {
+            assert!(valid_default_plugin_name(name), "valid plugin name: {name}");
+        }
+        assert!(valid_default_plugin_name(&maximum_length_name));
+
+        let overlong_name = "a".repeat(72);
+        for name in [
+            "",
+            "YubiKey_1",
+            "space name",
+            "slash/name",
+            "non-ascii-é",
+            "-",
+            "vendor-",
+            &overlong_name,
+        ] {
+            assert!(
+                !valid_default_plugin_name(name),
+                "invalid plugin name: {name}"
+            );
+            assert!(matches!(
+                AgeYubikeyMethod::with_plugin("age1invalid", name),
+                Err(UnlockError::Unavailable(_))
+            ));
+        }
     }
 
     #[test]

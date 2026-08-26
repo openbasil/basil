@@ -46,6 +46,10 @@ ignore = [
   # Unmaintained (no vulnerability): rustls-pemfile via google-cloud-* tonic
   # 0.12.
   { id = "RUSTSEC-2025-0134", reason = "unmaintained PEM parser via google-cloud KMS tonic 0.12 pin; tracked basil-0niq" },
+  # Unmaintained (no vulnerability): proc-macro-error2 via age 0.11.5 and
+  # i18n-embed-fl 0.9.4. A tagged replacement must preserve Basil's reviewed
+  # ML-KEM graph; tracked by basil-ik7x and basil-0niq.
+  { id = "RUSTSEC-2026-0173", reason = "unmaintained proc-macro-error2 via age 0.11.5; compatible tagged replacement pending; tracked basil-ik7x and basil-0niq" },
 ]
 
 [licenses]
@@ -94,11 +98,3 @@ deny = [
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# Temporary, revision-pinned upstream dependency for basil-ik7x. Revert this
-# allowlist together with the `age` Git pin when the successor release lands.
-required-git-spec = "rev"
-allow-git = [
-  "https://github.com/str4d/rage",
-  "https://github.com/str4d/RustCrypto-KEMs",
-  "https://github.com/str4d/rust-hpke",
-]

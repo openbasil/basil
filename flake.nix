@@ -126,11 +126,6 @@
                 version = workspace_version;
                 cargoLock = {
                   lockFile = ./Cargo.lock;
-                  outputHashes = {
-                    "age-0.12.1" = "sha256-5d6GgktZeEXW/WpxdqdwZrlDtQ8hZTNX4Z2SZ8zIpYE=";
-                    "hpke-0.14.0" = "sha256-zfFj7rr68584WueYAnGrAQIlXpu1E5b3dkYyG0Uo5ts=";
-                    "x-wing-0.1.0" = "sha256-7c77Kggk8QzoYCyCJJ5ndErCu2ZzMlIHbQ2Fb7d2o8o=";
-                  };
                 };
                 src = ./.;
                 nativeBuildInputs = [ buildProtobuf ];
