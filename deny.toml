@@ -91,8 +91,8 @@ allow-wildcard-paths = true
 # past its ceiling — but cargo never auto-selects pre-releases, so that bump
 # requires a Cargo.toml edit, which is itself the review trigger.
 deny = [
-  # basil-iry5: keystore-backend store adapter; requalified at 0.5.0.
-  { crate = "db-keystore@>=0.5.1", reason = "supply-chain ceiling: re-review the dependency diff and raise this ceiling in the same change (basil-0npm; requalification basil-iry5)" },
+  # basil-njmj: keystore-backend store adapter; requalified at 0.5.1.
+  { crate = "db-keystore@>=0.5.2", reason = "supply-chain ceiling: re-review the dependency diff and raise this ceiling in the same change (basil-0npm; requalification basil-njmj)" },
 ]
 
 [sources]

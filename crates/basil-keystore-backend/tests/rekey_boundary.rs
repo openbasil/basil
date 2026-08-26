@@ -352,30 +352,45 @@ fn recovery_files(dir: &TestDir) -> RecoveryFiles {
     }
 }
 
-/// Adoption condition C3: the turso version and the sidecar suffix set are
+/// Adoption condition C3: the turso-family versions and sidecar suffix set are
 /// pinned together; a turso bump must fail here until the set is re-verified.
 #[test]
-fn sidecar_suffix_set_is_pinned_to_the_turso_version() {
+fn sidecar_suffix_set_is_pinned_to_the_turso_family() {
     assert_eq!(SIDECAR_SUFFIXES, ["-wal", "-tshm"]);
     let lock = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"))
         .expect("read workspace Cargo.lock");
-    let mut version = None;
-    let mut lines = lock.lines();
-    while let Some(line) = lines.next() {
-        if line.trim() == "name = \"turso\"" {
-            version = lines.next().and_then(|v| {
-                v.trim()
-                    .strip_prefix("version = \"")
-                    .and_then(|v| v.strip_suffix('"'))
-            });
-            break;
+
+    let mut package = None;
+    let mut found_turso = false;
+    let mut found_turso_core = false;
+    for line in lock.lines() {
+        let line = line.trim();
+        if line == "[[package]]" {
+            package = None;
+        } else if let Some(name) = line
+            .strip_prefix("name = \"")
+            .and_then(|name| name.strip_suffix('"'))
+        {
+            package = Some(name);
+        } else if let Some(version) = line
+            .strip_prefix("version = \"")
+            .and_then(|version| version.strip_suffix('"'))
+            && let Some(name) = package
+            && (name == "turso" || name.starts_with("turso_"))
+        {
+            assert_eq!(
+                version, PINNED_TURSO_VERSION,
+                "{name} version changed: re-verify the WAL/SHM sidecar suffix set \
+                 and the resolved turso-family diff, then update PINNED_TURSO_VERSION"
+            );
+            found_turso |= name == "turso";
+            found_turso_core |= name == "turso_core";
         }
     }
-    assert_eq!(
-        version,
-        Some(PINNED_TURSO_VERSION),
-        "turso version changed: re-verify the WAL/SHM sidecar suffix set \
-         against the new turso, then update PINNED_TURSO_VERSION"
+    assert!(found_turso, "workspace lockfile has no turso package");
+    assert!(
+        found_turso_core,
+        "workspace lockfile has no turso_core package"
     );
 }
 
