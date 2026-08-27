@@ -6,9 +6,11 @@ SPDX-License-Identifier: Apache-2.0
 
 # Changelog
 
-## Unreleased
+## 0.8.0-alpha.1
 
 ### Changed
+
+- 2026-09-04 - bumped rust-toolchain to 1.98.1.
 
 - CI and the Nix development shell qualify the local action under Node.js 24
   through `just test-actions`. `just check-actions` includes the same lifecycle
