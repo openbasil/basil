@@ -113,8 +113,12 @@ jobs:
         include: ${{ fromJson(needs.matrix.outputs.all) }}
     runs-on: ${{ matrix.runner }}
     steps:
+      # Provider policy checks inspect the immutable self-action pin in this branch's history.
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
 
       # Provision the exact toolchain pinned by rust-toolchain.toml (channel +
       # rustfmt/clippy components + targets). `rustup show` installs the

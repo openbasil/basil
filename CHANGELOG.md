@@ -12,7 +12,9 @@ SPDX-License-Identifier: Apache-2.0
 
 - CI and the Nix development shell qualify the local action under Node.js 24
   through `just test-actions`. `just check-actions` includes the same lifecycle
-  and provider-workflow policy tests in local gates.
+  and provider-workflow policy tests in local gates. Branch-dispatched CI
+  verifies that protected workflows pin a published ancestor of the selected
+  revision whose action payload matches the checked-in runtime.
 
 ## 0.8.0 2026-08-27
 

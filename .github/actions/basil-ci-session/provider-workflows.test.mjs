@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
@@ -14,6 +14,17 @@ const repository = path.resolve(actionDirectory, "../../..");
 
 function workflow(relativePath) {
   return fs.readFileSync(path.join(repository, relativePath), "utf8");
+}
+
+function indentedBlock(text, key, indentation) {
+  const prefix = " ".repeat(indentation);
+  const marker = `${prefix}${key}:\n`;
+  const start = text.indexOf(marker);
+  assert.notEqual(start, -1, `missing ${key} block`);
+
+  const body = text.slice(start + marker.length);
+  const nextBlock = body.search(new RegExp(`^${prefix}\\S`, "mu"));
+  return nextBlock === -1 ? body : body.slice(0, nextBlock);
 }
 
 function actionRevision(text) {
@@ -37,24 +48,53 @@ test("action and qualification runtime use the checked-in Node major", () => {
 });
 
 function assertPinnedActionExists(revision) {
-  execFileSync("git", ["cat-file", "-e", `${revision}^{commit}`], {
+  const object = spawnSync("git", ["cat-file", "-e", `${revision}^{commit}`], {
     cwd: repository,
     stdio: "ignore",
   });
+  assert.equal(
+    object.status,
+    0,
+    `pinned action revision ${revision} must be available in the checkout`,
+  );
+  const checkedOutRevision = process.env.GITHUB_SHA || "HEAD";
+  if (process.env.GITHUB_SHA) {
+    const checkedOutHead = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: repository,
+      encoding: "utf8",
+    }).trim();
+    assert.equal(
+      checkedOutHead,
+      process.env.GITHUB_SHA,
+      "checkout HEAD must match the triggering GITHUB_SHA",
+    );
+  }
+  const ancestry = spawnSync(
+    "git",
+    ["merge-base", "--is-ancestor", revision, checkedOutRevision],
+    { cwd: repository, stdio: "ignore" },
+  );
+  assert.equal(
+    ancestry.status,
+    0,
+    `pinned action revision ${revision} must be an ancestor of ${checkedOutRevision}`,
+  );
   for (const relative of [
     "action.yml",
     "main.mjs",
     "post.mjs",
     "session.mjs",
   ]) {
-    execFileSync(
+    const pinned = execFileSync(
       "git",
-      [
-        "cat-file",
-        "-e",
-        `${revision}:.github/actions/basil-ci-session/${relative}`,
-      ],
-      { cwd: repository, stdio: "ignore" },
+      ["show", `${revision}:.github/actions/basil-ci-session/${relative}`],
+      { cwd: repository },
+    );
+    const checkedIn = fs.readFileSync(path.join(actionDirectory, relative));
+    assert.deepEqual(
+      pinned,
+      checkedIn,
+      `${relative} must match pinned action revision ${revision}`,
     );
   }
 
@@ -147,4 +187,12 @@ test("provider workflows pin the same reviewed action revision", () => {
   const github = workflow(".github/workflows/basil-ci-session-protected.yml");
   const forgejo = workflow(".forgejo/workflows/basil-ci-session-protected.yml");
   assert.equal(actionRevision(github), actionRevision(forgejo));
+});
+
+test("CI fetches triggering branch history before action qualification", () => {
+  const ciJob = indentedBlock(workflow(".github/workflows/ci.yml"), "ci", 2);
+  assert.match(
+    ciJob,
+    /- name: Checkout\n {8}uses: actions\/checkout@[0-9a-f]{40}[^\n]*\n {8}with:\n {10}persist-credentials: false\n {10}fetch-depth: 0/u,
+  );
 });

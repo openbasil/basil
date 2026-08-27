@@ -19,7 +19,7 @@ jobs:
     steps:
       - name: Start Basil CI session
         id: session
-        uses: openbasil/basil/.github/actions/basil-ci-session@ccb3705a950cb85b84ff152b73936195ad739c1a
+        uses: openbasil/basil/.github/actions/basil-ci-session@fe68666e22d861ce579ef5e3b4f693695fa00259
         with:
           basil-executable: /usr/local/bin/basil
           basil-executable-sha256: ${{ secrets.BASIL_CI_EXECUTABLE_SHA256 }}
