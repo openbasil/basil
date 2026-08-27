@@ -126,9 +126,10 @@ errors, zeroized secret paths, and an append-only audit trail. The
 out what Basil defends against and, just as importantly, what it does not.
 Startup and reload logs also trace each configuration source by slot, resolved
 path, modification time, byte size, and SHA-256 hash. Rejected reloads keep and
-identify the active generation. New configurations use the schema-3 corpus
-bootstrap; Basil 0.7.2 continues to accept the 0.7.1 config, catalog, policy,
-and direct source flags during migration.
+identify the active generation. Basil 0.8.0 requires a complete schema-3
+corpus. Legacy agent configuration, catalog v1, policy v2, and the removed
+direct source flags fail closed; migrate all configuration documents before
+upgrading.
 
 To report a vulnerability, please use the private channels described in
 [SECURITY.md](SECURITY.md): email security@openbasil.org or GitHub private
@@ -139,7 +140,7 @@ vulnerabilities.
 
 [Feature matrix and Roadmap](https://docs.openbasil.org/reference/feature-matrix/)
 
-Basil is pre-1.0 (currently 0.7.x) and under active development.
+Basil is pre-1.0 (currently 0.8.x) and under active development.
 All changes are documented in [CHANGELOG.md](CHANGELOG.md).
 
 Basil is committed to following Rust SEMVER conventions: any breaking api change or wire

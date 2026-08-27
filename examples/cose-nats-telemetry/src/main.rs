@@ -431,6 +431,8 @@ async fn build_telemetry(signer: &basil::BrokerSigner) -> Result<Vec<u8>> {
         response_subject: None,
         in_reply_to: None,
         request_hash: None,
+        freshness_challenge: None,
+        response_public_key_cose: None,
     };
     let cose = build_signed(
         &SignParams {

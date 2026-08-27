@@ -43,8 +43,8 @@ let
 
   platformTable = {
     x86_64-linux = {
-      tier = "production";
-      production = true;
+      tier = "preview";
+      production = false;
       qualification = {
         mode = "native-full-build";
         status = "passed";
@@ -52,8 +52,8 @@ let
       };
     };
     aarch64-linux = {
-      tier = "production";
-      production = true;
+      tier = "preview";
+      production = false;
       qualification = {
         mode = "native-full-build";
         status = "pending";

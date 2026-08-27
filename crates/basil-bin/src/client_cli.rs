@@ -2497,12 +2497,12 @@ mod tests {
     fn status_json_shape_is_backend_version_protocol() {
         let s = basil::AgentStatus {
             backend: "keystore".to_string(),
-            version: "0.7.2".to_string(),
+            version: "0.8.0".to_string(),
             protocol: 1,
         };
         let v = status_json(&s);
         assert_eq!(v["backend"], serde_json::json!("keystore"));
-        assert_eq!(v["version"], serde_json::json!("0.7.2"));
+        assert_eq!(v["version"], serde_json::json!("0.8.0"));
         assert_eq!(v["protocol"], serde_json::json!(1));
         let obj = v.as_object().expect("status --json is a JSON object");
         assert_eq!(

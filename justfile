@@ -223,8 +223,8 @@ check-nix-pilot-matrix:
       pilot_patch_flags="$(nix eval --json ".#packages.${pilot_system}.nix-pilot-cli.basilPilot.sourcePatchFlags")"
       test "${pilot_patch_flags}" = '["-p1","--fuzz=0"]'
       case "${pilot_system}:${pilot_tier}:${pilot_evidence}:${pilot_status}" in
-        x86_64-linux:production:native-full-build:passed) ;;
-        aarch64-linux:production:native-full-build:pending) ;;
+        x86_64-linux:preview:native-full-build:passed) ;;
+        aarch64-linux:preview:native-full-build:pending) ;;
         aarch64-darwin:development:evaluation-only:passed) ;;
         *) echo "unexpected Nix pilot evidence: ${pilot_system}:${pilot_tier}:${pilot_evidence}:${pilot_status}" >&2; exit 1 ;;
       esac

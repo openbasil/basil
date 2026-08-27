@@ -8,17 +8,54 @@ SPDX-License-Identifier: Apache-2.0
 
 ## Unreleased
 
-### Changed
+## 0.8.0 2026-08-27
 
-- GitHub Actions now pass actionlint and its embedded ShellCheck analysis.
-  Release workflow regeneration preserves the shell fixes, and non-runnable
-  release job fragments live outside GitHub's workflow discovery directory.
-- 2026-08-22 clean under Rust 1.98 clippy: allow `unused_async_trait_impl`
-  workspace-wide (the AFIT signing/verify/transport traits keep synchronous
-  local implementations by design), adopt `is_ok_and`/`as_chunks`/`const fn`
-  where the new lints asked, and drop unused test imports. No behavior change.
+### Breaking API and protocol changes
 
-## 0.7.2 2026-07-31
+- Generated Rust `AdminService` server implementations must add
+  `ListConnections` and `DropConnections`; `InvocationService` implementations
+  must add `GetInvocationChallenge` and `GetInvocationCapabilities`. Reload
+  and readiness responses gain listener-rewire fields, and the protocol adds
+  the purpose-specific `NixCacheService`.
+- In the Rust `basil` client, `AgentReadiness`, `AgentReload`, and
+  `SealedInvocationOptions` gain fields, and `Error` gains `Protocol`.
+  Exhaustive matches on `InvocationStatusCode` must handle
+  `ChallengeUnknown` and `PerRunQuotaExceeded`.
+- In `basil-cose`, `Claims`, `ProtectedHeaders`, and `VerifiedSealed` gain
+  fields. `ProfileError`, `DecodeError`, `ClaimsError`, and `BuildError` gain
+  variants.
+- In `basil-core`, `ReloadInputs` changes from an enum to a struct;
+  `PrincipalSpec`, `SubjectMatch`, and unauthenticated policy subjects are
+  replaced by domain-scoped evidence expressions; unauthenticated actor
+  resolution and invocation replay-capacity interfaces are replaced by
+  stricter context and challenge-table interfaces. Bundle-opening helpers are
+  now crate-private.
+- In `basil-nats-bridge`, `MESSAGE_HEADER` and `BridgeErrorReply::message` are
+  removed; `BasilInvokeError` is replaced by `CourierCallError`.
+  `BasilInvoker::invoke` changes its error type and implementers must add
+  `get_challenge`; `BasilGrpcInvoker::connect` now takes `&BasilConfig` and a
+  `bool` challenge requirement. `BasilConfig` and `BridgeConfig` gain fields,
+  and the closed `BridgeErrorCode` and `ConfigError` enums gain variants.
+- Schema 3 is required in 0.8.0. Legacy agent configuration, catalog v1,
+  policy v2, and the removed direct `--catalog`, `--policy`, and `--bundle`
+  source flags fail closed. Policy subjects must move from principal arrays and
+  `unauthenticatedSubject` to domain-scoped recursive evidence expressions.
+  Migrate the complete corpus and select its schema-3 bootstrap with
+  `-c`/`--config` or `BASIL_CONFIG` before upgrading.
+
+### Support boundaries
+
+- GitHub OIDC federation, the `basil-ci-session` action, and real-provider
+  workflows are preview features until the external provider and runner
+  qualification tracked by `basil-jjgi.10` completes. Forgejo remains an
+  unsupported experimental provider that requires an operator opt-in.
+- The Nix cache service, clients, local mutation commands, external signer,
+  and patched-Nix integration are preview features until native platform
+  qualification and the contract-freeze work under `basil-bimd` completes.
+- The matching Go client source is frozen at commit
+  `97266ce4885d3ed208a0d25e5c22666e356eda69`. Release publication must tag
+  that exact boundary as `v0.8.0`; release-candidate users must pin the commit
+  until the tag exists.
 
 ### Configuration and policy
 
@@ -26,10 +63,6 @@ SPDX-License-Identifier: Apache-2.0
   schema-3 agent bootstrap names its catalog, policy, and sealed bundle under
   `[import]`; typed `-o PATH=VALUE` startup overrides are validated, bounded,
   reapplied on reload, and reported without logging their values.
-- Keeps the 0.7.1 top-level config keys, direct `--catalog`/`--policy`/`--bundle`
-  flags, catalog v1, and policy v2 working. Existing installations can upgrade
-  without migrating their configuration; new and generated configuration uses
-  schema 3.
 - Startup, offline validation, and reload use bounded, race-checked reads and
   emit source provenance with the resolved path, size, modification time, and
   SHA-256 digest. A rejected reload leaves the active generation serving.
@@ -48,10 +81,15 @@ SPDX-License-Identifier: Apache-2.0
   work from Jujutsu workspaces while keeping the sandbox sealed from unrelated
   host paths.
 
-### Release scope
+### Changed
 
-- Keeps Docker and Podman runtime integration, container-only image packaging,
-  and rootless-container qualification outside the 0.7.2 maintenance line.
+- GitHub Actions now pass actionlint and its embedded ShellCheck analysis.
+  Release workflow regeneration preserves the shell fixes, and non-runnable
+  release job fragments live outside GitHub's workflow discovery directory.
+- 2026-08-22 clean under Rust 1.98 clippy: allow `unused_async_trait_impl`
+  workspace-wide (the AFIT signing/verify/transport traits keep synchronous
+  local implementations by design), adopt `is_ok_and`/`as_chunks`/`const fn`
+  where the new lints asked, and drop unused test imports. No behavior change.
 
 ## 0.7.1 2026-07-08
 

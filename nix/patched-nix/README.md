@@ -13,7 +13,7 @@ $ nix build .#nix-pilot-full
 
 The resulting `nix` accepts `nix store sign --signer-socket PATH`. Use it with
 `basil nix signer serve`; use `basil nix cache sign|replace|remove` for
-production mutation of a `file://` binary cache.
+preview mutation of a `file://` binary cache.
 
 ## Provenance
 
@@ -28,7 +28,7 @@ source, confirms the reported Nix version, and compares the patched
 The source derivations actually consumed by both package lanes set
 `patchFlags = [ "-p1" "--fuzz=0" ]`. Evaluation asserts those effective flags
 and asserts that the CLI, utility tests, and functional tests consume the
-resulting strict source. Both production pilot outputs also depend on the
+resulting strict source. Both pilot outputs also depend on the
 provenance derivation, so a package build cannot bypass reconstruction and
 whole-tree comparison.
 
@@ -68,7 +68,7 @@ $ just check-nix-pilot-master-compat
 
 ## Platform tiers
 
-`x86_64-linux` and `aarch64-linux` are production pilot targets, but only the
+`x86_64-linux` and `aarch64-linux` are preview pilot targets, but only the
 `x86_64-linux` full package has passed a native build. Native full-build
 qualification for `aarch64-linux` is pending. `aarch64-darwin` is a
 development-only, evaluation-qualified target. The package passthrough and the

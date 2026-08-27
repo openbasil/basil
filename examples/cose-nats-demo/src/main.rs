@@ -299,6 +299,8 @@ async fn peer_message<S: Signer>(
         response_subject: None,
         in_reply_to: None,
         request_hash: None,
+        freshness_challenge: None,
+        response_public_key_cose: None,
     };
     let message = build_sealed(
         &SealParams {
