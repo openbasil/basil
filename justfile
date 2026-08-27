@@ -194,7 +194,7 @@ check-sh:
     fd -e sh -0 | xargs -0 shellcheck
 
 # GitHub Actions syntax and embedded-shell gates.
-check-actions:
+check-actions: test-actions
     scripts/normalize-release-workflow.py --check .github/workflows/release.yml
     actionlint
 
@@ -271,6 +271,10 @@ clean:
 # Run the full default Rust test suite.
 test-rust:
     cargo test --workspace
+
+# Run the composite action's lifecycle and provider-workflow policy tests.
+test-actions:
+    node --test .github/actions/basil-ci-session/*.test.mjs
 
 # Run every checked-in Go module.
 test-go:

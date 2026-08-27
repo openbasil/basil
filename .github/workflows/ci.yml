@@ -129,16 +129,16 @@ jobs:
       - name: Install just
         uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
 
-      # The composite action uses Node 20. Pin the test runtime to the exact
-      # checked-in release; the tests use only Node's standard library.
-      - name: Install Node 20 for action qualification
+      # The action tests use the checked-in Node release. Their
+      # standard-library-only suite checks that action metadata uses its major.
+      - name: Install Node for action qualification
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version-file: .node-version
           package-manager-cache: false
 
       - name: Node action qualification
-        run: just test-node
+        run: just test-actions
 
       # basil-proto's build.rs drives `tonic-prost-build`, which shells out to
       # `protoc`. The Nix build (build.yml) gets it from the flake; these native

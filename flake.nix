@@ -72,6 +72,7 @@
             jq
             just
             nats-server
+            nodejs_24
             protobuf
             python3
           ];

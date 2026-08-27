@@ -24,6 +24,18 @@ function actionRevision(text) {
   return match[1];
 }
 
+test("action and qualification runtime use the checked-in Node major", () => {
+  const version = workflow(".node-version").trim();
+  const versionMatch = version.match(/^([0-9]+)\.[0-9]+\.[0-9]+$/u);
+  assert.notEqual(versionMatch, null);
+  assert.equal(process.versions.node.split(".")[0], versionMatch[1]);
+
+  const metadata = workflow(".github/actions/basil-ci-session/action.yml");
+  const runtimeMatch = metadata.match(/^\s{2}using: node([0-9]+)\s*$/mu);
+  assert.notEqual(runtimeMatch, null);
+  assert.equal(runtimeMatch[1], versionMatch[1]);
+});
+
 function assertPinnedActionExists(revision) {
   execFileSync("git", ["cat-file", "-e", `${revision}^{commit}`], {
     cwd: repository,
