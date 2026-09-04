@@ -159,8 +159,8 @@ pin-actions:
 check-rust:
     cargo build  --workspace --all-features
     cargo clippy --workspace --all-targets --all-features -- -D warnings
-    cargo test   --workspace
-    cargo fmt --all -- --check
+    gate check
+    just test-rust
 
 # Go gates: module hygiene, build, vet, test, and format-check.
 check-go:
@@ -270,7 +270,7 @@ clean:
 
 # Run the full default Rust test suite.
 test-rust:
-    cargo test --workspace
+    TMP=/tmp TMPDIR=/tmp cargo test --workspace
 
 # Run the composite action's lifecycle and provider-workflow policy tests.
 test-actions:

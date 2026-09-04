@@ -10,6 +10,7 @@ SPDX-License-Identifier: Apache-2.0
 
 ### Changed
 
+- 2026-09-15 - updated dependencies; updated rustls to 0.23.45 to resolve RUSTSEC-2026-0285.
 - 2026-09-04 - bumped rust-toolchain to 1.98.1.
 
 - CI and the Nix development shell qualify the local action under Node.js 24
