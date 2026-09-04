@@ -64,7 +64,7 @@
             # To refresh after editing rust-toolchain.toml: set sha256 = "" (or
             # lib.fakeHash), run `nix build` (or `nix develop`), and paste the
             # `got:` sha256 the hash-mismatch error prints into this field.
-            sha256 = "sha256-P30Tm3O7vQAE725YtDCDHGjNrSsfZO4us11UwJGZSJo=";
+            sha256 = "sha256-p8h3Sl/YRByZfZTAKXdsvF6xEenXKrXSVvpphmZENH4=";
           };
           toolchainNightly = inputs.fenix.packages.${system}.latest.toolchain;
           shellTools = with pkgs; [
