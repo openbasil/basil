@@ -10,6 +10,11 @@ SPDX-License-Identifier: Apache-2.0
 
 ### Changed
 
+- 2026-09-30 - updated dependencies: db-keystore 0.6.0 with the exact Turso
+  0.8.1 family (WAL/SHM sidecar set re-verified unchanged: `-wal`, `-tshm`;
+  `PINNED_TURSO_VERSION` moved to 0.8.1), aws-sdk-kms 1.122.0, hyper-util
+  0.1.21, jsonwebtoken 11.1.0, OpenTelemetry 0.33, thiserror 2.0.21, toml
+  1.1.6, and rcgen 0.14 in basil-tests.
 - 2026-09-15 - updated dependencies; updated rustls to 0.23.45 to resolve RUSTSEC-2026-0285.
 - 2026-09-04 - bumped rust-toolchain to 1.98.1.
 

@@ -61,7 +61,7 @@ prost = { workspace = true }
 # source; `url` must be the workspace version so the fetcher trait types unify).
 rand = { workspace = true }
 # Hermetic, test-only CA/server rotation for `ci_trust_reload_matrix`.
-rcgen = "=0.13.2"
+rcgen = "=0.14.10"
 reqwest = { workspace = true }
 rsa = { workspace = true }
 serde = { workspace = true }

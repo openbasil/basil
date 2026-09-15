@@ -389,7 +389,10 @@ fn tls_material() -> TlsMaterial {
     ])
     .expect("qualification server parameters");
     let server = server_params
-        .signed_by(&server_key, &ca, &ca_key)
+        .signed_by(
+            &server_key,
+            &rcgen::Issuer::from_params(&ca_params, &ca_key),
+        )
         .expect("sign qualification server certificate");
     TlsMaterial {
         ca: ca.pem(),

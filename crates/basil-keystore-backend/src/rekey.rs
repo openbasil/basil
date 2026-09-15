@@ -97,7 +97,7 @@ pub const SIDECAR_SUFFIXES: [&str; 2] = ["-wal", "-tshm"];
 
 /// The turso-family version the [`SIDECAR_SUFFIXES`] set was verified against
 /// (adoption condition C3; see `tests/rekey_boundary.rs`).
-pub const PINNED_TURSO_VERSION: &str = "0.7.2";
+pub const PINNED_TURSO_VERSION: &str = "0.8.1";
 
 /// First line of the intent-marker file: magic plus format version.
 const MARKER_MAGIC: &str = "basil-rekey-intent-v2";

@@ -144,7 +144,10 @@ fn tls_material() -> TlsMaterial {
     let server_params =
         CertificateParams::new(vec!["localhost".to_string()]).expect("server parameters");
     let server = server_params
-        .signed_by(&server_key, &ca, &ca_key)
+        .signed_by(
+            &server_key,
+            &rcgen::Issuer::from_params(&ca_params, &ca_key),
+        )
         .expect("sign test server certificate");
     TlsMaterial {
         ca: ca.pem(),
