@@ -22,9 +22,7 @@ members = [
 [workspace.package]
 version = "0.8.0-alpha.1"
 authors = ["info@openbasil.org"]
-documentation = "https://docs.openbasil.org"
 edition = "2024"
-homepage = "https://github.com/openbasil/basil"
 license = "Apache-2.0"
 repository = "https://github.com/openbasil/basil"
 
@@ -43,7 +41,7 @@ basil-proto = { version = "0.8.0-alpha.1", path = "crates/basil-proto" }
 # `aes` is depended on directly (alongside aes-gcm's own `zeroize` feature, which
 # only scrubs the GHASH key) so its `zeroize` feature zeroizes AES round-key
 # schedules on drop; `aes-gcm` does not forward it.
-aes = { version = "0.9.3", default-features = false, features = ["zeroize"] }
+# aes = { version = "0.9.3", default-features = false, features = ["zeroize"] }
 aes-gcm = { version = "0.11.1", default-features = false, features = ["aes", "alloc", "zeroize"] }
 aes-kw = "0.3"
 age = { version = "=0.11.5", features = ["plugin"] }
@@ -86,7 +84,7 @@ hkdf = { version = "0.13.0", default-features = false }
 hmac = { version = "0.13.0", default-features = false }
 http-body-util = "0.1.5"
 httparse = "1.10.1"
-hyper = { version = "1.11.1", default-features = false, features = ["http1", "server"] }
+hyper = { version = "1.12.0", default-features = false, features = ["http1", "server"] }
 hyper-util = { version = "0.1.21", default-features = false, features = ["http1", "server-auto", "service", "tokio"] }
 # jsonwebtoken 10&11 requires selecting a crypto backend; `rust_crypto` uses the
 # pure-Rust RustCrypto stack (no C toolchain), matching this workspace. Without
@@ -111,7 +109,7 @@ p384 = { version = "0.13", features = ["ecdsa"] }
 p521 = { version = "0.13", features = ["ecdsa"] }
 percent-encoding = "2.3"
 pkcs8 = "0.10"
-proptest = "1.11.0"
+# proptest = "1.11.0"
 prost = "0.14.4"
 prost-types = "0.14.4"
 rand = "0.8"
@@ -133,7 +131,7 @@ serde_json = { version = "1", default-features = false, features = ["alloc", "ar
 # file (YAML or JSON; YAML is a superset so one parser covers both). Values
 # stay encrypted and are never parsed as secrets.
 serde_yaml = "0.9"
-sha2 = { version = "0.11.0", default-features = false }
+sha2 = { version = "0.11.1", default-features = false }
 # `rsa` 0.9 still implements OAEP against `digest` 0.10. Keep this narrow alias
 # until the stable `rsa` 0.10 line is available.
 sha2-legacy = { package = "sha2", version = "0.10", default-features = false }

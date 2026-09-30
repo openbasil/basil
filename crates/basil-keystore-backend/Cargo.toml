@@ -9,7 +9,6 @@ authors.workspace = true
 categories = ["cryptography", "authentication"]
 documentation = "https://docs.rs/basil-keystore-backend"
 edition.workspace = true
-homepage.workspace = true
 keywords = ["basil", "keystore", "keyring", "onepassword", "secrets"]
 license.workspace = true
 publish = true

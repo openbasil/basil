@@ -10,7 +10,6 @@ autobins = false
 categories = ["network-programming", "command-line-utilities"]
 documentation = "https://docs.openbasil.org/"
 edition.workspace = true
-homepage.workspace = true
 keywords = ["basil", "https", "courier", "security"]
 license.workspace = true
 publish = true

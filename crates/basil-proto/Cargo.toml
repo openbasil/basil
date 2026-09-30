@@ -9,7 +9,6 @@ authors.workspace = true
 categories = ["network-programming", "api-bindings"]
 documentation = "https://docs.rs/basil-proto"
 edition.workspace = true
-homepage.workspace = true
 keywords = ["basil", "grpc", "protobuf", "spiffe", "tonic"]
 license.workspace = true
 publish = true

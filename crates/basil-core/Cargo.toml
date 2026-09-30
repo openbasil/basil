@@ -9,7 +9,6 @@ authors.workspace = true
 categories = ["cryptography", "network-programming", "authentication"]
 documentation = "https://docs.rs/basil-core"
 edition.workspace = true
-homepage.workspace = true
 keywords = ["basil", "vault", "broker", "cryptography", "kms"]
 license.workspace = true
 publish = true

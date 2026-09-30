@@ -9,7 +9,6 @@ authors.workspace = true
 categories = ["cryptography", "no-std"]
 documentation = "https://docs.rs/basil-cose"
 edition.workspace = true
-homepage.workspace = true
 keywords = ["cose", "cbor", "cryptography", "security"]
 license.workspace = true
 publish = true

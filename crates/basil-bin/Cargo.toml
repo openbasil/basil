@@ -9,7 +9,6 @@ authors.workspace = true
 categories = ["cryptography", "command-line-utilities"]
 documentation = "https://docs.openbasil.org"
 edition.workspace = true
-homepage.workspace = true
 keywords = ["basil", "vault", "secrets", "cryptography", "cli"]
 license.workspace = true
 publish = true

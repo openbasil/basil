@@ -9,7 +9,6 @@ authors.workspace = true
 categories = ["network-programming", "authentication"]
 documentation = "https://docs.openbasil.org/clients/sealed-invocations/"
 edition.workspace = true
-homepage.workspace = true
 keywords = ["basil", "grpc", "courier", "unix", "security"]
 license.workspace = true
 publish = true

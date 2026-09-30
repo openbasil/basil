@@ -10,7 +10,6 @@ autobins = false
 categories = ["network-programming", "command-line-utilities"]
 documentation = "https://docs.openbasil.org/clients/nats-bridge/"
 edition.workspace = true
-homepage.workspace = true
 keywords = ["basil", "nats", "grpc", "bridge", "messaging"]
 license.workspace = true
 publish = true

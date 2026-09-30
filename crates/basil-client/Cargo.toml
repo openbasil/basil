@@ -9,7 +9,6 @@ authors.workspace = true
 categories = ["cryptography", "api-bindings", "authentication"]
 documentation = "https://docs.rs/basil"
 edition.workspace = true
-homepage.workspace = true
 keywords = ["basil", "grpc", "cryptography", "secrets", "client"]
 license.workspace = true
 publish = true
